@@ -337,28 +337,56 @@ pub struct TcpProxy<C: NatDstConnector> {
     connector: C,
 }
 
+const PROXY_REDIRECT: bool = true;
+
 #[async_trait::async_trait]
 impl<C: NatDstConnector> PeerPacketFilter for TcpProxy<C> {
     async fn try_process_packet_from_peer(&self, mut packet: ZCPacket) -> Option<ZCPacket> {
-        if self.try_handle_peer_packet(&mut packet).await.is_some() {
-            if self.is_smoltcp_enabled() {
-                let smoltcp_stack_sender = self.smoltcp_stack_sender.as_ref().unwrap();
-                if let Err(e) = smoltcp_stack_sender.try_send(packet) {
-                    tracing::error!("send to smoltcp stack failed: {:?}", e);
-                }
-            } else if let Err(e) = self.peer_manager.get_nic_channel().send(packet).await {
-                tracing::error!("send to nic failed: {:?}", e);
+        packet.tcp_trace("try_process_packet_from_peer");
+
+        if self.try_handle_peer_packet(&mut packet).await.is_none() {
+            return Some(packet);
+        }
+
+        if self.is_smoltcp_enabled() {
+            let smoltcp_stack_sender = self.smoltcp_stack_sender.as_ref().unwrap();
+            if let Err(e) = smoltcp_stack_sender.try_send(packet) {
+                tracing::error!("send to smoltcp stack failed: {:?}", e);
             }
             return None;
-        } else {
-            Some(packet)
         }
+
+        if packet.loopback && PROXY_REDIRECT {
+            packet.loopback = false;
+            tracing::trace!("loopback packet");
+
+            let (_, ip_dst, _, _, _) = packet.tcp_parse();
+
+            if let Err(e) = self
+                .peer_manager
+                .send_msg_by_ip(packet, IpAddr::from(ip_dst))
+                .await
+            {
+                tracing::error!("send msg failed: {:?}", e);
+            }
+
+            return None;
+        }
+
+        tracing::trace!("send to nic");
+        if let Err(e) = self.peer_manager.get_nic_channel().send(packet).await {
+            tracing::error!("send to nic failed: {:?}", e);
+        }
+
+        None
     }
 }
 
 #[async_trait::async_trait]
 impl<C: NatDstConnector> NicPacketFilter for TcpProxy<C> {
     async fn try_process_packet_from_nic(&self, zc_packet: &mut ZCPacket) -> bool {
+        zc_packet.tcp_trace("try_process_packet_from_nic");
+
         let Some(my_ipv4_inet) = self.get_local_inet() else {
             return false;
         };
@@ -834,6 +862,8 @@ impl<C: NatDstConnector> TcpProxy<C> {
     }
 
     async fn try_handle_peer_packet(&self, packet: &mut ZCPacket) -> Option<()> {
+        packet.tcp_trace("try_handle_peer_packet");
+
         if !self
             .connector
             .check_packet_from_peer_fast(&self.cidr_set, &self.global_ctx)
@@ -906,22 +936,47 @@ impl<C: NatDstConnector> TcpProxy<C> {
             return None;
         }
 
-        let mut ip_packet = MutableIpv4Packet::new(payload_bytes).unwrap();
-        if !self.is_smoltcp_enabled() && source_ip == ipv4_addr {
-            // modify the source so the response packet can be handled by tun device
-            ip_packet.set_source(Self::get_fake_local_ipv4(&ipv4_inet));
-        }
-        ip_packet.set_destination(ipv4_addr);
-        let source = ip_packet.get_source();
+        tracing::info!("modifying packet");
 
-        let mut tcp_packet = MutableTcpPacket::new(ip_packet.payload_mut()).unwrap();
-        tcp_packet.set_destination(self.get_local_port());
+        let mut ip_packet;
+        let mut tcp_packet;
+        let source;
+
+        if PROXY_REDIRECT {
+            ip_packet = MutableIpv4Packet::new(payload_bytes).unwrap();
+            if !self.is_smoltcp_enabled() && source_ip == ipv4_addr {
+                // modify the source so the response packet can be handled by tun device
+                ip_packet.set_destination(Self::get_fake_local_ipv4(&ipv4_inet));
+                // ip_packet.set_source(self.get_local_ip().unwrap());
+            }
+            ip_packet.set_source(ipv4_addr);
+            source = ip_packet.get_source();
+
+            tcp_packet = MutableTcpPacket::new(ip_packet.payload_mut()).unwrap();
+            let tcp_src = tcp_packet.get_source();
+            tcp_packet.set_source(self.get_local_port());
+            tcp_packet.set_destination(tcp_src);
+        } else {
+            ip_packet = MutableIpv4Packet::new(payload_bytes).unwrap();
+            if !self.is_smoltcp_enabled() && source_ip == ipv4_addr {
+                // modify the source so the response packet can be handled by tun device
+                ip_packet.set_source(Self::get_fake_local_ipv4(&ipv4_inet));
+                // ip_packet.set_source(self.get_local_ip().unwrap());
+            }
+            ip_packet.set_destination(ipv4_addr);
+            source = ip_packet.get_source();
+
+            tcp_packet = MutableTcpPacket::new(ip_packet.payload_mut()).unwrap();
+            tcp_packet.set_destination(self.get_local_port());
+        }
 
         Self::update_tcp_packet_checksum(&mut tcp_packet, &source, &ipv4_addr);
         drop(tcp_packet);
         Self::update_ip_packet_checksum(&mut ip_packet);
 
-        tracing::trace!(?source, ?ipv4_addr, ?packet, "tcp packet after modified");
+        packet.loopback = true;
+
+        packet.tcp_trace("modified packet");
 
         Some(())
     }
