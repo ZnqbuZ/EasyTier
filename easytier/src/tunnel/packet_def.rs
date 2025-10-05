@@ -1,5 +1,9 @@
+use std::net::Ipv4Addr;
 use bytes::Bytes;
 use bytes::BytesMut;
+use pnet::packet::ipv4::Ipv4Packet;
+use pnet::packet::Packet;
+use pnet::packet::tcp::TcpPacket;
 use zerocopy::byteorder::*;
 use zerocopy::AsBytes;
 use zerocopy::FromBytes;
@@ -400,13 +404,32 @@ impl ZCPacketType {
 pub struct ZCPacket {
     inner: BytesMut,
     packet_type: ZCPacketType,
+    pub loopback: bool,
 }
 
 impl ZCPacket {
+    pub fn tcp_parse(&self) -> (Ipv4Addr, Ipv4Addr, u16, u16, String) {
+        let ip_packet = Ipv4Packet::new(self.payload()).unwrap();
+        let tcp_packet = TcpPacket::new(ip_packet.payload()).unwrap();
+        (
+            ip_packet.get_source(),
+            ip_packet.get_destination(),
+            tcp_packet.get_source(),
+            tcp_packet.get_destination(),
+            String::from_utf8_lossy(tcp_packet.payload()).parse().unwrap()
+        )
+    }
+    
+    pub fn tcp_trace(&self, message: &str) {
+        let (ip_src, ip_dst, tcp_src, tcp_dst, content) = self.tcp_parse();
+        tracing::warn!(zc_packet = ?self, ?ip_src, ?tcp_src, ?ip_dst, ?tcp_dst, ?content, message);
+    }
+    
     pub fn new_nic_packet() -> Self {
         Self {
             inner: BytesMut::new(),
             packet_type: ZCPacketType::NIC,
+            loopback: false,
         }
     }
 
@@ -414,6 +437,7 @@ impl ZCPacket {
         Self {
             inner: buf,
             packet_type,
+            loopback: false,
         }
     }
 
