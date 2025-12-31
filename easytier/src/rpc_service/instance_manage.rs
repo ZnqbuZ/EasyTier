@@ -1,23 +1,24 @@
-use std::sync::Arc;
+use std::{collections::HashSet, sync::Arc};
 
 use crate::{
-    common::config::ConfigLoader,
+    common::config::{ConfigFileControl, ConfigFilePermission, ConfigLoader},
     instance_manager::NetworkInstanceManager,
-    launcher::ConfigSource,
     proto::{
-        api::manage::*,
+        api::{config::GetConfigRequest, manage::*},
         rpc_types::{self, controller::BaseController},
     },
+    web_client::WebClientHooks,
 };
 
 #[derive(Clone)]
 pub struct InstanceManageRpcService {
     manager: Arc<NetworkInstanceManager>,
+    hooks: Arc<dyn WebClientHooks>,
 }
 
 impl InstanceManageRpcService {
-    pub fn new(manager: Arc<NetworkInstanceManager>) -> Self {
-        Self { manager }
+    pub fn new(manager: Arc<NetworkInstanceManager>, hooks: Arc<dyn WebClientHooks>) -> Self {
+        Self { manager, hooks }
     }
 }
 
@@ -47,11 +48,75 @@ impl WebClientService for InstanceManageRpcService {
         if let Some(inst_id) = req.inst_id {
             cfg.set_id(inst_id.into());
         }
-        self.manager.run_network_instance(cfg, ConfigSource::Web)?;
-        println!("instance {} started", id);
-        Ok(RunNetworkInstanceResponse {
+        let resp = RunNetworkInstanceResponse {
             inst_id: Some(id.into()),
-        })
+        };
+
+        let mut control = if let Some(control) = self.manager.get_instance_config_control(&id) {
+            let error_msg = self
+                .manager
+                .get_network_info(&id)
+                .await
+                .and_then(|i| i.error_msg)
+                .unwrap_or_default();
+
+            if !req.overwrite && error_msg.is_empty() {
+                return Ok(resp);
+            }
+            if control.is_read_only() {
+                return Err(
+                    anyhow::anyhow!("instance {} is read-only, cannot be overwritten", id).into(),
+                );
+            }
+
+            if let Some(path) = control.path.as_ref() {
+                let real_control = ConfigFileControl::from_path(path.clone()).await;
+                if real_control.is_read_only() {
+                    return Err(anyhow::anyhow!(
+                        "config file {} is read-only, cannot be overwritten",
+                        path.display()
+                    )
+                    .into());
+                }
+            }
+
+            self.manager.delete_network_instance(vec![id])?;
+
+            control.clone()
+        } else if let Some(config_dir) = self.manager.get_config_dir() {
+            ConfigFileControl::new(
+                Some(config_dir.join(format!("{}.toml", id))),
+                ConfigFilePermission::default(),
+            )
+        } else {
+            ConfigFileControl::new(None, ConfigFilePermission::default())
+        };
+
+        if !control.is_read_only() {
+            if let Some(config_file) = control.path.as_ref() {
+                if let Err(e) = std::fs::write(config_file, cfg.dump()) {
+                    tracing::warn!(
+                        "failed to write config file {}: {}",
+                        config_file.display(),
+                        e
+                    );
+                    control.set_read_only(true);
+                }
+            }
+        }
+
+        if let Err(e) = self.hooks.pre_run_network_instance(&cfg).await {
+            return Err(anyhow::anyhow!("pre-run hook failed: {}", e).into());
+        }
+
+        self.manager.run_network_instance(cfg, true, control)?;
+        println!("instance {} started", id);
+
+        if let Err(e) = self.hooks.post_run_network_instance(&id).await {
+            tracing::warn!("post-run hook failed: {}", e);
+        }
+
+        Ok(resp)
     }
 
     async fn retain_network_instance(
@@ -125,12 +190,102 @@ impl WebClientService for InstanceManageRpcService {
         _: BaseController,
         req: DeleteNetworkInstanceRequest,
     ) -> Result<DeleteNetworkInstanceResponse, rpc_types::error::Error> {
-        let remain_inst_ids = self
+        let inst_ids: HashSet<uuid::Uuid> = req.inst_ids.into_iter().map(Into::into).collect();
+
+        let hook_ids: Vec<uuid::Uuid> = inst_ids.iter().cloned().collect();
+
+        let inst_ids = self
             .manager
-            .delete_network_instance(req.inst_ids.into_iter().map(Into::into).collect())?;
+            .iter()
+            .filter(|v| inst_ids.contains(v.key()))
+            .filter(|v| v.get_config_file_control().is_deletable())
+            .map(|v| *v.key())
+            .collect::<Vec<_>>();
+        let config_files = inst_ids
+            .iter()
+            .filter_map(|id| {
+                self.manager
+                    .get_instance_config_control(id)
+                    .and_then(|control| control.path)
+            })
+            .collect::<Vec<_>>();
+        let remain_inst_ids = self.manager.delete_network_instance(inst_ids)?;
         println!("instance {:?} retained", remain_inst_ids);
+
+        if let Err(e) = self.hooks.post_remove_network_instances(&hook_ids).await {
+            tracing::warn!("post-remove hook failed: {}", e);
+        }
+
+        for config_file in config_files {
+            if let Err(e) = std::fs::remove_file(&config_file) {
+                tracing::warn!(
+                    "failed to remove config file {}: {}",
+                    config_file.display(),
+                    e
+                );
+            }
+        }
         Ok(DeleteNetworkInstanceResponse {
             remain_inst_ids: remain_inst_ids.into_iter().map(Into::into).collect(),
         })
+    }
+
+    async fn get_network_instance_config(
+        &self,
+        _: BaseController,
+        req: GetNetworkInstanceConfigRequest,
+    ) -> Result<GetNetworkInstanceConfigResponse, rpc_types::error::Error> {
+        let inst_id: uuid::Uuid = req
+            .inst_id
+            .ok_or_else(|| anyhow::anyhow!("instance id is required"))?
+            .into();
+
+        let control = self
+            .manager
+            .get_instance_config_control(&inst_id)
+            .ok_or_else(|| anyhow::anyhow!("instance config control not found"))?;
+
+        if control.is_read_only() {
+            return Err(anyhow::anyhow!(
+                "Configuration for instance {} is read-only (uses environment variables) and cannot be retrieved via API. \
+                 Please access the configuration file directly on the file system.",
+                inst_id
+            )
+            .into());
+        }
+
+        let config = self
+            .manager
+            .get_instance_service(&inst_id)
+            .ok_or_else(|| anyhow::anyhow!("instance service not found"))?
+            .get_config_service()
+            .get_config(BaseController::default(), GetConfigRequest::default())
+            .await?
+            .config;
+        Ok(GetNetworkInstanceConfigResponse { config })
+    }
+
+    async fn list_network_instance_meta(
+        &self,
+        _: BaseController,
+        req: ListNetworkInstanceMetaRequest,
+    ) -> Result<ListNetworkInstanceMetaResponse, rpc_types::error::Error> {
+        let mut metas = Vec::with_capacity(req.inst_ids.len());
+        for inst_id in req.inst_ids {
+            let inst_id: uuid::Uuid = (inst_id).into();
+            let Some(control) = self.manager.get_instance_config_control(&inst_id) else {
+                continue;
+            };
+            let Some(name) = self.manager.get_network_instance_name(&inst_id) else {
+                continue;
+            };
+            let meta = NetworkMeta {
+                inst_id: Some(inst_id.into()),
+                network_name: name,
+                config_permission: control.permission.into(),
+            };
+            metas.push(meta);
+        }
+        Ok(ListNetworkInstanceMetaResponse { metas })
     }
 }

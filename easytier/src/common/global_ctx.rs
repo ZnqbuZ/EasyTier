@@ -55,6 +55,8 @@ pub enum GlobalCtxEvent {
     PortForwardAdded(PortForwardConfigPb),
 
     ConfigPatched(InstanceConfigPatch),
+
+    ProxyCidrsUpdated(Vec<cidr::Ipv4Cidr>, Vec<cidr::Ipv4Cidr>), // (added, removed)
 }
 
 pub type EventBus = tokio::sync::broadcast::Sender<GlobalCtxEvent>;
@@ -84,6 +86,7 @@ pub struct GlobalCtx {
     enable_exit_node: bool,
     proxy_forward_by_system: bool,
     no_tun: bool,
+    p2p_only: bool,
 
     feature_flags: AtomicCell<PeerFeatureFlag>,
 
@@ -138,10 +141,12 @@ impl GlobalCtx {
         let enable_exit_node = config_fs.get_flags().enable_exit_node || cfg!(target_env = "ohos");
         let proxy_forward_by_system = config_fs.get_flags().proxy_forward_by_system;
         let no_tun = config_fs.get_flags().no_tun;
+        let p2p_only = config_fs.get_flags().p2p_only;
 
         let feature_flags = PeerFeatureFlag {
             kcp_input: !config_fs.get_flags().disable_kcp_input,
             no_relay_kcp: config_fs.get_flags().disable_relay_kcp,
+            support_conn_list_sync: true, // Enable selective peer list sync by default
             ..Default::default()
         };
 
@@ -171,6 +176,7 @@ impl GlobalCtx {
             enable_exit_node,
             proxy_forward_by_system,
             no_tun,
+            p2p_only,
 
             feature_flags: AtomicCell::new(feature_flags),
             quic_proxy_port: AtomicCell::new(None),
@@ -419,6 +425,15 @@ impl GlobalCtx {
             .and_then(|acl| acl.acl_v1)
             .and_then(|acl_v1| acl_v1.group)
             .map_or_else(Vec::new, |group| group.declares.to_vec())
+    }
+
+    pub fn p2p_only(&self) -> bool {
+        self.p2p_only
+    }
+
+    pub fn latency_first(&self) -> bool {
+        // NOTICE: p2p only is conflict with latency first
+        self.config.get_flags().latency_first && !self.p2p_only
     }
 }
 

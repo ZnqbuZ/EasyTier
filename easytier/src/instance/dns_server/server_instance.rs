@@ -442,6 +442,7 @@ impl RpcServerHook for MagicDnsServerInstanceData {
             item.value_mut().remove(&remote_addr);
         }
         self.route_infos.retain(|_, v| !v.is_empty());
+        self.route_infos.shrink_to_fit();
         self.update().await;
     }
 }
@@ -491,16 +492,18 @@ impl MagicDnsServerInstance {
         let mut dns_server = Server::new(dns_config);
         dns_server.run().await?;
 
-        if !tun_inet.contains(&fake_ip) && tun_dev.is_some() {
-            let cost = if cfg!(target_os = "windows") {
-                Some(4)
-            } else {
-                None
-            };
-            let ifcfg = IfConfiger {};
-            ifcfg
-                .add_ipv4_route(tun_dev.as_ref().unwrap(), fake_ip, 32, cost)
-                .await?;
+        if !tun_inet.contains(&fake_ip) {
+            if let Some(tun_dev_name) = &tun_dev {
+                let cost = if cfg!(target_os = "windows") {
+                    Some(4)
+                } else {
+                    None
+                };
+                let ifcfg = IfConfiger {};
+                ifcfg
+                    .add_ipv4_route(tun_dev_name, fake_ip, 32, cost)
+                    .await?;
+            }
         }
 
         let data = Arc::new(MagicDnsServerInstanceData {
@@ -524,6 +527,11 @@ impl MagicDnsServerInstance {
         // Use configured tld_dns_zone or fall back to DEFAULT_ET_DNS_ZONE if empty
         let flags = peer_mgr.get_global_ctx().config.get_flags();
         let tld_dns_zone_clone = flags.tld_dns_zone.clone();
+
+        data.update_dns_records(std::iter::empty(), &tld_dns_zone_clone)
+            .await
+            .context("Failed to initialize DNS zone")?;
+
         let data_clone = data.clone();
         tokio::task::spawn_blocking(move || data_clone.do_system_config(&tld_dns_zone_clone))
             .await
@@ -543,13 +551,14 @@ impl MagicDnsServerInstance {
             if let Err(e) = ret {
                 tracing::error!("Failed to close system config: {:?}", e);
             }
-        }
-
-        if !self.tun_inet.contains(&self.data.fake_ip) && self.data.tun_dev.is_some() {
-            let ifcfg = IfConfiger {};
-            let _ = ifcfg
-                .remove_ipv4_route(self.data.tun_dev.as_ref().unwrap(), self.data.fake_ip, 32)
-                .await;
+            if !self.tun_inet.contains(&self.data.fake_ip) {
+                if let Some(tun_dev_name) = &self.data.tun_dev {
+                    let ifcfg = IfConfiger {};
+                    let _ = ifcfg
+                        .remove_ipv4_route(tun_dev_name, self.data.fake_ip, 32)
+                        .await;
+                }
+            }
         }
 
         let _ = self

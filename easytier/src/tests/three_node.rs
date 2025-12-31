@@ -2,6 +2,7 @@
 
 use core::panic;
 use std::{
+    future::Future,
     sync::{atomic::AtomicU32, Arc},
     time::Duration,
 };
@@ -10,6 +11,8 @@ use rand::Rng;
 use tokio::{net::UdpSocket, task::JoinSet};
 
 use super::*;
+
+// TODO: 需要加一个单测，确保 socks5 + exit node == self || proxy_cidr == 0.0.0.0/0 时，可以实现出口节点的能力。
 
 use crate::{
     common::{
@@ -337,6 +340,77 @@ pub async fn basic_three_node_test(
         Duration::from_secs(5),
     )
     .await;
+
+    drop_insts(insts).await;
+}
+
+#[tokio::test]
+#[serial_test::serial]
+pub async fn subnet_proxy_loop_prevention_test() {
+    // 测试场景：inst1 和 inst2 都代理了 10.1.2.0/24 网段，
+    // inst1 发起对 10.1.2.5 的 ping，不应该出现环路
+    let insts = init_three_node_ex(
+        "udp",
+        |cfg| {
+            if cfg.get_inst_name() == "inst1" {
+                // inst1 代理 10.1.2.0/24 网段
+                cfg.add_proxy_cidr("10.1.2.0/24".parse().unwrap(), None)
+                    .unwrap();
+            } else if cfg.get_inst_name() == "inst2" {
+                // inst2 也代理相同的 10.1.2.0/24 网段
+                cfg.add_proxy_cidr("10.1.2.0/24".parse().unwrap(), None)
+                    .unwrap();
+            }
+            cfg
+        },
+        false,
+    )
+    .await;
+
+    // 等待代理路由出现 - inst1 应该看到 inst2 的代理路由
+    wait_proxy_route_appear(
+        &insts[0].get_peer_manager(),
+        "10.144.144.2/24",
+        insts[1].peer_id(),
+        "10.1.2.0/24",
+    )
+    .await;
+
+    // 等待代理路由出现 - inst2 应该看到 inst1 的代理路由
+    wait_proxy_route_appear(
+        &insts[1].get_peer_manager(),
+        "10.144.144.1/24",
+        insts[0].peer_id(),
+        "10.1.2.0/24",
+    )
+    .await;
+
+    // 从 inst1 (net_a) 发起对 10.1.2.5 的 ping 测试
+    // 这应该失败，并且不会产生环路
+    let now = std::time::Instant::now();
+    while now.elapsed().as_secs() < 10 {
+        ping_test("net_a", "10.1.2.5", None).await;
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+
+    println!(
+        "inst0 metrics: {:?}",
+        insts[0]
+            .get_global_ctx()
+            .stats_manager()
+            .export_prometheus()
+    );
+
+    let all_metrics = insts[0].get_global_ctx().stats_manager().get_all_metrics();
+    for metric in all_metrics {
+        if metric.name == MetricName::TrafficPacketsSelfTx {
+            let counter = insts[0]
+                .get_global_ctx()
+                .stats_manager()
+                .get_counter(metric.name, metric.labels.clone());
+            assert!(counter.get() < 40);
+        }
+    }
 
     drop_insts(insts).await;
 }
@@ -998,7 +1072,9 @@ pub async fn wireguard_vpn_portal(#[values(true, false)] test_v6: bool) {
 #[rstest::rstest]
 #[tokio::test]
 #[serial_test::serial]
-pub async fn socks5_vpn_portal(#[values("10.144.144.1", "10.144.144.3")] dst_addr: &str) {
+pub async fn socks5_vpn_portal(
+    #[values("10.144.144.1", "10.144.144.3", "10.1.2.4")] dst_addr: &str,
+) {
     use rand::Rng as _;
     use tokio::{
         io::{AsyncReadExt, AsyncWriteExt},
@@ -1006,7 +1082,19 @@ pub async fn socks5_vpn_portal(#[values("10.144.144.1", "10.144.144.3")] dst_add
     };
     use tokio_socks::tcp::socks5::Socks5Stream;
 
-    let _insts = init_three_node("tcp").await;
+    let _insts = init_three_node_ex(
+        "tcp",
+        |cfg| {
+            if cfg.get_inst_name() == "inst3" {
+                // 添加子网代理配置
+                cfg.add_proxy_cidr("10.1.2.0/24".parse().unwrap(), None)
+                    .unwrap();
+            }
+            cfg
+        },
+        false,
+    )
+    .await;
 
     let mut buf = vec![0u8; 1024];
     rand::thread_rng().fill(&mut buf[..]);
@@ -1016,18 +1104,23 @@ pub async fn socks5_vpn_portal(#[values("10.144.144.1", "10.144.144.3")] dst_add
     let task = tokio::spawn(async move {
         let net_ns = if dst_addr_clone == "10.144.144.1" {
             NetNS::new(Some("net_a".into()))
-        } else {
+        } else if dst_addr_clone == "10.144.144.3" {
             NetNS::new(Some("net_c".into()))
+        } else {
+            NetNS::new(Some("net_d".into()))
         };
+
         let _g = net_ns.guard();
 
         let socket = TcpListener::bind("0.0.0.0:22222").await.unwrap();
         let (mut st, addr) = socket.accept().await.unwrap();
 
-        if dst_addr_clone == "10.144.144.3" {
+        if dst_addr_clone == "10.144.144.1" {
+            assert_eq!(addr.ip().to_string(), "127.0.0.1".to_string());
+        } else if dst_addr_clone == "10.144.144.3" {
             assert_eq!(addr.ip().to_string(), "10.144.144.1".to_string());
         } else {
-            assert_eq!(addr.ip().to_string(), "127.0.0.1".to_string());
+            assert_eq!(addr.ip().to_string(), "10.1.2.3".to_string());
         }
 
         let rbuf = &mut [0u8; 1024];
@@ -1035,7 +1128,11 @@ pub async fn socks5_vpn_portal(#[values("10.144.144.1", "10.144.144.3")] dst_add
         assert_eq!(rbuf, buf_clone.as_slice());
     });
 
-    let net_ns = NetNS::new(Some("net_a".into()));
+    let net_ns = if dst_addr == "10.1.2.4" {
+        NetNS::new(Some("net_c".into()))
+    } else {
+        NetNS::new(Some("net_a".into()))
+    };
     let _g = net_ns.guard();
 
     println!("connect to socks5 portal");
@@ -1854,6 +1951,107 @@ pub async fn acl_rule_test_subnet_proxy(
     drop_insts(insts).await;
 }
 
+async fn assert_panics_ext<F, Fut>(f: F, expect_panic: bool)
+where
+    F: FnOnce() -> Fut + Send + 'static,
+    Fut: Future + Send + 'static,
+{
+    // Run the async function in a separate task so panics surface as JoinError
+    let res = tokio::spawn(async move {
+        f().await;
+    })
+    .await;
+
+    if expect_panic {
+        assert!(
+            res.is_err() && res.as_ref().unwrap_err().is_panic(),
+            "Expected function to panic, but it didn't",
+        );
+    } else {
+        assert!(res.is_ok(), "Expected function not to panic, but it did");
+    }
+}
+
+#[rstest::rstest]
+#[tokio::test]
+#[serial_test::serial]
+pub async fn p2p_only_test(
+    #[values(true, false)] has_p2p_conn: bool,
+    #[values(true, false)] enable_kcp_proxy: bool,
+    #[values(true, false)] enable_quic_proxy: bool,
+) {
+    use crate::peers::tests::wait_route_appear_with_cost;
+
+    let insts = init_three_node_ex(
+        "udp",
+        |cfg| {
+            if cfg.get_inst_name() == "inst1" {
+                let mut flags = cfg.get_flags();
+                flags.enable_kcp_proxy = enable_kcp_proxy;
+                flags.enable_quic_proxy = enable_quic_proxy;
+                flags.disable_p2p = true;
+                flags.p2p_only = true;
+                cfg.set_flags(flags);
+            } else if cfg.get_inst_name() == "inst3" {
+                // 添加子网代理配置
+                cfg.add_proxy_cidr("10.1.2.0/24".parse().unwrap(), None)
+                    .unwrap();
+            }
+            cfg
+        },
+        false,
+    )
+    .await;
+
+    if has_p2p_conn {
+        insts[2]
+            .get_conn_manager()
+            .add_connector(RingTunnelConnector::new(
+                format!("ring://{}", insts[0].id()).parse().unwrap(),
+            ));
+        wait_route_appear_with_cost(
+            insts[2].get_peer_manager(),
+            insts[0].get_peer_manager().my_peer_id(),
+            Some(1),
+        )
+        .await
+        .unwrap();
+    }
+
+    let target_ip = "10.1.2.4";
+
+    for target_ip in ["10.144.144.3", target_ip] {
+        assert_panics_ext(
+            || async {
+                subnet_proxy_test_icmp(target_ip).await;
+            },
+            !has_p2p_conn,
+        )
+        .await;
+
+        let listen_ip = if target_ip == "10.144.144.3" {
+            "0.0.0.0"
+        } else {
+            "10.1.2.4"
+        };
+        assert_panics_ext(
+            || async {
+                subnet_proxy_test_tcp(listen_ip, target_ip).await;
+            },
+            !has_p2p_conn,
+        )
+        .await;
+
+        assert_panics_ext(
+            || async {
+                subnet_proxy_test_udp(listen_ip, target_ip).await;
+            },
+            !has_p2p_conn,
+        )
+        .await;
+    }
+}
+
 #[rstest::rstest]
 #[tokio::test]
 #[serial_test::serial]
@@ -2263,6 +2461,113 @@ pub async fn acl_group_self_test(
     println!("ACL stats after group {} tests: {:?}", protocol, stats);
 
     println!("✓ All group-based ACL tests completed successfully");
+
+    drop_insts(insts).await;
+}
+
+#[rstest::rstest]
+#[tokio::test]
+#[serial_test::serial]
+pub async fn whitelist_test(
+    #[values("tcp", "udp")] protocol: &str,
+    #[values(true, false)] test_outbound_allow_list: bool,
+) {
+    let port = 44553;
+    let acl_configured_inst = if test_outbound_allow_list {
+        "inst1"
+    } else {
+        "inst3"
+    };
+    let insts = init_three_node_ex(
+        protocol,
+        move |cfg| {
+            let port = if test_outbound_allow_list { 0 } else { port };
+            if cfg.get_inst_name() == acl_configured_inst {
+                if protocol == "tcp" {
+                    cfg.set_tcp_whitelist(vec![format!("{}", port)]);
+                } else if protocol == "udp" {
+                    cfg.set_udp_whitelist(vec![format!("{}", port)]);
+                }
+            }
+            cfg
+        },
+        false,
+    )
+    .await;
+
+    use crate::tunnel::{
+        common::tests::_tunnel_pingpong_netns_with_timeout,
+        tcp::{TcpTunnelConnector, TcpTunnelListener},
+        udp::{UdpTunnelConnector, UdpTunnelListener},
+        TunnelConnector, TunnelListener,
+    };
+    use rand::Rng;
+
+    let make_listener =
+        |protocol: &str, port: u16| -> Box<dyn TunnelListener + Send + Sync + 'static> {
+            match protocol {
+                "tcp" => Box::new(TcpTunnelListener::new(
+                    format!("tcp://0.0.0.0:{}", port).parse().unwrap(),
+                )),
+                "udp" => Box::new(UdpTunnelListener::new(
+                    format!("udp://0.0.0.0:{}", port).parse().unwrap(),
+                )),
+                _ => panic!("unsupported protocol: {}", protocol),
+            }
+        };
+
+    let make_connector =
+        |protocol: &str, port: u16| -> Box<dyn TunnelConnector + Send + Sync + 'static> {
+            match protocol {
+                "tcp" => Box::new(TcpTunnelConnector::new(
+                    format!("tcp://10.144.144.3:{}", port).parse().unwrap(),
+                )),
+                "udp" => Box::new(UdpTunnelConnector::new(
+                    format!("udp://10.144.144.3:{}", port).parse().unwrap(),
+                )),
+                _ => panic!("unsupported protocol: {}", protocol),
+            }
+        };
+
+    let mut buf = vec![0; 32];
+    rand::thread_rng().fill(&mut buf[..]);
+
+    for p in &["tcp", "udp"] {
+        _tunnel_pingpong_netns_with_timeout(
+            make_listener(p, port),
+            make_connector(p, port),
+            NetNS::new(Some("net_c".into())),
+            NetNS::new(Some("net_a".into())),
+            buf.clone(),
+            std::time::Duration::from_millis(100),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("{} should be allowed", p));
+    }
+
+    if test_outbound_allow_list {
+        return;
+    }
+
+    // test other port
+    let other_port = port + 1;
+    for p in ["tcp", "udp"] {
+        let r = _tunnel_pingpong_netns_with_timeout(
+            make_listener(p, other_port),
+            make_connector(p, other_port),
+            NetNS::new(Some("net_c".into())),
+            NetNS::new(Some("net_a".into())),
+            buf.clone(),
+            std::time::Duration::from_millis(100),
+        )
+        .await;
+
+        if p != protocol {
+            assert!(r.is_ok(), "{} should be allowed", p);
+        } else {
+            assert!(r.is_err(), "{} should be blocked", p);
+        }
+    }
 
     drop_insts(insts).await;
 }

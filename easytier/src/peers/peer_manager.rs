@@ -24,6 +24,7 @@ use crate::{
         constants::EASYTIER_VERSION,
         error::Error,
         global_ctx::{ArcGlobalCtx, NetworkIdentity},
+        shrink_dashmap,
         stats_manager::{CounterHandle, LabelSet, LabelType, MetricName},
         stun::StunInfoCollectorTrait,
         PeerId,
@@ -241,7 +242,7 @@ impl PeerManager {
         ));
         let foreign_network_client = Arc::new(ForeignNetworkClient::new(
             global_ctx.clone(),
-            packet_send.clone(),
+            packet_send,
             peer_rpc_mgr.clone(),
             my_peer_id,
         ));
@@ -288,7 +289,7 @@ impl PeerManager {
 
             packet_recv: Arc::new(Mutex::new(Some(packet_recv))),
 
-            peers: peers.clone(),
+            peers,
 
             peer_rpc_mgr,
             peer_rpc_tspt: rpc_tspt,
@@ -514,6 +515,7 @@ impl PeerManager {
         }
 
         self.reserved_my_peer_id_map.remove(&peer_network_name);
+        shrink_dashmap(&self.reserved_my_peer_id_map, None);
 
         tracing::info!("add tunnel as server done");
         Ok(())
@@ -789,7 +791,7 @@ impl PeerManager {
         impl PeerPacketFilter for NicPacketProcessor {
             async fn try_process_packet_from_peer(&self, packet: ZCPacket) -> Option<ZCPacket> {
                 let hdr = packet.peer_manager_header().unwrap();
-                if hdr.packet_type == PacketType::Data as u8 {
+                if hdr.packet_type == PacketType::Data as u8 && !hdr.is_not_send_to_tun() {
                     tracing::trace!(?packet, "send packet to nic channel");
                     // TODO: use a function to get the body ref directly for zero copy
                     let _ = self.nic_channel.send(packet).await;
@@ -995,11 +997,20 @@ impl PeerManager {
         }
     }
 
+    fn check_p2p_only_before_send(&self, dst_peer_id: PeerId) -> Result<(), Error> {
+        if self.global_ctx.p2p_only() && !self.peers.has_peer(dst_peer_id) {
+            return Err(Error::RouteError(None));
+        }
+        Ok(())
+    }
+
     pub async fn send_msg_for_proxy(
         &self,
         mut msg: ZCPacket,
         dst_peer_id: PeerId,
     ) -> Result<(), Error> {
+        self.check_p2p_only_before_send(dst_peer_id)?;
+
         self.self_tx_counters
             .compress_tx_bytes_before
             .add(msg.buf_len() as u64);
@@ -1052,7 +1063,14 @@ impl PeerManager {
         }
     }
 
-    pub async fn get_msg_dst_peer(&self, ipv4_addr: &Ipv4Addr) -> (Vec<PeerId>, bool) {
+    pub async fn get_msg_dst_peer(&self, addr: &IpAddr) -> (Vec<PeerId>, bool) {
+        match addr {
+            IpAddr::V4(ipv4_addr) => self.get_msg_dst_peer_ipv4(ipv4_addr).await,
+            IpAddr::V6(ipv6_addr) => self.get_msg_dst_peer_ipv6(ipv6_addr).await,
+        }
+    }
+
+    pub async fn get_msg_dst_peer_ipv4(&self, ipv4_addr: &Ipv4Addr) -> (Vec<PeerId>, bool) {
         let mut is_exit_node = false;
         let mut dst_peers = vec![];
         let network_length = self
@@ -1148,7 +1166,12 @@ impl PeerManager {
         Ok(())
     }
 
-    pub async fn send_msg_by_ip(&self, mut msg: ZCPacket, ip_addr: IpAddr) -> Result<(), Error> {
+    pub async fn send_msg_by_ip(
+        &self,
+        mut msg: ZCPacket,
+        ip_addr: IpAddr,
+        not_send_to_self: bool,
+    ) -> Result<(), Error> {
         tracing::trace!(
             "do send_msg in peer manager, msg: {:?}, ip_addr: {}",
             msg,
@@ -1173,7 +1196,7 @@ impl PeerManager {
         }
 
         let (dst_peers, is_exit_node) = match ip_addr {
-            IpAddr::V4(ipv4_addr) => self.get_msg_dst_peer(&ipv4_addr).await,
+            IpAddr::V4(ipv4_addr) => self.get_msg_dst_peer_ipv4(&ipv4_addr).await,
             IpAddr::V6(ipv6_addr) => self.get_msg_dst_peer_ipv6(&ipv6_addr).await,
         };
 
@@ -1192,7 +1215,7 @@ impl PeerManager {
             .compress_tx_bytes_after
             .add(msg.buf_len() as u64);
 
-        let is_latency_first = self.global_ctx.get_flags().latency_first;
+        let is_latency_first = self.global_ctx.latency_first();
         msg.mut_peer_manager_header()
             .unwrap()
             .set_latency_first(is_latency_first)
@@ -1202,16 +1225,28 @@ impl PeerManager {
         let mut msg = Some(msg);
         let total_dst_peers = dst_peers.len();
         for (i, peer_id) in dst_peers.iter().enumerate() {
+            if let Err(e) = self.check_p2p_only_before_send(*peer_id) {
+                errs.push(e);
+                continue;
+            }
+
             let mut msg = if i == total_dst_peers - 1 {
                 msg.take().unwrap()
             } else {
                 msg.clone().unwrap()
             };
 
-            msg.mut_peer_manager_header()
-                .unwrap()
-                .to_peer_id
-                .set(*peer_id);
+            let hdr = msg.mut_peer_manager_header().unwrap();
+            hdr.to_peer_id.set(*peer_id);
+
+            #[cfg(not(target_env = "ohos"))]
+            {
+                if not_send_to_self && *peer_id == self.my_peer_id {
+                    // the packet may be sent to vpn portal, so we just set flags instead of drop it
+                    hdr.set_not_send_to_tun(true);
+                    hdr.set_no_proxy(true);
+                }
+            }
 
             self.self_tx_counters
                 .self_tx_bytes
@@ -1291,6 +1326,10 @@ impl PeerManager {
 
     pub fn get_global_ctx(&self) -> ArcGlobalCtx {
         self.global_ctx.clone()
+    }
+
+    pub fn get_global_ctx_ref(&self) -> &ArcGlobalCtx {
+        &self.global_ctx
     }
 
     pub fn get_nic_channel(&self) -> PacketRecvChan {

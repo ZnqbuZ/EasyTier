@@ -16,6 +16,7 @@ pub mod config;
 pub mod constants;
 pub mod defer;
 pub mod dns;
+pub mod env_parser;
 pub mod error;
 pub mod global_ctx;
 pub mod idn;
@@ -154,6 +155,16 @@ pub fn get_machine_id() -> uuid::Uuid {
     }
 
     gen_mid
+}
+
+pub fn shrink_dashmap<K: Eq + std::hash::Hash, V>(
+    map: &dashmap::DashMap<K, V>,
+    threshold: Option<usize>,
+) {
+    let threshold = threshold.unwrap_or(16);
+    if map.capacity() - map.len() > threshold {
+        map.shrink_to_fit();
+    }
 }
 
 #[cfg(test)]

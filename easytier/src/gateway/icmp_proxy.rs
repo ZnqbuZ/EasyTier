@@ -255,6 +255,7 @@ impl IcmpProxy {
                 loop {
                     tokio::time::sleep(std::time::Duration::from_secs(1)).await;
                     nat_table.retain(|_, v| v.start_time.elapsed().as_secs() < 20);
+                    nat_table.shrink_to_fit();
                 }
             }
             .instrument(tracing::info_span!("icmp proxy nat table cleaner")),
@@ -274,7 +275,7 @@ impl IcmpProxy {
         }
 
         let peer_manager = self.peer_manager.clone();
-        let is_latency_first = self.global_ctx.get_flags().latency_first;
+        let is_latency_first = self.global_ctx.latency_first();
         self.tasks.lock().await.spawn(
             async move {
                 while let Some(mut msg) = receiver.recv().await {
