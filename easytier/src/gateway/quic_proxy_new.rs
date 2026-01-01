@@ -2,7 +2,9 @@ use bytes::Bytes;
 use futures::{ready, SinkExt};
 use quinn_plaintext::{client_config, server_config};
 use quinn_proto::congestion::BbrConfig;
-use quinn_proto::{ConnectionError, ConnectionHandle, Endpoint, EndpointConfig, StreamId, TransportConfig, VarInt};
+use quinn_proto::{
+    ConnectionError, ConnectionHandle, Endpoint, EndpointConfig, StreamId, TransportConfig, VarInt,
+};
 use std::cmp::min;
 use std::io::Error;
 use std::net::SocketAddr;
@@ -42,8 +44,8 @@ pub enum QuicCmd {
 #[derive(Debug)]
 pub enum QuicEvt {
     Data(Bytes),
-    Closed,
-    Reset(ConnectionError),
+    Fin,
+    Closed(ConnectionError),
 }
 
 pub struct QuicStream {
@@ -80,10 +82,8 @@ impl AsyncRead for QuicStream {
                         }
                         self.pending = Some(data);
                     }
-                    QuicEvt::Closed => return Poll::Ready(Ok(())),
-                    QuicEvt::Reset(error) => {
-                        return Poll::Ready(Err(Error::from(error)))
-                    }
+                    QuicEvt::Fin => return Poll::Ready(Ok(())),
+                    QuicEvt::Closed(e) => return Poll::Ready(Err(Error::from(e))),
                 },
                 Poll::Ready(None) => return Poll::Ready(Ok(())),
                 Poll::Pending => return Poll::Pending,
