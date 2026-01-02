@@ -7,7 +7,7 @@ use bytes::{Bytes, BytesMut};
 use quinn_plaintext::client_config;
 use quinn_proto::{
     ClientConfig, ConnectError, Connection, ConnectionHandle, DatagramEvent, Dir, Endpoint, Event,
-    ReadError, StreamEvent, StreamId, WriteError,
+    ReadError, StreamEvent, StreamId,
 };
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -337,19 +337,21 @@ impl QuicDriver {
     pub fn handle_timeout(&mut self) {
         let now = Instant::now();
 
-        for conn_handle in self.conns.keys().copied().collect::<Vec<_>>() {
-            let mut expired = false;
+        let expired_handles: Vec<_> = self
+            .conns
+            .iter_mut()
+            .filter_map(|(conn_handle, (conn, _))| {
+                conn.poll_timeout()
+                    .and_then(|t| if t <= now { Some(*conn_handle) } else { None })
+            })
+            .collect();
 
+        for conn_handle in expired_handles {
             if let Some((conn, _)) = self.conns.get_mut(&conn_handle) {
-                if conn.poll_timeout().map_or(false, |t| t <= now) {
-                    conn.handle_timeout(now);
-                    expired = true;
-                }
+                conn.handle_timeout(now);
             }
 
-            if expired {
-                self.process_conn(conn_handle);
-            }
+            self.process_conn(conn_handle);
         }
     }
 

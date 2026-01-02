@@ -13,7 +13,6 @@ use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::sleep_until;
 use tokio::{select, spawn};
-use tracing::error;
 
 #[derive(Clone)]
 struct QuicController {
