@@ -1,17 +1,20 @@
-use crate::gateway::quic::cmd::{QuicPacket, QuicStreamInfo};
+use crate::gateway::quic::cmd::{QuicCmd, QuicPacket, QuicStreamInfo};
 use crate::gateway::quic::evt::{
     QuicNetEvt, QuicNetEvtSender, QuicStreamEvt, QuicStreamEvtReceiver, QuicStreamEvtSender,
 };
 use anyhow::{anyhow, Error};
 use bytes::{Bytes, BytesMut};
 use quinn_plaintext::client_config;
-use quinn_proto::{ClientConfig, ConnectError, Connection, ConnectionHandle, DatagramEvent, Dir, Endpoint, Event, ReadError, StreamEvent, StreamId, WriteError};
+use quinn_proto::{
+    ClientConfig, ConnectError, Connection, ConnectionHandle, DatagramEvent, Dir, Endpoint, Event,
+    ReadError, StreamEvent, StreamId, WriteError,
+};
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::time::Instant;
 use tokio::sync::mpsc;
-use tracing::{error, warn};
 use tracing::log::trace;
+use tracing::{error, warn};
 
 const QUIC_STREAM_EVT_BUFFER: usize = 2048;
 
@@ -19,8 +22,7 @@ pub type QuicStreamPartsSender = mpsc::Sender<(QuicStreamInfo, QuicStreamEvtRece
 pub type QuicStreamPartsReceiver = mpsc::Receiver<(QuicStreamInfo, QuicStreamEvtReceiver)>;
 
 pub(crate) struct QuicDriver {
-    conns:
-        HashMap<ConnectionHandle, (Connection, HashMap<StreamId, QuicStreamEvtSender>)>,
+    conns: HashMap<ConnectionHandle, (Connection, HashMap<StreamId, QuicStreamEvtSender>)>,
     endpoint: Endpoint,
     net_evt_tx: QuicNetEvtSender,
     incoming_stream_tx: QuicStreamPartsSender,
@@ -41,6 +43,30 @@ impl QuicDriver {
             incoming_stream_tx,
             client_config: client_config(),
             buf: Vec::with_capacity(2048),
+        }
+    }
+
+    pub fn execute(&mut self, cmd: QuicCmd) {
+        match cmd {
+            QuicCmd::PacketIncoming(packet) => {
+                self.handle_packet_incoming(packet);
+            }
+
+            QuicCmd::OpenBiStream { addr, stream_tx } => {
+                if let Err(e) = stream_tx.send(self.open_stream(addr, Dir::Bi)) {
+                    error!("Failed to send opened stream: {:?}", e);
+                }
+            }
+
+            QuicCmd::StreamWrite {
+                stream_info,
+                data,
+                fin,
+            } => {
+                self.write_stream(stream_info, data, fin);
+            }
+
+            _ => {}
         }
     }
 }
@@ -147,7 +173,10 @@ impl QuicDriver {
         let (conn, _) = match self.conns.get_mut(&conn_handle) {
             Some(c) => c,
             None => {
-                warn!("write_stream ignored: connection {:?} not found", conn_handle);
+                warn!(
+                    "write_stream ignored: connection {:?} not found",
+                    conn_handle
+                );
                 return;
             }
         };
@@ -165,7 +194,12 @@ impl QuicDriver {
 
             Ok(n) => {
                 //TODO: flow control
-                error!("Stream {:?} flow control limit reached ({} < {}), resetting", stream_info, n, data.len());
+                error!(
+                    "Stream {:?} flow control limit reached ({} < {}), resetting",
+                    stream_info,
+                    n,
+                    data.len()
+                );
                 stream.reset(0u32.into()).ok();
             }
 
@@ -202,7 +236,7 @@ impl QuicDriver {
                             "Connection lost: {:?}",
                             reason.to_string()
                         )))
-                            .ok();
+                        .ok();
                     }
                 }
 
@@ -253,7 +287,7 @@ impl QuicDriver {
                                             tx.try_send(QuicStreamEvt::Reset(format!(
                                                 "Failed to read from stream. Error code: {code}"
                                             )))
-                                                .ok();
+                                            .ok();
                                         }
                                         break;
                                     }
@@ -296,5 +330,33 @@ impl QuicDriver {
         if rm_conn {
             self.conns.remove(&conn_handle);
         }
+    }
+}
+
+impl QuicDriver {
+    pub fn handle_timeout(&mut self) {
+        let now = Instant::now();
+
+        for conn_handle in self.conns.keys().copied().collect::<Vec<_>>() {
+            let mut expired = false;
+
+            if let Some((conn, _)) = self.conns.get_mut(&conn_handle) {
+                if conn.poll_timeout().map_or(false, |t| t <= now) {
+                    conn.handle_timeout(now);
+                    expired = true;
+                }
+            }
+
+            if expired {
+                self.process_conn(conn_handle);
+            }
+        }
+    }
+
+    pub fn min_timeout(&mut self) -> Option<Instant> {
+        self.conns
+            .values_mut()
+            .filter_map(|(conn, _)| conn.poll_timeout())
+            .min()
     }
 }

@@ -9,9 +9,10 @@ use quinn_proto::{Endpoint, EndpointConfig, TransportConfig, VarInt};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::spawn;
 use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::{mpsc, oneshot};
+use tokio::time::sleep_until;
+use tokio::{select, spawn};
 use tracing::error;
 
 #[derive(Clone)]
@@ -120,26 +121,13 @@ impl QuicEndpoint {
 
         spawn(async move {
             loop {
-                match cmd_rx.recv().await {
-                    Some(cmd) => match cmd {
-                        QuicCmd::PacketIncoming(packet) => {
-                            drv.handle_packet_incoming(packet);
-                        }
+                let min_timeout = drv
+                    .min_timeout()
+                    .unwrap_or(Instant::now() + Duration::from_secs(60));
 
-                        QuicCmd::OpenBiStream { addr, stream_tx } => {
-                            if let Err(e) = stream_tx
-                                .send(drv.open_stream(addr, quinn_proto::Dir::Bi)) {
-                                error!("Failed to send opened stream: {:?}", e);
-                            }
-                        }
-
-                        QuicCmd::StreamWrite { stream_info, data, fin } => {
-                            drv.write_stream(stream_info, data, fin);
-                        }
-
-                        _ => {}
-                    },
-                    None => {}
+                select! {
+                    Some(cmd) = cmd_rx.recv() => drv.execute(cmd),
+                    _ = sleep_until(min_timeout.into()) => drv.handle_timeout(),
                 }
             }
         });
