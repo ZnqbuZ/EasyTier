@@ -1,7 +1,7 @@
 use std::cmp::max;
 use crate::gateway::quic::cmd::{QuicCmd, QuicPacket, QuicStreamInfo};
 use crate::gateway::quic::evt::{
-    QuicNetEvt, QuicNetEvtSender, QuicStreamEvt, QuicStreamEvtReceiver, QuicStreamEvtSender,
+    QuicNetEvt, QuicNetEvtTx, QuicStreamEvt, QuicStreamEvtRx, QuicStreamEvtTx,
 };
 use anyhow::{anyhow, Error};
 use bytes::{BufMut, Bytes, BytesMut};
@@ -44,14 +44,14 @@ impl QuicPacketPool {
 const QUIC_STREAM_EVT_BUFFER: usize = 2048;
 const QUIC_PACKET_POOL_MIN_CAPACITY: usize = 64 * 1024;
 
-pub type QuicStreamPartsSender = mpsc::Sender<(QuicStreamInfo, QuicStreamEvtReceiver)>;
-pub type QuicStreamPartsReceiver = mpsc::Receiver<(QuicStreamInfo, QuicStreamEvtReceiver)>;
+pub type QuicStreamPartsTx = mpsc::Sender<(QuicStreamInfo, QuicStreamEvtRx)>;
+pub type QuicStreamPartsRx = mpsc::Receiver<(QuicStreamInfo, QuicStreamEvtRx)>;
 
 pub(super) struct QuicDriver {
-    conns: HashMap<ConnectionHandle, (Connection, HashMap<StreamId, QuicStreamEvtSender>)>,
+    conns: HashMap<ConnectionHandle, (Connection, HashMap<StreamId, QuicStreamEvtTx>)>,
     endpoint: Endpoint,
-    net_evt_tx: QuicNetEvtSender,
-    incoming_stream_tx: QuicStreamPartsSender,
+    net_evt_tx: QuicNetEvtTx,
+    incoming_stream_tx: QuicStreamPartsTx,
     client_config: ClientConfig,
     buf: Vec<u8>,
     packet_pool: QuicPacketPool,
@@ -60,8 +60,8 @@ pub(super) struct QuicDriver {
 impl QuicDriver {
     pub fn new(
         endpoint: Endpoint,
-        net_evt_tx: QuicNetEvtSender,
-        incoming_stream_tx: QuicStreamPartsSender,
+        net_evt_tx: QuicNetEvtTx,
+        incoming_stream_tx: QuicStreamPartsTx,
     ) -> Self {
         Self {
             conns: HashMap::new(),
@@ -173,7 +173,7 @@ impl QuicDriver {
         &mut self,
         addr: SocketAddr,
         dir: Dir,
-    ) -> Result<(QuicStreamInfo, QuicStreamEvtReceiver), Error> {
+    ) -> Result<(QuicStreamInfo, QuicStreamEvtRx), Error> {
         let conn_handle = self.connect(addr)?;
         let (conn, streams) = self
             .conns

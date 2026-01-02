@@ -7,8 +7,8 @@ pub(super) enum QuicNetEvt {
     PacketOutgoing(QuicPacket),
 }
 
-pub type QuicNetEvtSender = mpsc::Sender<QuicNetEvt>;
-pub type QuicNetEvtReceiver = mpsc::Receiver<QuicNetEvt>;
+pub type QuicNetEvtTx = mpsc::Sender<QuicNetEvt>;
+pub type QuicNetEvtRx = mpsc::Receiver<QuicNetEvt>;
 
 #[derive(Debug)]
 pub(super) enum QuicStreamEvt {
@@ -17,5 +17,5 @@ pub(super) enum QuicStreamEvt {
     Reset(String),
 }
 
-pub type QuicStreamEvtSender = mpsc::Sender<QuicStreamEvt>;
-pub type QuicStreamEvtReceiver = mpsc::Receiver<QuicStreamEvt>;
+pub type QuicStreamEvtTx = mpsc::Sender<QuicStreamEvt>;
+pub type QuicStreamEvtRx = mpsc::Receiver<QuicStreamEvt>;

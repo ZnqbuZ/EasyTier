@@ -1,4 +1,4 @@
-use crate::gateway::quic::evt::QuicStreamEvtReceiver;
+use crate::gateway::quic::evt::QuicStreamEvtRx;
 use anyhow::Error;
 use bytes::{Bytes, BytesMut};
 use quinn_proto::{ConnectionHandle, StreamId};
@@ -24,7 +24,7 @@ pub(super) enum QuicCmd {
     // Connection
     OpenBiStream {
         addr: SocketAddr,
-        stream_tx: oneshot::Sender<Result<(QuicStreamInfo, QuicStreamEvtReceiver), Error>>,
+        stream_tx: oneshot::Sender<Result<(QuicStreamInfo, QuicStreamEvtRx), Error>>,
     },
     CloseConnection {
         conn_handle: ConnectionHandle,
@@ -47,5 +47,5 @@ pub(super) enum QuicCmd {
     },
 }
 
-pub(super) type QuicCmdSender = mpsc::Sender<QuicCmd>;
-pub(super) type QuicCmdReceiver = mpsc::Receiver<QuicCmd>;
+pub(super) type QuicCmdTx = mpsc::Sender<QuicCmd>;
+pub(super) type QuicCmdRx = mpsc::Receiver<QuicCmd>;

@@ -1,6 +1,6 @@
-use crate::gateway::quic::cmd::{QuicCmd, QuicCmdSender, QuicPacket};
-use crate::gateway::quic::driver::{QuicDriver, QuicStreamPartsReceiver};
-use crate::gateway::quic::evt::{QuicNetEvt, QuicNetEvtReceiver};
+use crate::gateway::quic::cmd::{QuicCmd, QuicCmdTx, QuicPacket};
+use crate::gateway::quic::driver::{QuicDriver, QuicStreamPartsRx};
+use crate::gateway::quic::evt::{QuicNetEvt, QuicNetEvtRx};
 use crate::gateway::quic::stream::QuicStream;
 use anyhow::Error;
 use quinn_plaintext::server_config;
@@ -13,9 +13,9 @@ use tokio::sync::{mpsc, oneshot};
 use tokio::time::sleep_until;
 use tokio::{select, spawn};
 
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub struct QuicController {
-    cmd_tx: QuicCmdSender,
+    cmd_tx: QuicCmdTx,
 }
 
 impl QuicController {
@@ -36,11 +36,11 @@ impl QuicController {
     }
 }
 
-pub struct QuicPacketReceiver {
-    net_evt_rx: QuicNetEvtReceiver,
+pub struct QuicPacketRx {
+    net_evt_rx: QuicNetEvtRx,
 }
 
-impl QuicPacketReceiver {
+impl QuicPacketRx {
     pub async fn recv(&mut self) -> Option<QuicPacket> {
         match self.net_evt_rx.recv().await? {
             QuicNetEvt::PacketOutgoing(packet) => Some(packet),
@@ -48,12 +48,12 @@ impl QuicPacketReceiver {
     }
 }
 
-pub struct QuicStreamReceiver {
-    cmd_tx: QuicCmdSender,
-    incoming_stream_rx: QuicStreamPartsReceiver,
+pub struct QuicStreamRx {
+    cmd_tx: QuicCmdTx,
+    incoming_stream_rx: QuicStreamPartsRx,
 }
 
-impl QuicStreamReceiver {
+impl QuicStreamRx {
     pub async fn recv(&mut self) -> Option<QuicStream> {
         let (stream_info, evt_rx) = self.incoming_stream_rx.recv().await?;
         Some(QuicStream::new(stream_info, evt_rx, self.cmd_tx.clone()))
@@ -98,7 +98,7 @@ impl QuicEndpoint {
         }
     }
 
-    pub fn run(&mut self) -> Option<(QuicController, QuicPacketReceiver, QuicStreamReceiver)> {
+    pub fn run(&mut self) -> Option<(QuicController, QuicPacketRx, QuicStreamRx)> {
         self.endpoint.as_ref()?;
 
         let (cmd_tx, mut cmd_rx) = mpsc::channel(2048);
@@ -108,8 +108,8 @@ impl QuicEndpoint {
         let ctrl = QuicController {
             cmd_tx: cmd_tx.clone(),
         };
-        let packet_rx = QuicPacketReceiver { net_evt_rx };
-        let stream_rx = QuicStreamReceiver {
+        let packet_rx = QuicPacketRx { net_evt_rx };
+        let stream_rx = QuicStreamRx {
             cmd_tx: cmd_tx.clone(),
             incoming_stream_rx,
         };

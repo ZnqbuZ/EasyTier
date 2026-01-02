@@ -8,21 +8,21 @@ use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio_util::sync::PollSender;
 
-use crate::gateway::quic::cmd::{QuicCmd, QuicCmdSender, QuicStreamInfo};
-use crate::gateway::quic::evt::{QuicStreamEvt, QuicStreamEvtReceiver};
+use crate::gateway::quic::cmd::{QuicCmd, QuicCmdTx, QuicStreamInfo};
+use crate::gateway::quic::evt::{QuicStreamEvt, QuicStreamEvtRx};
 
 #[derive(Debug)]
 pub struct QuicStream {
     stream_info: QuicStreamInfo,
 
-    evt_rx: QuicStreamEvtReceiver,
+    evt_rx: QuicStreamEvtRx,
     cmd_tx: PollSender<QuicCmd>,
 
     pending: Option<Bytes>,
 }
 
 impl QuicStream {
-    pub(super) fn new(stream_info: QuicStreamInfo, evt_rx: QuicStreamEvtReceiver, cmd_tx: QuicCmdSender) -> Self {
+    pub(super) fn new(stream_info: QuicStreamInfo, evt_rx: QuicStreamEvtRx, cmd_tx: QuicCmdTx) -> Self {
         Self {
             stream_info,
             evt_rx,
