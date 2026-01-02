@@ -22,7 +22,7 @@ pub struct QuicStream {
 }
 
 impl QuicStream {
-    pub fn new(stream_info: QuicStreamInfo, evt_rx: QuicStreamEvtReceiver, cmd_tx: QuicCmdSender) -> Self {
+    pub(super) fn new(stream_info: QuicStreamInfo, evt_rx: QuicStreamEvtReceiver, cmd_tx: QuicCmdSender) -> Self {
         Self {
             stream_info,
             evt_rx,

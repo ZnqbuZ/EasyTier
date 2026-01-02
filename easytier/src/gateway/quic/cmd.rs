@@ -1,6 +1,6 @@
 use crate::gateway::quic::evt::QuicStreamEvtReceiver;
 use anyhow::Error;
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use quinn_proto::{ConnectionHandle, StreamId};
 use std::net::SocketAddr;
 use tokio::sync::{mpsc, oneshot};
@@ -8,17 +8,17 @@ use tokio::sync::{mpsc, oneshot};
 #[derive(Debug)]
 pub struct QuicPacket {
     pub addr: SocketAddr,
-    pub data: Bytes,
+    pub data: BytesMut,
 }
 
 #[derive(Debug, Clone, Copy)]
-pub struct QuicStreamInfo {
-    pub conn_handle: ConnectionHandle,
-    pub stream_id: StreamId,
+pub(super) struct QuicStreamInfo {
+    pub(super) conn_handle: ConnectionHandle,
+    pub(super) stream_id: StreamId,
 }
 
 #[derive(Debug)]
-pub enum QuicCmd {
+pub(super) enum QuicCmd {
     // Net
     PacketIncoming(QuicPacket),
     // Connection
@@ -47,5 +47,5 @@ pub enum QuicCmd {
     },
 }
 
-pub type QuicCmdSender = mpsc::Sender<QuicCmd>;
-pub type QuicCmdReceiver = mpsc::Receiver<QuicCmd>;
+pub(super) type QuicCmdSender = mpsc::Sender<QuicCmd>;
+pub(super) type QuicCmdReceiver = mpsc::Receiver<QuicCmd>;

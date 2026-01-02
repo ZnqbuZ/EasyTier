@@ -69,7 +69,7 @@ impl QuicDriver {
             net_evt_tx,
             incoming_stream_tx,
             client_config: client_config(),
-            buf: Vec::with_capacity(2048),
+            buf: Vec::with_capacity(64 * 1024),
             packet_pool: QuicPacketPool::new(QUIC_PACKET_POOL_MIN_CAPACITY),
         }
     }
