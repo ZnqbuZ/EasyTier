@@ -9,22 +9,24 @@ use quinn_proto::{Endpoint, EndpointConfig, TransportConfig, VarInt};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::sleep_until;
 use tokio::{select, spawn};
 
 #[derive(Clone)]
-struct QuicController {
+pub struct QuicController {
     cmd_tx: QuicCmdSender,
 }
 
 impl QuicController {
-    pub fn send(self, packet: QuicPacket) -> Result<(), TrySendError<QuicCmd>> {
-        self.cmd_tx.try_send(QuicCmd::PacketIncoming(packet))
+    pub async fn send(&self, packet: QuicPacket) -> Result<(), Error> {
+        self.cmd_tx
+            .send(QuicCmd::PacketIncoming(packet))
+            .await
+            .map_err(|e| Error::msg(format!("Failed to send QuicCmd::PacketIncoming: {:?}", e)))
     }
 
-    pub async fn connect(self, addr: SocketAddr) -> Result<QuicStream, Error> {
+    pub async fn connect(&self, addr: SocketAddr) -> Result<QuicStream, Error> {
         let (stream_tx, stream_rx) = oneshot::channel();
         self.cmd_tx
             .send(QuicCmd::OpenBiStream { addr, stream_tx })
@@ -34,25 +36,25 @@ impl QuicController {
     }
 }
 
-struct QuicPacketReceiver {
+pub struct QuicPacketReceiver {
     net_evt_rx: QuicNetEvtReceiver,
 }
 
 impl QuicPacketReceiver {
-    pub async fn recv(mut self) -> Option<QuicPacket> {
+    pub async fn recv(&mut self) -> Option<QuicPacket> {
         match self.net_evt_rx.recv().await? {
             QuicNetEvt::PacketOutgoing(packet) => Some(packet),
         }
     }
 }
 
-struct QuicStreamReceiver {
+pub struct QuicStreamReceiver {
     cmd_tx: QuicCmdSender,
     incoming_stream_rx: QuicStreamPartsReceiver,
 }
 
 impl QuicStreamReceiver {
-    pub async fn recv(mut self) -> Option<QuicStream> {
+    pub async fn recv(&mut self) -> Option<QuicStream> {
         let (stream_info, evt_rx) = self.incoming_stream_rx.recv().await?;
         Some(QuicStream::new(stream_info, evt_rx, self.cmd_tx.clone()))
     }
