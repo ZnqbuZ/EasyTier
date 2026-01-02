@@ -21,7 +21,7 @@ const QUIC_STREAM_EVT_BUFFER: usize = 2048;
 pub type QuicStreamPartsSender = mpsc::Sender<(QuicStreamInfo, QuicStreamEvtReceiver)>;
 pub type QuicStreamPartsReceiver = mpsc::Receiver<(QuicStreamInfo, QuicStreamEvtReceiver)>;
 
-pub(crate) struct QuicDriver {
+pub(super) struct QuicDriver {
     conns: HashMap<ConnectionHandle, (Connection, HashMap<StreamId, QuicStreamEvtSender>)>,
     endpoint: Endpoint,
     net_evt_tx: QuicNetEvtSender,
@@ -82,7 +82,7 @@ macro_rules! emit_transmit {
 }
 
 impl QuicDriver {
-    pub fn handle_packet_incoming(&mut self, packet: QuicPacket) {
+    fn handle_packet_incoming(&mut self, packet: QuicPacket) {
         let now = Instant::now();
 
         self.buf.clear();
@@ -124,7 +124,7 @@ impl QuicDriver {
         }
     }
 
-    pub fn connect(&mut self, addr: SocketAddr) -> Result<ConnectionHandle, ConnectError> {
+    fn connect(&mut self, addr: SocketAddr) -> Result<ConnectionHandle, ConnectError> {
         if let Some((conn_handle, _)) = self
             .conns
             .iter()
@@ -141,7 +141,7 @@ impl QuicDriver {
         Ok(conn_handle)
     }
 
-    pub fn open_stream(
+    fn open_stream(
         &mut self,
         addr: SocketAddr,
         dir: Dir,
@@ -167,7 +167,7 @@ impl QuicDriver {
         ))
     }
 
-    pub fn write_stream(&mut self, stream_info: QuicStreamInfo, data: Bytes, fin: bool) {
+    fn write_stream(&mut self, stream_info: QuicStreamInfo, data: Bytes, fin: bool) {
         let conn_handle = stream_info.conn_handle;
 
         let (conn, _) = match self.conns.get_mut(&conn_handle) {
@@ -214,7 +214,7 @@ impl QuicDriver {
 }
 
 impl QuicDriver {
-    pub fn process_conn(&mut self, conn_handle: ConnectionHandle) {
+    fn process_conn(&mut self, conn_handle: ConnectionHandle) {
         let mut rm_conn = false;
 
         let (conn, streams) = match self.conns.get_mut(&conn_handle) {

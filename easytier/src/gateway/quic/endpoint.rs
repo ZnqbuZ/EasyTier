@@ -58,7 +58,7 @@ impl QuicStreamReceiver {
     }
 }
 
-struct QuicEndpoint {
+pub struct QuicEndpoint {
     endpoint: Option<Endpoint>,
 }
 

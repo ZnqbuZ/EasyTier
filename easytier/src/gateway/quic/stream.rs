@@ -13,12 +13,12 @@ use crate::gateway::quic::evt::{QuicStreamEvt, QuicStreamEvtReceiver};
 
 #[derive(Debug)]
 pub struct QuicStream {
-    pub(crate) stream_info: QuicStreamInfo,
+    stream_info: QuicStreamInfo,
 
-    pub(crate) evt_rx: QuicStreamEvtReceiver,
-    pub(crate) cmd_tx: PollSender<QuicCmd>,
+    evt_rx: QuicStreamEvtReceiver,
+    cmd_tx: PollSender<QuicCmd>,
 
-    pub(crate) pending: Option<Bytes>,
+    pending: Option<Bytes>,
 }
 
 impl QuicStream {
