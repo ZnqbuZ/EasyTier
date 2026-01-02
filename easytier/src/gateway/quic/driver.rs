@@ -1,9 +1,10 @@
+use std::cmp::max;
 use crate::gateway::quic::cmd::{QuicCmd, QuicPacket, QuicStreamInfo};
 use crate::gateway::quic::evt::{
     QuicNetEvt, QuicNetEvtSender, QuicStreamEvt, QuicStreamEvtReceiver, QuicStreamEvtSender,
 };
 use anyhow::{anyhow, Error};
-use bytes::{Bytes, BytesMut};
+use bytes::{BufMut, Bytes, BytesMut};
 use quinn_plaintext::client_config;
 use quinn_proto::{
     ClientConfig, ConnectError, Connection, ConnectionHandle, DatagramEvent, Dir, Endpoint, Event,
@@ -16,7 +17,32 @@ use tokio::sync::mpsc;
 use tracing::log::trace;
 use tracing::{error, warn};
 
+struct QuicPacketPool {
+    pool: BytesMut,
+    min_capacity: usize,
+}
+
+impl QuicPacketPool {
+    fn new(min_capacity: usize) -> Self {
+        Self {
+            pool: BytesMut::new(),
+            min_capacity
+        }
+    }
+
+    fn pack(&mut self, data: &[u8]) -> BytesMut {
+        let len = data.len();
+        if len + self.pool.len() > self.pool.capacity() {
+            self.pool.clear();
+            self.pool.reserve(max(len * 4, self.min_capacity));
+        }
+        self.pool.put_slice(data);
+        self.pool.split_to(len)
+    }
+}
+
 const QUIC_STREAM_EVT_BUFFER: usize = 2048;
+const QUIC_PACKET_POOL_MIN_CAPACITY: usize = 64 * 1024;
 
 pub type QuicStreamPartsSender = mpsc::Sender<(QuicStreamInfo, QuicStreamEvtReceiver)>;
 pub type QuicStreamPartsReceiver = mpsc::Receiver<(QuicStreamInfo, QuicStreamEvtReceiver)>;
@@ -28,6 +54,7 @@ pub(super) struct QuicDriver {
     incoming_stream_tx: QuicStreamPartsSender,
     client_config: ClientConfig,
     buf: Vec<u8>,
+    packet_pool: QuicPacketPool,
 }
 
 impl QuicDriver {
@@ -43,6 +70,7 @@ impl QuicDriver {
             incoming_stream_tx,
             client_config: client_config(),
             buf: Vec::with_capacity(2048),
+            packet_pool: QuicPacketPool::new(QUIC_PACKET_POOL_MIN_CAPACITY),
         }
     }
 
@@ -76,7 +104,7 @@ macro_rules! emit_transmit {
         $drv.net_evt_tx
             .try_send(QuicNetEvt::PacketOutgoing(QuicPacket {
                 addr: $transmit.destination,
-                data: Bytes::copy_from_slice(&$drv.buf[0..$transmit.size]),
+                data: $drv.packet_pool.pack(&$drv.buf[0..$transmit.size]),
             }))
     };
 }
@@ -91,7 +119,7 @@ impl QuicDriver {
             packet.addr,
             None,
             None,
-            BytesMut::from(packet.data),
+            packet.data,
             &mut self.buf,
         ) {
             Some(DatagramEvent::NewConnection(incoming)) => {
@@ -117,7 +145,7 @@ impl QuicDriver {
             }
 
             Some(DatagramEvent::Response(transmit)) => {
-                emit_transmit!(self, transmit).ok();
+                let _ = emit_transmit!(self, transmit);
             }
 
             None => {}
@@ -200,12 +228,12 @@ impl QuicDriver {
                     n,
                     data.len()
                 );
-                stream.reset(0u32.into()).ok();
+                let _ = stream.reset(0u32.into());
             }
 
             Err(e) => {
                 error!("Failed to write to stream {:?}: {:?}", stream_info, e);
-                stream.reset(0u32.into()).ok();
+                let _ = stream.reset(0u32.into());
             }
         }
 
@@ -232,11 +260,10 @@ impl QuicDriver {
                     error!("Connection lost: {:?}", reason);
                     rm_conn = true;
                     for tx in streams.values() {
-                        tx.try_send(QuicStreamEvt::Reset(format!(
+                        let _ = tx.try_send(QuicStreamEvt::Reset(format!(
                             "Connection lost: {:?}",
                             reason.to_string()
-                        )))
-                        .ok();
+                        )));
                     }
                 }
 
@@ -277,17 +304,16 @@ impl QuicDriver {
                             loop {
                                 match chunks.next(usize::MAX) {
                                     Ok(Some(chunk)) => {
-                                        tx.try_send(QuicStreamEvt::Data(chunk.bytes)).ok();
+                                        let _ = tx.try_send(QuicStreamEvt::Data(chunk.bytes));
                                     }
 
                                     Ok(None) => break,
 
                                     Err(e) => {
                                         if let ReadError::Reset(code) = e {
-                                            tx.try_send(QuicStreamEvt::Reset(format!(
+                                            let _ = tx.try_send(QuicStreamEvt::Reset(format!(
                                                 "Failed to read from stream. Error code: {code}"
-                                            )))
-                                            .ok();
+                                            )));
                                         }
                                         break;
                                     }
@@ -298,7 +324,7 @@ impl QuicDriver {
 
                     StreamEvent::Finished { id } => {
                         if let Some(tx) = streams.get_mut(&id) {
-                            tx.try_send(QuicStreamEvt::Fin).ok();
+                            let _ = tx.try_send(QuicStreamEvt::Fin);
                         }
                     }
 
@@ -321,7 +347,7 @@ impl QuicDriver {
         loop {
             self.buf.clear();
             if let Some(transmit) = conn.poll_transmit(now, 1, &mut self.buf) {
-                emit_transmit!(self, transmit).ok();
+                let _ = emit_transmit!(self, transmit);
             } else {
                 break;
             }
