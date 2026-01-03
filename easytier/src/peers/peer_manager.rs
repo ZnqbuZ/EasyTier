@@ -1475,7 +1475,7 @@ impl PeerManager {
         let Some(dst_peer_id) = route.get_peer_id_by_ip(dst_ip).await else {
             return false;
         };
-        let Some(peer_info) = route.get_peer_info(dst_peer_id).await else {
+        let Some(_) = route.get_peer_info(dst_peer_id).await else {
             return false;
         };
 
@@ -1493,7 +1493,7 @@ impl PeerManager {
             return true;
         }
 
-        let Some(next_hop_info) = route.get_peer_info(next_hop_id).await else {
+        let Some(_) = route.get_peer_info(next_hop_id).await else {
             return false;
         };
 
