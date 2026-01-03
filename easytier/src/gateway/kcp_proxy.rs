@@ -491,6 +491,9 @@ impl KcpProxyDst {
         );
         crate::defer! {
             proxy_entries.remove(&conn_id);
+            if proxy_entries.capacity() - proxy_entries.len() > 16 {
+                proxy_entries.shrink_to_fit();
+            }
         }
 
         let src_ip = src_socket.ip();
@@ -504,6 +507,15 @@ impl KcpProxyDst {
             Some(dst_socket.ip()) == global_ctx.get_ipv4().map(|ip| IpAddr::V4(ip.address()));
 
         if send_to_self && global_ctx.no_tun() {
+            if global_ctx.is_port_in_running_listeners(dst_socket.port(), false)
+                && global_ctx.is_ip_in_same_network(&src_ip)
+            {
+                return Err(anyhow::anyhow!(
+                    "dst socket {:?} is in running listeners, ignore it",
+                    dst_socket
+                )
+                .into());
+            }
             dst_socket = format!("127.0.0.1:{}", dst_socket.port()).parse().unwrap();
         }
 
@@ -548,7 +560,7 @@ impl KcpProxyDst {
 
     async fn run_accept_task(&mut self) {
         let kcp_endpoint = self.kcp_endpoint.clone();
-        let global_ctx = self.peer_manager.get_global_ctx().clone();
+        let global_ctx = self.peer_manager.get_global_ctx();
         let proxy_entries = self.proxy_entries.clone();
         let cidr_set = self.cidr_set.clone();
         let route = Arc::new(self.peer_manager.get_route());

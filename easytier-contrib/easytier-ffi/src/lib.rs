@@ -2,9 +2,8 @@ use std::sync::Mutex;
 
 use dashmap::DashMap;
 use easytier::{
-    common::config::{ConfigLoader as _, TomlConfigLoader},
+    common::config::{ConfigFileControl, ConfigLoader as _, TomlConfigLoader},
     instance_manager::NetworkInstanceManager,
-    launcher::ConfigSource,
 };
 
 static INSTANCE_NAME_ID_MAP: once_cell::sync::Lazy<DashMap<String, uuid::Uuid>> =
@@ -129,13 +128,14 @@ pub unsafe extern "C" fn run_network_instance(cfg_str: *const std::ffi::c_char) 
         return -1;
     }
 
-    let instance_id = match INSTANCE_MANAGER.run_network_instance(cfg, ConfigSource::FFI) {
-        Ok(id) => id,
-        Err(e) => {
-            set_error_msg(&format!("failed to start instance: {}", e));
-            return -1;
-        }
-    };
+    let instance_id =
+        match INSTANCE_MANAGER.run_network_instance(cfg, false, ConfigFileControl::STATIC_CONFIG) {
+            Ok(id) => id,
+            Err(e) => {
+                set_error_msg(&format!("failed to start instance: {}", e));
+                return -1;
+            }
+        };
 
     INSTANCE_NAME_ID_MAP.insert(inst_name, instance_id);
 

@@ -1,4 +1,4 @@
-use crate::common::config::PortForwardConfig;
+use crate::common::config::{ConfigFileControl, PortForwardConfig};
 use crate::proto::api::{self, manage};
 use crate::proto::rpc_types::controller::BaseController;
 use crate::rpc_service::InstanceRpcService;
@@ -10,7 +10,6 @@ use crate::{
         },
         constants::EASYTIER_VERSION,
         global_ctx::{EventBusSubscriber, GlobalCtxEvent},
-        idn::safe_convert_idn_to_ascii,
     },
     instance::instance::Instance,
     proto::api::instance::list_peer_route_pair,
@@ -132,12 +131,6 @@ impl EasyTierLauncher {
         let mut instance = Instance::new(cfg);
         let mut tasks = JoinSet::new();
 
-        api_service
-            .write()
-            .unwrap()
-            .replace(Arc::new(instance.get_api_rpc_service()));
-        drop(api_service);
-
         // Subscribe to global context events
         let global_ctx = instance.get_global_ctx();
         let data_c = data.clone();
@@ -163,6 +156,13 @@ impl EasyTierLauncher {
         Self::run_routine_for_android(&instance, &data, &mut tasks).await;
 
         instance.run().await?;
+
+        api_service
+            .write()
+            .unwrap()
+            .replace(Arc::new(instance.get_api_rpc_service()));
+        drop(api_service);
+
         stop_signal.notified().await;
 
         tasks.abort_all();
@@ -224,7 +224,7 @@ impl EasyTierLauncher {
             let notifier = data.instance_stop_notifier.clone();
             let ret = rt.block_on(Self::easytier_routine(
                 cfg,
-                stop_notifier.clone(),
+                stop_notifier,
                 api_service,
                 data,
             ));
@@ -281,33 +281,19 @@ impl Drop for EasyTierLauncher {
 
 pub type NetworkInstanceRunningInfo = crate::proto::api::manage::NetworkInstanceRunningInfo;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ConfigSource {
-    Cli,
-    File,
-    Web,
-    GUI,
-    FFI,
-}
-
 pub struct NetworkInstance {
     config: TomlConfigLoader,
     launcher: Option<EasyTierLauncher>,
-
-    config_source: ConfigSource,
+    config_file_control: ConfigFileControl,
 }
 
 impl NetworkInstance {
-    pub fn new(config: TomlConfigLoader, source: ConfigSource) -> Self {
+    pub fn new(config: TomlConfigLoader, config_file_control: ConfigFileControl) -> Self {
         Self {
             config,
             launcher: None,
-            config_source: source,
+            config_file_control,
         }
-    }
-
-    pub fn get_config_source(&self) -> ConfigSource {
-        self.config_source.clone()
     }
 
     pub fn is_easytier_running(&self) -> bool {
@@ -403,6 +389,10 @@ impl NetworkInstance {
         self.config.get_inst_name()
     }
 
+    pub fn get_network_name(&self) -> String {
+        self.config.get_network_identity().network_name
+    }
+
     pub fn set_tun_fd(&mut self, tun_fd: i32) {
         if let Some(launcher) = self.launcher.as_ref() {
             launcher.data.tun_fd.write().unwrap().replace(tun_fd);
@@ -436,6 +426,10 @@ impl NetworkInstance {
         self.launcher
             .as_ref()
             .map(|launcher| launcher.data.instance_stop_notifier.clone())
+    }
+
+    pub fn get_config_file_control(&self) -> &ConfigFileControl {
+        &self.config_file_control
     }
 
     pub fn get_latest_error_msg(&self) -> Option<String> {
@@ -524,13 +518,9 @@ impl NetworkConfig {
         {
             NetworkingMethod::PublicServer => {
                 let public_server_url = self.public_server_url.clone().unwrap_or_default();
-                let converted_public_server_url = safe_convert_idn_to_ascii(&public_server_url);
                 cfg.set_peers(vec![PeerConfig {
-                    uri: converted_public_server_url.parse().with_context(|| {
-                        format!(
-                            "failed to parse public server uri: {}",
-                            converted_public_server_url
-                        )
+                    uri: public_server_url.parse().with_context(|| {
+                        format!("failed to parse public server uri: {}", public_server_url)
                     })?,
                 }]);
             }
@@ -540,11 +530,10 @@ impl NetworkConfig {
                     if peer_url.is_empty() {
                         continue;
                     }
-                    let converted_peer_url = safe_convert_idn_to_ascii(peer_url);
                     peers.push(PeerConfig {
-                        uri: converted_peer_url.parse().with_context(|| {
-                            format!("failed to parse peer uri: {}", converted_peer_url)
-                        })?,
+                        uri: peer_url
+                            .parse()
+                            .with_context(|| format!("failed to parse peer uri: {}", peer_url))?,
                     });
                 }
 
@@ -558,10 +547,11 @@ impl NetworkConfig {
             if listener_url.is_empty() {
                 continue;
             }
-            let converted_listener_url = safe_convert_idn_to_ascii(listener_url);
-            listener_urls.push(converted_listener_url.parse().with_context(|| {
-                format!("failed to parse listener uri: {}", converted_listener_url)
-            })?);
+            listener_urls.push(
+                listener_url
+                    .parse()
+                    .with_context(|| format!("failed to parse listener uri: {}", listener_url))?,
+            );
         }
         cfg.set_listeners(listener_urls);
 
@@ -655,12 +645,8 @@ impl NetworkConfig {
                 self.mapped_listeners
                     .iter()
                     .map(|s| {
-                        let converted_s = safe_convert_idn_to_ascii(s);
-                        converted_s
-                            .parse()
-                            .with_context(|| {
-                                format!("mapped listener is not a valid url: {}", converted_s)
-                            })
+                        s.parse()
+                            .with_context(|| format!("mapped listener is not a valid url: {}", s))
                             .unwrap()
                     })
                     .map(|s: url::Url| {
@@ -714,6 +700,10 @@ impl NetworkConfig {
             flags.disable_p2p = disable_p2p;
         }
 
+        if let Some(p2p_only) = self.p2p_only {
+            flags.p2p_only = p2p_only;
+        }
+
         if let Some(bind_device) = self.bind_device {
             flags.bind_device = bind_device;
         }
@@ -750,6 +740,10 @@ impl NetworkConfig {
             }
         }
 
+        if let Some(disable_tcp_hole_punching) = self.disable_tcp_hole_punching {
+            flags.disable_tcp_hole_punching = disable_tcp_hole_punching;
+        }
+
         if let Some(disable_udp_hole_punching) = self.disable_udp_hole_punching {
             flags.disable_udp_hole_punching = disable_udp_hole_punching;
         }
@@ -768,6 +762,18 @@ impl NetworkConfig {
 
         if let Some(enable_private_mode) = self.enable_private_mode {
             flags.private_mode = enable_private_mode;
+        }
+
+        if let Some(encryption_algorithm) = self.encryption_algorithm.clone() {
+            flags.encryption_algorithm = encryption_algorithm;
+        }
+
+        if let Some(data_compress_algo) = self.data_compress_algo {
+            if data_compress_algo < 1 {
+                flags.data_compress_algo = 1;
+            } else {
+                flags.data_compress_algo = data_compress_algo
+            }
         }
 
         cfg.set_flags(flags);
@@ -790,7 +796,7 @@ impl NetworkConfig {
 
         let network_identity = config.get_network_identity();
         result.network_name = Some(network_identity.network_name.clone());
-        result.network_secret = network_identity.network_secret.clone();
+        result.network_secret = network_identity.network_secret;
 
         if let Some(ipv4) = config.get_ipv4() {
             result.virtual_ipv4 = Some(ipv4.address().to_string());
@@ -888,6 +894,7 @@ impl NetworkConfig {
         result.disable_quic_input = Some(flags.disable_quic_input);
         result.quic_listen_port = Some(flags.quic_listen_port as i32);
         result.disable_p2p = Some(flags.disable_p2p);
+        result.p2p_only = Some(flags.p2p_only);
         result.bind_device = Some(flags.bind_device);
         result.no_tun = Some(flags.no_tun);
         result.enable_exit_node = Some(flags.enable_exit_node);
@@ -895,18 +902,26 @@ impl NetworkConfig {
         result.multi_thread = Some(flags.multi_thread);
         result.proxy_forward_by_system = Some(flags.proxy_forward_by_system);
         result.disable_encryption = Some(!flags.enable_encryption);
+        result.disable_tcp_hole_punching = Some(flags.disable_tcp_hole_punching);
         result.disable_udp_hole_punching = Some(flags.disable_udp_hole_punching);
+        result.disable_sym_hole_punching = Some(flags.disable_sym_hole_punching);
         result.enable_magic_dns = Some(flags.accept_dns);
         result.mtu = Some(flags.mtu as i32);
         result.enable_private_mode = Some(flags.private_mode);
 
-        if !flags.relay_network_whitelist.is_empty() && flags.relay_network_whitelist != "*" {
+        if flags.relay_network_whitelist == "*" {
+            result.enable_relay_network_whitelist = Some(false);
+        } else {
             result.enable_relay_network_whitelist = Some(true);
-            result.relay_network_whitelist = flags
-                .relay_network_whitelist
-                .split_whitespace()
-                .map(|s| s.to_string())
-                .collect();
+            if flags.relay_network_whitelist.is_empty() {
+                result.relay_network_whitelist = vec![];
+            } else {
+                result.relay_network_whitelist = flags
+                    .relay_network_whitelist
+                    .split_whitespace()
+                    .map(|s| s.to_string())
+                    .collect();
+            }
         }
 
         Ok(result)
@@ -1122,6 +1137,7 @@ mod tests {
                 flags.enable_quic_proxy = rng.gen_bool(0.5);
                 flags.disable_quic_input = rng.gen_bool(0.3);
                 flags.disable_p2p = rng.gen_bool(0.2);
+                flags.p2p_only = rng.gen_bool(0.2);
                 flags.bind_device = rng.gen_bool(0.3);
                 flags.no_tun = rng.gen_bool(0.1);
                 flags.enable_exit_node = rng.gen_bool(0.4);
@@ -1129,6 +1145,7 @@ mod tests {
                 flags.multi_thread = rng.gen_bool(0.7);
                 flags.proxy_forward_by_system = rng.gen_bool(0.3);
                 flags.enable_encryption = rng.gen_bool(0.8);
+                flags.disable_tcp_hole_punching = rng.gen_bool(0.2);
                 flags.disable_udp_hole_punching = rng.gen_bool(0.2);
                 flags.accept_dns = rng.gen_bool(0.6);
                 flags.mtu = rng.gen_range(1200..1500);

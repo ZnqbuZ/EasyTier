@@ -333,6 +333,9 @@ impl QUICProxyDst {
         let remote_addr = conn.remote_address();
         defer!(
             proxy_entries.remove(&remote_addr);
+            if proxy_entries.capacity() - proxy_entries.len() > 16 {
+                proxy_entries.shrink_to_fit();
+            }
         );
         let ret = timeout(
             std::time::Duration::from_secs(10),
@@ -413,6 +416,15 @@ impl QUICProxyDst {
 
         let send_to_self = Some(*dst_socket.ip()) == ctx.get_ipv4().map(|ip| ip.address());
         if send_to_self && ctx.no_tun() {
+            if ctx.is_port_in_running_listeners(dst_socket.port(), false)
+                && ctx.is_ip_in_same_network(&src_ip)
+            {
+                return Err(anyhow::anyhow!(
+                    "dst socket {:?} is in running listeners, ignore it",
+                    dst_socket
+                )
+                .into());
+            }
             dst_socket = format!("127.0.0.1:{}", dst_socket.port()).parse().unwrap();
         }
 

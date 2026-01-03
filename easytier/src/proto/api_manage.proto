@@ -76,6 +76,11 @@ message NetworkConfig {
   repeated PortForwardConfig port_forwards = 48;
 
   optional bool disable_sym_hole_punching = 49;
+
+  optional bool p2p_only = 51;
+  optional common.CompressionAlgoPb data_compress_algo = 52;
+  optional string encryption_algorithm = 53;
+  optional bool disable_tcp_hole_punching = 54;
 }
 
 message PortForwardConfig {
@@ -112,6 +117,12 @@ message NetworkInstanceRunningInfoMap {
   map<string, NetworkInstanceRunningInfo> map = 1;
 }
 
+message NetworkMeta {
+  common.UUID inst_id = 1;
+  string network_name = 2;
+  uint32 config_permission = 3;
+}
+
 message ValidateConfigRequest { NetworkConfig config = 1; }
 
 message ValidateConfigResponse { string toml_config = 1; }
@@ -119,6 +130,7 @@ message ValidateConfigResponse { string toml_config = 1; }
 message RunNetworkInstanceRequest {
   common.UUID inst_id = 1;
   NetworkConfig config = 2;
+  bool overwrite = 3;
 }
 
 message RunNetworkInstanceResponse { common.UUID inst_id = 1; }
@@ -143,6 +155,14 @@ message DeleteNetworkInstanceResponse {
   repeated common.UUID remain_inst_ids = 1;
 }
 
+message GetNetworkInstanceConfigRequest { common.UUID inst_id = 1; }
+
+message GetNetworkInstanceConfigResponse { NetworkConfig config = 1; }
+
+message ListNetworkInstanceMetaRequest { repeated common.UUID inst_ids = 1; }
+
+message ListNetworkInstanceMetaResponse { repeated NetworkMeta metas = 1; }
+
 service WebClientService {
   rpc ValidateConfig(ValidateConfigRequest) returns (ValidateConfigResponse) {}
   rpc RunNetworkInstance(RunNetworkInstanceRequest)
@@ -155,4 +175,8 @@ service WebClientService {
       returns (ListNetworkInstanceResponse) {}
   rpc DeleteNetworkInstance(DeleteNetworkInstanceRequest)
       returns (DeleteNetworkInstanceResponse) {}
+  rpc GetNetworkInstanceConfig(GetNetworkInstanceConfigRequest)
+      returns (GetNetworkInstanceConfigResponse) {}
+  rpc ListNetworkInstanceMeta(ListNetworkInstanceMetaRequest)
+      returns (ListNetworkInstanceMetaResponse) {}
 }

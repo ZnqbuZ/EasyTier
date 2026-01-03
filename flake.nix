@@ -32,6 +32,11 @@
         rustVersion = "1.89.0";
         makeRust =
           features:
+          let
+            rustTarget = pkgs.stdenv.hostPlatform.config;
+            muslTarget = pkgs.lib.replaceStrings [ "gnu" ] [ "musl" ] rustTarget;
+            muslTargets = if pkgs.stdenv.isLinux then [ muslTarget ] else [ ];
+          in
           pkgs.rust-bin.stable.${rustVersion}.default.override {
             extensions = [
               "rust-src"
@@ -39,7 +44,7 @@
             ]
             ++ (if builtins.elem "android" features then android.rust.extensions else [ ]);
 
-            targets = if builtins.elem "android" features then android.rust.targets else [ ];
+            targets = muslTargets ++ (if builtins.elem "android" features then android.rust.targets else []);
           };
 
         android = import ./android.nix {
@@ -69,10 +74,14 @@
                   nodejs_22
                   pnpm
                 ])
+                ++ (withFeature "gui" [
+                  libayatana-appindicator
+                ])
                 ++ (withFeature "android" android.packages)
               );
 
             buildInputs = with pkgs; ([
+              jemalloc
               zstd
               openssl
               libclang
@@ -87,6 +96,7 @@
             LD_LIBRARY_PATH = pkgs.lib.makeLibraryPath (flattenPaths (buildInputs ++ nativeBuildInputs));
             ZSTD_SYS_USE_PKG_CONFIG = true;
             KCP_SYS_EXTRA_HEADER_PATH = "${pkgs.libclang.lib}/lib/clang/19/include:${pkgs.glibc.dev}/include";
+            JEMALLOC_OVERRIDE = "${pkgs.jemalloc}/lib/libjemalloc.so";
           }
           // (if hasFeature "android" then android.envVars else { }));
       in
@@ -95,7 +105,7 @@
           default = makeShell [ ];
           core = makeShell [ ];
           web = makeShell [ "web" ];
-          gui = makeShell [ "gui" ];
+          gui = makeShell [ "gui" "web" ];
           android = makeShell [
             "android"
             "web"

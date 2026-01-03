@@ -105,9 +105,9 @@ After successful execution, you can check the network status using `easytier-cli
 ```text
 | ipv4         | hostname       | cost  | lat_ms | loss_rate | rx_bytes | tx_bytes | tunnel_proto | nat_type | id         | version         |
 | ------------ | -------------- | ----- | ------ | --------- | -------- | -------- | ------------ | -------- | ---------- | --------------- |
-| 10.126.126.1 | abc-1          | Local | *      | *         | *        | *        | udp          | FullCone | 439804259  | 2.4.5-70e69a38~ |
-| 10.126.126.2 | abc-2          | p2p   | 3.452  | 0         | 17.33 kB | 20.42 kB | udp          | FullCone | 390879727  | 2.4.5-70e69a38~ |
-|              | PublicServer_a | p2p   | 27.796 | 0.000     | 50.01 kB | 67.46 kB | tcp          | Unknown  | 3771642457 | 2.4.5-70e69a38~ |
+| 10.126.126.1 | abc-1          | Local | *      | *         | *        | *        | udp          | FullCone | 439804259  | 2.5.0-70e69a38~ |
+| 10.126.126.2 | abc-2          | p2p   | 3.452  | 0         | 17.33 kB | 20.42 kB | udp          | FullCone | 390879727  | 2.5.0-70e69a38~ |
+|              | PublicServer_a | p2p   | 27.796 | 0.000     | 50.01 kB | 67.46 kB | tcp          | Unknown  | 3771642457 | 2.5.0-70e69a38~ |
 ```
 
 You can test connectivity between nodes:
@@ -280,8 +280,6 @@ sudo easytier-core --network-name mysharednode --network-secret mysharednode
 
 - [ZeroTier](https://www.zerotier.com/): A global virtual network for connecting devices.
 - [TailScale](https://tailscale.com/): A VPN solution aimed at simplifying network configuration.
-- [vpncloud](https://github.com/dswd/vpncloud): A P2P Mesh VPN
-- [Candy](https://github.com/lanthora/candy): A reliable, low-latency, and anti-censorship virtual private network
 
 ### Contact Us
 
