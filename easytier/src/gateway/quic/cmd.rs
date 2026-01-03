@@ -1,15 +1,10 @@
 use crate::gateway::quic::evt::QuicStreamEvtRx;
 use anyhow::Error;
-use bytes::{Bytes, BytesMut};
+use bytes::Bytes;
 use quinn_proto::{ConnectionHandle, StreamId};
 use std::net::SocketAddr;
 use tokio::sync::{mpsc, oneshot};
-
-#[derive(Debug)]
-pub struct QuicPacket {
-    pub addr: SocketAddr,
-    pub data: BytesMut,
-}
+use crate::gateway::quic::packet::QuicPacket;
 
 #[derive(Debug, Clone, Copy)]
 pub(super) struct QuicStreamInfo {
@@ -20,7 +15,7 @@ pub(super) struct QuicStreamInfo {
 #[derive(Debug)]
 pub(super) enum QuicCmd {
     // Net
-    PacketIncoming(QuicPacket),
+    InputPacket(QuicPacket),
     // Connection
     OpenBiStream {
         addr: SocketAddr,

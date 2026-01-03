@@ -1,8 +1,8 @@
-use crate::gateway::quic::cmd::{QuicCmd, QuicCmdTx, QuicPacket};
+use crate::gateway::quic::cmd::{QuicCmd, QuicCmdTx};
 use crate::gateway::quic::driver::{QuicDriver, QuicStreamPartsRx};
 use crate::gateway::quic::evt::{QuicNetEvt, QuicNetEvtRx};
 use crate::gateway::quic::stream::QuicStream;
-use anyhow::Error;
+use anyhow::{anyhow, Error};
 use quinn_plaintext::{client_config, server_config};
 use quinn_proto::congestion::BbrConfig;
 use quinn_proto::{ClientConfig, Endpoint, EndpointConfig, TransportConfig, VarInt};
@@ -12,9 +12,10 @@ use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinSet;
 use tokio::time::sleep_until;
-use tokio::{select, spawn};
+use tokio::select;
+use crate::gateway::quic::packet::{QuicPacket, QuicPacketMargins};
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct QuicController {
     cmd_tx: QuicCmdTx,
 }
@@ -22,7 +23,7 @@ pub struct QuicController {
 impl QuicController {
     pub async fn send(&self, packet: QuicPacket) -> Result<(), Error> {
         self.cmd_tx
-            .send(QuicCmd::PacketIncoming(packet))
+            .send(QuicCmd::InputPacket(packet))
             .await
             .map_err(|e| Error::msg(format!("Failed to send QuicCmd::PacketIncoming: {:?}", e)))
     }
@@ -40,13 +41,18 @@ impl QuicController {
 #[derive(Debug)]
 pub struct QuicPacketRx {
     net_evt_rx: QuicNetEvtRx,
+    packet_margins: QuicPacketMargins,
 }
 
 impl QuicPacketRx {
     pub async fn recv(&mut self) -> Option<QuicPacket> {
         match self.net_evt_rx.recv().await? {
-            QuicNetEvt::PacketOutgoing(packet) => Some(packet),
+            QuicNetEvt::OutputPacket(packet) => Some(packet),
         }
+    }
+    
+    pub fn packet_margins(&self) -> QuicPacketMargins {
+        self.packet_margins
     }
 }
 
@@ -65,8 +71,8 @@ impl QuicStreamRx {
 
 pub struct QuicEndpoint {
     endpoint: Option<Endpoint>,
-    client_config: Option<ClientConfig>,
-    ctrl: Option<QuicController>,
+    client_config: ClientConfig,
+    ctrl: Option<Arc<QuicController>>,
     tasks: JoinSet<()>,
 }
 
@@ -105,13 +111,13 @@ impl QuicEndpoint {
     pub fn with_endpoint(endpoint: Endpoint, client_config: ClientConfig) -> Self {
         Self {
             endpoint: Some(endpoint),
-            client_config: Some(client_config),
+            client_config,
             ctrl: None,
             tasks: JoinSet::new(),
         }
     }
 
-    pub fn run(&mut self) -> Option<(QuicPacketRx, QuicStreamRx)> {
+    pub fn run(&mut self, packet_margins: QuicPacketMargins) -> Option<(QuicPacketRx, QuicStreamRx)> {
         self.endpoint.as_ref()?;
 
         let (cmd_tx, mut cmd_rx) = mpsc::channel(2048);
@@ -120,8 +126,8 @@ impl QuicEndpoint {
 
         self.ctrl = Some(QuicController {
             cmd_tx: cmd_tx.clone(),
-        });
-        let packet_rx = QuicPacketRx { net_evt_rx };
+        }.into());
+        let packet_rx = QuicPacketRx { net_evt_rx, packet_margins };
         let stream_rx = QuicStreamRx {
             cmd_tx: cmd_tx.clone(),
             incoming_stream_rx,
@@ -129,9 +135,10 @@ impl QuicEndpoint {
 
         let mut drv = QuicDriver::new(
             self.endpoint.take().unwrap(),
-            self.client_config.take().unwrap(),
+            self.client_config.clone(),
             net_evt_tx.clone(),
             incoming_stream_tx.clone(),
+            packet_margins
         );
 
         self.tasks.spawn(async move {
@@ -150,9 +157,9 @@ impl QuicEndpoint {
         Some((packet_rx, stream_rx))
     }
 
-    pub fn ctrl(&self) -> QuicController {
+    pub fn ctrl(&self) -> Result<Arc<QuicController>, Error> {
         self.ctrl
             .clone()
-            .expect("Failed to get QUIC controller. Is QUIC endpoint running?")
+            .ok_or(anyhow!("Failed to get QUIC controller. Is QUIC endpoint running?"))
     }
 }

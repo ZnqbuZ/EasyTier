@@ -10,6 +10,7 @@ use tokio_util::sync::PollSender;
 
 use crate::gateway::quic::cmd::{QuicCmd, QuicCmdTx, QuicStreamInfo};
 use crate::gateway::quic::evt::{QuicStreamEvt, QuicStreamEvtRx};
+use crate::gateway::quic::QuicBufferPool;
 
 #[derive(Debug)]
 pub struct QuicStream {
@@ -19,15 +20,21 @@ pub struct QuicStream {
     cmd_tx: PollSender<QuicCmd>,
 
     pending: Option<Bytes>,
+    pool: QuicBufferPool,
 }
 
 impl QuicStream {
-    pub(super) fn new(stream_info: QuicStreamInfo, evt_rx: QuicStreamEvtRx, cmd_tx: QuicCmdTx) -> Self {
+    pub(super) fn new(
+        stream_info: QuicStreamInfo,
+        evt_rx: QuicStreamEvtRx,
+        cmd_tx: QuicCmdTx,
+    ) -> Self {
         Self {
             stream_info,
             evt_rx,
             cmd_tx: PollSender::new(cmd_tx),
             pending: None,
+            pool: QuicBufferPool::new(8192),
         }
     }
 }
@@ -45,7 +52,9 @@ impl AsyncRead for QuicStream {
                 if !pending.is_empty() {
                     self.pending = Some(pending);
                 }
-                return Poll::Ready(Ok(()));
+                if buf.remaining() == 0 {
+                    return Poll::Ready(Ok(()));
+                }
             }
 
             match self.evt_rx.poll_recv(cx) {
@@ -57,7 +66,9 @@ impl AsyncRead for QuicStream {
                         self.pending = Some(data);
                     }
                     QuicStreamEvt::Fin => return Poll::Ready(Ok(())),
-                    QuicStreamEvt::Reset(e) => return Poll::Ready(Err(Error::new(ErrorKind::ConnectionReset, e))),
+                    QuicStreamEvt::Reset(e) => {
+                        return Poll::Ready(Err(Error::new(ErrorKind::ConnectionReset, e)))
+                    }
                 },
                 Poll::Ready(None) => return Poll::Ready(Ok(())),
                 Poll::Pending => return Poll::Pending,
@@ -88,7 +99,7 @@ macro_rules! ready_tx {
 
 impl QuicStream {
     #[inline]
-    fn mk_write_cmd(&self, data: Bytes, fin: bool) -> QuicCmd {
+    const fn mk_write_cmd(&self, data: Bytes, fin: bool) -> QuicCmd {
         QuicCmd::StreamWrite {
             stream_info: self.stream_info,
             data,
@@ -104,7 +115,7 @@ impl AsyncWrite for QuicStream {
         buf: &[u8],
     ) -> Poll<Result<usize, Error>> {
         ready_tx!(self.cmd_tx.poll_ready_unpin(cx));
-        let cmd = self.mk_write_cmd(Bytes::copy_from_slice(buf), false);
+        let cmd = self.mk_write_cmd(self.pool.buf(buf, (0, 0).into()).freeze(), false);
         let _ = check_tx!(self.cmd_tx.start_send_unpin(cmd));
         Poll::Ready(Ok(buf.len()))
     }

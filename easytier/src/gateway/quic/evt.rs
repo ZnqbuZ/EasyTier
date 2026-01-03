@@ -1,10 +1,10 @@
+use crate::gateway::quic::packet::QuicPacket;
 use bytes::Bytes;
 use tokio::sync::mpsc;
-use crate::gateway::quic::cmd::QuicPacket;
 
 #[derive(Debug)]
 pub(super) enum QuicNetEvt {
-    PacketOutgoing(QuicPacket),
+    OutputPacket(QuicPacket),
 }
 
 pub type QuicNetEvtTx = mpsc::Sender<QuicNetEvt>;

@@ -1,10 +1,7 @@
-use std::cmp::max;
-use crate::gateway::quic::cmd::{QuicCmd, QuicPacket, QuicStreamInfo};
-use crate::gateway::quic::evt::{
-    QuicNetEvt, QuicNetEvtTx, QuicStreamEvt, QuicStreamEvtRx, QuicStreamEvtTx,
-};
+use crate::gateway::quic::cmd::{QuicCmd, QuicStreamInfo};
+use crate::gateway::quic::evt::{QuicNetEvt, QuicNetEvtTx, QuicStreamEvt, QuicStreamEvtRx, QuicStreamEvtTx};
 use anyhow::{anyhow, Error};
-use bytes::{BufMut, Bytes, BytesMut};
+use bytes::{Bytes};
 use quinn_proto::{
     ClientConfig, ConnectError, Connection, ConnectionHandle, DatagramEvent, Dir, Endpoint, Event,
     ReadError, StreamEvent, StreamId,
@@ -15,30 +12,8 @@ use std::time::Instant;
 use tokio::sync::mpsc;
 use tracing::log::trace;
 use tracing::{error, warn};
-
-struct QuicPacketPool {
-    pool: BytesMut,
-    min_capacity: usize,
-}
-
-impl QuicPacketPool {
-    fn new(min_capacity: usize) -> Self {
-        Self {
-            pool: BytesMut::new(),
-            min_capacity
-        }
-    }
-
-    fn pack(&mut self, data: &[u8]) -> BytesMut {
-        let len = data.len();
-        if len + self.pool.len() > self.pool.capacity() {
-            self.pool.clear();
-            self.pool.reserve(max(len * 4, self.min_capacity));
-        }
-        self.pool.put_slice(data);
-        self.pool.split_to(len)
-    }
-}
+use crate::gateway::quic::packet::{QuicPacket, QuicPacketMargins};
+use crate::gateway::quic::utils::QuicBufferPool;
 
 const QUIC_STREAM_EVT_BUFFER: usize = 2048;
 const QUIC_PACKET_POOL_MIN_CAPACITY: usize = 64 * 1024;
@@ -53,7 +28,8 @@ pub(super) struct QuicDriver {
     net_evt_tx: QuicNetEvtTx,
     incoming_stream_tx: QuicStreamPartsTx,
     buf: Vec<u8>,
-    packet_pool: QuicPacketPool,
+    packet_pool: QuicBufferPool,
+    packet_margins: QuicPacketMargins,
 }
 
 impl QuicDriver {
@@ -62,6 +38,7 @@ impl QuicDriver {
         client_config: ClientConfig,
         net_evt_tx: QuicNetEvtTx,
         incoming_stream_tx: QuicStreamPartsTx,
+        packet_margins: QuicPacketMargins,
     ) -> Self {
         Self {
             conns: HashMap::new(),
@@ -70,13 +47,14 @@ impl QuicDriver {
             net_evt_tx,
             incoming_stream_tx,
             buf: Vec::with_capacity(64 * 1024),
-            packet_pool: QuicPacketPool::new(QUIC_PACKET_POOL_MIN_CAPACITY),
+            packet_pool: QuicBufferPool::new(QUIC_PACKET_POOL_MIN_CAPACITY),
+            packet_margins,
         }
     }
 
     pub fn execute(&mut self, cmd: QuicCmd) {
         match cmd {
-            QuicCmd::PacketIncoming(packet) => {
+            QuicCmd::InputPacket(packet) => {
                 self.handle_packet_incoming(packet);
             }
 
@@ -102,9 +80,9 @@ impl QuicDriver {
 macro_rules! emit_transmit {
     ($drv:expr, $transmit:expr) => {
         $drv.net_evt_tx
-            .try_send(QuicNetEvt::PacketOutgoing(QuicPacket {
+            .try_send(QuicNetEvt::OutputPacket(QuicPacket {
                 addr: $transmit.destination,
-                data: $drv.packet_pool.pack(&$drv.buf[0..$transmit.size]),
+                payload: $drv.packet_pool.buf(&$drv.buf[0..$transmit.size], $drv.packet_margins),
             }))
     };
 }
@@ -119,7 +97,7 @@ impl QuicDriver {
             packet.addr,
             None,
             None,
-            packet.data,
+            packet.payload,
             &mut self.buf,
         ) {
             Some(DatagramEvent::NewConnection(incoming)) => {
