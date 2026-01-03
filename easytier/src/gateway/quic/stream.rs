@@ -97,17 +97,6 @@ macro_rules! ready_tx {
     };
 }
 
-impl QuicStream {
-    #[inline]
-    const fn mk_write_cmd(&self, data: Bytes, fin: bool) -> QuicCmd {
-        QuicCmd::StreamWrite {
-            stream_info: self.stream_info,
-            data,
-            fin,
-        }
-    }
-}
-
 impl AsyncWrite for QuicStream {
     fn poll_write(
         mut self: Pin<&mut Self>,
@@ -115,7 +104,11 @@ impl AsyncWrite for QuicStream {
         buf: &[u8],
     ) -> Poll<Result<usize, Error>> {
         ready_tx!(self.cmd_tx.poll_ready_unpin(cx));
-        let cmd = self.mk_write_cmd(self.pool.buf(buf, (0, 0).into()).freeze(), false);
+        let cmd = QuicCmd::StreamWrite {
+            stream_info: self.stream_info,
+            data: self.pool.buf(buf, (0, 0).into()).freeze(),
+            fin: false,
+        };
         let _ = check_tx!(self.cmd_tx.start_send_unpin(cmd));
         Poll::Ready(Ok(buf.len()))
     }
@@ -128,7 +121,11 @@ impl AsyncWrite for QuicStream {
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Error>> {
         ready_tx!(self.cmd_tx.poll_flush_unpin(cx));
         ready_tx!(self.cmd_tx.poll_ready_unpin(cx));
-        let cmd = self.mk_write_cmd(Bytes::new(), true);
+        let cmd = QuicCmd::StreamWrite {
+            stream_info: self.stream_info,
+            data: Bytes::new(),
+            fin: true,
+        };
         check_tx!(self.cmd_tx.start_send_unpin(cmd))
     }
 }
