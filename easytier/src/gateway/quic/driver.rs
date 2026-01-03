@@ -5,7 +5,6 @@ use crate::gateway::quic::evt::{
 };
 use anyhow::{anyhow, Error};
 use bytes::{BufMut, Bytes, BytesMut};
-use quinn_plaintext::client_config;
 use quinn_proto::{
     ClientConfig, ConnectError, Connection, ConnectionHandle, DatagramEvent, Dir, Endpoint, Event,
     ReadError, StreamEvent, StreamId,
@@ -50,9 +49,9 @@ pub type QuicStreamPartsRx = mpsc::Receiver<(QuicStreamInfo, QuicStreamEvtRx)>;
 pub(super) struct QuicDriver {
     conns: HashMap<ConnectionHandle, (Connection, HashMap<StreamId, QuicStreamEvtTx>)>,
     endpoint: Endpoint,
+    client_config: ClientConfig,
     net_evt_tx: QuicNetEvtTx,
     incoming_stream_tx: QuicStreamPartsTx,
-    client_config: ClientConfig,
     buf: Vec<u8>,
     packet_pool: QuicPacketPool,
 }
@@ -60,15 +59,16 @@ pub(super) struct QuicDriver {
 impl QuicDriver {
     pub fn new(
         endpoint: Endpoint,
+        client_config: ClientConfig,
         net_evt_tx: QuicNetEvtTx,
         incoming_stream_tx: QuicStreamPartsTx,
     ) -> Self {
         Self {
             conns: HashMap::new(),
             endpoint,
+            client_config,
             net_evt_tx,
             incoming_stream_tx,
-            client_config: client_config(),
             buf: Vec::with_capacity(64 * 1024),
             packet_pool: QuicPacketPool::new(QUIC_PACKET_POOL_MIN_CAPACITY),
         }
