@@ -18,9 +18,9 @@ pub mod socks5;
 
 pub mod kcp_proxy;
 
-pub mod quic_proxy_old;
+pub mod quic_proxy;
 mod quic;
-mod quic_proxy;
+mod quic_proxy_new;
 
 #[derive(Debug)]
 pub(crate) struct CidrSet {
