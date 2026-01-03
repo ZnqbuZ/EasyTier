@@ -1,5 +1,5 @@
-use std::cmp::max;
 use bytes::{BufMut, BytesMut};
+use std::cmp::max;
 
 #[derive(Debug, Clone, Copy)]
 pub struct QuicBufferMargins {
@@ -9,14 +9,17 @@ pub struct QuicBufferMargins {
 
 impl From<(usize, usize)> for QuicBufferMargins {
     fn from(tuple: (usize, usize)) -> Self {
-        Self { header: tuple.0, trailer: tuple.1 }
+        Self {
+            header: tuple.0,
+            trailer: tuple.1,
+        }
     }
 }
 
-impl From<&QuicBufferMargins> for (usize, usize) {
-    fn from(margins: &QuicBufferMargins) -> Self {
+impl From<QuicBufferMargins> for (usize, usize) {
+    fn from(margins: QuicBufferMargins) -> Self {
         (margins.header, margins.trailer)
-    }   
+    }
 }
 
 #[derive(Debug)]
@@ -29,12 +32,12 @@ impl QuicBufferPool {
     pub(crate) fn new(min_capacity: usize) -> Self {
         Self {
             pool: BytesMut::new(),
-            min_capacity
+            min_capacity,
         }
     }
 
     pub(crate) fn buf(&mut self, data: &[u8], margins: QuicBufferMargins) -> BytesMut {
-        let QuicBufferMargins { header, trailer } = margins;
+        let (header, trailer) = margins.into();
 
         let len = header + data.len() + trailer;
         if len > self.pool.remaining_mut() {

@@ -51,8 +51,6 @@ impl AsyncRead for QuicStream {
                 buf.put_slice(&pending.split_to(len));
                 if !pending.is_empty() {
                     self.pending = Some(pending);
-                }
-                if buf.remaining() == 0 {
                     return Poll::Ready(Ok(()));
                 }
             }
