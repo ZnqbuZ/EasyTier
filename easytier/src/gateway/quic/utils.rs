@@ -1,9 +1,10 @@
 use bytes::{BufMut, BytesMut};
 use std::cmp::max;
 use std::ops::{Deref, DerefMut};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use tokio::sync::mpsc;
+use tracing::{error, info, trace};
 
 #[derive(Debug)]
 pub struct AtomicSwitch(AtomicBool);
@@ -60,8 +61,14 @@ pub fn switched_channel<T>(buffer: usize) -> (SwitchedSender<T>, SwitchedReceive
     let switch = Arc::new(AtomicSwitch::new(true));
 
     (
-        SwitchedSender { inner: tx, switch: switch.clone() },
-        SwitchedReceiver { inner: rx, switch: switch.clone() },
+        SwitchedSender {
+            inner: tx,
+            switch: switch.clone(),
+        },
+        SwitchedReceiver {
+            inner: rx,
+            switch: switch.clone(),
+        },
     )
 }
 
@@ -107,14 +114,17 @@ impl QuicBufferPool {
         let (header, trailer) = margins.into();
 
         let len = header + data.len() + trailer;
-        if len > self.pool.remaining_mut() {
-            self.pool.reserve(max(len * 4, self.min_capacity));
+        
+        if len > self.pool.capacity() {
+            let additional = max(len * 4, self.min_capacity);
+            self.pool.reserve(additional);
+            unsafe {
+                self.pool.set_len(self.pool.len() + self.pool.capacity());
+            }
         }
-        unsafe {
-            self.pool.advance_mut(len);
-        }
+        
         let mut buf = self.pool.split_to(len);
-        buf[header..header + data.len()].copy_from_slice(data);
+        buf[header..len - trailer].copy_from_slice(data);
         buf
     }
 }
