@@ -290,7 +290,9 @@ impl QuicDriver {
                             loop {
                                 match chunks.next(usize::MAX) {
                                     Ok(Some(chunk)) => {
-                                        let _ = tx.try_send(QuicStreamEvt::Data(chunk.bytes));
+                                       if let Err(e) = tx.try_send(QuicStreamEvt::Data(chunk.bytes)) {
+                                           error!("Failed to send data to stream: {:?}", e);
+                                       }
                                     }
 
                                     Ok(None) => break,
