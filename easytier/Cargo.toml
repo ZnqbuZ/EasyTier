@@ -36,6 +36,7 @@ tracing-subscriber = { version = "0.3", features = [
     "local-time",
     "time",
 ] }
+derivative = "2.2.0"
 console-subscriber = { version = "0.4.1", optional = true }
 thiserror = "1.0"
 auto_impl = "1.1.0"

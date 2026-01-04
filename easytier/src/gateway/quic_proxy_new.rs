@@ -1,4 +1,4 @@
-use crate::common::global_ctx::GlobalCtx;
+use crate::common::global_ctx::{ArcGlobalCtx, GlobalCtx};
 use crate::common::PeerId;
 use crate::gateway::kcp_proxy::TcpProxyForKcpSrcTrait;
 use crate::gateway::quic::{QuicController, QuicEndpoint, QuicPacket, QuicPacketRx, QuicStream, QuicStreamHandle, QuicStreamRx};
@@ -12,6 +12,7 @@ use crate::tunnel::packet_def::{PacketType, PeerManagerHeader, ZCPacket, ZCPacke
 use anyhow::{anyhow, Context, Error};
 use bytes::{BufMut, Bytes, BytesMut};
 use dashmap::DashMap;
+use derivative::Derivative;
 use pnet::packet::ipv4::Ipv4Packet;
 use prost::Message;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -96,7 +97,7 @@ impl QuicProxyRole {
             QuicProxyRole::Dst => PacketType::QuicSrc,
         }
     }
-    
+
     #[inline]
     const fn outgoing(&self) -> PacketType {
         match self {
@@ -425,24 +426,68 @@ impl QuicProxySrc {
     }
 }
 
+#[derive(Derivative, Clone)]
+#[derivative(Debug)]
+struct QuicStreamContext {
+    global_ctx: ArcGlobalCtx,
+    proxy_entries: Arc<DashMap<QuicStreamHandle, TcpProxyEntry>>,
+    cidr_set: Arc<CidrSet>,
+    #[derivative(Debug = "ignore")]
+    route: Arc<dyn crate::peers::route_trait::Route + Send + Sync + 'static>,
+}
+
+impl QuicStreamContext {
+    fn new(peer_mgr: Arc<PeerManager>) -> Self {
+        let global_ctx = peer_mgr.get_global_ctx();
+        Self {
+            global_ctx: global_ctx.clone(),
+            proxy_entries: Arc::new(DashMap::new()),
+            cidr_set: Arc::new(CidrSet::new(global_ctx.clone())),
+            route: Arc::new(peer_mgr.get_route()),
+        }
+    }
+}
+
 pub struct QuicProxyDst {
     quic_ctrl: Arc<QuicController>,
     peer_mgr: Arc<PeerManager>,
 
-    proxy_entries: Arc<DashMap<QuicStreamHandle, TcpProxyEntry>>,
-    cidr_set: Arc<CidrSet>,
     tasks: JoinSet<()>,
 }
 
 impl QuicProxyDst {
-    pub fn new(quic_ctrl: Arc<QuicController>, peer_mgr: Arc<PeerManager>) -> Self {
-        let cidr_set = CidrSet::new(peer_mgr.get_global_ctx());
+    fn new(quic_ctrl: Arc<QuicController>, peer_mgr: Arc<PeerManager>) -> Self {
         Self {
             quic_ctrl,
             peer_mgr,
-            proxy_entries: Arc::new(DashMap::new()),
-            cidr_set: Arc::new(cidr_set),
             tasks: JoinSet::new(),
         }
     }
+
+    async fn run(&mut self, mut stream_rx: QuicStreamRx) {
+        self.peer_mgr
+            .add_packet_process_pipeline(Box::new(QuicPacketReceiver {
+                quic_ctrl: self.quic_ctrl.clone(),
+                role: QuicProxyRole::Dst,
+            }))
+            .await;
+
+        let stream_ctx = Arc::new(QuicStreamContext::new(self.peer_mgr.clone()));
+        self.tasks.spawn(async move {
+            while let Some(stream) = stream_rx.recv().await {
+                let stream_ctx = stream_ctx.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = QuicProxyDst::establish_stream(stream, stream_ctx).await {
+                        error!("failed to establish quic dst stream: {:?}", e);
+                    }
+                });
+            }
+        });
+    }
+
+    #[tracing::instrument(ret)]
+    async fn establish_stream(
+        stream: QuicStream,
+        stream_ctx: Arc<QuicStreamContext>,
+    ) -> crate::common::error::Result<()> {todo!()}
 }
