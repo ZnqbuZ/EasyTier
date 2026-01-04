@@ -1,6 +1,6 @@
 use crate::common::global_ctx::{ArcGlobalCtx, GlobalCtx};
 use crate::common::PeerId;
-use crate::gateway::kcp_proxy::{KcpProxyDst, TcpProxyForKcpSrcTrait};
+use crate::gateway::kcp_proxy::{ProxyAclHandler, TcpProxyForKcpSrcTrait};
 use crate::gateway::quic::{
     QuicController, QuicEndpoint, QuicPacket, QuicPacketRx, QuicStream, QuicStreamHandle,
     QuicStreamRx,
@@ -9,7 +9,7 @@ use crate::gateway::tcp_proxy::{NatDstConnector, TcpProxy};
 use crate::gateway::CidrSet;
 use crate::peers::peer_manager::PeerManager;
 use crate::peers::PeerPacketFilter;
-use crate::proto::api::instance::{ListTcpProxyEntryRequest, ListTcpProxyEntryResponse, TcpProxyEntry, TcpProxyEntryTransportType, TcpProxyRpc};
+use crate::proto::api::instance::{ListTcpProxyEntryRequest, ListTcpProxyEntryResponse, TcpProxyEntry, TcpProxyEntryState, TcpProxyEntryTransportType, TcpProxyRpc};
 use crate::proto::peer_rpc::KcpConnData;
 use crate::tunnel::packet_def::{PacketType, PeerManagerHeader, ZCPacket, ZCPacketType};
 use anyhow::{anyhow, Context, Error};
@@ -21,11 +21,12 @@ use prost::Message;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::{Arc, Weak};
 use std::time::Duration;
-use kcp_sys::endpoint::ConnId;
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::select;
 use tokio::task::JoinSet;
 use tracing::error;
+use crate::common::acl_processor::PacketInfo;
+use crate::proto::acl::{ChainType, Protocol};
 use crate::proto::rpc_types;
 use crate::proto::rpc_types::controller::BaseController;
 
@@ -346,8 +347,107 @@ impl QuicStreamReceiver {
     async fn run(mut self) {
         while let Some(stream) = self.stream_rx.recv().await {
             let stream_ctx = self.stream_ctx.clone();
-            tokio::spawn(async move {});
+            tokio::spawn(Self::establish_stream(stream, stream_ctx));
         }
+    }
+
+    #[tracing::instrument(ret)]
+    async fn establish_stream(mut stream: QuicStream, stream_ctx: Arc<QuicStreamContext>) -> crate::common::error::Result<()> {
+        let conn_data_len = {
+            let mut header_len =[0u8; 2];
+            stream.read_exact(&mut header_len).await.context("failed to read length of quic stream header")?;
+            u16::from_be_bytes(header_len) as usize
+        };
+
+        let mut conn_data = vec![0u8; conn_data_len];
+        stream.read_exact(&mut conn_data).await.context("failed to read quic stream header")?;
+        let conn_data_parsed = QuicConnData::decode(&mut conn_data.as_slice()).context("failed to decode quic stream header")?;
+
+        let proxy_entries = &stream_ctx.proxy_entries;
+        let handle = stream.handle();
+        proxy_entries.insert(
+            handle,
+            TcpProxyEntry {
+                src: conn_data_parsed.src.clone(),
+                dst: conn_data_parsed.dst.clone(),
+                start_time: chrono::Local::now().timestamp() as u64,
+                state: TcpProxyEntryState::ConnectingDst.into(),
+                transport_type: TcpProxyEntryTransportType::Quic.into(),
+            },
+        );
+        crate::defer! {
+            proxy_entries.remove(&handle);
+            if proxy_entries.capacity() - proxy_entries.len() > 16 {
+                proxy_entries.shrink_to_fit();
+            }
+        }
+
+        let mut src_socket: SocketAddr = conn_data_parsed.src.clone().ok_or_else(|| anyhow!("missing src addr in quic stream header"))?.into();
+        let mut dst_socket: SocketAddr = conn_data_parsed.dst.clone().ok_or_else(|| anyhow!("missing dst addr in quic stream header"))?.into();
+
+        let src_ip = src_socket.ip();
+        let dst_ip = dst_socket.ip();
+        
+        let route = stream_ctx.route.clone();
+        let (src_groups, dst_groups) = tokio::join!(
+            route.get_peer_groups_by_ip(&src_ip),
+            route.get_peer_groups_by_ip(&dst_ip)
+        );
+
+        let global_ctx = stream_ctx.global_ctx.clone();
+        let send_to_self =
+            Some(dst_socket.ip()) == global_ctx.get_ipv4().map(|ip| IpAddr::V4(ip.address()));
+
+        if send_to_self && global_ctx.no_tun() {
+            if global_ctx.is_port_in_running_listeners(dst_socket.port(), false)
+                && global_ctx.is_ip_in_same_network(&src_ip)
+            {
+                return Err(anyhow::anyhow!(
+                    "dst socket {:?} is in running listeners, ignore it",
+                    dst_socket
+                )
+                    .into());
+            }
+            dst_socket = format!("127.0.0.1:{}", dst_socket.port()).parse().unwrap();
+        }
+
+        let acl_handler = ProxyAclHandler {
+            acl_filter: global_ctx.get_acl_filter().clone(),
+            packet_info: PacketInfo {
+                src_ip,
+                dst_ip,
+                src_port: Some(src_socket.port()),
+                dst_port: Some(dst_socket.port()),
+                protocol: Protocol::Tcp,
+                packet_size: conn_data.len(),
+                src_groups,
+                dst_groups,
+            },
+            chain_type: if send_to_self {
+                ChainType::Inbound
+            } else {
+                ChainType::Forward
+            },
+        };
+        acl_handler.handle_packet(&conn_data)?;
+
+        tracing::debug!("quic connect to dst socket: {:?}", dst_socket);
+
+        let _g = global_ctx.net_ns.guard();
+        let connector = crate::gateway::tcp_proxy::NatDstTcpConnector {};
+        let ret = connector
+            .connect("0.0.0.0:0".parse().unwrap(), dst_socket)
+            .await?;
+
+        if let Some(mut e) = proxy_entries.get_mut(&handle) {
+            e.state = TcpProxyEntryState::Connected.into();
+        }
+
+        acl_handler
+            .copy_bidirection_with_acl(stream, ret)
+            .await?;
+        
+        Ok(())
     }
 }
 

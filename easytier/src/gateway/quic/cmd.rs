@@ -7,6 +7,7 @@ use tokio::sync::{mpsc, oneshot};
 use crate::gateway::quic::packet::QuicPacket;
 use crate::gateway::quic::stream::QuicStreamHandle;
 
+// TODO: add more commands
 #[derive(Debug)]
 pub(super) enum QuicCmd {
     // Net

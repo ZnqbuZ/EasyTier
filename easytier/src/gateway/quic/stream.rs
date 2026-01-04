@@ -44,6 +44,12 @@ pub struct QuicStream {
 }
 
 impl QuicStream {
+    pub fn handle(&self) -> QuicStreamHandle {
+        self.stream_handle
+    }
+}
+
+impl QuicStream {
     pub(super) fn new(
         stream_handle: QuicStreamHandle,
         evt_rx: QuicStreamEvtRx,
