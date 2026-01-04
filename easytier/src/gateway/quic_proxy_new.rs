@@ -1,12 +1,15 @@
 use crate::common::global_ctx::{ArcGlobalCtx, GlobalCtx};
 use crate::common::PeerId;
-use crate::gateway::kcp_proxy::TcpProxyForKcpSrcTrait;
-use crate::gateway::quic::{QuicController, QuicEndpoint, QuicPacket, QuicPacketRx, QuicStream, QuicStreamHandle, QuicStreamRx};
+use crate::gateway::kcp_proxy::{KcpProxyDst, TcpProxyForKcpSrcTrait};
+use crate::gateway::quic::{
+    QuicController, QuicEndpoint, QuicPacket, QuicPacketRx, QuicStream, QuicStreamHandle,
+    QuicStreamRx,
+};
 use crate::gateway::tcp_proxy::{NatDstConnector, TcpProxy};
 use crate::gateway::CidrSet;
 use crate::peers::peer_manager::PeerManager;
 use crate::peers::PeerPacketFilter;
-use crate::proto::api::instance::{TcpProxyEntry, TcpProxyEntryTransportType};
+use crate::proto::api::instance::{ListTcpProxyEntryRequest, ListTcpProxyEntryResponse, TcpProxyEntry, TcpProxyEntryTransportType, TcpProxyRpc};
 use crate::proto::peer_rpc::KcpConnData;
 use crate::tunnel::packet_def::{PacketType, PeerManagerHeader, ZCPacket, ZCPacketType};
 use anyhow::{anyhow, Context, Error};
@@ -18,11 +21,15 @@ use prost::Message;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::{Arc, Weak};
 use std::time::Duration;
+use kcp_sys::endpoint::ConnId;
 use tokio::io::AsyncWriteExt;
 use tokio::select;
 use tokio::task::JoinSet;
 use tracing::error;
+use crate::proto::rpc_types;
+use crate::proto::rpc_types::controller::BaseController;
 
+//This helper class encodes/decodes peer_id and packet_type into/from SocketAddr.
 #[derive(Debug)]
 struct QuicPacketMeta {
     peer_id: PeerId,
@@ -80,88 +87,6 @@ impl TryFrom<SocketAddr> for QuicPacketMeta {
             peer_id,
             packet_type,
         })
-    }
-}
-
-#[derive(Debug)]
-enum QuicProxyRole {
-    Src,
-    Dst,
-}
-
-impl QuicProxyRole {
-    #[inline]
-    const fn incoming(&self) -> PacketType {
-        match self {
-            QuicProxyRole::Src => PacketType::QuicDst,
-            QuicProxyRole::Dst => PacketType::QuicSrc,
-        }
-    }
-
-    #[inline]
-    const fn outgoing(&self) -> PacketType {
-        match self {
-            QuicProxyRole::Src => PacketType::QuicSrc,
-            QuicProxyRole::Dst => PacketType::QuicDst,
-        }
-    }
-}
-
-// Receive packets from peers and forward them to the QUIC endpoint
-#[derive(Debug)]
-struct QuicPacketReceiver {
-    quic_ctrl: Arc<QuicController>,
-    role: QuicProxyRole,
-}
-
-#[async_trait::async_trait]
-impl PeerPacketFilter for QuicPacketReceiver {
-    async fn try_process_packet_from_peer(&self, packet: ZCPacket) -> Option<ZCPacket> {
-        let header = packet.peer_manager_header().unwrap();
-
-        if header.packet_type != self.role.incoming() as u8 {
-            return Some(packet);
-        }
-
-        let _ = self
-            .quic_ctrl
-            .send(
-                QuicPacketMeta::new(header.from_peer_id.get().into(), self.role.outgoing())
-                    .pack(packet.payload_bytes()),
-            )
-            .await;
-
-        None
-    }
-}
-
-// Receive packets from QUIC endpoint and forward them to peers
-#[derive(Debug)]
-struct QuicPacketSender {
-    peer_mgr: Arc<PeerManager>,
-    packet_rx: QuicPacketRx,
-
-    header: Bytes,
-    zc_packet_type: ZCPacketType,
-}
-
-impl QuicPacketSender {
-    #[tracing::instrument]
-    pub async fn run(&mut self) {
-        while let Some(packet) = self.packet_rx.recv().await {
-            let (packet_info, mut payload) = QuicPacketMeta::unpack(packet).unwrap();
-
-            payload[..self.header.len()].copy_from_slice(&*self.header);
-            let mut packet = ZCPacket::new_from_buf(payload, self.zc_packet_type);
-
-            let peer_id = packet_info.peer_id;
-            let packet_type = packet_info.packet_type;
-            packet.fill_peer_manager_hdr(self.peer_mgr.my_peer_id(), peer_id, packet_type as u8);
-
-            if let Err(e) = self.peer_mgr.send_msg_for_proxy(packet, peer_id).await {
-                error!("failed to send QUIC packet to peer: {:?}", e);
-            }
-        }
     }
 }
 
@@ -302,6 +227,130 @@ impl TcpProxyForKcpSrcTrait for TcpProxyForQuicSrc {
     }
 }
 
+#[derive(Debug)]
+enum QuicProxyRole {
+    Src,
+    Dst,
+}
+
+impl QuicProxyRole {
+    #[inline]
+    const fn incoming(&self) -> PacketType {
+        match self {
+            QuicProxyRole::Src => PacketType::QuicDst,
+            QuicProxyRole::Dst => PacketType::QuicSrc,
+        }
+    }
+
+    #[inline]
+    const fn outgoing(&self) -> PacketType {
+        match self {
+            QuicProxyRole::Src => PacketType::QuicSrc,
+            QuicProxyRole::Dst => PacketType::QuicDst,
+        }
+    }
+}
+
+// Receive packets from peers and forward them to the QUIC endpoint
+#[derive(Debug)]
+struct QuicPacketReceiver {
+    quic_ctrl: Arc<QuicController>,
+    role: QuicProxyRole,
+}
+
+#[async_trait::async_trait]
+impl PeerPacketFilter for QuicPacketReceiver {
+    async fn try_process_packet_from_peer(&self, packet: ZCPacket) -> Option<ZCPacket> {
+        let header = packet.peer_manager_header().unwrap();
+
+        if header.packet_type != self.role.incoming() as u8 {
+            return Some(packet);
+        }
+
+        let _ = self
+            .quic_ctrl
+            .send(
+                QuicPacketMeta::new(header.from_peer_id.get().into(), self.role.outgoing())
+                    .pack(packet.payload_bytes()),
+            )
+            .await;
+
+        None
+    }
+}
+
+// Send to peers packets received from the QUIC endpoint
+#[derive(Debug)]
+struct QuicPacketSender {
+    peer_mgr: Arc<PeerManager>,
+    packet_rx: QuicPacketRx,
+
+    header: Bytes,
+    zc_packet_type: ZCPacketType,
+}
+
+impl QuicPacketSender {
+    #[tracing::instrument]
+    pub async fn run(mut self) {
+        while let Some(packet) = self.packet_rx.recv().await {
+            let (packet_info, mut payload) = match QuicPacketMeta::unpack(packet) {
+                Some(v) => v,
+                None => {
+                    error!("failed to extract metadata from quic packet");
+                    continue;
+                }
+            };
+
+            payload[..self.header.len()].copy_from_slice(&*self.header);
+            let mut packet = ZCPacket::new_from_buf(payload, self.zc_packet_type);
+
+            let peer_id = packet_info.peer_id;
+            let packet_type = packet_info.packet_type;
+            packet.fill_peer_manager_hdr(self.peer_mgr.my_peer_id(), peer_id, packet_type as u8);
+
+            if let Err(e) = self.peer_mgr.send_msg_for_proxy(packet, peer_id).await {
+                error!("failed to send QUIC packet to peer: {:?}", e);
+            }
+        }
+    }
+}
+
+#[derive(Derivative, Clone)]
+#[derivative(Debug)]
+struct QuicStreamContext {
+    global_ctx: ArcGlobalCtx,
+    proxy_entries: Arc<DashMap<QuicStreamHandle, TcpProxyEntry>>,
+    cidr_set: Arc<CidrSet>,
+    #[derivative(Debug = "ignore")]
+    route: Arc<dyn crate::peers::route_trait::Route + Send + Sync + 'static>,
+}
+
+impl QuicStreamContext {
+    fn new(peer_mgr: Arc<PeerManager>) -> Self {
+        let global_ctx = peer_mgr.get_global_ctx();
+        Self {
+            global_ctx: global_ctx.clone(),
+            proxy_entries: Arc::new(DashMap::new()),
+            cidr_set: Arc::new(CidrSet::new(global_ctx.clone())),
+            route: Arc::new(peer_mgr.get_route()),
+        }
+    }
+}
+
+struct QuicStreamReceiver {
+    stream_rx: QuicStreamRx,
+    stream_ctx: Arc<QuicStreamContext>,
+}
+
+impl QuicStreamReceiver {
+    async fn run(mut self) {
+        while let Some(stream) = self.stream_rx.recv().await {
+            let stream_ctx = self.stream_ctx.clone();
+            tokio::spawn(async move {});
+        }
+    }
+}
+
 pub struct QuicProxy {
     endpoint: QuicEndpoint,
     peer_mgr: Arc<PeerManager>,
@@ -350,29 +399,59 @@ impl QuicProxy {
             .run((header.len(), 0).into())
             .expect("failed to start quic endpoint");
         let peer_mgr = self.peer_mgr.clone();
-        self.tasks.spawn(async move {
+        self.tasks.spawn(
             QuicPacketSender {
                 peer_mgr,
                 packet_rx,
                 header,
                 zc_packet_type,
             }
-            .run()
-            .await;
-        });
+            .run(),
+        );
 
         let peer_mgr = self.peer_mgr.clone();
         let quic_ctrl = self.endpoint.ctrl().unwrap();
 
         if src {
-            let src = QuicProxySrc::new(quic_ctrl.clone(), peer_mgr.clone());
+            let tcp_proxy = TcpProxyForQuicSrc(TcpProxy::new(
+                peer_mgr.clone(),
+                NatDstQuicConnector {
+                    quic_ctrl: quic_ctrl.clone(),
+                    peer_mgr: Arc::downgrade(&peer_mgr),
+                },
+            ));
+
+            let src = QuicProxySrc {
+                quic_ctrl: quic_ctrl.clone(),
+                peer_mgr: peer_mgr.clone(),
+                tcp_proxy,
+            };
             src.run().await;
 
             self.src = Some(src);
         }
 
         stream_rx.switch().set(dst);
-        if dst {}
+        if dst {
+            let stream_ctx = Arc::new(QuicStreamContext::new(peer_mgr.clone()));
+
+            let dst = QuicProxyDst {
+                quic_ctrl: quic_ctrl.clone(),
+                peer_mgr: peer_mgr.clone(),
+                stream_ctx: stream_ctx.clone(),
+            };
+            dst.run().await;
+
+            self.tasks.spawn(
+                QuicStreamReceiver {
+                    stream_rx,
+                    stream_ctx,
+                }
+                .run(),
+            );
+
+            self.dst = Some(dst);
+        }
     }
 }
 
@@ -381,7 +460,6 @@ pub struct QuicProxySrc {
     peer_mgr: Arc<PeerManager>,
 
     tcp_proxy: TcpProxyForQuicSrc,
-    tasks: JoinSet<()>,
 }
 
 impl QuicProxySrc {
@@ -392,23 +470,6 @@ impl QuicProxySrc {
 }
 
 impl QuicProxySrc {
-    fn new(quic_ctrl: Arc<QuicController>, peer_mgr: Arc<PeerManager>) -> Self {
-        let tcp_proxy = TcpProxyForQuicSrc(TcpProxy::new(
-            peer_mgr.clone(),
-            NatDstQuicConnector {
-                quic_ctrl: quic_ctrl.clone(),
-                peer_mgr: Arc::downgrade(&peer_mgr),
-            },
-        ));
-
-        Self {
-            quic_ctrl,
-            peer_mgr,
-            tcp_proxy,
-            tasks: JoinSet::new(),
-        }
-    }
-
     async fn run(&self) {
         self.peer_mgr
             .add_nic_packet_process_pipeline(Box::new(self.tcp_proxy.clone()))
@@ -426,68 +487,47 @@ impl QuicProxySrc {
     }
 }
 
-#[derive(Derivative, Clone)]
-#[derivative(Debug)]
-struct QuicStreamContext {
-    global_ctx: ArcGlobalCtx,
-    proxy_entries: Arc<DashMap<QuicStreamHandle, TcpProxyEntry>>,
-    cidr_set: Arc<CidrSet>,
-    #[derivative(Debug = "ignore")]
-    route: Arc<dyn crate::peers::route_trait::Route + Send + Sync + 'static>,
-}
-
-impl QuicStreamContext {
-    fn new(peer_mgr: Arc<PeerManager>) -> Self {
-        let global_ctx = peer_mgr.get_global_ctx();
-        Self {
-            global_ctx: global_ctx.clone(),
-            proxy_entries: Arc::new(DashMap::new()),
-            cidr_set: Arc::new(CidrSet::new(global_ctx.clone())),
-            route: Arc::new(peer_mgr.get_route()),
-        }
-    }
-}
-
 pub struct QuicProxyDst {
     quic_ctrl: Arc<QuicController>,
     peer_mgr: Arc<PeerManager>,
 
-    tasks: JoinSet<()>,
+    stream_ctx: Arc<QuicStreamContext>,
 }
 
 impl QuicProxyDst {
-    fn new(quic_ctrl: Arc<QuicController>, peer_mgr: Arc<PeerManager>) -> Self {
-        Self {
-            quic_ctrl,
-            peer_mgr,
-            tasks: JoinSet::new(),
-        }
-    }
-
-    async fn run(&mut self, mut stream_rx: QuicStreamRx) {
+    async fn run(&self) {
         self.peer_mgr
             .add_packet_process_pipeline(Box::new(QuicPacketReceiver {
                 quic_ctrl: self.quic_ctrl.clone(),
                 role: QuicProxyRole::Dst,
             }))
             .await;
-
-        let stream_ctx = Arc::new(QuicStreamContext::new(self.peer_mgr.clone()));
-        self.tasks.spawn(async move {
-            while let Some(stream) = stream_rx.recv().await {
-                let stream_ctx = stream_ctx.clone();
-                tokio::spawn(async move {
-                    if let Err(e) = QuicProxyDst::establish_stream(stream, stream_ctx).await {
-                        error!("failed to establish quic dst stream: {:?}", e);
-                    }
-                });
-            }
-        });
     }
+}
 
-    #[tracing::instrument(ret)]
-    async fn establish_stream(
-        stream: QuicStream,
-        stream_ctx: Arc<QuicStreamContext>,
-    ) -> crate::common::error::Result<()> {todo!()}
+#[derive(Clone)]
+pub struct QuicProxyDstRpcService(Weak<DashMap<QuicStreamHandle, TcpProxyEntry>>);
+
+impl QuicProxyDstRpcService {
+    pub fn new(quic_proxy_dst: &QuicProxyDst) -> Self {
+        Self(Arc::downgrade(&quic_proxy_dst.stream_ctx.proxy_entries))
+    }
+}
+
+#[async_trait::async_trait]
+impl TcpProxyRpc for QuicProxyDstRpcService {
+    type Controller = BaseController;
+    async fn list_tcp_proxy_entry(
+        &self,
+        _: BaseController,
+        _request: ListTcpProxyEntryRequest, // Accept request of type HelloRequest
+    ) -> std::result::Result<ListTcpProxyEntryResponse, rpc_types::error::Error> {
+        let mut reply = ListTcpProxyEntryResponse::default();
+        if let Some(tcp_proxy) = self.0.upgrade() {
+            for item in tcp_proxy.iter() {
+                reply.entries.push(*item.value());
+            }
+        }
+        Ok(reply)
+    }
 }
