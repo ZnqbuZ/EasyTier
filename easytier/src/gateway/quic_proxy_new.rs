@@ -296,13 +296,32 @@ pub struct QuicProxy {
 
     src: Option<QuicProxySrc>,
     dst: Option<QuicProxyDst>,
-    stream_rx: Option<QuicStreamRx>,
 
     tasks: JoinSet<()>,
 }
 
 impl QuicProxy {
+    pub fn src(&self) -> Option<&QuicProxySrc> {
+        self.src.as_ref()
+    }
+
+    pub fn dst(&self) -> Option<&QuicProxyDst> {
+        self.dst.as_ref()
+    }
+}
+
+impl QuicProxy {
     pub fn new(peer_mgr: Arc<PeerManager>) -> Self {
+        Self {
+            endpoint: QuicEndpoint::new(),
+            peer_mgr,
+            src: None,
+            dst: None,
+            tasks: JoinSet::new(),
+        }
+    }
+
+    pub async fn run(&mut self, src: bool, dst: bool) {
         let (header, zc_packet_type) = {
             let header = ZCPacket::new_with_payload(&[]);
             let zc_packet_type = header.packet_type();
@@ -312,58 +331,35 @@ impl QuicProxy {
                 zc_packet_type,
             )
         };
-
-        let mut endpoint = QuicEndpoint::new();
-        let (packet_rx, stream_rx) = endpoint
+        let (packet_rx, stream_rx) = self.endpoint
             .run((header.len(), 0).into())
             .expect("failed to start quic endpoint");
-
-        let mut tasks = JoinSet::new();
-        {
-            let peer_mgr = peer_mgr.clone();
-            tasks.spawn(async move {
-                QuicPacketSender {
-                    peer_mgr,
-                    packet_rx,
-                    header,
-                    zc_packet_type,
-                }
+        let peer_mgr = self.peer_mgr.clone();
+        self.tasks.spawn(async move {
+            QuicPacketSender {
+                peer_mgr,
+                packet_rx,
+                header,
+                zc_packet_type,
+            }
                 .run()
                 .await;
-            });
-        }
+        });
 
-        Self {
-            endpoint: QuicEndpoint::new(),
-            peer_mgr,
-            src: None,
-            dst: None,
-            stream_rx: Some(stream_rx),
-            tasks,
-        }
-    }
-
-    pub fn run_src(&mut self) -> QuicProxySrc {
-        let quic_ctrl = self.endpoint.ctrl().unwrap();
         let peer_mgr = self.peer_mgr.clone();
+        let quic_ctrl = self.endpoint.ctrl().unwrap();
 
-        let tcp_proxy = TcpProxyForQuicSrc(TcpProxy::new(
-            peer_mgr.clone(),
-            NatDstQuicConnector {
-                quic_ctrl: quic_ctrl.clone(),
-                peer_mgr: Arc::downgrade(&peer_mgr),
-            },
-        ));
+        if src {
+            let src = QuicProxySrc::new(quic_ctrl.clone(), peer_mgr.clone());
+            src.run().await;
 
-        let src = QuicProxySrc {
-            quic_ctrl,
-            peer_mgr,
+            self.src = Some(src);
+        }
 
-            tcp_proxy,
-            tasks: JoinSet::new(),
-        };
+        stream_rx.switch().set(dst);
+        if dst {
 
-        src
+        }
     }
 }
 
@@ -373,6 +369,47 @@ pub struct QuicProxySrc {
 
     tcp_proxy: TcpProxyForQuicSrc,
     tasks: JoinSet<()>,
+}
+
+impl QuicProxySrc {
+    pub fn get_tcp_proxy(&self) -> Arc<TcpProxy<NatDstQuicConnector>> {
+        self.tcp_proxy.0.clone()
+    }
+}
+
+impl QuicProxySrc {
+    fn new(quic_ctrl: Arc<QuicController>, peer_mgr: Arc<PeerManager>) -> Self {
+        let tcp_proxy = TcpProxyForQuicSrc(TcpProxy::new(
+            peer_mgr.clone(),
+            NatDstQuicConnector {
+                quic_ctrl: quic_ctrl.clone(),
+                peer_mgr: Arc::downgrade(&peer_mgr),
+            },
+        ));
+
+        Self {
+            quic_ctrl,
+            peer_mgr,
+            tcp_proxy,
+            tasks: JoinSet::new(),
+        }
+    }
+
+    async fn run(&self) {
+        self.peer_mgr
+            .add_nic_packet_process_pipeline(Box::new(self.tcp_proxy.clone()))
+            .await;
+        self.peer_mgr
+            .add_packet_process_pipeline(Box::new(self.tcp_proxy.0.clone()))
+            .await;
+        self.peer_mgr
+            .add_packet_process_pipeline(Box::new(QuicPacketReceiver {
+                quic_ctrl: self.quic_ctrl.clone(),
+                role: QuicProxyRole::Src,
+            }))
+            .await;
+        self.tcp_proxy.0.start(false).await.unwrap();
+    }
 }
 
 pub struct QuicProxyDst {
