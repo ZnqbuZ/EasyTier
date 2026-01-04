@@ -1,169 +1,194 @@
-use anyhow::Context;
-use dashmap::DashMap;
-use pnet::packet::ipv4::Ipv4Packet;
-use prost::Message as _;
-use quinn::{Endpoint, Incoming};
-use std::net::{IpAddr, Ipv4Addr};
-use std::sync::{Arc, Mutex, Weak};
-use std::{net::SocketAddr, pin::Pin};
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite};
-use tokio::net::TcpStream;
-use tokio::task::JoinSet;
-use tokio::time::timeout;
-
-use crate::common::acl_processor::PacketInfo;
-use crate::common::config::ConfigLoader;
-use crate::common::error::Result;
 use crate::common::global_ctx::{ArcGlobalCtx, GlobalCtx};
-use crate::common::join_joinset_background;
-use crate::defer;
+use crate::common::PeerId;
 use crate::gateway::kcp_proxy::{ProxyAclHandler, TcpProxyForKcpSrcTrait};
-use crate::gateway::tcp_proxy::{NatDstConnector, NatDstTcpConnector, TcpProxy};
+use crate::gateway::quic::{
+    QuicController, QuicEndpoint, QuicPacket, QuicPacketRx, QuicStream, QuicStreamHandle,
+    QuicStreamRx,
+};
+use crate::gateway::tcp_proxy::{NatDstConnector, TcpProxy};
 use crate::gateway::CidrSet;
 use crate::peers::peer_manager::PeerManager;
+use crate::peers::PeerPacketFilter;
+use crate::proto::api::instance::{ListTcpProxyEntryRequest, ListTcpProxyEntryResponse, TcpProxyEntry, TcpProxyEntryState, TcpProxyEntryTransportType, TcpProxyRpc};
+use crate::proto::peer_rpc::KcpConnData;
+use crate::tunnel::packet_def::{PacketType, PeerManagerHeader, ZCPacket, ZCPacketType};
+use anyhow::{anyhow, Context, Error};
+use bytes::{BufMut, Bytes, BytesMut};
+use dashmap::DashMap;
+use derivative::Derivative;
+use pnet::packet::ipv4::Ipv4Packet;
+use prost::Message;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::sync::{Arc, Weak};
+use std::time::Duration;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::select;
+use tokio::task::JoinSet;
+use tracing::error;
+use crate::common::acl_processor::PacketInfo;
 use crate::proto::acl::{ChainType, Protocol};
-use crate::proto::api::instance::{
-    ListTcpProxyEntryRequest, ListTcpProxyEntryResponse, TcpProxyEntry, TcpProxyEntryState,
-    TcpProxyEntryTransportType, TcpProxyRpc,
-};
-use crate::proto::common::ProxyDstInfo;
 use crate::proto::rpc_types;
 use crate::proto::rpc_types::controller::BaseController;
-use crate::tunnel::packet_def::PeerManagerHeader;
-use crate::tunnel::quic::{configure_client, make_server_endpoint};
 
-pub struct QUICStream {
-    endpoint: Option<quinn::Endpoint>,
-    connection: Option<quinn::Connection>,
-    sender: quinn::SendStream,
-    receiver: quinn::RecvStream,
+//This helper class encodes/decodes peer_id and packet_type into/from SocketAddr.
+#[derive(Debug)]
+struct QuicPacketMeta {
+    peer_id: PeerId,
+    packet_type: PacketType,
 }
 
-impl AsyncRead for QUICStream {
-    fn poll_read(
-        self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-        buf: &mut tokio::io::ReadBuf<'_>,
-    ) -> std::task::Poll<std::io::Result<()>> {
-        let this = self.get_mut();
-        Pin::new(&mut this.receiver).poll_read(cx, buf)
+impl QuicPacketMeta {
+    #[inline]
+    fn new(peer_id: PeerId, packet_type: PacketType) -> Self {
+        Self {
+            peer_id,
+            packet_type,
+        }
+    }
+
+    #[inline]
+    fn pack(self, data: BytesMut) -> QuicPacket {
+        QuicPacket {
+            addr: self.into(),
+            payload: data,
+        }
+    }
+
+    #[inline]
+    fn unpack(packet: QuicPacket) -> Option<(Self, BytesMut)> {
+        let packet_info = packet.addr.try_into().ok()?;
+        Some((packet_info, packet.payload))
     }
 }
 
-impl AsyncWrite for QUICStream {
-    fn poll_write(
-        self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-        buf: &[u8],
-    ) -> std::task::Poll<std::io::Result<usize>> {
-        let this = self.get_mut();
-        AsyncWrite::poll_write(Pin::new(&mut this.sender), cx, buf)
-    }
-
-    fn poll_flush(
-        self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<std::io::Result<()>> {
-        let this = self.get_mut();
-        Pin::new(&mut this.sender).poll_flush(cx)
-    }
-
-    fn poll_shutdown(
-        self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<std::io::Result<()>> {
-        let this = self.get_mut();
-        Pin::new(&mut this.sender).poll_shutdown(cx)
+impl From<QuicPacketMeta> for SocketAddr {
+    #[inline]
+    fn from(meta: QuicPacketMeta) -> Self {
+        SocketAddr::new(IpAddr::V4(meta.peer_id.into()), meta.packet_type as u16)
     }
 }
+
+impl TryFrom<SocketAddr> for QuicPacketMeta {
+    type Error = ();
+
+    #[inline]
+    fn try_from(value: SocketAddr) -> Result<Self, Self::Error> {
+        let IpAddr::V4(ipv4) = value.ip() else {
+            return Err(());
+        };
+        let peer_id = ipv4.into();
+
+        let packet_type = match value.port() {
+            p if p == PacketType::QuicSrc as u16 => PacketType::QuicSrc,
+            p if p == PacketType::QuicDst as u16 => PacketType::QuicDst,
+            _ => return Err(()),
+        };
+
+        Ok(Self {
+            peer_id,
+            packet_type,
+        })
+    }
+}
+
+type QuicConnData = KcpConnData;
 
 #[derive(Debug, Clone)]
-pub struct NatDstQUICConnector {
+pub struct NatDstQuicConnector {
+    pub(crate) quic_ctrl: Arc<QuicController>,
     pub(crate) peer_mgr: Weak<PeerManager>,
 }
 
 #[async_trait::async_trait]
-impl NatDstConnector for NatDstQUICConnector {
-    type DstStream = QUICStream;
+impl NatDstConnector for NatDstQuicConnector {
+    type DstStream = QuicStream;
 
-    #[tracing::instrument(skip(self), level = "debug", name = "NatDstQUICConnector::connect")]
-    async fn connect(&self, src: SocketAddr, nat_dst: SocketAddr) -> Result<Self::DstStream> {
+    async fn connect(
+        &self,
+        src: SocketAddr,
+        nat_dst: SocketAddr,
+    ) -> crate::common::error::Result<Self::DstStream> {
         let Some(peer_mgr) = self.peer_mgr.upgrade() else {
             return Err(anyhow::anyhow!("peer manager is not available").into());
         };
 
-        let IpAddr::V4(dst_ipv4) = nat_dst.ip() else {
-            return Err(anyhow::anyhow!("src must be an IPv4 address").into());
+        let Some(dst_peer_id) = (match nat_dst {
+            SocketAddr::V4(addr) => peer_mgr.get_peer_map().get_peer_id_by_ipv4(addr.ip()).await,
+            SocketAddr::V6(_) => return Err(anyhow::anyhow!("ipv6 is not supported").into()),
+        }) else {
+            return Err(anyhow::anyhow!("no peer found for nat dst: {}", nat_dst).into());
         };
 
-        let Some(dst_peer) = peer_mgr.get_peer_map().get_peer_id_by_ipv4(&dst_ipv4).await else {
-            return Err(anyhow::anyhow!("no peer found for dst: {}", nat_dst).into());
+        tracing::trace!("kcp nat dst: {:?}, dst peers: {:?}", nat_dst, dst_peer_id);
+
+        let header = {
+            let conn_data = QuicConnData {
+                src: Some(src.into()),
+                dst: Some(nat_dst.into()),
+            };
+
+            let len = conn_data.encoded_len();
+            if len > (u16::MAX as usize) {
+                return Err(anyhow!("conn data too large: {:?}", len).into());
+            }
+
+            let mut buf = BytesMut::with_capacity(2 + len);
+
+            buf.put_u16(len as u16);
+            conn_data.encode(&mut buf).unwrap();
+
+            buf.freeze()
         };
 
-        let Some(dst_peer_info) = peer_mgr.get_peer_map().get_route_peer_info(dst_peer).await
-        else {
-            return Err(anyhow::anyhow!("no peer info found for dst peer: {}", dst_peer).into());
-        };
+        let mut connect_tasks: JoinSet<Result<QuicStream, Error>> = JoinSet::new();
+        let mut retry_remain = 5;
+        loop {
+            select! {
+                Some(Ok(Ok(stream))) = connect_tasks.join_next() => {
+                    // just wait for the previous connection to finish
+                    return Ok(stream);
+                }
+                _ = tokio::time::sleep(Duration::from_millis(200)), if !connect_tasks.is_empty() && retry_remain > 0 => {
+                    // no successful connection yet, trigger another connection attempt
+                }
+                else => {
+                    // got error in connect_tasks, continue to retry
+                    if retry_remain == 0 && connect_tasks.is_empty() {
+                        break;
+                    }
+                }
+            }
 
-        let Some(dst_ipv4): Option<Ipv4Addr> = dst_peer_info.ipv4_addr.map(Into::into) else {
-            return Err(anyhow::anyhow!("no ipv4 found for dst peer: {}", dst_peer).into());
-        };
+            // create a new connection task
+            if retry_remain == 0 {
+                continue;
+            }
+            retry_remain -= 1;
 
-        let Some(quic_port) = dst_peer_info.quic_port else {
-            return Err(anyhow::anyhow!("no quic port found for dst peer: {}", dst_peer).into());
-        };
+            let quic_ctrl = self.quic_ctrl.clone();
+            let conn_data = header.clone();
 
-        let mut endpoint = Endpoint::client("0.0.0.0:0".parse().unwrap())
-            .with_context(|| format!("failed to create QUIC endpoint for src: {}", src))?;
-        endpoint.set_default_client_config(configure_client());
+            connect_tasks.spawn(async move {
+                let mut stream = quic_ctrl
+                    .connect(QuicPacketMeta::new(dst_peer_id, PacketType::QuicSrc).into())
+                    .await
+                    .with_context(|| format!("failed to connect to nat dst: {}", nat_dst))?;
 
-        // connect to server
-        let connection = {
-            let _g = peer_mgr.get_global_ctx().net_ns.guard();
-            endpoint
-                .connect(
-                    SocketAddr::new(dst_ipv4.into(), quic_port as u16),
-                    "localhost",
-                )
-                .unwrap()
-                .await
-                .with_context(|| {
-                    format!(
-                        "failed to connect to NAT destination {} from {}, real dst: {}",
-                        nat_dst, src, dst_ipv4
-                    )
-                })?
-        };
+                stream.write_all(&conn_data).await?;
 
-        let (mut w, r) = connection
-            .open_bi()
-            .await
-            .with_context(|| "open_bi failed")?;
+                Ok(stream)
+            });
+        }
 
-        let proxy_dst_info = ProxyDstInfo {
-            dst_addr: Some(nat_dst.into()),
-        };
-        let proxy_dst_info_buf = proxy_dst_info.encode_to_vec();
-        let buf_len = proxy_dst_info_buf.len() as u8;
-        w.write(&buf_len.to_le_bytes())
-            .await
-            .with_context(|| "failed to write proxy dst info buf len to QUIC stream")?;
-        w.write(&proxy_dst_info_buf)
-            .await
-            .with_context(|| "failed to write proxy dst info to QUIC stream")?;
-
-        Ok(QUICStream {
-            endpoint: Some(endpoint),
-            connection: Some(connection),
-            sender: w,
-            receiver: r,
-        })
+        Err(anyhow!("failed to connect to nat dst: {}", nat_dst).into())
     }
 
+    #[inline]
     fn check_packet_from_peer_fast(&self, _cidr_set: &CidrSet, _global_ctx: &GlobalCtx) -> bool {
         true
     }
 
+    #[inline]
     fn check_packet_from_peer(
         &self,
         _cidr_set: &CidrSet,
@@ -172,282 +197,229 @@ impl NatDstConnector for NatDstQUICConnector {
         _ipv4: &Ipv4Packet,
         _real_dst_ip: &mut Ipv4Addr,
     ) -> bool {
-        hdr.from_peer_id == hdr.to_peer_id && !hdr.is_kcp_src_modified()
-    }
+        hdr.from_peer_id == hdr.to_peer_id && hdr.is_kcp_src_modified()
+    } //TODO: Can we use the same flag?
 
+    #[inline]
     fn transport_type(&self) -> TcpProxyEntryTransportType {
         TcpProxyEntryTransportType::Quic
     }
 }
 
 #[derive(Clone)]
-struct TcpProxyForQUICSrc(Arc<TcpProxy<NatDstQUICConnector>>);
+struct TcpProxyForQuicSrc(Arc<TcpProxy<NatDstQuicConnector>>);
 
+//TODO: rename & move this trait
 #[async_trait::async_trait]
-impl TcpProxyForKcpSrcTrait for TcpProxyForQUICSrc {
-    type Connector = NatDstQUICConnector;
+impl TcpProxyForKcpSrcTrait for TcpProxyForQuicSrc {
+    type Connector = NatDstQuicConnector;
 
+    #[inline]
     fn get_tcp_proxy(&self) -> &Arc<TcpProxy<Self::Connector>> {
         &self.0
     }
 
+    #[inline]
     async fn check_dst_allow_kcp_input(&self, dst_ip: &Ipv4Addr) -> bool {
-        let peer_map: Arc<crate::peers::peer_map::PeerMap> =
-            self.0.get_peer_manager().get_peer_map();
-        let Some(dst_peer_id) = peer_map.get_peer_id_by_ipv4(dst_ip).await else {
-            return false;
-        };
-        let Some(peer_info) = peer_map.get_route_peer_info(dst_peer_id).await else {
-            return false;
-        };
-        tracing::debug!(
-            "check dst {} allow quic input, peer info: {:?}",
-            dst_ip,
-            peer_info
-        );
-        let Some(quic_port) = peer_info.quic_port else {
-            return false;
-        };
-        quic_port > 0
+        self.0
+            .get_peer_manager()
+            .check_allow_quic_to_dst(&IpAddr::V4(*dst_ip))
+            .await
     }
 }
 
-pub struct QUICProxySrc {
-    peer_manager: Arc<PeerManager>,
-    tcp_proxy: TcpProxyForQUICSrc,
+#[derive(Debug)]
+enum QuicProxyRole {
+    Src,
+    Dst,
 }
 
-impl QUICProxySrc {
-    pub async fn new(peer_manager: Arc<PeerManager>) -> Self {
-        let tcp_proxy = TcpProxy::new(
-            peer_manager.clone(),
-            NatDstQUICConnector {
-                peer_mgr: Arc::downgrade(&peer_manager),
-            },
-        );
-
-        Self {
-            peer_manager,
-            tcp_proxy: TcpProxyForQUICSrc(tcp_proxy),
+impl QuicProxyRole {
+    #[inline]
+    const fn incoming(&self) -> PacketType {
+        match self {
+            QuicProxyRole::Src => PacketType::QuicDst,
+            QuicProxyRole::Dst => PacketType::QuicSrc,
         }
     }
 
-    pub async fn start(&self) {
-        self.peer_manager
-            .add_nic_packet_process_pipeline(Box::new(self.tcp_proxy.clone()))
-            .await;
-        self.peer_manager
-            .add_packet_process_pipeline(Box::new(self.tcp_proxy.0.clone()))
-            .await;
-        self.tcp_proxy.0.start(false).await.unwrap();
-    }
-
-    pub fn get_tcp_proxy(&self) -> Arc<TcpProxy<NatDstQUICConnector>> {
-        self.tcp_proxy.0.clone()
+    #[inline]
+    const fn outgoing(&self) -> PacketType {
+        match self {
+            QuicProxyRole::Src => PacketType::QuicSrc,
+            QuicProxyRole::Dst => PacketType::QuicDst,
+        }
     }
 }
 
-pub struct QUICProxyDst {
-    global_ctx: Arc<GlobalCtx>,
-    endpoint: Arc<quinn::Endpoint>,
-    proxy_entries: Arc<DashMap<SocketAddr, TcpProxyEntry>>,
-    tasks: Arc<Mutex<JoinSet<()>>>,
+// Receive packets from peers and forward them to the QUIC endpoint
+#[derive(Debug)]
+struct QuicPacketReceiver {
+    quic_ctrl: Arc<QuicController>,
+    role: QuicProxyRole,
+}
+
+#[async_trait::async_trait]
+impl PeerPacketFilter for QuicPacketReceiver {
+    async fn try_process_packet_from_peer(&self, packet: ZCPacket) -> Option<ZCPacket> {
+        let header = packet.peer_manager_header().unwrap();
+
+        if header.packet_type != self.role.incoming() as u8 {
+            return Some(packet);
+        }
+
+        let _ = self
+            .quic_ctrl
+            .send(
+                QuicPacketMeta::new(header.from_peer_id.get(), self.role.outgoing())
+                    .pack(packet.payload_bytes()),
+            )
+            .await;
+
+        None
+    }
+}
+
+// Send to peers packets received from the QUIC endpoint
+#[derive(Debug)]
+struct QuicPacketSender {
+    peer_mgr: Arc<PeerManager>,
+    packet_rx: QuicPacketRx,
+
+    header: Bytes,
+    zc_packet_type: ZCPacketType,
+}
+
+impl QuicPacketSender {
+    #[tracing::instrument]
+    pub async fn run(mut self) {
+        while let Some(packet) = self.packet_rx.recv().await {
+            let (packet_info, mut payload) = match QuicPacketMeta::unpack(packet) {
+                Some(v) => v,
+                None => {
+                    error!("failed to extract metadata from quic packet");
+                    continue;
+                }
+            };
+
+            payload[..self.header.len()].copy_from_slice(&self.header);
+            let mut packet = ZCPacket::new_from_buf(payload, self.zc_packet_type);
+
+            let peer_id = packet_info.peer_id;
+            let packet_type = packet_info.packet_type;
+            packet.fill_peer_manager_hdr(self.peer_mgr.my_peer_id(), peer_id, packet_type as u8);
+
+            if let Err(e) = self.peer_mgr.send_msg_for_proxy(packet, peer_id).await {
+                error!("failed to send QUIC packet to peer: {:?}", e);
+            }
+        }
+    }
+}
+
+#[derive(Derivative, Clone)]
+#[derivative(Debug)]
+struct QuicStreamContext {
+    global_ctx: ArcGlobalCtx,
+    proxy_entries: Arc<DashMap<QuicStreamHandle, TcpProxyEntry>>,
+    cidr_set: Arc<CidrSet>,
+    #[derivative(Debug = "ignore")]
     route: Arc<dyn crate::peers::route_trait::Route + Send + Sync + 'static>,
 }
 
-impl QUICProxyDst {
-    pub fn new(
-        global_ctx: ArcGlobalCtx,
-        route: Arc<dyn crate::peers::route_trait::Route + Send + Sync + 'static>,
-    ) -> Result<Self> {
-        let _g = global_ctx.net_ns.guard();
-        let (endpoint, _) = make_server_endpoint(
-            format!("0.0.0.0:{}", global_ctx.config.get_flags().quic_listen_port)
-                .parse()
-                .unwrap(),
-        )
-        .map_err(|e| anyhow::anyhow!("failed to create QUIC endpoint: {}", e))?;
-        let tasks = Arc::new(Mutex::new(JoinSet::new()));
-        join_joinset_background(tasks.clone(), "QUICProxyDst tasks".to_string());
-        Ok(Self {
-            global_ctx,
-            endpoint: Arc::new(endpoint),
+impl QuicStreamContext {
+    fn new(peer_mgr: Arc<PeerManager>) -> Self {
+        let global_ctx = peer_mgr.get_global_ctx();
+        Self {
+            global_ctx: global_ctx.clone(),
             proxy_entries: Arc::new(DashMap::new()),
-            tasks,
-            route,
-        })
+            cidr_set: Arc::new(CidrSet::new(global_ctx.clone())),
+            route: Arc::new(peer_mgr.get_route()),
+        }
+    }
+}
+
+struct QuicStreamReceiver {
+    stream_rx: QuicStreamRx,
+    stream_ctx: Arc<QuicStreamContext>,
+}
+
+impl QuicStreamReceiver {
+    async fn run(mut self) {
+        while let Some(stream) = self.stream_rx.recv().await {
+            let stream_ctx = self.stream_ctx.clone();
+            tokio::spawn(Self::establish_stream(stream, stream_ctx));
+        }
     }
 
-    pub async fn start(&self) -> Result<()> {
-        let endpoint = self.endpoint.clone();
-        let tasks = Arc::downgrade(&self.tasks.clone());
-        let ctx = self.global_ctx.clone();
-        let cidr_set = Arc::new(CidrSet::new(ctx.clone()));
-        let proxy_entries = self.proxy_entries.clone();
-        let route = self.route.clone();
-
-        let task = async move {
-            loop {
-                match endpoint.accept().await {
-                    Some(conn) => {
-                        let Some(tasks) = tasks.upgrade() else {
-                            tracing::warn!(
-                                "QUICProxyDst tasks is not available, stopping accept loop"
-                            );
-                            return;
-                        };
-                        tasks
-                            .lock()
-                            .unwrap()
-                            .spawn(Self::handle_connection_with_timeout(
-                                conn,
-                                ctx.clone(),
-                                cidr_set.clone(),
-                                proxy_entries.clone(),
-                                route.clone(),
-                            ));
-                    }
-                    None => {
-                        return;
-                    }
-                }
-            }
+    #[tracing::instrument(ret)]
+    async fn establish_stream(mut stream: QuicStream, stream_ctx: Arc<QuicStreamContext>) -> crate::common::error::Result<()> {
+        let conn_data_len = {
+            let mut header_len =[0u8; 2];
+            stream.read_exact(&mut header_len).await.context("failed to read length of quic stream header")?;
+            u16::from_be_bytes(header_len) as usize
         };
 
-        self.tasks.lock().unwrap().spawn(task);
+        let mut conn_data = vec![0u8; conn_data_len];
+        stream.read_exact(&mut conn_data).await.context("failed to read quic stream header")?;
+        let conn_data_parsed = QuicConnData::decode(&mut conn_data.as_slice()).context("failed to decode quic stream header")?;
 
-        Ok(())
-    }
-
-    pub fn local_addr(&self) -> Result<SocketAddr> {
-        self.endpoint.local_addr().map_err(Into::into)
-    }
-
-    async fn handle_connection_with_timeout(
-        conn: Incoming,
-        ctx: Arc<GlobalCtx>,
-        cidr_set: Arc<CidrSet>,
-        proxy_entries: Arc<DashMap<SocketAddr, TcpProxyEntry>>,
-        route: Arc<dyn crate::peers::route_trait::Route + Send + Sync + 'static>,
-    ) {
-        let remote_addr = conn.remote_address();
-        defer!(
-            proxy_entries.remove(&remote_addr);
-            if proxy_entries.capacity() - proxy_entries.len() > 16 {
-                proxy_entries.shrink_to_fit();
-            }
-        );
-        let ret = timeout(
-            std::time::Duration::from_secs(10),
-            Self::handle_connection(
-                conn,
-                ctx,
-                cidr_set,
-                remote_addr,
-                proxy_entries.clone(),
-                route,
-            ),
-        )
-        .await;
-
-        match ret {
-            Ok(Ok((quic_stream, tcp_stream, acl))) => {
-                let remote_addr = quic_stream.connection.as_ref().map(|c| c.remote_address());
-                let ret = acl.copy_bidirection_with_acl(quic_stream, tcp_stream).await;
-                tracing::info!(
-                    "QUIC connection handled, result: {:?}, remote addr: {:?}",
-                    ret,
-                    remote_addr,
-                );
-            }
-            Ok(Err(e)) => {
-                tracing::error!("Failed to handle QUIC connection: {}", e);
-            }
-            Err(_) => {
-                tracing::warn!("Timeout while handling QUIC connection");
-            }
-        }
-    }
-
-    async fn handle_connection(
-        incoming: Incoming,
-        ctx: ArcGlobalCtx,
-        cidr_set: Arc<CidrSet>,
-        proxy_entry_key: SocketAddr,
-        proxy_entries: Arc<DashMap<SocketAddr, TcpProxyEntry>>,
-        route: Arc<dyn crate::peers::route_trait::Route + Send + Sync + 'static>,
-    ) -> Result<(QUICStream, TcpStream, ProxyAclHandler)> {
-        let conn = incoming.await.with_context(|| "accept failed")?;
-        let addr = conn.remote_address();
-        tracing::info!("Accepted QUIC connection from {}", addr);
-        let (w, mut r) = conn.accept_bi().await.with_context(|| "accept_bi failed")?;
-        let len = r
-            .read_u8()
-            .await
-            .with_context(|| "failed to read proxy dst info buf len")?;
-        let mut buf = vec![0u8; len as usize];
-        r.read_exact(&mut buf)
-            .await
-            .with_context(|| "failed to read proxy dst info")?;
-
-        let proxy_dst_info =
-            ProxyDstInfo::decode(&buf[..]).with_context(|| "failed to decode proxy dst info")?;
-
-        let dst_socket: SocketAddr = proxy_dst_info
-            .dst_addr
-            .map(Into::into)
-            .ok_or_else(|| anyhow::anyhow!("no dst addr in proxy dst info"))?;
-
-        let SocketAddr::V4(mut dst_socket) = dst_socket else {
-            return Err(anyhow::anyhow!("NAT destination must be an IPv4 address").into());
-        };
-
-        let mut real_ip = *dst_socket.ip();
-        if cidr_set.contains_v4(*dst_socket.ip(), &mut real_ip) {
-            dst_socket.set_ip(real_ip);
-        }
-
-        let src_ip = addr.ip();
-        let dst_ip = *dst_socket.ip();
-        let (src_groups, dst_groups) = tokio::join!(
-            route.get_peer_groups_by_ip(&src_ip),
-            route.get_peer_groups_by_ipv4(&dst_ip)
-        );
-
-        let send_to_self = Some(*dst_socket.ip()) == ctx.get_ipv4().map(|ip| ip.address());
-        if send_to_self && ctx.no_tun() {
-            if ctx.is_port_in_running_listeners(dst_socket.port(), false)
-                && ctx.is_ip_in_same_network(&src_ip)
-            {
-                return Err(anyhow::anyhow!(
-                    "dst socket {:?} is in running listeners, ignore it",
-                    dst_socket
-                )
-                .into());
-            }
-            dst_socket = format!("127.0.0.1:{}", dst_socket.port()).parse().unwrap();
-        }
-
+        let proxy_entries = &stream_ctx.proxy_entries;
+        let handle = stream.handle();
         proxy_entries.insert(
-            proxy_entry_key,
+            handle,
             TcpProxyEntry {
-                src: Some(addr.into()),
-                dst: Some(SocketAddr::V4(dst_socket).into()),
+                src: conn_data_parsed.src,
+                dst: conn_data_parsed.dst,
                 start_time: chrono::Local::now().timestamp() as u64,
                 state: TcpProxyEntryState::ConnectingDst.into(),
                 transport_type: TcpProxyEntryTransportType::Quic.into(),
             },
         );
+        crate::defer! {
+            proxy_entries.remove(&handle);
+            if proxy_entries.capacity() - proxy_entries.len() > 16 {
+                proxy_entries.shrink_to_fit();
+            }
+        }
+
+        let src_socket: SocketAddr = conn_data_parsed.src.ok_or_else(|| anyhow!("missing src addr in quic stream header"))?.into();
+        let mut dst_socket: SocketAddr = conn_data_parsed.dst.ok_or_else(|| anyhow!("missing dst addr in quic stream header"))?.into();
+
+        let src_ip = src_socket.ip();
+        let dst_ip = dst_socket.ip();
+
+        let route = stream_ctx.route.clone();
+        let (src_groups, dst_groups) = tokio::join!(
+            route.get_peer_groups_by_ip(&src_ip),
+            route.get_peer_groups_by_ip(&dst_ip)
+        );
+
+        let global_ctx = stream_ctx.global_ctx.clone();
+        let send_to_self =
+            Some(dst_socket.ip()) == global_ctx.get_ipv4().map(|ip| IpAddr::V4(ip.address()));
+
+        if send_to_self && global_ctx.no_tun() {
+            if global_ctx.is_port_in_running_listeners(dst_socket.port(), false)
+                && global_ctx.is_ip_in_same_network(&src_ip)
+            {
+                return Err(anyhow::anyhow!(
+                    "dst socket {:?} is in running listeners, ignore it",
+                    dst_socket
+                )
+                    .into());
+            }
+            dst_socket = format!("127.0.0.1:{}", dst_socket.port()).parse().unwrap();
+        }
 
         let acl_handler = ProxyAclHandler {
-            acl_filter: ctx.get_acl_filter().clone(),
+            acl_filter: global_ctx.get_acl_filter().clone(),
             packet_info: PacketInfo {
                 src_ip,
-                dst_ip: dst_ip.into(),
-                src_port: Some(addr.port()),
+                dst_ip,
+                src_port: Some(src_socket.port()),
                 dst_port: Some(dst_socket.port()),
                 protocol: Protocol::Tcp,
-                packet_size: len as usize,
+                packet_size: conn_data.len(),
                 src_groups,
                 dst_groups,
             },
@@ -457,49 +429,199 @@ impl QUICProxyDst {
                 ChainType::Forward
             },
         };
-        acl_handler.handle_packet(&buf)?;
+        acl_handler.handle_packet(&conn_data)?;
 
-        let connector = NatDstTcpConnector {};
+        tracing::debug!("quic connect to dst socket: {:?}", dst_socket);
 
-        let dst_stream = {
-            let _g = ctx.net_ns.guard();
-            connector
-                .connect("0.0.0.0:0".parse().unwrap(), dst_socket.into())
-                .await?
-        };
+        let _g = global_ctx.net_ns.guard();
+        let connector = crate::gateway::tcp_proxy::NatDstTcpConnector {};
+        let ret = connector
+            .connect("0.0.0.0:0".parse().unwrap(), dst_socket)
+            .await?;
 
-        if let Some(mut e) = proxy_entries.get_mut(&proxy_entry_key) {
+        if let Some(mut e) = proxy_entries.get_mut(&handle) {
             e.state = TcpProxyEntryState::Connected.into();
         }
 
-        let quic_stream = QUICStream {
-            endpoint: None,
-            connection: Some(conn),
-            sender: w,
-            receiver: r,
-        };
+        acl_handler
+            .copy_bidirection_with_acl(stream, ret)
+            .await?;
 
-        Ok((quic_stream, dst_stream, acl_handler))
+        Ok(())
+    }
+}
+
+pub struct QuicProxy {
+    endpoint: QuicEndpoint,
+    peer_mgr: Arc<PeerManager>,
+
+    src: Option<QuicProxySrc>,
+    dst: Option<QuicProxyDst>,
+
+    tasks: JoinSet<()>,
+}
+
+impl QuicProxy {
+    #[inline]
+    pub fn src(&self) -> Option<&QuicProxySrc> {
+        self.src.as_ref()
+    }
+
+    #[inline]
+    pub fn dst(&self) -> Option<&QuicProxyDst> {
+        self.dst.as_ref()
+    }
+}
+
+impl QuicProxy {
+    pub fn new(peer_mgr: Arc<PeerManager>) -> Self {
+        Self {
+            endpoint: QuicEndpoint::new(),
+            peer_mgr,
+            src: None,
+            dst: None,
+            tasks: JoinSet::new(),
+        }
+    }
+
+    pub async fn run(&mut self, src: bool, dst: bool) {
+        let (header, zc_packet_type) = {
+            let header = ZCPacket::new_with_payload(&[]);
+            let zc_packet_type = header.packet_type();
+            let payload_offset = header.payload_offset();
+            (
+                header.inner().split_to(payload_offset).freeze(),
+                zc_packet_type,
+            )
+        };
+        let (packet_rx, stream_rx) = self
+            .endpoint
+            .run((header.len(), 0).into())
+            .expect("failed to start quic endpoint");
+        let peer_mgr = self.peer_mgr.clone();
+        self.tasks.spawn(
+            QuicPacketSender {
+                peer_mgr,
+                packet_rx,
+                header,
+                zc_packet_type,
+            }
+            .run(),
+        );
+
+        let peer_mgr = self.peer_mgr.clone();
+        let quic_ctrl = self.endpoint.ctrl().unwrap();
+
+        if src {
+            let tcp_proxy = TcpProxyForQuicSrc(TcpProxy::new(
+                peer_mgr.clone(),
+                NatDstQuicConnector {
+                    quic_ctrl: quic_ctrl.clone(),
+                    peer_mgr: Arc::downgrade(&peer_mgr),
+                },
+            ));
+
+            let src = QuicProxySrc {
+                quic_ctrl: quic_ctrl.clone(),
+                peer_mgr: peer_mgr.clone(),
+                tcp_proxy,
+            };
+            src.run().await;
+
+            self.src = Some(src);
+        }
+
+        stream_rx.switch().set(dst);
+        if dst {
+            let stream_ctx = Arc::new(QuicStreamContext::new(peer_mgr.clone()));
+
+            let dst = QuicProxyDst {
+                quic_ctrl: quic_ctrl.clone(),
+                peer_mgr: peer_mgr.clone(),
+                stream_ctx: stream_ctx.clone(),
+            };
+            dst.run().await;
+
+            self.tasks.spawn(
+                QuicStreamReceiver {
+                    stream_rx,
+                    stream_ctx,
+                }
+                .run(),
+            );
+
+            self.dst = Some(dst);
+        }
+    }
+}
+
+pub struct QuicProxySrc {
+    quic_ctrl: Arc<QuicController>,
+    peer_mgr: Arc<PeerManager>,
+
+    tcp_proxy: TcpProxyForQuicSrc,
+}
+
+impl QuicProxySrc {
+    #[inline]
+    pub fn get_tcp_proxy(&self) -> Arc<TcpProxy<NatDstQuicConnector>> {
+        self.tcp_proxy.get_tcp_proxy().clone()
+    }
+}
+
+impl QuicProxySrc {
+    async fn run(&self) {
+        self.peer_mgr
+            .add_nic_packet_process_pipeline(Box::new(self.tcp_proxy.clone()))
+            .await;
+        self.peer_mgr
+            .add_packet_process_pipeline(Box::new(self.tcp_proxy.0.clone()))
+            .await;
+        self.peer_mgr
+            .add_packet_process_pipeline(Box::new(QuicPacketReceiver {
+                quic_ctrl: self.quic_ctrl.clone(),
+                role: QuicProxyRole::Src,
+            }))
+            .await;
+        self.tcp_proxy.0.start(false).await.unwrap();
+    }
+}
+
+pub struct QuicProxyDst {
+    quic_ctrl: Arc<QuicController>,
+    peer_mgr: Arc<PeerManager>,
+
+    stream_ctx: Arc<QuicStreamContext>,
+}
+
+impl QuicProxyDst {
+    async fn run(&self) {
+        self.peer_mgr
+            .add_packet_process_pipeline(Box::new(QuicPacketReceiver {
+                quic_ctrl: self.quic_ctrl.clone(),
+                role: QuicProxyRole::Dst,
+            }))
+            .await;
     }
 }
 
 #[derive(Clone)]
-pub struct QUICProxyDstRpcService(Weak<DashMap<SocketAddr, TcpProxyEntry>>);
+pub struct QuicProxyDstRpcService(Weak<DashMap<QuicStreamHandle, TcpProxyEntry>>);
 
-impl QUICProxyDstRpcService {
-    pub fn new(quic_proxy_dst: &QUICProxyDst) -> Self {
-        Self(Arc::downgrade(&quic_proxy_dst.proxy_entries))
+impl QuicProxyDstRpcService {
+    pub fn new(quic_proxy_dst: &QuicProxyDst) -> Self {
+        Self(Arc::downgrade(&quic_proxy_dst.stream_ctx.proxy_entries))
     }
 }
 
 #[async_trait::async_trait]
-impl TcpProxyRpc for QUICProxyDstRpcService {
+impl TcpProxyRpc for QuicProxyDstRpcService {
     type Controller = BaseController;
     async fn list_tcp_proxy_entry(
         &self,
         _: BaseController,
         _request: ListTcpProxyEntryRequest, // Accept request of type HelloRequest
-    ) -> std::result::Result<ListTcpProxyEntryResponse, rpc_types::error::Error> {
+    ) -> Result<ListTcpProxyEntryResponse, rpc_types::error::Error> {
         let mut reply = ListTcpProxyEntryResponse::default();
         if let Some(tcp_proxy) = self.0.upgrade() {
             for item in tcp_proxy.iter() {
