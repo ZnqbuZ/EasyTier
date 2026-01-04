@@ -271,7 +271,7 @@ impl PeerPacketFilter for QuicPacketReceiver {
         let _ = self
             .quic_ctrl
             .send(
-                QuicPacketMeta::new(header.from_peer_id.get().into(), self.role.outgoing())
+                QuicPacketMeta::new(header.from_peer_id.get(), self.role.outgoing())
                     .pack(packet.payload_bytes()),
             )
             .await;
@@ -302,7 +302,7 @@ impl QuicPacketSender {
                 }
             };
 
-            payload[..self.header.len()].copy_from_slice(&*self.header);
+            payload[..self.header.len()].copy_from_slice(&self.header);
             let mut packet = ZCPacket::new_from_buf(payload, self.zc_packet_type);
 
             let peer_id = packet_info.peer_id;
@@ -368,8 +368,8 @@ impl QuicStreamReceiver {
         proxy_entries.insert(
             handle,
             TcpProxyEntry {
-                src: conn_data_parsed.src.clone(),
-                dst: conn_data_parsed.dst.clone(),
+                src: conn_data_parsed.src,
+                dst: conn_data_parsed.dst,
                 start_time: chrono::Local::now().timestamp() as u64,
                 state: TcpProxyEntryState::ConnectingDst.into(),
                 transport_type: TcpProxyEntryTransportType::Quic.into(),
@@ -382,12 +382,12 @@ impl QuicStreamReceiver {
             }
         }
 
-        let mut src_socket: SocketAddr = conn_data_parsed.src.clone().ok_or_else(|| anyhow!("missing src addr in quic stream header"))?.into();
-        let mut dst_socket: SocketAddr = conn_data_parsed.dst.clone().ok_or_else(|| anyhow!("missing dst addr in quic stream header"))?.into();
+        let src_socket: SocketAddr = conn_data_parsed.src.ok_or_else(|| anyhow!("missing src addr in quic stream header"))?.into();
+        let mut dst_socket: SocketAddr = conn_data_parsed.dst.ok_or_else(|| anyhow!("missing dst addr in quic stream header"))?.into();
 
         let src_ip = src_socket.ip();
         let dst_ip = dst_socket.ip();
-        
+
         let route = stream_ctx.route.clone();
         let (src_groups, dst_groups) = tokio::join!(
             route.get_peer_groups_by_ip(&src_ip),
@@ -446,7 +446,7 @@ impl QuicStreamReceiver {
         acl_handler
             .copy_bidirection_with_acl(stream, ret)
             .await?;
-        
+
         Ok(())
     }
 }
@@ -621,7 +621,7 @@ impl TcpProxyRpc for QuicProxyDstRpcService {
         &self,
         _: BaseController,
         _request: ListTcpProxyEntryRequest, // Accept request of type HelloRequest
-    ) -> std::result::Result<ListTcpProxyEntryResponse, rpc_types::error::Error> {
+    ) -> Result<ListTcpProxyEntryResponse, rpc_types::error::Error> {
         let mut reply = ListTcpProxyEntryResponse::default();
         if let Some(tcp_proxy) = self.0.upgrade() {
             for item in tcp_proxy.iter() {
