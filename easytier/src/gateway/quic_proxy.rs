@@ -202,7 +202,7 @@ impl NatDstConnector for NatDstQuicConnector {
 
     #[inline]
     fn transport_type(&self) -> TcpProxyEntryTransportType {
-        TcpProxyEntryTransportType::Quic
+        TcpProxyEntryTransportType::Kcp
     }
 }
 
@@ -372,7 +372,7 @@ impl QuicStreamReceiver {
                 dst: conn_data_parsed.dst,
                 start_time: chrono::Local::now().timestamp() as u64,
                 state: TcpProxyEntryState::ConnectingDst.into(),
-                transport_type: TcpProxyEntryTransportType::Quic.into(),
+                transport_type: TcpProxyEntryTransportType::Kcp.into(),
             },
         );
         crate::defer! {
