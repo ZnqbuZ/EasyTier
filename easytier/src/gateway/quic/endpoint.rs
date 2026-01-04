@@ -14,6 +14,7 @@ use tokio::task::JoinSet;
 use tokio::time::sleep_until;
 use tokio::select;
 use crate::gateway::quic::packet::{QuicPacket, QuicPacketMargins};
+use crate::gateway::quic::switched_channel;
 
 #[derive(Debug)]
 pub struct QuicController {
@@ -122,7 +123,7 @@ impl QuicEndpoint {
 
         let (cmd_tx, mut cmd_rx) = mpsc::channel(2048);
         let (net_evt_tx, net_evt_rx) = mpsc::channel(2048);
-        let (incoming_stream_tx, incoming_stream_rx) = mpsc::channel(128);
+        let (incoming_stream_tx, incoming_stream_rx) = switched_channel(128);
 
         self.ctrl = Some(QuicController {
             cmd_tx: cmd_tx.clone(),

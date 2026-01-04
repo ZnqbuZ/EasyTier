@@ -1,5 +1,63 @@
 use bytes::{BufMut, BytesMut};
 use std::cmp::max;
+use std::ops::{Deref, DerefMut};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use tokio::sync::mpsc;
+
+#[derive(Debug)]
+pub struct AtomicSwitch(AtomicBool);
+
+impl AtomicSwitch {
+    pub fn new(value: bool) -> Self {
+        Self(AtomicBool::new(value))
+    }
+
+    pub fn set(&self, value: bool) {
+        self.0.store(value, Ordering::Relaxed);
+    }
+
+    pub fn get(&self) -> bool {
+        self.0.load(Ordering::Relaxed)
+    }
+
+    pub fn switch(&self) {
+        self.0.fetch_xor(true, Ordering::Relaxed);
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct Switched<T> {
+    inner: T,
+    pub switch: Arc<AtomicSwitch>,
+}
+
+impl<T> Deref for Switched<T> {
+    type Target = T;
+
+    fn deref(&self) -> &Self::Target {
+        &self.inner
+    }
+}
+
+impl<T> DerefMut for Switched<T> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.inner
+    }
+}
+
+pub type SwitchedReceiver<T> = Switched<mpsc::Receiver<T>>;
+pub type SwitchedSender<T> = Switched<mpsc::Sender<T>>;
+
+pub fn switched_channel<T>(buffer: usize) -> (SwitchedSender<T>, SwitchedReceiver<T>) {
+    let (tx, rx) = mpsc::channel(buffer);
+    let switch = Arc::new(AtomicSwitch::new(true));
+
+    (
+        SwitchedSender { inner: tx, switch: switch.clone() },
+        SwitchedReceiver { inner: rx, switch: switch.clone() },
+    )
+}
 
 #[derive(Debug, Clone, Copy)]
 pub struct QuicBufferMargins {

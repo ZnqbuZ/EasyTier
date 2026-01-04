@@ -13,13 +13,14 @@ use tokio::sync::mpsc;
 use tracing::log::trace;
 use tracing::{error, warn};
 use crate::gateway::quic::packet::{QuicPacket, QuicPacketMargins};
+use crate::gateway::quic::{SwitchedReceiver, SwitchedSender};
 use crate::gateway::quic::utils::QuicBufferPool;
 
 const QUIC_STREAM_EVT_BUFFER: usize = 2048;
 const QUIC_PACKET_POOL_MIN_CAPACITY: usize = 64 * 1024;
 
-pub type QuicStreamPartsTx = mpsc::Sender<(QuicStreamInfo, QuicStreamEvtRx)>;
-pub type QuicStreamPartsRx = mpsc::Receiver<(QuicStreamInfo, QuicStreamEvtRx)>;
+pub type QuicStreamPartsTx = SwitchedSender<(QuicStreamInfo, QuicStreamEvtRx)>;
+pub type QuicStreamPartsRx = SwitchedReceiver<(QuicStreamInfo, QuicStreamEvtRx)>;
 
 pub(super) struct QuicDriver {
     conns: HashMap<ConnectionHandle, (Connection, HashMap<StreamId, QuicStreamEvtTx>)>,
@@ -55,7 +56,7 @@ impl QuicDriver {
     pub fn execute(&mut self, cmd: QuicCmd) {
         match cmd {
             QuicCmd::InputPacket(packet) => {
-                self.handle_packet_incoming(packet);
+                self.handle_packet_input(packet);
             }
 
             QuicCmd::OpenBiStream { addr, stream_tx } => {
@@ -88,7 +89,7 @@ macro_rules! emit_transmit {
 }
 
 impl QuicDriver {
-    fn handle_packet_incoming(&mut self, packet: QuicPacket) {
+    fn handle_packet_input(&mut self, packet: QuicPacket) {
         let now = Instant::now();
 
         self.buf.clear();
@@ -102,6 +103,11 @@ impl QuicDriver {
         ) {
             Some(DatagramEvent::NewConnection(incoming)) => {
                 trace!("New connection from {:?}", incoming.remote_address());
+                
+                if !self.incoming_stream_tx.switch.get() {
+                    trace!("Incoming stream channel is closed. Connection dropped.");
+                    return;
+                }
 
                 match self.endpoint.accept(incoming, now, &mut self.buf, None) {
                     Ok((conn_handle, conn)) => {
