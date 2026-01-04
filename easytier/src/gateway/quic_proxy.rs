@@ -347,7 +347,11 @@ impl QuicStreamReceiver {
     async fn run(mut self) {
         while let Some(stream) = self.stream_rx.recv().await {
             let stream_ctx = self.stream_ctx.clone();
-            tokio::spawn(Self::establish_stream(stream, stream_ctx));
+            tokio::spawn(async move {
+                if let Err(e) = Self::establish_stream(stream, stream_ctx).await {
+                    error!("Failed to establish stream: {:?}", e);
+                }
+            });
         }
     }
 
