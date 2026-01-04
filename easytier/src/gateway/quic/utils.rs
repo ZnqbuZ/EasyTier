@@ -9,18 +9,22 @@ use tokio::sync::mpsc;
 pub struct AtomicSwitch(AtomicBool);
 
 impl AtomicSwitch {
+    #[inline]
     pub fn new(value: bool) -> Self {
         Self(AtomicBool::new(value))
     }
 
+    #[inline]
     pub fn set(&self, value: bool) {
         self.0.store(value, Ordering::Relaxed);
     }
 
+    #[inline]
     pub fn get(&self) -> bool {
         self.0.load(Ordering::Relaxed)
     }
 
+    #[inline]
     pub fn switch(&self) {
         self.0.fetch_xor(true, Ordering::Relaxed);
     }
@@ -35,12 +39,14 @@ pub struct Switched<T> {
 impl<T> Deref for Switched<T> {
     type Target = T;
 
+    #[inline]
     fn deref(&self) -> &Self::Target {
         &self.inner
     }
 }
 
 impl<T> DerefMut for Switched<T> {
+    #[inline]
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.inner
     }
@@ -66,6 +72,7 @@ pub struct QuicBufferMargins {
 }
 
 impl From<(usize, usize)> for QuicBufferMargins {
+    #[inline]
     fn from(tuple: (usize, usize)) -> Self {
         Self {
             header: tuple.0,
@@ -75,26 +82,28 @@ impl From<(usize, usize)> for QuicBufferMargins {
 }
 
 impl From<QuicBufferMargins> for (usize, usize) {
+    #[inline]
     fn from(margins: QuicBufferMargins) -> Self {
         (margins.header, margins.trailer)
     }
 }
 
 #[derive(Debug)]
-pub(crate) struct QuicBufferPool {
+pub(super) struct QuicBufferPool {
     pool: BytesMut,
     min_capacity: usize,
 }
 
 impl QuicBufferPool {
-    pub(crate) fn new(min_capacity: usize) -> Self {
+    #[inline]
+    pub(super) fn new(min_capacity: usize) -> Self {
         Self {
             pool: BytesMut::new(),
             min_capacity,
         }
     }
 
-    pub(crate) fn buf(&mut self, data: &[u8], margins: QuicBufferMargins) -> BytesMut {
+    pub(super) fn buf(&mut self, data: &[u8], margins: QuicBufferMargins) -> BytesMut {
         let (header, trailer) = margins.into();
 
         let len = header + data.len() + trailer;

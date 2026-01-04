@@ -22,6 +22,7 @@ pub struct QuicController {
 }
 
 impl QuicController {
+    #[inline]
     pub async fn send(&self, packet: QuicPacket) -> Result<(), Error> {
         self.cmd_tx
             .send(QuicCmd::InputPacket(packet))
@@ -29,13 +30,14 @@ impl QuicController {
             .map_err(|e| Error::msg(format!("Failed to send QuicCmd::PacketIncoming: {:?}", e)))
     }
 
+    #[inline]
     pub async fn connect(&self, addr: SocketAddr) -> Result<QuicStream, Error> {
         let (stream_tx, stream_rx) = oneshot::channel();
         self.cmd_tx
             .send(QuicCmd::OpenBiStream { addr, stream_tx })
             .await?;
-        let (stream_info, evt_rx) = stream_rx.await??;
-        Ok(QuicStream::new(stream_info, evt_rx, self.cmd_tx.clone()))
+        let (stream_handle, evt_rx) = stream_rx.await??;
+        Ok(QuicStream::new(stream_handle, evt_rx, self.cmd_tx.clone()))
     }
 }
 
@@ -46,12 +48,14 @@ pub struct QuicPacketRx {
 }
 
 impl QuicPacketRx {
+    #[inline]
     pub async fn recv(&mut self) -> Option<QuicPacket> {
         match self.net_evt_rx.recv().await? {
             QuicNetEvt::OutputPacket(packet) => Some(packet),
         }
     }
-    
+
+    #[inline]
     pub fn packet_margins(&self) -> QuicPacketMargins {
         self.packet_margins
     }
@@ -64,11 +68,13 @@ pub struct QuicStreamRx {
 }
 
 impl QuicStreamRx {
+    #[inline]
     pub async fn recv(&mut self) -> Option<QuicStream> {
-        let (stream_info, evt_rx) = self.incoming_stream_rx.recv().await?;
-        Some(QuicStream::new(stream_info, evt_rx, self.cmd_tx.clone()))
+        let (stream_handle, evt_rx) = self.incoming_stream_rx.recv().await?;
+        Some(QuicStream::new(stream_handle, evt_rx, self.cmd_tx.clone()))
     }
 
+    #[inline]
     pub fn switch(&self) -> &AtomicSwitch {
         self.incoming_stream_rx.switch.as_ref()
     }
@@ -113,6 +119,7 @@ impl QuicEndpoint {
         Self::with_endpoint(endpoint, client_config())
     }
 
+    #[inline]
     pub fn with_endpoint(endpoint: Endpoint, client_config: ClientConfig) -> Self {
         Self {
             endpoint: Some(endpoint),
@@ -162,6 +169,7 @@ impl QuicEndpoint {
         Some((packet_rx, stream_rx))
     }
 
+    #[inline]
     pub fn ctrl(&self) -> Result<Arc<QuicController>, Error> {
         self.ctrl
             .clone()

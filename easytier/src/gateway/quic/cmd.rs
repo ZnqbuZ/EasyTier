@@ -1,16 +1,11 @@
 use crate::gateway::quic::evt::QuicStreamEvtRx;
 use anyhow::Error;
 use bytes::Bytes;
-use quinn_proto::{ConnectionHandle, StreamId};
+use quinn_proto::ConnectionHandle;
 use std::net::SocketAddr;
 use tokio::sync::{mpsc, oneshot};
 use crate::gateway::quic::packet::QuicPacket;
-
-#[derive(Debug, Clone, Copy)]
-pub(super) struct QuicStreamInfo {
-    pub(super) conn_handle: ConnectionHandle,
-    pub(super) stream_id: StreamId,
-}
+use crate::gateway::quic::stream::QuicStreamHandle;
 
 #[derive(Debug)]
 pub(super) enum QuicCmd {
@@ -19,7 +14,7 @@ pub(super) enum QuicCmd {
     // Connection
     OpenBiStream {
         addr: SocketAddr,
-        stream_tx: oneshot::Sender<Result<(QuicStreamInfo, QuicStreamEvtRx), Error>>,
+        stream_tx: oneshot::Sender<Result<(QuicStreamHandle, QuicStreamEvtRx), Error>>,
     },
     CloseConnection {
         conn_handle: ConnectionHandle,
@@ -28,16 +23,16 @@ pub(super) enum QuicCmd {
     },
     // Stream
     StreamWrite {
-        stream_info: QuicStreamInfo,
+        stream_handle: QuicStreamHandle,
         data: Bytes,
         fin: bool,
     },
     StopStream {
-        stream_info: QuicStreamInfo,
+        stream_handle: QuicStreamHandle,
         error_code: u32,
     },
     ResetStream {
-        stream_info: QuicStreamInfo,
+        stream_handle: QuicStreamHandle,
         error_code: u32,
     },
 }

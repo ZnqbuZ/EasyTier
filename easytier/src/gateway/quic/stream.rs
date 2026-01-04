@@ -7,14 +7,34 @@ use std::task::ready;
 use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio_util::sync::PollSender;
-
-use crate::gateway::quic::cmd::{QuicCmd, QuicCmdTx, QuicStreamInfo};
+use quinn_proto::{ConnectionHandle, StreamId};
+use crate::gateway::quic::cmd::{QuicCmd, QuicCmdTx};
 use crate::gateway::quic::evt::{QuicStreamEvt, QuicStreamEvtRx};
 use crate::gateway::quic::QuicBufferPool;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct QuicStreamHandle {
+    pub(super) conn_handle: ConnectionHandle,
+    pub(super) stream_id: StreamId,
+}
+
+impl From<(ConnectionHandle, StreamId)> for QuicStreamHandle {
+    #[inline]
+    fn from((conn_handle, stream_id): (ConnectionHandle, StreamId)) -> Self {
+        Self { conn_handle, stream_id }
+    }
+}
+
+impl From<QuicStreamHandle> for (ConnectionHandle, StreamId) {
+    #[inline]
+    fn from(stream_handle: QuicStreamHandle) -> Self {
+        (stream_handle.conn_handle, stream_handle.stream_id)
+    }
+}
+
 #[derive(Debug)]
 pub struct QuicStream {
-    stream_info: QuicStreamInfo,
+    stream_handle: QuicStreamHandle,
 
     evt_rx: QuicStreamEvtRx,
     cmd_tx: PollSender<QuicCmd>,
@@ -25,12 +45,12 @@ pub struct QuicStream {
 
 impl QuicStream {
     pub(super) fn new(
-        stream_info: QuicStreamInfo,
+        stream_handle: QuicStreamHandle,
         evt_rx: QuicStreamEvtRx,
         cmd_tx: QuicCmdTx,
     ) -> Self {
         Self {
-            stream_info,
+            stream_handle,
             evt_rx,
             cmd_tx: PollSender::new(cmd_tx),
             pending: None,
@@ -103,7 +123,7 @@ impl AsyncWrite for QuicStream {
     ) -> Poll<Result<usize, Error>> {
         ready_tx!(self.cmd_tx.poll_ready_unpin(cx));
         let cmd = QuicCmd::StreamWrite {
-            stream_info: self.stream_info,
+            stream_handle: self.stream_handle,
             data: self.pool.buf(buf, (0, 0).into()).freeze(),
             fin: false,
         };
@@ -120,7 +140,7 @@ impl AsyncWrite for QuicStream {
         ready_tx!(self.cmd_tx.poll_flush_unpin(cx));
         ready_tx!(self.cmd_tx.poll_ready_unpin(cx));
         let cmd = QuicCmd::StreamWrite {
-            stream_info: self.stream_info,
+            stream_handle: self.stream_handle,
             data: Bytes::new(),
             fin: true,
         };

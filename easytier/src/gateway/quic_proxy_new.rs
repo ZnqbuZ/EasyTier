@@ -1,9 +1,7 @@
 use crate::common::global_ctx::GlobalCtx;
 use crate::common::PeerId;
 use crate::gateway::kcp_proxy::TcpProxyForKcpSrcTrait;
-use crate::gateway::quic::{
-    QuicController, QuicEndpoint, QuicPacket, QuicPacketRx, QuicStream, QuicStreamRx,
-};
+use crate::gateway::quic::{QuicController, QuicEndpoint, QuicPacket, QuicPacketRx, QuicStream, QuicStreamHandle, QuicStreamRx};
 use crate::gateway::tcp_proxy::{NatDstConnector, TcpProxy};
 use crate::gateway::CidrSet;
 use crate::peers::peer_manager::PeerManager;
@@ -31,6 +29,7 @@ struct QuicPacketMeta {
 }
 
 impl QuicPacketMeta {
+    #[inline]
     fn new(peer_id: PeerId, packet_type: PacketType) -> Self {
         Self {
             peer_id,
@@ -38,6 +37,7 @@ impl QuicPacketMeta {
         }
     }
 
+    #[inline]
     fn pack(self, data: BytesMut) -> QuicPacket {
         QuicPacket {
             addr: self.into(),
@@ -45,6 +45,7 @@ impl QuicPacketMeta {
         }
     }
 
+    #[inline]
     fn unpack(packet: QuicPacket) -> Option<(Self, BytesMut)> {
         let packet_info = packet.addr.try_into().ok()?;
         Some((packet_info, packet.payload))
@@ -52,6 +53,7 @@ impl QuicPacketMeta {
 }
 
 impl From<QuicPacketMeta> for SocketAddr {
+    #[inline]
     fn from(meta: QuicPacketMeta) -> Self {
         SocketAddr::new(IpAddr::V4(meta.peer_id.into()), meta.packet_type as u16)
     }
@@ -60,6 +62,7 @@ impl From<QuicPacketMeta> for SocketAddr {
 impl TryFrom<SocketAddr> for QuicPacketMeta {
     type Error = ();
 
+    #[inline]
     fn try_from(value: SocketAddr) -> Result<Self, Self::Error> {
         let IpAddr::V4(ipv4) = value.ip() else {
             return Err(());
@@ -86,12 +89,15 @@ enum QuicProxyRole {
 }
 
 impl QuicProxyRole {
+    #[inline]
     const fn incoming(&self) -> PacketType {
         match self {
             QuicProxyRole::Src => PacketType::QuicDst,
             QuicProxyRole::Dst => PacketType::QuicSrc,
         }
     }
+    
+    #[inline]
     const fn outgoing(&self) -> PacketType {
         match self {
             QuicProxyRole::Src => PacketType::QuicSrc,
@@ -250,10 +256,12 @@ impl NatDstConnector for NatDstQuicConnector {
         Err(anyhow!("failed to connect to nat dst: {}", nat_dst).into())
     }
 
+    #[inline]
     fn check_packet_from_peer_fast(&self, _cidr_set: &CidrSet, _global_ctx: &GlobalCtx) -> bool {
         true
     }
 
+    #[inline]
     fn check_packet_from_peer(
         &self,
         _cidr_set: &CidrSet,
@@ -265,6 +273,7 @@ impl NatDstConnector for NatDstQuicConnector {
         hdr.from_peer_id == hdr.to_peer_id && hdr.is_kcp_src_modified()
     } //TODO: Can we use the same flag?
 
+    #[inline]
     fn transport_type(&self) -> TcpProxyEntryTransportType {
         TcpProxyEntryTransportType::Quic
     }
@@ -278,10 +287,12 @@ struct TcpProxyForQuicSrc(Arc<TcpProxy<NatDstQuicConnector>>);
 impl TcpProxyForKcpSrcTrait for TcpProxyForQuicSrc {
     type Connector = NatDstQuicConnector;
 
+    #[inline]
     fn get_tcp_proxy(&self) -> &Arc<TcpProxy<Self::Connector>> {
         &self.0
     }
 
+    #[inline]
     async fn check_dst_allow_kcp_input(&self, dst_ip: &Ipv4Addr) -> bool {
         self.0
             .get_peer_manager()
@@ -301,10 +312,12 @@ pub struct QuicProxy {
 }
 
 impl QuicProxy {
+    #[inline]
     pub fn src(&self) -> Option<&QuicProxySrc> {
         self.src.as_ref()
     }
 
+    #[inline]
     pub fn dst(&self) -> Option<&QuicProxyDst> {
         self.dst.as_ref()
     }
@@ -331,7 +344,8 @@ impl QuicProxy {
                 zc_packet_type,
             )
         };
-        let (packet_rx, stream_rx) = self.endpoint
+        let (packet_rx, stream_rx) = self
+            .endpoint
             .run((header.len(), 0).into())
             .expect("failed to start quic endpoint");
         let peer_mgr = self.peer_mgr.clone();
@@ -342,8 +356,8 @@ impl QuicProxy {
                 header,
                 zc_packet_type,
             }
-                .run()
-                .await;
+            .run()
+            .await;
         });
 
         let peer_mgr = self.peer_mgr.clone();
@@ -357,9 +371,7 @@ impl QuicProxy {
         }
 
         stream_rx.switch().set(dst);
-        if dst {
-
-        }
+        if dst {}
     }
 }
 
@@ -372,8 +384,9 @@ pub struct QuicProxySrc {
 }
 
 impl QuicProxySrc {
+    #[inline]
     pub fn get_tcp_proxy(&self) -> Arc<TcpProxy<NatDstQuicConnector>> {
-        self.tcp_proxy.0.clone()
+        self.tcp_proxy.get_tcp_proxy().clone()
     }
 }
 
@@ -416,7 +429,20 @@ pub struct QuicProxyDst {
     quic_ctrl: Arc<QuicController>,
     peer_mgr: Arc<PeerManager>,
 
-    proxy_entries: Arc<DashMap<QuicStream, TcpProxyEntry>>,
+    proxy_entries: Arc<DashMap<QuicStreamHandle, TcpProxyEntry>>,
     cidr_set: Arc<CidrSet>,
     tasks: JoinSet<()>,
+}
+
+impl QuicProxyDst {
+    pub fn new(quic_ctrl: Arc<QuicController>, peer_mgr: Arc<PeerManager>) -> Self {
+        let cidr_set = CidrSet::new(peer_mgr.get_global_ctx());
+        Self {
+            quic_ctrl,
+            peer_mgr,
+            proxy_entries: Arc::new(DashMap::new()),
+            cidr_set: Arc::new(cidr_set),
+            tasks: JoinSet::new(),
+        }
+    }
 }

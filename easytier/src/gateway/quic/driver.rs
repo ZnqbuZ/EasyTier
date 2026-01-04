@@ -1,7 +1,7 @@
-use crate::gateway::quic::cmd::{QuicCmd, QuicStreamInfo};
+use crate::gateway::quic::cmd::QuicCmd;
 use crate::gateway::quic::evt::{QuicNetEvt, QuicNetEvtTx, QuicStreamEvt, QuicStreamEvtRx, QuicStreamEvtTx};
 use anyhow::{anyhow, Error};
-use bytes::{Bytes};
+use bytes::Bytes;
 use quinn_proto::{
     ClientConfig, ConnectError, Connection, ConnectionHandle, DatagramEvent, Dir, Endpoint, Event,
     ReadError, StreamEvent, StreamId,
@@ -14,13 +14,14 @@ use tracing::log::trace;
 use tracing::{error, warn};
 use crate::gateway::quic::packet::{QuicPacket, QuicPacketMargins};
 use crate::gateway::quic::{SwitchedReceiver, SwitchedSender};
+use crate::gateway::quic::stream::QuicStreamHandle;
 use crate::gateway::quic::utils::QuicBufferPool;
 
 const QUIC_STREAM_EVT_BUFFER: usize = 2048;
 const QUIC_PACKET_POOL_MIN_CAPACITY: usize = 64 * 1024;
 
-pub type QuicStreamPartsTx = SwitchedSender<(QuicStreamInfo, QuicStreamEvtRx)>;
-pub type QuicStreamPartsRx = SwitchedReceiver<(QuicStreamInfo, QuicStreamEvtRx)>;
+pub type QuicStreamPartsTx = SwitchedSender<(QuicStreamHandle, QuicStreamEvtRx)>;
+pub type QuicStreamPartsRx = SwitchedReceiver<(QuicStreamHandle, QuicStreamEvtRx)>;
 
 pub(super) struct QuicDriver {
     conns: HashMap<ConnectionHandle, (Connection, HashMap<StreamId, QuicStreamEvtTx>)>,
@@ -66,11 +67,11 @@ impl QuicDriver {
             }
 
             QuicCmd::StreamWrite {
-                stream_info,
+                stream_handle,
                 data,
                 fin,
             } => {
-                self.write_stream(stream_info, data, fin);
+                self.write_stream(stream_handle, data, fin);
             }
 
             _ => {}
@@ -157,7 +158,7 @@ impl QuicDriver {
         &mut self,
         addr: SocketAddr,
         dir: Dir,
-    ) -> Result<(QuicStreamInfo, QuicStreamEvtRx), Error> {
+    ) -> Result<(QuicStreamHandle, QuicStreamEvtRx), Error> {
         let conn_handle = self.connect(addr)?;
         let (conn, streams) = self
             .conns
@@ -171,7 +172,7 @@ impl QuicDriver {
         let (evt_tx, evt_rx) = mpsc::channel(QUIC_STREAM_EVT_BUFFER);
         streams.insert(stream_id, evt_tx);
         Ok((
-            QuicStreamInfo {
+            QuicStreamHandle {
                 conn_handle,
                 stream_id,
             },
@@ -179,8 +180,8 @@ impl QuicDriver {
         ))
     }
 
-    fn write_stream(&mut self, stream_info: QuicStreamInfo, data: Bytes, fin: bool) {
-        let conn_handle = stream_info.conn_handle;
+    fn write_stream(&mut self, stream_handle: QuicStreamHandle, data: Bytes, fin: bool) {
+        let conn_handle = stream_handle.conn_handle;
 
         let (conn, _) = match self.conns.get_mut(&conn_handle) {
             Some(c) => c,
@@ -193,13 +194,13 @@ impl QuicDriver {
             }
         };
 
-        let mut stream = conn.send_stream(stream_info.stream_id);
+        let mut stream = conn.send_stream(stream_handle.stream_id);
 
         match stream.write(&*data) {
             Ok(n) if n == data.len() => {
                 if fin {
                     if let Err(e) = stream.finish() {
-                        error!("Failed to finish stream {:?}: {:?}", stream_info, e);
+                        error!("Failed to finish stream {:?}: {:?}", stream_handle, e);
                     }
                 }
             }
@@ -208,7 +209,7 @@ impl QuicDriver {
                 //TODO: flow control
                 error!(
                     "Stream {:?} flow control limit reached ({} < {}), resetting",
-                    stream_info,
+                    stream_handle,
                     n,
                     data.len()
                 );
@@ -216,7 +217,7 @@ impl QuicDriver {
             }
 
             Err(e) => {
-                error!("Failed to write to stream {:?}: {:?}", stream_info, e);
+                error!("Failed to write to stream {:?}: {:?}", stream_handle, e);
                 let _ = stream.reset(0u32.into());
             }
         }
@@ -262,7 +263,7 @@ impl QuicDriver {
 
                             let (evt_tx, evt_rx) = mpsc::channel(QUIC_STREAM_EVT_BUFFER);
                             if let Err(e) = self.incoming_stream_tx.try_send((
-                                QuicStreamInfo {
+                                QuicStreamHandle {
                                     conn_handle,
                                     stream_id,
                                 },
