@@ -71,12 +71,18 @@ impl AsyncRead for QuicStream {
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<Result<(), Error>> {
+        let mut written: bool = false;
+
         loop {
             if let Some(mut pending) = self.pending.take() {
                 let len = min(pending.len(), buf.remaining());
                 buf.put_slice(&pending.split_to(len));
+                written = true;
                 if !pending.is_empty() {
                     self.pending = Some(pending);
+                    return Poll::Ready(Ok(()));
+                }
+                if buf.remaining() == 0 {
                     return Poll::Ready(Ok(()));
                 }
             }
@@ -94,8 +100,8 @@ impl AsyncRead for QuicStream {
                         return Poll::Ready(Err(Error::new(ErrorKind::ConnectionReset, e)))
                     }
                 },
-                Poll::Ready(None) => return Poll::Ready(Ok(())),
-                Poll::Pending => return Poll::Pending,
+                Poll::Pending if !written => return Poll::Pending,
+                _ => return Poll::Ready(Ok(())),
             }
         }
     }
