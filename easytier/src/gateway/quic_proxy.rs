@@ -24,7 +24,7 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::select;
 use tokio::task::JoinSet;
-use tracing::error;
+use tracing::{debug, error, instrument, trace};
 use crate::common::acl_processor::PacketInfo;
 use crate::proto::acl::{ChainType, Protocol};
 use crate::proto::rpc_types;
@@ -119,7 +119,7 @@ impl NatDstConnector for NatDstQuicConnector {
             return Err(anyhow::anyhow!("no peer found for nat dst: {}", nat_dst).into());
         };
 
-        tracing::trace!("kcp nat dst: {:?}, dst peers: {:?}", nat_dst, dst_peer_id);
+        trace!("quic nat dst: {:?}, dst peers: {:?}", nat_dst, dst_peer_id);
 
         let header = {
             let conn_data = QuicConnData {
@@ -291,7 +291,7 @@ struct QuicPacketSender {
 }
 
 impl QuicPacketSender {
-    #[tracing::instrument]
+    #[instrument]
     pub async fn run(mut self) {
         while let Some(packet) = self.packet_rx.recv().await {
             let (packet_info, mut payload) = match QuicPacketMeta::unpack(packet) {
@@ -351,7 +351,7 @@ impl QuicStreamReceiver {
         }
     }
 
-    #[tracing::instrument(ret)]
+    #[instrument(ret)]
     async fn establish_stream(mut stream: QuicStream, stream_ctx: Arc<QuicStreamContext>) -> crate::common::error::Result<()> {
         let conn_data_len = {
             let mut header_len =[0u8; 2];
@@ -431,7 +431,7 @@ impl QuicStreamReceiver {
         };
         acl_handler.handle_packet(&conn_data)?;
 
-        tracing::debug!("quic connect to dst socket: {:?}", dst_socket);
+        debug!("quic connect to dst socket: {:?}", dst_socket);
 
         let _g = global_ctx.net_ns.guard();
         let connector = crate::gateway::tcp_proxy::NatDstTcpConnector {};
@@ -485,6 +485,8 @@ impl QuicProxy {
     }
 
     pub async fn run(&mut self, src: bool, dst: bool) {
+        trace!("quic proxy starting");
+
         let (header, zc_packet_type) = {
             let header = ZCPacket::new_with_payload(&[]);
             let zc_packet_type = header.packet_type();
@@ -571,6 +573,7 @@ impl QuicProxySrc {
 
 impl QuicProxySrc {
     async fn run(&self) {
+        trace!("quic proxy src starting");
         self.peer_mgr
             .add_nic_packet_process_pipeline(Box::new(self.tcp_proxy.clone()))
             .await;
@@ -596,6 +599,7 @@ pub struct QuicProxyDst {
 
 impl QuicProxyDst {
     async fn run(&self) {
+        trace!("quic proxy dst starting");
         self.peer_mgr
             .add_packet_process_pipeline(Box::new(QuicPacketReceiver {
                 quic_ctrl: self.quic_ctrl.clone(),
