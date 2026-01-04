@@ -14,7 +14,7 @@ use tokio::task::JoinSet;
 use tokio::time::sleep_until;
 use tokio::select;
 use crate::gateway::quic::packet::{QuicPacket, QuicPacketMargins};
-use crate::gateway::quic::switched_channel;
+use crate::gateway::quic::{switched_channel, AtomicSwitch};
 
 #[derive(Debug)]
 pub struct QuicController {
@@ -67,6 +67,10 @@ impl QuicStreamRx {
     pub async fn recv(&mut self) -> Option<QuicStream> {
         let (stream_info, evt_rx) = self.incoming_stream_rx.recv().await?;
         Some(QuicStream::new(stream_info, evt_rx, self.cmd_tx.clone()))
+    }
+
+    pub fn switch(&self) -> &AtomicSwitch {
+        self.incoming_stream_rx.switch.as_ref()
     }
 }
 
