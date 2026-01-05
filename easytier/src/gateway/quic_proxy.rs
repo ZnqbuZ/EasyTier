@@ -1,3 +1,4 @@
+use crate::common::acl_processor::PacketInfo;
 use crate::common::global_ctx::{ArcGlobalCtx, GlobalCtx};
 use crate::common::PeerId;
 use crate::gateway::kcp_proxy::{ProxyAclHandler, TcpProxyForKcpSrcTrait};
@@ -9,8 +10,14 @@ use crate::gateway::tcp_proxy::{NatDstConnector, TcpProxy};
 use crate::gateway::CidrSet;
 use crate::peers::peer_manager::PeerManager;
 use crate::peers::PeerPacketFilter;
-use crate::proto::api::instance::{ListTcpProxyEntryRequest, ListTcpProxyEntryResponse, TcpProxyEntry, TcpProxyEntryState, TcpProxyEntryTransportType, TcpProxyRpc};
+use crate::proto::acl::{ChainType, Protocol};
+use crate::proto::api::instance::{
+    ListTcpProxyEntryRequest, ListTcpProxyEntryResponse, TcpProxyEntry, TcpProxyEntryState,
+    TcpProxyEntryTransportType, TcpProxyRpc,
+};
 use crate::proto::peer_rpc::KcpConnData;
+use crate::proto::rpc_types;
+use crate::proto::rpc_types::controller::BaseController;
 use crate::tunnel::packet_def::{PacketType, PeerManagerHeader, ZCPacket, ZCPacketType};
 use anyhow::{anyhow, Context, Error};
 use bytes::{BufMut, Bytes, BytesMut};
@@ -21,14 +28,10 @@ use prost::Message;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::{Arc, Weak};
 use std::time::Duration;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::select;
 use tokio::task::JoinSet;
 use tracing::{debug, error, instrument, trace};
-use crate::common::acl_processor::PacketInfo;
-use crate::proto::acl::{ChainType, Protocol};
-use crate::proto::rpc_types;
-use crate::proto::rpc_types::controller::BaseController;
 
 //This helper class encodes/decodes peer_id and packet_type into/from SocketAddr.
 #[derive(Debug)]
@@ -169,14 +172,13 @@ impl NatDstConnector for NatDstQuicConnector {
             let conn_data = header.clone();
 
             connect_tasks.spawn(async move {
-                let mut stream = quic_ctrl
-                    .connect(QuicPacketMeta::new(dst_peer_id, PacketType::QuicSrc).into(), None)
+                quic_ctrl
+                    .connect(
+                        QuicPacketMeta::new(dst_peer_id, PacketType::QuicSrc).into(),
+                        Some(conn_data),
+                    )
                     .await
-                    .with_context(|| format!("failed to connect to nat dst: {}", nat_dst))?;
-
-                stream.write_all(&conn_data).await?;
-
-                Ok(stream)
+                    .with_context(|| format!("failed to connect to nat dst: {}", nat_dst))
             });
         }
 
@@ -356,19 +358,28 @@ impl QuicStreamReceiver {
     }
 
     #[instrument(ret)]
-    async fn establish_stream(mut stream: QuicStream, stream_ctx: Arc<QuicStreamContext>) -> crate::common::error::Result<()> {
-        let conn_data_len = {
-            let mut header_len =[0u8; 2];
-            stream.read_exact(&mut header_len).await.context("failed to read length of quic stream header")?;
-            u16::from_be_bytes(header_len) as usize
-        };
+    async fn establish_stream(
+        stream: QuicStream,
+        stream_ctx: Arc<QuicStreamContext>,
+    ) -> crate::common::error::Result<()> {
+        let handle = stream.handle();
+        let mut stream = BufReader::new(stream);
+
+        let conn_data_len = stream
+            .read_u16()
+            .await
+            .context("failed to read length of quic stream header")?
+            as usize;
 
         let mut conn_data = vec![0u8; conn_data_len];
-        stream.read_exact(&mut conn_data).await.context("failed to read quic stream header")?;
-        let conn_data_parsed = QuicConnData::decode(&mut conn_data.as_slice()).context("failed to decode quic stream header")?;
+        stream
+            .read_exact(&mut conn_data)
+            .await
+            .context("failed to read quic stream header")?;
+        let conn_data_parsed = QuicConnData::decode(&mut conn_data.as_slice())
+            .context("failed to decode quic stream header")?;
 
         let proxy_entries = &stream_ctx.proxy_entries;
-        let handle = stream.handle();
         proxy_entries.insert(
             handle,
             TcpProxyEntry {
@@ -386,8 +397,14 @@ impl QuicStreamReceiver {
             }
         }
 
-        let src_socket: SocketAddr = conn_data_parsed.src.ok_or_else(|| anyhow!("missing src addr in quic stream header"))?.into();
-        let mut dst_socket: SocketAddr = conn_data_parsed.dst.ok_or_else(|| anyhow!("missing dst addr in quic stream header"))?.into();
+        let src_socket: SocketAddr = conn_data_parsed
+            .src
+            .ok_or_else(|| anyhow!("missing src addr in quic stream header"))?
+            .into();
+        let mut dst_socket: SocketAddr = conn_data_parsed
+            .dst
+            .ok_or_else(|| anyhow!("missing dst addr in quic stream header"))?
+            .into();
 
         let src_ip = src_socket.ip();
         let dst_ip = dst_socket.ip();
@@ -410,7 +427,7 @@ impl QuicStreamReceiver {
                     "dst socket {:?} is in running listeners, ignore it",
                     dst_socket
                 )
-                    .into());
+                .into());
             }
             dst_socket = format!("127.0.0.1:{}", dst_socket.port()).parse().unwrap();
         }
@@ -447,9 +464,7 @@ impl QuicStreamReceiver {
             e.state = TcpProxyEntryState::Connected.into();
         }
 
-        acl_handler
-            .copy_bidirection_with_acl(stream, ret)
-            .await?;
+        acl_handler.copy_bidirection_with_acl(stream, ret).await?;
 
         Ok(())
     }
