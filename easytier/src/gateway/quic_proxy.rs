@@ -473,9 +473,16 @@ impl QuicStreamReceiver {
 
         let _g = global_ctx.net_ns.guard();
         let connector = crate::gateway::tcp_proxy::NatDstTcpConnector {};
-        let ret = connector
+        let ret = match connector
             .connect("0.0.0.0:0".parse().unwrap(), dst_socket)
-            .await?;
+            .await
+        {
+            Ok(s) => s,
+            Err(e) => {
+                let _ = stream.reset(1).await;
+                return Err(e);
+            }
+        };
 
         if let Some(mut e) = proxy_entries.get_mut(&handle) {
             e.state = TcpProxyEntryState::Connected.into();
