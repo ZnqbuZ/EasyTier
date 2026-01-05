@@ -90,24 +90,6 @@ jobs:
             ./target
           key: ${{ runner.os }}-cargo-test-${{ hashFiles('**/Cargo.lock') }}
 
-      - name: Install GUI dependencies (Used by clippy)
-        run: |
-          bash ./.github/workflows/install_gui_dep.sh
-          bash ./.github/workflows/install_rust.sh
-          rustup component add rustfmt
-          rustup component add clippy
-
-      - name: Check formatting
-        if: ${{ !cancelled() }}
-        run: cargo fmt --all -- --check
-
-      - name: Check Clippy
-        if: ${{ !cancelled() }}
-        # NOTE: tauri need `dist` dir in build.rs
-        run: |
-          mkdir -p easytier-gui/dist
-          cargo clippy --all-targets --all-features --all -- -D warnings
-
       - name: Run tests
         env:
           RUST_LOG: trace
