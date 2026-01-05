@@ -62,7 +62,8 @@ pub struct QuicStream {
     read_pending: Option<Bytes>,
     write_pool: QuicBufferPool,
 
-    shutdown: bool,
+    fin_sent: bool,
+    fin_received: bool,
 }
 
 impl QuicStream {
@@ -83,18 +84,19 @@ impl QuicStream {
             cmd_tx: PollSender::new(cmd_tx),
             read_pending: None,
             write_pool: QuicBufferPool::new(8192),
-            shutdown: false,
+            fin_sent: false,
+            fin_received: false,
         }
     }
 
     pub async fn reset(&mut self, error_code: u32) -> Result<(), Error> {
         check_tx!(
             self.cmd_tx
-            .send(QuicCmd::ResetStream {
-                stream_handle: self.stream_handle,
-                error_code,
-            })
-            .await
+                .send(QuicCmd::ResetStream {
+                    stream_handle: self.stream_handle,
+                    error_code,
+                })
+                .await
         )
     }
 }
@@ -149,6 +151,10 @@ impl AsyncRead for QuicStream {
                 }
             }
 
+            if self.fin_received {
+                return Poll::Ready(Ok(()));
+            }
+
             match self.evt_rx.poll_recv(cx) {
                 Poll::Ready(Some(event)) => match event {
                     QuicStreamEvt::Data(data) => {
@@ -157,7 +163,7 @@ impl AsyncRead for QuicStream {
                         }
                         self.read_pending = Some(data);
                     }
-                    QuicStreamEvt::Fin => return Poll::Ready(Ok(())),
+                    QuicStreamEvt::Fin => self.fin_received = true,
                     QuicStreamEvt::Reset(e) => {
                         return Poll::Ready(Err(Error::new(ErrorKind::ConnectionReset, e)))
                     }
@@ -187,7 +193,7 @@ impl AsyncWrite for QuicStream {
     }
 
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Error>> {
-        if self.shutdown {
+        if self.fin_sent {
             return Poll::Ready(Ok(()));
         }
 
@@ -196,8 +202,8 @@ impl AsyncWrite for QuicStream {
         let cmd = self.new_write_cmd(Bytes::new(), true);
         check_tx!(self.cmd_tx.start_send_unpin(cmd))?;
         ready_tx!(self.cmd_tx.poll_flush_unpin(cx))?;
-        
-        self.shutdown = true;
+
+        self.fin_sent = true;
         Poll::Ready(Ok(()))
     }
 }
