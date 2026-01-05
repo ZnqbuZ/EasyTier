@@ -8,16 +8,12 @@ use crate::gateway::quic::utils::QuicBufferPool;
 use crate::gateway::quic::{SwitchedReceiver, SwitchedSender};
 use anyhow::{anyhow, Error};
 use bytes::Bytes;
-use quinn_proto::{
-    ClientConfig, ConnectError, Connection, ConnectionHandle, DatagramEvent, Dir, Endpoint, Event,
-    ReadError, StreamEvent, StreamId,
-};
+use quinn_proto::{ClientConfig, ConnectError, Connection, ConnectionHandle, DatagramEvent, Dir, Endpoint, Event, ReadError, ReadableError, StreamEvent, StreamId};
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::time::Instant;
 use tokio::sync::mpsc;
-use tracing::log::trace;
-use tracing::{error, warn};
+use tracing::{error, warn, trace};
 
 const QUIC_STREAM_EVT_BUFFER: usize = 2048;
 const QUIC_PACKET_POOL_MIN_CAPACITY: usize = 64 * 1024;
@@ -316,7 +312,9 @@ impl QuicDriver {
                             let mut chunks = match stream.read(true) {
                                 Ok(chunks) => chunks,
                                 Err(e) => {
-                                    error!("Stream is not readable: {:?}", e);
+                                    if !matches!(e, ReadableError::ClosedStream) {
+                                        error!("Stream is not readable: {:?}", e);
+                                    }
                                     continue;
                                 }
                             };
@@ -330,24 +328,25 @@ impl QuicDriver {
                                         }
                                     }
 
-                                    Ok(None) => break,
+                                    Ok(None) => {
+                                        if let Err(e) = tx.try_send(QuicStreamEvt::Fin) {
+                                            error!("Failed to send fin to stream: {:?}", e);
+                                        }
+                                        break;
+                                    },
 
                                     Err(e) => {
                                         if let ReadError::Reset(code) = e {
-                                            let _ = tx.try_send(QuicStreamEvt::Reset(format!(
+                                            if let Err(e) = tx.try_send(QuicStreamEvt::Reset(format!(
                                                 "Failed to read from stream. Error code: {code}"
-                                            )));
+                                            ))) {
+                                                error!("Failed to send reset to stream: {:?}", e);
+                                            }
                                         }
                                         break;
                                     }
                                 }
                             }
-                        }
-                    }
-
-                    StreamEvent::Finished { id } => {
-                        if let Some(tx) = streams.get_mut(&id) {
-                            let _ = tx.try_send(QuicStreamEvt::Fin);
                         }
                     }
 
@@ -359,10 +358,14 @@ impl QuicDriver {
                         }
                     }
 
-                    _ => {}
+                    _ => {
+                        trace!("Unhandled stream event: {:?}", stream_evt);
+                    }
                 },
 
-                _ => {}
+                _ => {
+                    trace!("Unhandled connection event: {:?}", evt);
+                }
             }
         }
 
