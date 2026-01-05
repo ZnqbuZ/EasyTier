@@ -81,6 +81,30 @@ impl QuicDriver {
                 self.write_stream(stream_handle, data, fin);
             }
 
+            QuicCmd::ResetStream {
+                stream_handle,
+                error_code,
+            } => {
+                if let Some((conn, _)) = self.conns.get_mut(&stream_handle.conn_handle) {
+                    let _ = conn
+                        .send_stream(stream_handle.stream_id)
+                        .reset(error_code.into());
+                    self.process_conn(stream_handle.conn_handle);
+                }
+            }
+
+            QuicCmd::StopStream {
+                stream_handle,
+                error_code,
+            } => {
+                if let Some((conn, _)) = self.conns.get_mut(&stream_handle.conn_handle) {
+                    let _ = conn
+                        .recv_stream(stream_handle.stream_id)
+                        .stop(error_code.into());
+                    self.process_conn(stream_handle.conn_handle);
+                }
+            }
+
             _ => {}
         }
     }
@@ -177,7 +201,7 @@ impl QuicDriver {
 
         let (evt_tx, evt_rx) = mpsc::channel(QUIC_STREAM_EVT_BUFFER);
         streams.insert(stream_id, evt_tx);
-        
+
         let stream_handle = QuicStreamHandle {
             conn_handle,
             stream_id,
@@ -186,7 +210,7 @@ impl QuicDriver {
         if let Some(data) = data {
             self.write_stream(stream_handle, data, false);
         }
-        
+
         Ok((stream_handle, evt_rx))
     }
 
@@ -206,7 +230,7 @@ impl QuicDriver {
 
         let mut stream = conn.send_stream(stream_handle.stream_id);
 
-        match stream.write(&*data) {
+        match stream.write(&data) {
             Ok(n) if n == data.len() => {
                 if fin {
                     if let Err(e) = stream.finish() {
