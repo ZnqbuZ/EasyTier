@@ -43,8 +43,6 @@ message FlagsInConfig {
   bool disable_quic_input = 25;
   // disable relay local network quic packets
   bool disable_relay_quic = 35;
-  // quic listen port
-  uint32 quic_listen_port = 33;
 
   // a global relay limit, only work for foreign network
   uint64 foreign_relay_bps_limit = 26;
