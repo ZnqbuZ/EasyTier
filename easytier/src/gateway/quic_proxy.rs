@@ -423,6 +423,13 @@ impl QuicStreamReceiver {
             .ok_or_else(|| anyhow!("missing dst addr in quic stream header"))?
             .into();
 
+        if let IpAddr::V4(dst_v4_ip) = dst_socket.ip() {
+            let mut real_ip = dst_v4_ip;
+            if stream_ctx.cidr_set.contains_v4(dst_v4_ip, &mut real_ip) {
+                dst_socket.set_ip(real_ip.into());
+            }
+        };
+
         let src_ip = src_socket.ip();
         let dst_ip = dst_socket.ip();
 
