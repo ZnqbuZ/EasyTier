@@ -113,7 +113,7 @@ impl QuicBufferPool {
         let (header, trailer) = margins.into();
 
         let len = header + data.len() + trailer;
-        
+
         if len > self.pool.capacity() {
             let additional = max(len * 4, self.min_capacity);
             self.pool.reserve(additional);
@@ -121,7 +121,7 @@ impl QuicBufferPool {
                 self.pool.set_len(self.pool.len() + self.pool.capacity());
             }
         }
-        
+
         let mut buf = self.pool.split_to(len);
         buf[header..len - trailer].copy_from_slice(data);
         buf

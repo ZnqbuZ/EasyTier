@@ -1,12 +1,12 @@
-mod stream;
+mod cmd;
 mod driver;
 mod endpoint;
-mod cmd;
 mod evt;
-mod utils;
 mod packet;
+mod stream;
+mod utils;
 
-pub use packet::*;
 pub use endpoint::*;
+pub use packet::*;
 pub use stream::*;
 pub use utils::*;

@@ -8,12 +8,15 @@ use crate::gateway::quic::utils::QuicBufferPool;
 use crate::gateway::quic::{SwitchedReceiver, SwitchedSender};
 use anyhow::{anyhow, Error};
 use bytes::Bytes;
-use quinn_proto::{ClientConfig, ConnectError, Connection, ConnectionHandle, DatagramEvent, Dir, Endpoint, Event, ReadError, ReadableError, StreamEvent, StreamId};
+use quinn_proto::{
+    ClientConfig, ConnectError, Connection, ConnectionHandle, DatagramEvent, Dir, Endpoint, Event,
+    ReadError, ReadableError, StreamEvent, StreamId,
+};
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::time::Instant;
 use tokio::sync::mpsc;
-use tracing::{error, warn, trace};
+use tracing::{error, trace, warn};
 
 const QUIC_STREAM_EVT_BUFFER: usize = 2048;
 const QUIC_PACKET_POOL_MIN_CAPACITY: usize = 64 * 1024;
@@ -333,11 +336,12 @@ impl QuicDriver {
                                             error!("Failed to send fin to stream: {:?}", e);
                                         }
                                         break;
-                                    },
+                                    }
 
                                     Err(e) => {
                                         if let ReadError::Reset(code) = e {
-                                            if let Err(e) = tx.try_send(QuicStreamEvt::Reset(format!(
+                                            if let Err(e) =
+                                                tx.try_send(QuicStreamEvt::Reset(format!(
                                                 "Failed to read from stream. Error code: {code}"
                                             ))) {
                                                 error!("Failed to send reset to stream: {:?}", e);

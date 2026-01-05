@@ -1,21 +1,21 @@
 use crate::gateway::quic::cmd::{QuicCmd, QuicCmdTx};
 use crate::gateway::quic::driver::{QuicDriver, QuicStreamPartsRx};
 use crate::gateway::quic::evt::{QuicNetEvt, QuicNetEvtRx};
+use crate::gateway::quic::packet::{QuicPacket, QuicPacketMargins};
 use crate::gateway::quic::stream::QuicStream;
+use crate::gateway::quic::{switched_channel, AtomicSwitch};
 use anyhow::{anyhow, Error};
+use bytes::Bytes;
 use quinn_plaintext::{client_config, server_config};
 use quinn_proto::congestion::BbrConfig;
 use quinn_proto::{ClientConfig, Endpoint, EndpointConfig, TransportConfig, VarInt};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use bytes::Bytes;
+use tokio::select;
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinSet;
 use tokio::time::sleep_until;
-use tokio::select;
-use crate::gateway::quic::packet::{QuicPacket, QuicPacketMargins};
-use crate::gateway::quic::{switched_channel, AtomicSwitch};
 
 #[derive(Debug)]
 pub struct QuicController {
@@ -32,10 +32,18 @@ impl QuicController {
     }
 
     #[inline]
-    pub async fn connect(&self, addr: SocketAddr, data: Option<Bytes>) -> Result<QuicStream, Error> {
+    pub async fn connect(
+        &self,
+        addr: SocketAddr,
+        data: Option<Bytes>,
+    ) -> Result<QuicStream, Error> {
         let (stream_tx, stream_rx) = oneshot::channel();
         self.cmd_tx
-            .send(QuicCmd::OpenBiStream { addr, data, stream_tx })
+            .send(QuicCmd::OpenBiStream {
+                addr,
+                data,
+                stream_tx,
+            })
             .await?;
         let (stream_handle, evt_rx) = stream_rx.await??;
         Ok(QuicStream::new(stream_handle, evt_rx, self.cmd_tx.clone()))
@@ -130,17 +138,26 @@ impl QuicEndpoint {
         }
     }
 
-    pub fn run(&mut self, packet_margins: QuicPacketMargins) -> Option<(QuicPacketRx, QuicStreamRx)> {
+    pub fn run(
+        &mut self,
+        packet_margins: QuicPacketMargins,
+    ) -> Option<(QuicPacketRx, QuicStreamRx)> {
         self.endpoint.as_ref()?;
 
         let (cmd_tx, mut cmd_rx) = mpsc::channel(2048);
         let (net_evt_tx, net_evt_rx) = mpsc::channel(2048);
         let (incoming_stream_tx, incoming_stream_rx) = switched_channel(128);
 
-        self.ctrl = Some(QuicController {
-            cmd_tx: cmd_tx.clone(),
-        }.into());
-        let packet_rx = QuicPacketRx { net_evt_rx, packet_margins };
+        self.ctrl = Some(
+            QuicController {
+                cmd_tx: cmd_tx.clone(),
+            }
+            .into(),
+        );
+        let packet_rx = QuicPacketRx {
+            net_evt_rx,
+            packet_margins,
+        };
         let stream_rx = QuicStreamRx {
             cmd_tx: cmd_tx.clone(),
             incoming_stream_rx,
@@ -151,7 +168,7 @@ impl QuicEndpoint {
             self.client_config.clone(),
             net_evt_tx.clone(),
             incoming_stream_tx.clone(),
-            packet_margins
+            packet_margins,
         );
 
         self.tasks.spawn(async move {
@@ -172,8 +189,8 @@ impl QuicEndpoint {
 
     #[inline]
     pub fn ctrl(&self) -> Result<Arc<QuicController>, Error> {
-        self.ctrl
-            .clone()
-            .ok_or(anyhow!("Failed to get QUIC controller. Is QUIC endpoint running?"))
+        self.ctrl.clone().ok_or(anyhow!(
+            "Failed to get QUIC controller. Is QUIC endpoint running?"
+        ))
     }
 }
