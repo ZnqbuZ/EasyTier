@@ -118,7 +118,7 @@ impl QuicBufferPool {
             let additional = max(len * 4, self.min_capacity);
             self.pool.reserve(additional);
             unsafe {
-                self.pool.set_len(self.pool.len() + self.pool.capacity());
+                self.pool.set_len(self.pool.capacity());
             }
         }
 
