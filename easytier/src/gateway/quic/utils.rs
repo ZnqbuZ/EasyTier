@@ -1,10 +1,9 @@
-use bytes::{BufMut, BytesMut};
+use bytes::BytesMut;
 use std::cmp::max;
 use std::ops::{Deref, DerefMut};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::sync::mpsc;
-use tracing::{error, info, trace};
 
 #[derive(Debug)]
 pub struct AtomicSwitch(AtomicBool);
