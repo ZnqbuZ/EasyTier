@@ -902,14 +902,6 @@ impl Instance {
             self.check_dhcp_ip_conflict();
         }
 
-        let quic_src = self.global_ctx.get_flags().enable_quic_proxy;
-        let quic_dst = !self.global_ctx.get_flags().disable_quic_input;
-        if quic_src || quic_dst {
-            let mut quic_proxy = QuicProxy::new(self.get_peer_manager());
-            quic_proxy.run(quic_src, quic_dst).await;
-            self.quic_proxy = Some(quic_proxy);
-        }
-
         if self.global_ctx.get_flags().enable_kcp_proxy {
             let src_proxy = KcpProxySrc::new(self.get_peer_manager()).await;
             src_proxy.start().await;
@@ -920,6 +912,14 @@ impl Instance {
             let mut dst_proxy = KcpProxyDst::new(self.get_peer_manager()).await;
             dst_proxy.start().await;
             self.kcp_proxy_dst = Some(dst_proxy);
+        }
+
+        let quic_src = self.global_ctx.get_flags().enable_quic_proxy;
+        let quic_dst = !self.global_ctx.get_flags().disable_quic_input;
+        if quic_src || quic_dst {
+            let mut quic_proxy = QuicProxy::new(self.get_peer_manager());
+            quic_proxy.run(quic_src, quic_dst).await;
+            self.quic_proxy = Some(quic_proxy);
         }
 
         self.global_ctx
