@@ -1458,12 +1458,16 @@ impl PeerManager {
         };
 
         // check dst allow quic input
-        if !peer_info.feature_flag.map(|x| x.quic_input).unwrap_or(false) {
+        if !peer_info
+            .feature_flag
+            .map(|x| x.quic_input)
+            .unwrap_or(false)
+        {
             return false;
         }
 
         let next_hop_policy = Self::get_next_hop_policy(self.global_ctx.get_flags().latency_first);
-        // check relay node allow relay kcp.
+        // check relay node allow relay quic.
         let Some(next_hop_id) = route
             .get_next_hop_with_policy(dst_peer_id, next_hop_policy)
             .await
@@ -1480,7 +1484,7 @@ impl PeerManager {
             return false;
         };
 
-        // check next hop allow kcp relay
+        // check next hop allow quic relay
         if next_hop_info
             .feature_flag
             .map(|x| x.no_relay_quic)
@@ -1488,7 +1492,7 @@ impl PeerManager {
         {
             return false;
         }
-        
+
         true
     }
 
