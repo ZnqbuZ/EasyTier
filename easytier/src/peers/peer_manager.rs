@@ -1453,9 +1453,14 @@ impl PeerManager {
         let Some(dst_peer_id) = route.get_peer_id_by_ip(dst_ip).await else {
             return false;
         };
-        let Some(_) = route.get_peer_info(dst_peer_id).await else {
+        let Some(peer_info) = route.get_peer_info(dst_peer_id).await else {
             return false;
         };
+
+        // check dst allow quic input
+        if !peer_info.feature_flag.map(|x| x.quic_input).unwrap_or(false) {
+            return false;
+        }
 
         let next_hop_policy = Self::get_next_hop_policy(self.global_ctx.get_flags().latency_first);
         // check relay node allow relay kcp.
@@ -1471,10 +1476,19 @@ impl PeerManager {
             return true;
         }
 
-        let Some(_) = route.get_peer_info(next_hop_id).await else {
+        let Some(next_hop_info) = route.get_peer_info(next_hop_id).await else {
             return false;
         };
 
+        // check next hop allow kcp relay
+        if next_hop_info
+            .feature_flag
+            .map(|x| x.no_relay_quic)
+            .unwrap_or(false)
+        {
+            return false;
+        }
+        
         true
     }
 

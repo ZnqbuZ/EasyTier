@@ -52,6 +52,8 @@ pub fn gen_default_flags() -> Flags {
         private_mode: false,
         enable_quic_proxy: false,
         disable_quic_input: false,
+        disable_relay_quic: false,
+        enable_relay_foreign_network_quic: false,
         quic_listen_port: 0,
         foreign_relay_bps_limit: u64::MAX,
         multi_thread_count: 2,

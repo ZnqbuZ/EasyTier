@@ -223,9 +223,15 @@ core_clap:
   disable_relay_kcp:
     en: "if true, disable relay kcp packets. avoid consuming too many bandwidth. default is false"
     zh-CN: "如果为true，则禁止节点转发 KCP 数据包，防止过度消耗流量。默认值为false"
+  disable_relay_quic:
+    en: "if true, disable relay quic packets. avoid consuming too many bandwidth. default is false"
+    zh-CN: "如果为true，则禁止节点转发 QUIC 数据包，防止过度消耗流量。默认值为false"
   enable_relay_foreign_network_kcp:
     en: "if true, allow relay kcp packets from foreign network. default is false (not forward foreign network kcp packets)"
     zh-CN: "如果为true，则作为共享节点时也可以转发其他网络的 KCP 数据包。默认值为false（不转发）"
+  enable_relay_foreign_network_quic:
+    en: "if true, allow relay quic packets from foreign network. default is false (not forward foreign network quic packets)"
+    zh-CN: "如果为true，则作为共享节点时也可以转发其他网络的 QUIC 数据包。默认值为false（不转发）"
   stun_servers:
     en: "Override default STUN servers; If configured but empty, STUN servers are not used"
     zh-CN: "覆盖内置的默认 STUN server 列表；如果设置了但是为空，则不使用 STUN servers；如果没设置，则使用默认 STUN server 列表"
