@@ -1,4 +1,4 @@
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use futures::SinkExt;
 use std::cmp::min;
 use std::io::{Error, ErrorKind};
@@ -39,8 +39,8 @@ pub struct QuicStream {
     evt_rx: QuicStreamEvtRx,
     cmd_tx: PollSender<QuicCmd>,
 
-    pending: Option<Bytes>,
-    pool: QuicBufferPool,
+    read_pending: Option<Bytes>,
+    write_pool: QuicBufferPool,
 }
 
 impl QuicStream {
@@ -59,9 +59,29 @@ impl QuicStream {
             stream_handle,
             evt_rx,
             cmd_tx: PollSender::new(cmd_tx),
-            pending: None,
-            pool: QuicBufferPool::new(8192),
+            read_pending: None,
+            write_pool: QuicBufferPool::new(8192),
         }
+    }
+}
+
+impl QuicStream {
+    pub fn put_back(&mut self, data: Bytes) {
+        if data.is_empty() {
+            return;
+        }
+
+        self.read_pending = match self.read_pending.take() {
+            Some(pending) => {
+                let mut new_pending = BytesMut::with_capacity(data.len() + pending.len());
+                new_pending.extend_from_slice(&data);
+                new_pending.extend_from_slice(&pending);
+                Some(new_pending.freeze())
+            }
+            None => {
+                Some(data)
+            }
+        };
     }
 }
 
@@ -74,12 +94,12 @@ impl AsyncRead for QuicStream {
         let mut written: bool = false;
 
         loop {
-            if let Some(mut pending) = self.pending.take() {
+            if let Some(mut pending) = self.read_pending.take() {
                 let len = min(pending.len(), buf.remaining());
                 buf.put_slice(&pending.split_to(len));
                 written = true;
                 if !pending.is_empty() {
-                    self.pending = Some(pending);
+                    self.read_pending = Some(pending);
                     return Poll::Ready(Ok(()));
                 }
                 if buf.remaining() == 0 {
@@ -93,7 +113,7 @@ impl AsyncRead for QuicStream {
                         if data.is_empty() {
                             continue;
                         }
-                        self.pending = Some(data);
+                        self.read_pending = Some(data);
                     }
                     QuicStreamEvt::Fin => return Poll::Ready(Ok(())),
                     QuicStreamEvt::Reset(e) => {
@@ -136,7 +156,7 @@ impl AsyncWrite for QuicStream {
         ready_tx!(self.cmd_tx.poll_ready_unpin(cx));
         let cmd = QuicCmd::StreamWrite {
             stream_handle: self.stream_handle,
-            data: self.pool.buf(buf, (0, 0).into()).freeze(),
+            data: self.write_pool.buf(buf, (0, 0).into()).freeze(),
             fin: false,
         };
         let _ = check_tx!(self.cmd_tx.start_send_unpin(cmd));

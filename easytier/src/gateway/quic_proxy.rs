@@ -20,15 +20,18 @@ use crate::proto::rpc_types;
 use crate::proto::rpc_types::controller::BaseController;
 use crate::tunnel::packet_def::{PacketType, PeerManagerHeader, ZCPacket, ZCPacketType};
 use anyhow::{anyhow, Context, Error};
-use bytes::{BufMut, Bytes, BytesMut};
+use bytes::{Buf, BufMut, Bytes, BytesMut};
 use dashmap::DashMap;
 use derivative::Derivative;
 use pnet::packet::ipv4::Ipv4Packet;
 use prost::Message;
+use std::io::{Cursor, Read};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::pin::Pin;
 use std::sync::{Arc, Weak};
+use std::task::Poll;
 use std::time::Duration;
-use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::select;
 use tokio::task::JoinSet;
 use tracing::{debug, error, instrument, trace};
@@ -357,28 +360,45 @@ impl QuicStreamReceiver {
         }
     }
 
+    async fn read_until<R: AsyncRead + Unpin>(
+        reader: &mut R,
+        buf: &mut BytesMut,
+        target_len: usize,
+    ) -> Result<(), Error> {
+        if buf.capacity() < target_len {
+            buf.reserve(target_len - buf.len());
+        }
+        while buf.len() < target_len {
+            if reader.read_buf(buf).await? == 0 {
+                return Err(anyhow!("reader closed before reading enough data"));
+            }
+        }
+        Ok(())
+    }
+
+    async fn read_stream_header(stream: &mut QuicStream) -> Result<Bytes, Error> {
+        let mut buf = BytesMut::with_capacity(2048);
+        Self::read_until(stream, &mut buf, 2).await?;
+        let header_len = buf.get_u16() as usize;
+        if header_len > buf.capacity() {
+            return Err(anyhow!("header too large: {}", header_len));
+        }
+        Self::read_until(stream, &mut buf, header_len).await?;
+        let header = buf.split_to(header_len).freeze();
+        stream.put_back(buf.freeze());
+        Ok(header)
+    }
+
     #[instrument(ret)]
     async fn establish_stream(
-        stream: QuicStream,
+        mut stream: QuicStream,
         stream_ctx: Arc<QuicStreamContext>,
     ) -> crate::common::error::Result<()> {
-        let handle = stream.handle();
-        let mut stream = BufReader::new(stream);
-
-        let conn_data_len = stream
-            .read_u16()
-            .await
-            .context("failed to read length of quic stream header")?
-            as usize;
-
-        let mut conn_data = vec![0u8; conn_data_len];
-        stream
-            .read_exact(&mut conn_data)
-            .await
-            .context("failed to read quic stream header")?;
-        let conn_data_parsed = QuicConnData::decode(&mut conn_data.as_slice())
+        let conn_data = Self::read_stream_header(&mut stream).await?;
+        let conn_data_parsed = QuicConnData::decode(conn_data.as_ref())
             .context("failed to decode quic stream header")?;
 
+        let handle = stream.handle();
         let proxy_entries = &stream_ctx.proxy_entries;
         proxy_entries.insert(
             handle,
