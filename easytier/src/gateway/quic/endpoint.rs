@@ -36,6 +36,7 @@ impl QuicController {
         &self,
         addr: SocketAddr,
         data: Option<Bytes>,
+        wait: bool,
     ) -> Result<QuicStream, Error> {
         let (stream_tx, stream_rx) = oneshot::channel();
         self.cmd_tx
@@ -46,7 +47,11 @@ impl QuicController {
             })
             .await?;
         let (stream_handle, evt_rx) = stream_rx.await??;
-        Ok(QuicStream::new(stream_handle, evt_rx, self.cmd_tx.clone()))
+        let mut stream = QuicStream::new(stream_handle, evt_rx, self.cmd_tx.clone(), false);
+        if wait {
+            stream.ready().await?;
+        }
+        Ok(stream)
     }
 }
 
@@ -80,7 +85,7 @@ impl QuicStreamRx {
     #[inline]
     pub async fn recv(&mut self) -> Option<QuicStream> {
         let (stream_handle, evt_rx) = self.incoming_stream_rx.recv().await?;
-        Some(QuicStream::new(stream_handle, evt_rx, self.cmd_tx.clone()))
+        Some(QuicStream::new(stream_handle, evt_rx, self.cmd_tx.clone(), true))
     }
 
     #[inline]

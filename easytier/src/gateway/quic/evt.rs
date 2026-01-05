@@ -12,6 +12,7 @@ pub type QuicNetEvtRx = mpsc::Receiver<QuicNetEvt>;
 
 #[derive(Debug)]
 pub(super) enum QuicStreamEvt {
+    Ready,
     Data(Bytes),
     Fin,
     Reset(String),

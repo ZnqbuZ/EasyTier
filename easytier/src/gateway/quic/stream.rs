@@ -59,6 +59,8 @@ pub struct QuicStream {
     evt_rx: QuicStreamEvtRx,
     cmd_tx: PollSender<QuicCmd>,
 
+    ready: bool,
+
     read_pending: Option<Bytes>,
     write_pool: QuicBufferPool,
 
@@ -77,11 +79,13 @@ impl QuicStream {
         stream_handle: QuicStreamHandle,
         evt_rx: QuicStreamEvtRx,
         cmd_tx: QuicCmdTx,
+        ready: bool,
     ) -> Self {
         Self {
             stream_handle,
             evt_rx,
             cmd_tx: PollSender::new(cmd_tx),
+            ready,
             read_pending: None,
             write_pool: QuicBufferPool::new(8192),
             fin_sent: false,
@@ -98,6 +102,32 @@ impl QuicStream {
                 })
                 .await
         )
+    }
+
+    pub async fn ready(&mut self) -> Result<(), Error> {
+        if self.ready {
+            return Ok(());
+        }
+
+        let evt = self.evt_rx.recv().await.ok_or_else(|| {
+            Error::new(
+                ErrorKind::UnexpectedEof,
+                "Quic stream event channel closed before ready",
+            )
+        })?;
+
+        match evt {
+            QuicStreamEvt::Ready => {}
+            _ => {
+                return Err(Error::new(
+                    ErrorKind::InvalidData,
+                    format!("Unexpected event {:?} before ready", evt),
+                ))
+            }
+        }
+
+        self.ready = true;
+        Ok(())
     }
 }
 
@@ -167,6 +197,7 @@ impl AsyncRead for QuicStream {
                     QuicStreamEvt::Reset(e) => {
                         return Poll::Ready(Err(Error::new(ErrorKind::ConnectionReset, e)))
                     }
+                    _ => continue,
                 },
                 Poll::Pending if !written => return Poll::Pending,
                 _ => return Poll::Ready(Ok(())),

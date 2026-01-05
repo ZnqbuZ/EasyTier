@@ -199,6 +199,9 @@ impl QuicDriver {
             .ok_or_else(|| anyhow!("Failed to open stream"))?;
 
         let (evt_tx, evt_rx) = mpsc::channel(QUIC_STREAM_EVT_BUFFER);
+        if !conn.is_handshaking() {
+            evt_tx.try_send(QuicStreamEvt::Ready)?;
+        }
         streams.insert(stream_id, evt_tx);
 
         let stream_handle = QuicStreamHandle {
@@ -272,6 +275,9 @@ impl QuicDriver {
             match evt {
                 Event::Connected => {
                     trace!("Connection established {:?}", conn_handle);
+                    for evt_tx in streams.values() {
+                        let _ = evt_tx.try_send(QuicStreamEvt::Ready);
+                    }
                 }
 
                 Event::ConnectionLost { reason } => {

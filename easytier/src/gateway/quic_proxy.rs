@@ -176,6 +176,7 @@ impl NatDstConnector for NatDstQuicConnector {
                     .connect(
                         QuicPacketMeta::new(dst_peer_id, PacketType::QuicSrc).into(),
                         Some(conn_data),
+                        true,
                     )
                     .await
                     .with_context(|| format!("failed to connect to nat dst: {}", nat_dst))
