@@ -9,6 +9,7 @@ use quinn_proto::{ClientConfig, Endpoint, EndpointConfig, TransportConfig, VarIn
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use bytes::Bytes;
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinSet;
 use tokio::time::sleep_until;
@@ -31,10 +32,10 @@ impl QuicController {
     }
 
     #[inline]
-    pub async fn connect(&self, addr: SocketAddr) -> Result<QuicStream, Error> {
+    pub async fn connect(&self, addr: SocketAddr, data: Option<Bytes>) -> Result<QuicStream, Error> {
         let (stream_tx, stream_rx) = oneshot::channel();
         self.cmd_tx
-            .send(QuicCmd::OpenBiStream { addr, stream_tx })
+            .send(QuicCmd::OpenBiStream { addr, data, stream_tx })
             .await?;
         let (stream_handle, evt_rx) = stream_rx.await??;
         Ok(QuicStream::new(stream_handle, evt_rx, self.cmd_tx.clone()))

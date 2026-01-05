@@ -1,5 +1,11 @@
 use crate::gateway::quic::cmd::QuicCmd;
-use crate::gateway::quic::evt::{QuicNetEvt, QuicNetEvtTx, QuicStreamEvt, QuicStreamEvtRx, QuicStreamEvtTx};
+use crate::gateway::quic::evt::{
+    QuicNetEvt, QuicNetEvtTx, QuicStreamEvt, QuicStreamEvtRx, QuicStreamEvtTx,
+};
+use crate::gateway::quic::packet::{QuicPacket, QuicPacketMargins};
+use crate::gateway::quic::stream::QuicStreamHandle;
+use crate::gateway::quic::utils::QuicBufferPool;
+use crate::gateway::quic::{SwitchedReceiver, SwitchedSender};
 use anyhow::{anyhow, Error};
 use bytes::Bytes;
 use quinn_proto::{
@@ -12,10 +18,6 @@ use std::time::Instant;
 use tokio::sync::mpsc;
 use tracing::log::trace;
 use tracing::{error, warn};
-use crate::gateway::quic::packet::{QuicPacket, QuicPacketMargins};
-use crate::gateway::quic::{SwitchedReceiver, SwitchedSender};
-use crate::gateway::quic::stream::QuicStreamHandle;
-use crate::gateway::quic::utils::QuicBufferPool;
 
 const QUIC_STREAM_EVT_BUFFER: usize = 2048;
 const QUIC_PACKET_POOL_MIN_CAPACITY: usize = 64 * 1024;
@@ -61,8 +63,12 @@ impl QuicDriver {
                 self.handle_packet_input(packet);
             }
 
-            QuicCmd::OpenBiStream { addr, stream_tx } => {
-                if let Err(e) = stream_tx.send(self.open_stream(addr, Dir::Bi)) {
+            QuicCmd::OpenBiStream {
+                addr,
+                data,
+                stream_tx,
+            } => {
+                if let Err(e) = stream_tx.send(self.open_stream(addr, Dir::Bi, data)) {
                     error!("Failed to send opened stream: {:?}", e);
                 }
             }
@@ -85,7 +91,9 @@ macro_rules! emit_transmit {
         $drv.net_evt_tx
             .try_send(QuicNetEvt::OutputPacket(QuicPacket {
                 addr: $transmit.destination,
-                payload: $drv.packet_pool.buf(&$drv.buf[0..$transmit.size], $drv.packet_margins),
+                payload: $drv
+                    .packet_pool
+                    .buf(&$drv.buf[0..$transmit.size], $drv.packet_margins),
             }))
     };
 }
@@ -95,17 +103,13 @@ impl QuicDriver {
         let now = Instant::now();
 
         self.buf.clear();
-        match self.endpoint.handle(
-            now,
-            packet.addr,
-            None,
-            None,
-            packet.payload,
-            &mut self.buf,
-        ) {
+        match self
+            .endpoint
+            .handle(now, packet.addr, None, None, packet.payload, &mut self.buf)
+        {
             Some(DatagramEvent::NewConnection(incoming)) => {
                 trace!("New connection from {:?}", incoming.remote_address());
-                
+
                 if !self.incoming_stream_tx.switch.get() {
                     trace!("Incoming stream channel is closed. Connection dropped.");
                     return;
@@ -159,6 +163,7 @@ impl QuicDriver {
         &mut self,
         addr: SocketAddr,
         dir: Dir,
+        data: Option<Bytes>,
     ) -> Result<(QuicStreamHandle, QuicStreamEvtRx), Error> {
         let conn_handle = self.connect(addr)?;
         let (conn, streams) = self
@@ -172,13 +177,17 @@ impl QuicDriver {
 
         let (evt_tx, evt_rx) = mpsc::channel(QUIC_STREAM_EVT_BUFFER);
         streams.insert(stream_id, evt_tx);
-        Ok((
-            QuicStreamHandle {
-                conn_handle,
-                stream_id,
-            },
-            evt_rx,
-        ))
+        
+        let stream_handle = QuicStreamHandle {
+            conn_handle,
+            stream_id,
+        };
+
+        if let Some(data) = data {
+            self.write_stream(stream_handle, data, false);
+        }
+        
+        Ok((stream_handle, evt_rx))
     }
 
     fn write_stream(&mut self, stream_handle: QuicStreamHandle, data: Bytes, fin: bool) {
@@ -290,9 +299,11 @@ impl QuicDriver {
                             loop {
                                 match chunks.next(usize::MAX) {
                                     Ok(Some(chunk)) => {
-                                       if let Err(e) = tx.try_send(QuicStreamEvt::Data(chunk.bytes)) {
-                                           error!("Failed to send data to stream: {:?}", e);
-                                       }
+                                        if let Err(e) =
+                                            tx.try_send(QuicStreamEvt::Data(chunk.bytes))
+                                        {
+                                            error!("Failed to send data to stream: {:?}", e);
+                                        }
                                     }
 
                                     Ok(None) => break,

@@ -170,7 +170,7 @@ impl NatDstConnector for NatDstQuicConnector {
 
             connect_tasks.spawn(async move {
                 let mut stream = quic_ctrl
-                    .connect(QuicPacketMeta::new(dst_peer_id, PacketType::QuicSrc).into())
+                    .connect(QuicPacketMeta::new(dst_peer_id, PacketType::QuicSrc).into(), None)
                     .await
                     .with_context(|| format!("failed to connect to nat dst: {}", nat_dst))?;
 

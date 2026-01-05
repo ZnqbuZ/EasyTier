@@ -15,6 +15,7 @@ pub(super) enum QuicCmd {
     // Connection
     OpenBiStream {
         addr: SocketAddr,
+        data: Option<Bytes>,
         stream_tx: oneshot::Sender<Result<(QuicStreamHandle, QuicStreamEvtRx), Error>>,
     },
     CloseConnection {
