@@ -112,12 +112,11 @@ impl QuicDriver {
 macro_rules! emit_transmit {
     ($drv:expr, $transmit:expr) => {
         $drv.net_evt_tx
-            .try_send(QuicNetEvt::OutputPacket(QuicPacket {
-                addr: $transmit.destination,
-                payload: $drv
-                    .packet_pool
+            .try_send(QuicNetEvt::OutputPacket(QuicPacket::new(
+                $transmit.destination,
+                $drv.packet_pool
                     .buf(&$drv.buf[0..$transmit.size], $drv.packet_margins),
-            }))
+            )))
     };
 }
 
@@ -246,9 +245,7 @@ impl QuicDriver {
                 //TODO: flow control
                 error!(
                     "Stream {:?} flow control limit reached ({} < {}), resetting",
-                    stream_handle,
-                    n.bytes,
-                    len
+                    stream_handle, n.bytes, len
                 );
                 let _ = stream.reset(0u32.into());
             }

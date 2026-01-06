@@ -51,10 +51,7 @@ impl QuicPacketMeta {
 
     #[inline]
     fn pack(self, data: BytesMut) -> QuicPacket {
-        QuicPacket {
-            addr: self.into(),
-            payload: data,
-        }
+        QuicPacket::new(self.into(), data)
     }
 
     #[inline]

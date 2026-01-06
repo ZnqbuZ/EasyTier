@@ -1,6 +1,5 @@
 use crate::gateway::quic::cmd::{QuicCmd, QuicCmdTx};
 use crate::gateway::quic::evt::{QuicStreamEvt, QuicStreamEvtRx};
-use crate::gateway::quic::QuicBufferPool;
 use bytes::{Bytes, BytesMut};
 use futures::SinkExt;
 use quinn_proto::{ConnectionHandle, StreamId};
@@ -9,6 +8,7 @@ use std::io::{Error, ErrorKind};
 use std::pin::Pin;
 use std::task::ready;
 use std::task::{Context, Poll};
+use derive_more::{From, Into};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio_util::sync::PollSender;
 
@@ -32,27 +32,10 @@ macro_rules! ready_tx {
     };
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, From, Into)]
 pub struct QuicStreamHandle {
     pub(super) conn_handle: ConnectionHandle,
     pub(super) stream_id: StreamId,
-}
-
-impl From<(ConnectionHandle, StreamId)> for QuicStreamHandle {
-    #[inline]
-    fn from((conn_handle, stream_id): (ConnectionHandle, StreamId)) -> Self {
-        Self {
-            conn_handle,
-            stream_id,
-        }
-    }
-}
-
-impl From<QuicStreamHandle> for (ConnectionHandle, StreamId) {
-    #[inline]
-    fn from(stream_handle: QuicStreamHandle) -> Self {
-        (stream_handle.conn_handle, stream_handle.stream_id)
-    }
 }
 
 #[derive(Debug)]

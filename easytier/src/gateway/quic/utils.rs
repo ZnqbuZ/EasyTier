@@ -1,6 +1,6 @@
 use bytes::BytesMut;
+use derive_more::{Deref, DerefMut, From, Into};
 use std::cmp::max;
-use std::ops::{Deref, DerefMut};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::sync::mpsc;
@@ -30,26 +30,12 @@ impl AtomicSwitch {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Deref, DerefMut)]
 pub struct Switched<T> {
+    #[deref]
+    #[deref_mut]
     inner: T,
     pub switch: Arc<AtomicSwitch>,
-}
-
-impl<T> Deref for Switched<T> {
-    type Target = T;
-
-    #[inline]
-    fn deref(&self) -> &Self::Target {
-        &self.inner
-    }
-}
-
-impl<T> DerefMut for Switched<T> {
-    #[inline]
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.inner
-    }
 }
 
 pub type SwitchedReceiver<T> = Switched<mpsc::Receiver<T>>;
@@ -71,27 +57,10 @@ pub fn switched_channel<T>(buffer: usize) -> (SwitchedSender<T>, SwitchedReceive
     )
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, From, Into)]
 pub struct QuicBufferMargins {
     pub header: usize,
     pub trailer: usize,
-}
-
-impl From<(usize, usize)> for QuicBufferMargins {
-    #[inline]
-    fn from(tuple: (usize, usize)) -> Self {
-        Self {
-            header: tuple.0,
-            trailer: tuple.1,
-        }
-    }
-}
-
-impl From<QuicBufferMargins> for (usize, usize) {
-    #[inline]
-    fn from(margins: QuicBufferMargins) -> Self {
-        (margins.header, margins.trailer)
-    }
 }
 
 #[derive(Debug)]

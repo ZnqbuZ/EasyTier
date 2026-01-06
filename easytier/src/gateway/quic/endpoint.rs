@@ -6,6 +6,7 @@ use crate::gateway::quic::stream::QuicStream;
 use crate::gateway::quic::{switched_channel, AtomicSwitch};
 use anyhow::{anyhow, Error};
 use bytes::Bytes;
+use derive_more::Constructor;
 use quinn_plaintext::{client_config, server_config};
 use quinn_proto::congestion::BbrConfig;
 use quinn_proto::{ClientConfig, Endpoint, EndpointConfig, TransportConfig, VarInt};
@@ -17,7 +18,7 @@ use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinSet;
 use tokio::time::sleep_until;
 
-#[derive(Debug)]
+#[derive(Debug, Constructor)]
 pub struct QuicCtrl {
     cmd_tx: QuicCmdTx,
 }
@@ -85,7 +86,12 @@ impl QuicStreamRx {
     #[inline]
     pub async fn recv(&mut self) -> Option<QuicStream> {
         let (stream_handle, evt_rx) = self.incoming_stream_rx.recv().await?;
-        Some(QuicStream::new(stream_handle, evt_rx, self.cmd_tx.clone(), true))
+        Some(QuicStream::new(
+            stream_handle,
+            evt_rx,
+            self.cmd_tx.clone(),
+            true,
+        ))
     }
 
     #[inline]
@@ -153,12 +159,7 @@ impl QuicEndpoint {
         let (net_evt_tx, net_evt_rx) = mpsc::channel(2048);
         let (incoming_stream_tx, incoming_stream_rx) = switched_channel(128);
 
-        self.ctrl = Some(
-            QuicCtrl {
-                cmd_tx: cmd_tx.clone(),
-            }
-            .into(),
-        );
+        self.ctrl = Some(QuicCtrl::new(cmd_tx.clone()).into());
         let packet_rx = QuicPacketRx {
             net_evt_rx,
             packet_margins,
