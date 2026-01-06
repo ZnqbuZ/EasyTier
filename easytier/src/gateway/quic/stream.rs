@@ -1,15 +1,19 @@
 use crate::gateway::quic::cmd::{QuicCmd, QuicCmdTx};
 use crate::gateway::quic::evt::{QuicStreamEvt, QuicStreamEvtRx};
+use async_stream::stream;
 use bytes::{Bytes, BytesMut};
-use futures::SinkExt;
+use derivative::Derivative;
+use derive_more::{From, Into};
+use futures::{SinkExt, Stream};
 use quinn_proto::{ConnectionHandle, StreamId};
-use std::cmp::min;
+use std::fmt::Debug;
 use std::io::{Error, ErrorKind};
+use std::mem::replace;
 use std::pin::Pin;
 use std::task::ready;
 use std::task::{Context, Poll};
-use derive_more::{From, Into};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+use tokio_util::io::StreamReader;
 use tokio_util::sync::PollSender;
 
 const QUIC_STREAM_FLUSH_THRESHOLD: usize = 1200;
@@ -38,20 +42,28 @@ pub struct QuicStreamHandle {
     pub(super) stream_id: StreamId,
 }
 
-#[derive(Debug)]
+type BoxedQuicStream = Pin<Box<dyn Stream<Item = Result<Bytes, Error>> + Send + Sync>>;
+type QuicStreamReader = StreamReader<BoxedQuicStream, Bytes>;
+
+#[derive(From)]
+enum QuicStreamReady {
+    Yes(QuicStreamReader),
+    No(QuicStreamEvtRx),
+    None,
+}
+
+#[derive(Derivative)]
+#[derivative(Debug)]
 pub struct QuicStream {
     stream_handle: QuicStreamHandle,
+    #[derivative(Debug = "ignore")]
+    stream_reader: QuicStreamReady,
 
-    evt_rx: QuicStreamEvtRx,
     cmd_tx: PollSender<QuicCmd>,
 
-    ready: bool,
-
-    read_pending: Option<Bytes>,
     write_buf: BytesMut,
 
     fin_sent: bool,
-    fin_received: bool,
 }
 
 impl QuicStream {
@@ -68,15 +80,18 @@ impl QuicStream {
         cmd_tx: QuicCmdTx,
         ready: bool,
     ) -> Self {
+        let stream_reader = if ready {
+            Self::build_reader(evt_rx).into()
+        } else {
+            evt_rx.into()
+        };
+
         Self {
             stream_handle,
-            evt_rx,
+            stream_reader,
             cmd_tx: PollSender::new(cmd_tx),
-            ready,
-            read_pending: None,
             write_buf: BytesMut::with_capacity(QUIC_STREAM_WRITE_BUFFER_CAPACITY),
             fin_sent: false,
-            fin_received: false,
         }
     }
 
@@ -92,93 +107,75 @@ impl QuicStream {
     }
 
     pub async fn ready(&mut self) -> Result<(), Error> {
-        if self.ready {
+        if let QuicStreamReady::Yes(_) = self.stream_reader {
             return Ok(());
         }
-
-        let evt = self.evt_rx.recv().await.ok_or_else(|| {
-            Error::new(
-                ErrorKind::UnexpectedEof,
-                "Quic stream event channel closed before ready",
-            )
-        })?;
-
-        match evt {
-            QuicStreamEvt::Ready => {}
-            _ => {
-                return Err(Error::new(
-                    ErrorKind::InvalidData,
-                    format!("Unexpected event {:?} before ready", evt),
-                ))
-            }
+        if let QuicStreamReady::None = self.stream_reader {
+            return Err(Error::other("Stream is in invalid state"));
         }
 
-        self.ready = true;
+        match replace(&mut self.stream_reader, QuicStreamReady::None) {
+            QuicStreamReady::No(mut evt_rx) => {
+                let evt = evt_rx.recv().await.ok_or_else(|| {
+                    Error::new(
+                        ErrorKind::UnexpectedEof,
+                        "Quic stream event channel closed before ready",
+                    )
+                })?;
+
+                match evt {
+                    QuicStreamEvt::Ready => {
+                        self.stream_reader = QuicStreamReady::Yes(Self::build_reader(evt_rx));
+                    }
+                    _ => {
+                        return Err(Error::new(
+                            ErrorKind::InvalidData,
+                            format!("Unexpected event {:?} before ready", evt),
+                        ));
+                    }
+                }
+            }
+            _ => unreachable!(),
+        }
         Ok(())
     }
 }
 
 impl QuicStream {
-    pub fn put_back(&mut self, data: Bytes) {
-        if data.is_empty() {
-            return;
-        }
-
-        self.read_pending = match self.read_pending.take() {
-            Some(pending) => {
-                let mut new_pending = BytesMut::with_capacity(data.len() + pending.len());
-                new_pending.extend_from_slice(&data);
-                new_pending.extend_from_slice(&pending);
-                Some(new_pending.freeze())
+    fn build_reader(mut evt_rx: QuicStreamEvtRx) -> QuicStreamReader {
+        let stream = stream! {
+            while let Some(evt) = evt_rx.recv().await {match evt {
+                    QuicStreamEvt::Data(data) => {
+                        if !data.is_empty() {
+                            yield Ok(data);
+                        }
+                    }
+                    QuicStreamEvt::Fin => {
+                        return;
+                    }
+                    QuicStreamEvt::Reset(e) => {
+                        yield Err(Error::new(ErrorKind::ConnectionReset, e));
+                        return;
+                    }
+                    _ => continue,
+                }
             }
-            None => Some(data),
         };
+
+        StreamReader::new(Box::pin(stream) as BoxedQuicStream)
     }
 }
 
 impl AsyncRead for QuicStream {
     fn poll_read(
-        mut self: Pin<&mut Self>,
+        self: Pin<&mut Self>,
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<Result<(), Error>> {
-        let mut written: bool = false;
-
-        loop {
-            if let Some(mut pending) = self.read_pending.take() {
-                let len = min(pending.len(), buf.remaining());
-                buf.put_slice(&pending.split_to(len));
-                written = true;
-                if !pending.is_empty() {
-                    self.read_pending = Some(pending);
-                    return Poll::Ready(Ok(()));
-                }
-                if buf.remaining() == 0 {
-                    return Poll::Ready(Ok(()));
-                }
-            }
-
-            if self.fin_received {
-                return Poll::Ready(Ok(()));
-            }
-
-            match self.evt_rx.poll_recv(cx) {
-                Poll::Ready(Some(event)) => match event {
-                    QuicStreamEvt::Data(data) => {
-                        if data.is_empty() {
-                            continue;
-                        }
-                        self.read_pending = Some(data);
-                    }
-                    QuicStreamEvt::Fin => self.fin_received = true,
-                    QuicStreamEvt::Reset(e) => {
-                        return Poll::Ready(Err(Error::new(ErrorKind::ConnectionReset, e)))
-                    }
-                    _ => continue,
-                },
-                Poll::Pending if !written => return Poll::Pending,
-                _ => return Poll::Ready(Ok(())),
-            }
+        if let QuicStreamReady::Yes(stream_reader) = &mut self.get_mut().stream_reader {
+            Pin::new(stream_reader).poll_read(cx, buf)
+        } else {
+            Err(Error::other("Stream is not ready. Did you call ready()?")).into()
         }
     }
 }
