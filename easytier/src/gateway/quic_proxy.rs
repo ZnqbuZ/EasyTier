@@ -3,8 +3,7 @@ use crate::common::global_ctx::{ArcGlobalCtx, GlobalCtx};
 use crate::common::PeerId;
 use crate::gateway::kcp_proxy::{ProxyAclHandler, TcpProxyForKcpSrcTrait};
 use crate::gateway::quic::{
-    QuicCtrl, QuicEndpoint, QuicPacket, QuicPacketRx, QuicStream, QuicStreamHandle,
-    QuicStreamRx,
+    QuicCtrl, QuicEndpoint, QuicPacket, QuicPacketRx, QuicStream, QuicStreamHandle, QuicStreamRx,
 };
 use crate::gateway::tcp_proxy::{NatDstConnector, TcpProxy};
 use crate::gateway::CidrSet;
@@ -20,7 +19,7 @@ use crate::proto::rpc_types;
 use crate::proto::rpc_types::controller::BaseController;
 use crate::tunnel::packet_def::{PacketType, PeerManagerHeader, ZCPacket, ZCPacketType};
 use anyhow::{anyhow, Context, Error};
-use bytes::{Buf, BufMut, Bytes, BytesMut};
+use bytes::{BufMut, Bytes, BytesMut};
 use dashmap::DashMap;
 use derivative::Derivative;
 use pnet::packet::ipv4::Ipv4Packet;
@@ -28,7 +27,7 @@ use prost::Message;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::{Arc, Weak};
 use std::time::Duration;
-use tokio::io::{AsyncRead, AsyncReadExt};
+use tokio::io::AsyncReadExt;
 use tokio::select;
 use tokio::task::JoinSet;
 use tracing::{debug, error, instrument, trace};
@@ -355,33 +354,11 @@ impl QuicStreamReceiver {
         }
     }
 
-    async fn read_until<R: AsyncRead + Unpin>(
-        reader: &mut R,
-        buf: &mut BytesMut,
-        target_len: usize,
-    ) -> Result<(), Error> {
-        if buf.capacity() < target_len {
-            buf.reserve(target_len - buf.len());
-        }
-        while buf.len() < target_len {
-            if reader.read_buf(buf).await? == 0 {
-                return Err(anyhow!("reader closed before reading enough data"));
-            }
-        }
-        Ok(())
-    }
-
     async fn read_stream_header(stream: &mut QuicStream) -> Result<Bytes, Error> {
-        let mut buf = BytesMut::with_capacity(2048);
-        Self::read_until(stream, &mut buf, 2).await?;
-        let header_len = buf.get_u16() as usize;
-        if header_len > buf.capacity() {
-            return Err(anyhow!("header too large: {}", header_len));
-        }
-        Self::read_until(stream, &mut buf, header_len).await?;
-        let header = buf.split_to(header_len).freeze();
-        stream.put_back(buf.freeze());
-        Ok(header)
+        let len = stream.read_u16().await?;
+        let mut header = Vec::with_capacity(len as usize);
+        stream.take(len as u64).read_to_end(&mut header).await?;
+        Ok(header.into())
     }
 
     #[instrument(ret)]
