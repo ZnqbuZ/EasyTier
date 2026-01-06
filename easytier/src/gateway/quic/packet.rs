@@ -1,7 +1,7 @@
 use crate::gateway::quic::QuicBufferMargins;
 use bytes::BytesMut;
-use std::net::SocketAddr;
 use derive_more::Constructor;
+use std::net::SocketAddr;
 
 #[derive(Debug, Constructor)]
 pub struct QuicPacket {
