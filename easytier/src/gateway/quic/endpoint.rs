@@ -18,11 +18,11 @@ use tokio::task::JoinSet;
 use tokio::time::sleep_until;
 
 #[derive(Debug)]
-pub struct QuicController {
+pub struct QuicCtrl {
     cmd_tx: QuicCmdTx,
 }
 
-impl QuicController {
+impl QuicCtrl {
     #[inline]
     pub async fn send(&self, packet: QuicPacket) -> Result<(), Error> {
         self.cmd_tx
@@ -97,7 +97,7 @@ impl QuicStreamRx {
 pub struct QuicEndpoint {
     endpoint: Option<Endpoint>,
     client_config: ClientConfig,
-    ctrl: Option<Arc<QuicController>>,
+    ctrl: Option<Arc<QuicCtrl>>,
     tasks: JoinSet<()>,
 }
 
@@ -154,7 +154,7 @@ impl QuicEndpoint {
         let (incoming_stream_tx, incoming_stream_rx) = switched_channel(128);
 
         self.ctrl = Some(
-            QuicController {
+            QuicCtrl {
                 cmd_tx: cmd_tx.clone(),
             }
             .into(),
@@ -193,7 +193,7 @@ impl QuicEndpoint {
     }
 
     #[inline]
-    pub fn ctrl(&self) -> Result<Arc<QuicController>, Error> {
+    pub fn ctrl(&self) -> Result<Arc<QuicCtrl>, Error> {
         self.ctrl.clone().ok_or(anyhow!(
             "Failed to get QUIC controller. Is QUIC endpoint running?"
         ))

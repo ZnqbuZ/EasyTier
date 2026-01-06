@@ -3,7 +3,7 @@ use crate::common::global_ctx::{ArcGlobalCtx, GlobalCtx};
 use crate::common::PeerId;
 use crate::gateway::kcp_proxy::{ProxyAclHandler, TcpProxyForKcpSrcTrait};
 use crate::gateway::quic::{
-    QuicController, QuicEndpoint, QuicPacket, QuicPacketRx, QuicStream, QuicStreamHandle,
+    QuicCtrl, QuicEndpoint, QuicPacket, QuicPacketRx, QuicStream, QuicStreamHandle,
     QuicStreamRx,
 };
 use crate::gateway::tcp_proxy::{NatDstConnector, TcpProxy};
@@ -98,7 +98,7 @@ type QuicConnData = KcpConnData;
 
 #[derive(Debug, Clone)]
 pub struct NatDstQuicConnector {
-    pub(crate) quic_ctrl: Arc<QuicController>,
+    pub(crate) quic_ctrl: Arc<QuicCtrl>,
     pub(crate) peer_mgr: Weak<PeerManager>,
 }
 
@@ -258,7 +258,7 @@ impl QuicProxyRole {
 // Receive packets from peers and forward them to the QUIC endpoint
 #[derive(Debug)]
 struct QuicPacketReceiver {
-    quic_ctrl: Arc<QuicController>,
+    quic_ctrl: Arc<QuicCtrl>,
     role: QuicProxyRole,
 }
 
@@ -609,7 +609,7 @@ impl QuicProxy {
 }
 
 pub struct QuicProxySrc {
-    quic_ctrl: Arc<QuicController>,
+    quic_ctrl: Arc<QuicCtrl>,
     peer_mgr: Arc<PeerManager>,
 
     tcp_proxy: TcpProxyForQuicSrc,
@@ -642,7 +642,7 @@ impl QuicProxySrc {
 }
 
 pub struct QuicProxyDst {
-    quic_ctrl: Arc<QuicController>,
+    quic_ctrl: Arc<QuicCtrl>,
     peer_mgr: Arc<PeerManager>,
 
     stream_ctx: Arc<QuicStreamContext>,
