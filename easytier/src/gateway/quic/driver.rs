@@ -1,9 +1,7 @@
 use crate::gateway::quic::cmd::QuicCmd;
-use crate::gateway::quic::evt::{
-    QuicNetEvt, QuicNetEvtTx, QuicStreamEvt, QuicStreamEvtRx, QuicStreamEvtTx,
-};
+use crate::gateway::quic::evt::{QuicNetEvt, QuicNetEvtTx, QuicStreamEvt, QuicStreamEvtTx};
 use crate::gateway::quic::packet::{QuicPacket, QuicPacketMargins};
-use crate::gateway::quic::stream::QuicStreamHandle;
+use crate::gateway::quic::stream::{QuicStreamCtx, QuicStreamFlowCtrl, QuicStreamHdl};
 use crate::gateway::quic::utils::QuicBufferPool;
 use crate::gateway::quic::{SwitchedReceiver, SwitchedSender};
 use anyhow::{anyhow, Error};
@@ -14,6 +12,7 @@ use quinn_proto::{
 };
 use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::mpsc;
 use tracing::{error, trace, warn};
@@ -21,15 +20,21 @@ use tracing::{error, trace, warn};
 const QUIC_STREAM_EVT_BUFFER: usize = 2048;
 const QUIC_PACKET_POOL_MIN_CAPACITY: usize = 64 * 1024;
 
-pub type QuicStreamPartsTx = SwitchedSender<(QuicStreamHandle, QuicStreamEvtRx)>;
-pub type QuicStreamPartsRx = SwitchedReceiver<(QuicStreamHandle, QuicStreamEvtRx)>;
+pub type QuicStreamCtxTx = SwitchedSender<QuicStreamCtx>;
+pub type QuicStreamCtxRx = SwitchedReceiver<QuicStreamCtx>;
+
+#[derive(Debug)]
+struct QuicStreamDrvCtx {
+    tx: QuicStreamEvtTx,
+    ctrl: Arc<QuicStreamFlowCtrl>,
+}
 
 pub(super) struct QuicDriver {
-    conns: HashMap<ConnectionHandle, (Connection, HashMap<StreamId, QuicStreamEvtTx>)>,
+    conns: HashMap<ConnectionHandle, (Connection, HashMap<StreamId, QuicStreamDrvCtx>)>,
     endpoint: Endpoint,
     client_config: ClientConfig,
     net_evt_tx: QuicNetEvtTx,
-    incoming_stream_tx: QuicStreamPartsTx,
+    incoming_stream_tx: QuicStreamCtxTx,
     buf: Vec<u8>,
     packet_pool: QuicBufferPool,
     packet_margins: QuicPacketMargins,
@@ -40,7 +45,7 @@ impl QuicDriver {
         endpoint: Endpoint,
         client_config: ClientConfig,
         net_evt_tx: QuicNetEvtTx,
-        incoming_stream_tx: QuicStreamPartsTx,
+        incoming_stream_tx: QuicStreamCtxTx,
         packet_margins: QuicPacketMargins,
     ) -> Self {
         Self {
@@ -73,34 +78,34 @@ impl QuicDriver {
             }
 
             QuicCmd::StreamWrite {
-                stream_handle,
+                stream_hdl,
                 data,
                 fin,
             } => {
-                self.write_stream(stream_handle, data, fin);
+                self.write_stream(stream_hdl, data, fin);
             }
 
             QuicCmd::ResetStream {
-                stream_handle,
+                stream_hdl,
                 error_code,
             } => {
-                if let Some((conn, _)) = self.conns.get_mut(&stream_handle.conn_handle) {
+                if let Some((conn, _)) = self.conns.get_mut(&stream_hdl.conn_hdl) {
                     let _ = conn
-                        .send_stream(stream_handle.stream_id)
+                        .send_stream(stream_hdl.stream_id)
                         .reset(error_code.into());
-                    self.process_conn(stream_handle.conn_handle);
+                    self.process_conn(stream_hdl.conn_hdl);
                 }
             }
 
             QuicCmd::StopStream {
-                stream_handle,
+                stream_hdl,
                 error_code,
             } => {
-                if let Some((conn, _)) = self.conns.get_mut(&stream_handle.conn_handle) {
+                if let Some((conn, _)) = self.conns.get_mut(&stream_hdl.conn_hdl) {
                     let _ = conn
-                        .recv_stream(stream_handle.stream_id)
+                        .recv_stream(stream_hdl.stream_id)
                         .stop(error_code.into());
-                    self.process_conn(stream_handle.conn_handle);
+                    self.process_conn(stream_hdl.conn_hdl);
                 }
             }
 
@@ -138,10 +143,10 @@ impl QuicDriver {
                 }
 
                 match self.endpoint.accept(incoming, now, &mut self.buf, None) {
-                    Ok((conn_handle, conn)) => {
-                        trace!("Accepted connection {:?}", conn_handle);
-                        self.conns.insert(conn_handle, (conn, HashMap::new()));
-                        self.process_conn(conn_handle);
+                    Ok((conn_hdl, conn)) => {
+                        trace!("Accepted connection {:?}", conn_hdl);
+                        self.conns.insert(conn_hdl, (conn, HashMap::new()));
+                        self.process_conn(conn_hdl);
                     }
                     Err(e) => {
                         error!("Failed to accept connection: {:?}", e);
@@ -149,10 +154,10 @@ impl QuicDriver {
                 }
             }
 
-            Some(DatagramEvent::ConnectionEvent(conn_handle, event)) => {
-                if let Some((conn, _)) = self.conns.get_mut(&conn_handle) {
+            Some(DatagramEvent::ConnectionEvent(conn_hdl, event)) => {
+                if let Some((conn, _)) = self.conns.get_mut(&conn_hdl) {
                     conn.handle_event(event);
-                    self.process_conn(conn_handle);
+                    self.process_conn(conn_hdl);
                 }
             }
 
@@ -165,20 +170,33 @@ impl QuicDriver {
     }
 
     fn connect(&mut self, addr: SocketAddr) -> Result<ConnectionHandle, ConnectError> {
-        if let Some((conn_handle, _)) = self
+        if let Some((conn_hdl, _)) = self
             .conns
             .iter()
             .find(|(_, (conn, _))| conn.remote_address() == addr)
         {
-            return Ok(*conn_handle);
+            return Ok(*conn_hdl);
         }
 
-        let (conn_handle, conn) =
+        let (conn_hdl, conn) =
             self.endpoint
                 .connect(Instant::now(), self.client_config.clone(), addr, "")?;
-        self.conns.insert(conn_handle, (conn, HashMap::new()));
-        self.process_conn(conn_handle);
-        Ok(conn_handle)
+        self.conns.insert(conn_hdl, (conn, HashMap::new()));
+        self.process_conn(conn_hdl);
+        Ok(conn_hdl)
+    }
+
+    fn new_stream_ctx(stream_hdl: QuicStreamHdl) -> (QuicStreamCtx, QuicStreamDrvCtx) {
+        let (tx, rx) = mpsc::channel(QUIC_STREAM_EVT_BUFFER);
+        let ctrl: Arc<_> = QuicStreamFlowCtrl::new().into();
+        (
+            QuicStreamCtx {
+                hdl: stream_hdl,
+                rx,
+                ctrl: ctrl.clone(),
+            },
+            QuicStreamDrvCtx { tx, ctrl },
+        )
     }
 
     fn open_stream(
@@ -186,57 +204,50 @@ impl QuicDriver {
         addr: SocketAddr,
         dir: Dir,
         data: Option<Bytes>,
-    ) -> Result<(QuicStreamHandle, QuicStreamEvtRx), Error> {
-        let conn_handle = self.connect(addr)?;
+    ) -> Result<QuicStreamCtx, Error> {
+        let conn_hdl = self.connect(addr)?;
         let (conn, streams) = self
             .conns
-            .get_mut(&conn_handle)
-            .ok_or_else(|| anyhow!("Failed to find connection {:?}", conn_handle))?;
+            .get_mut(&conn_hdl)
+            .ok_or_else(|| anyhow!("Failed to find connection {:?}", conn_hdl))?;
         let stream_id = conn
             .streams()
             .open(dir)
             .ok_or_else(|| anyhow!("Failed to open stream"))?;
 
-        let (evt_tx, evt_rx) = mpsc::channel(QUIC_STREAM_EVT_BUFFER);
+        let stream_hdl: QuicStreamHdl = (conn_hdl, stream_id).into();
+        let (ctx, drv_ctx) = Self::new_stream_ctx(stream_hdl);
         if !conn.is_handshaking() {
-            evt_tx.try_send(QuicStreamEvt::Ready)?;
+            drv_ctx.tx.try_send(QuicStreamEvt::Ready)?;
         }
-        streams.insert(stream_id, evt_tx);
-
-        let stream_handle = QuicStreamHandle {
-            conn_handle,
-            stream_id,
-        };
+        streams.insert(stream_id, drv_ctx);
 
         if let Some(data) = data {
-            self.write_stream(stream_handle, data, false);
+            self.write_stream(stream_hdl, data, false);
         }
 
-        Ok((stream_handle, evt_rx))
+        Ok(ctx)
     }
 
-    fn write_stream(&mut self, stream_handle: QuicStreamHandle, data: Bytes, fin: bool) {
-        let conn_handle = stream_handle.conn_handle;
+    fn write_stream(&mut self, stream_hdl: QuicStreamHdl, data: Bytes, fin: bool) {
+        let conn_hdl = stream_hdl.conn_hdl;
 
-        let (conn, _) = match self.conns.get_mut(&conn_handle) {
+        let (conn, _) = match self.conns.get_mut(&conn_hdl) {
             Some(c) => c,
             None => {
-                warn!(
-                    "write_stream ignored: connection {:?} not found",
-                    conn_handle
-                );
+                warn!("write_stream ignored: connection {:?} not found", conn_hdl);
                 return;
             }
         };
 
-        let mut stream = conn.send_stream(stream_handle.stream_id);
+        let mut stream = conn.send_stream(stream_hdl.stream_id);
         let len = data.len();
 
         match stream.write_chunks(&mut [data]) {
             Ok(n) if n.bytes == len => {
                 if fin {
                     if let Err(e) = stream.finish() {
-                        error!("Failed to finish stream {:?}: {:?}", stream_handle, e);
+                        error!("Failed to finish stream {:?}: {:?}", stream_hdl, e);
                     }
                 }
             }
@@ -245,26 +256,26 @@ impl QuicDriver {
                 //TODO: flow control
                 error!(
                     "Stream {:?} flow control limit reached ({} < {}), resetting",
-                    stream_handle, n.bytes, len
+                    stream_hdl, n.bytes, len
                 );
                 let _ = stream.reset(0u32.into());
             }
 
             Err(e) => {
-                error!("Failed to write to stream {:?}: {:?}", stream_handle, e);
+                error!("Failed to write to stream {:?}: {:?}", stream_hdl, e);
                 let _ = stream.reset(0u32.into());
             }
         }
 
-        self.process_conn(conn_handle);
+        self.process_conn(conn_hdl);
     }
 }
 
 impl QuicDriver {
-    fn process_conn(&mut self, conn_handle: ConnectionHandle) {
+    fn process_conn(&mut self, conn_hdl: ConnectionHandle) {
         let mut rm_conn = false;
 
-        let (conn, streams) = match self.conns.get_mut(&conn_handle) {
+        let (conn, streams) = match self.conns.get_mut(&conn_hdl) {
             Some(c) => c,
             None => return,
         };
@@ -272,17 +283,17 @@ impl QuicDriver {
         while let Some(evt) = conn.poll() {
             match evt {
                 Event::Connected => {
-                    trace!("Connection established {:?}", conn_handle);
-                    for evt_tx in streams.values() {
-                        let _ = evt_tx.try_send(QuicStreamEvt::Ready);
+                    trace!("Connection established {:?}", conn_hdl);
+                    for ctx in streams.values() {
+                        let _ = ctx.tx.try_send(QuicStreamEvt::Ready);
                     }
                 }
 
                 Event::ConnectionLost { reason } => {
                     error!("Connection lost: {:?}", reason);
                     rm_conn = true;
-                    for tx in streams.values() {
-                        let _ = tx.try_send(QuicStreamEvt::Reset(format!(
+                    for ctx in streams.values() {
+                        let _ = ctx.tx.try_send(QuicStreamEvt::Reset(format!(
                             "Connection lost: {:?}",
                             reason.to_string()
                         )));
@@ -295,26 +306,29 @@ impl QuicDriver {
                             trace!(
                                 "Accepted new stream: {:?} on connection {:?}",
                                 stream_id,
-                                conn_handle
+                                conn_hdl
                             );
 
                             let (evt_tx, evt_rx) = mpsc::channel(QUIC_STREAM_EVT_BUFFER);
-                            if let Err(e) = self.incoming_stream_tx.try_send((
-                                QuicStreamHandle {
-                                    conn_handle,
-                                    stream_id,
-                                },
-                                evt_rx,
-                            )) {
+                            let flow_ctrl: Arc<_> = QuicStreamFlowCtrl::new().into();
+                            if let Err(e) = self.incoming_stream_tx.try_send(
+                                ((conn_hdl, stream_id).into(), evt_rx, flow_ctrl.clone()).into(),
+                            ) {
                                 error!("Failed to hand off stream: {:?}", e);
                             } else {
-                                streams.insert(stream_id, evt_tx);
+                                streams.insert(
+                                    stream_id,
+                                    QuicStreamDrvCtx {
+                                        tx: evt_tx,
+                                        ctrl: flow_ctrl,
+                                    },
+                                );
                             }
                         }
                     }
 
                     StreamEvent::Readable { id } => {
-                        if let Some(tx) = streams.get_mut(&id) {
+                        if let Some(ctx) = streams.get_mut(&id) {
                             let mut stream = conn.recv_stream(id);
                             let mut chunks = match stream.read(true) {
                                 Ok(chunks) => chunks,
@@ -329,14 +343,14 @@ impl QuicDriver {
                                 match chunks.next(usize::MAX) {
                                     Ok(Some(chunk)) => {
                                         if let Err(e) =
-                                            tx.try_send(QuicStreamEvt::Data(chunk.bytes))
+                                            ctx.tx.try_send(QuicStreamEvt::Data(chunk.bytes))
                                         {
                                             error!("Failed to send data to stream: {:?}", e);
                                         }
                                     }
 
                                     Ok(None) => {
-                                        if let Err(e) = tx.try_send(QuicStreamEvt::Fin) {
+                                        if let Err(e) = ctx.tx.try_send(QuicStreamEvt::Fin) {
                                             error!("Failed to send fin to stream: {:?}", e);
                                         }
                                         break;
@@ -345,7 +359,7 @@ impl QuicDriver {
                                     Err(e) => {
                                         if let ReadError::Reset(code) = e {
                                             if let Err(e) =
-                                                tx.try_send(QuicStreamEvt::Reset(format!(
+                                                ctx.tx.try_send(QuicStreamEvt::Reset(format!(
                                                 "Failed to read from stream. Error code: {code}"
                                             ))) {
                                                 error!("Failed to send reset to stream: {:?}", e);
@@ -359,8 +373,8 @@ impl QuicDriver {
                     }
 
                     StreamEvent::Stopped { id, error_code } => {
-                        if let Some(tx) = streams.get_mut(&id) {
-                            let _ = tx.try_send(QuicStreamEvt::Reset(format!(
+                        if let Some(ctx) = streams.get_mut(&id) {
+                            let _ = ctx.tx.try_send(QuicStreamEvt::Reset(format!(
                                 "Remote stop: {error_code}"
                             )));
                         }
@@ -388,7 +402,7 @@ impl QuicDriver {
         }
 
         if rm_conn {
-            self.conns.remove(&conn_handle);
+            self.conns.remove(&conn_hdl);
         }
     }
 }
@@ -400,18 +414,18 @@ impl QuicDriver {
         let expired_handles: Vec<_> = self
             .conns
             .iter_mut()
-            .filter_map(|(conn_handle, (conn, _))| {
+            .filter_map(|(conn_hdl, (conn, _))| {
                 conn.poll_timeout()
-                    .and_then(|t| if t <= now { Some(*conn_handle) } else { None })
+                    .and_then(|t| if t <= now { Some(*conn_hdl) } else { None })
             })
             .collect();
 
-        for conn_handle in expired_handles {
-            if let Some((conn, _)) = self.conns.get_mut(&conn_handle) {
+        for conn_hdl in expired_handles {
+            if let Some((conn, _)) = self.conns.get_mut(&conn_hdl) {
                 conn.handle_timeout(now);
             }
 
-            self.process_conn(conn_handle);
+            self.process_conn(conn_hdl);
         }
     }
 

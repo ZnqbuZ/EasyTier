@@ -3,7 +3,7 @@ use crate::common::global_ctx::{ArcGlobalCtx, GlobalCtx};
 use crate::common::PeerId;
 use crate::gateway::kcp_proxy::{ProxyAclHandler, TcpProxyForKcpSrcTrait};
 use crate::gateway::quic::{
-    QuicCtrl, QuicEndpoint, QuicPacket, QuicPacketRx, QuicStream, QuicStreamHandle, QuicStreamRx,
+    QuicCtrl, QuicEndpoint, QuicPacket, QuicPacketRx, QuicStream, QuicStreamHdl, QuicStreamRx,
 };
 use crate::gateway::tcp_proxy::{NatDstConnector, TcpProxy};
 use crate::gateway::CidrSet;
@@ -319,7 +319,7 @@ impl QuicPacketSender {
 #[derivative(Debug)]
 struct QuicStreamContext {
     global_ctx: ArcGlobalCtx,
-    proxy_entries: Arc<DashMap<QuicStreamHandle, TcpProxyEntry>>,
+    proxy_entries: Arc<DashMap<QuicStreamHdl, TcpProxyEntry>>,
     cidr_set: Arc<CidrSet>,
     #[derivative(Debug = "ignore")]
     route: Arc<dyn crate::peers::route_trait::Route + Send + Sync + 'static>,
@@ -635,7 +635,7 @@ impl QuicProxyDst {
 }
 
 #[derive(Clone)]
-pub struct QuicProxyDstRpcService(Weak<DashMap<QuicStreamHandle, TcpProxyEntry>>);
+pub struct QuicProxyDstRpcService(Weak<DashMap<QuicStreamHdl, TcpProxyEntry>>);
 
 impl QuicProxyDstRpcService {
     pub fn new(quic_proxy_dst: &QuicProxyDst) -> Self {

@@ -1,6 +1,6 @@
-use crate::gateway::quic::evt::QuicStreamEvtRx;
 use crate::gateway::quic::packet::QuicPacket;
-use crate::gateway::quic::stream::QuicStreamHandle;
+use crate::gateway::quic::stream::QuicStreamHdl;
+use crate::gateway::quic::QuicStreamCtx;
 use anyhow::Error;
 use bytes::Bytes;
 use quinn_proto::ConnectionHandle;
@@ -16,25 +16,25 @@ pub(super) enum QuicCmd {
     OpenBiStream {
         addr: SocketAddr,
         data: Option<Bytes>,
-        stream_tx: oneshot::Sender<Result<(QuicStreamHandle, QuicStreamEvtRx), Error>>,
+        stream_tx: oneshot::Sender<Result<QuicStreamCtx, Error>>,
     },
     CloseConnection {
-        conn_handle: ConnectionHandle,
+        conn_hdl: ConnectionHandle,
         error_code: u32,
         reason: Bytes,
     },
     // Stream
     StreamWrite {
-        stream_handle: QuicStreamHandle,
+        stream_hdl: QuicStreamHdl,
         data: Bytes,
         fin: bool,
     },
     StopStream {
-        stream_handle: QuicStreamHandle,
+        stream_hdl: QuicStreamHdl,
         error_code: u32,
     },
     ResetStream {
-        stream_handle: QuicStreamHandle,
+        stream_hdl: QuicStreamHdl,
         error_code: u32,
     },
 }

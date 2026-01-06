@@ -1,5 +1,5 @@
 use crate::gateway::quic::cmd::{QuicCmd, QuicCmdTx};
-use crate::gateway::quic::driver::{QuicDriver, QuicStreamPartsRx};
+use crate::gateway::quic::driver::{QuicDriver, QuicStreamCtxRx};
 use crate::gateway::quic::evt::{QuicNetEvt, QuicNetEvtRx};
 use crate::gateway::quic::packet::{QuicPacket, QuicPacketMargins};
 use crate::gateway::quic::stream::QuicStream;
@@ -47,8 +47,7 @@ impl QuicCtrl {
                 stream_tx,
             })
             .await?;
-        let (stream_handle, evt_rx) = stream_rx.await??;
-        let mut stream = QuicStream::new(stream_handle, evt_rx, self.cmd_tx.clone(), false);
+        let mut stream = QuicStream::new(stream_rx.await??, self.cmd_tx.clone(), false);
         if wait {
             stream.ready().await?;
         }
@@ -79,16 +78,14 @@ impl QuicPacketRx {
 #[derive(Debug)]
 pub struct QuicStreamRx {
     cmd_tx: QuicCmdTx,
-    incoming_stream_rx: QuicStreamPartsRx,
+    incoming_stream_rx: QuicStreamCtxRx,
 }
 
 impl QuicStreamRx {
     #[inline]
     pub async fn recv(&mut self) -> Option<QuicStream> {
-        let (stream_handle, evt_rx) = self.incoming_stream_rx.recv().await?;
         Some(QuicStream::new(
-            stream_handle,
-            evt_rx,
+            self.incoming_stream_rx.recv().await?,
             self.cmd_tx.clone(),
             true,
         ))

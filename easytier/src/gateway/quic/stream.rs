@@ -7,11 +7,15 @@ use quinn_proto::{ConnectionHandle, StreamId};
 use std::cmp::min;
 use std::io::{Error, ErrorKind};
 use std::pin::Pin;
+use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 use std::task::ready;
 use std::task::{Context, Poll};
+use futures::task::AtomicWaker;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio_util::sync::PollSender;
 
+const QUIC_STREAM_WRITE_POOL_CAPACITY: usize = 16;
 const QUIC_STREAM_FLUSH_THRESHOLD: usize = 1200;
 const QUIC_STREAM_WRITE_BUFFER_CAPACITY: usize = 2 * QUIC_STREAM_FLUSH_THRESHOLD;
 
@@ -33,16 +37,37 @@ macro_rules! ready_tx {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, From, Into)]
-pub struct QuicStreamHandle {
-    pub(super) conn_handle: ConnectionHandle,
+pub struct QuicStreamHdl {
+    pub(super) conn_hdl: ConnectionHandle,
     pub(super) stream_id: StreamId,
 }
 
 #[derive(Debug)]
-pub struct QuicStream {
-    stream_handle: QuicStreamHandle,
+pub(super) struct QuicStreamFlowCtrl {
+    blocked: AtomicBool,
+    waker: AtomicWaker,
+}
 
-    evt_rx: QuicStreamEvtRx,
+impl QuicStreamFlowCtrl {
+    pub fn new() -> Self {
+        Self {
+            blocked: AtomicBool::new(false),
+            waker: AtomicWaker::new(),
+        }
+    }
+}
+
+#[derive(Debug, From, Into)]
+pub(super) struct QuicStreamCtx {
+    pub(super) hdl: QuicStreamHdl,
+    pub(super) rx: QuicStreamEvtRx,
+    pub(super) ctrl: Arc<QuicStreamFlowCtrl>,
+}
+
+#[derive(Debug)]
+pub struct QuicStream {
+    ctx: QuicStreamCtx,
+    
     cmd_tx: PollSender<QuicCmd>,
 
     ready: bool,
@@ -56,21 +81,19 @@ pub struct QuicStream {
 
 impl QuicStream {
     #[inline]
-    pub fn handle(&self) -> QuicStreamHandle {
-        self.stream_handle
+    pub fn handle(&self) -> QuicStreamHdl {
+        self.ctx.hdl
     }
 }
 
 impl QuicStream {
     pub(super) fn new(
-        stream_handle: QuicStreamHandle,
-        evt_rx: QuicStreamEvtRx,
+        ctx: QuicStreamCtx,
         cmd_tx: QuicCmdTx,
         ready: bool,
     ) -> Self {
         Self {
-            stream_handle,
-            evt_rx,
+            ctx,
             cmd_tx: PollSender::new(cmd_tx),
             ready,
             read_pending: None,
@@ -84,7 +107,7 @@ impl QuicStream {
         check_tx!(
             self.cmd_tx
                 .send(QuicCmd::ResetStream {
-                    stream_handle: self.stream_handle,
+                    stream_hdl: self.ctx.hdl,
                     error_code,
                 })
                 .await
@@ -96,7 +119,7 @@ impl QuicStream {
             return Ok(());
         }
 
-        let evt = self.evt_rx.recv().await.ok_or_else(|| {
+        let evt = self.ctx.rx.recv().await.ok_or_else(|| {
             Error::new(
                 ErrorKind::UnexpectedEof,
                 "Quic stream event channel closed before ready",
@@ -144,7 +167,7 @@ impl AsyncRead for QuicStream {
                 return Poll::Ready(Ok(()));
             }
 
-            match self.evt_rx.poll_recv(cx) {
+            match self.ctx.rx.poll_recv(cx) {
                 Poll::Ready(Some(event)) => match event {
                     QuicStreamEvt::Data(data) => {
                         if data.is_empty() {
@@ -169,7 +192,7 @@ impl QuicStream {
     #[inline]
     fn send_write_cmd(mut self: Pin<&mut Self>, data: Bytes, fin: bool) -> Result<(), Error> {
         let cmd = QuicCmd::StreamWrite {
-            stream_handle: self.stream_handle,
+            stream_hdl: self.ctx.hdl,
             data,
             fin,
         };
