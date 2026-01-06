@@ -231,9 +231,10 @@ impl QuicDriver {
         };
 
         let mut stream = conn.send_stream(stream_handle.stream_id);
+        let len = data.len();
 
-        match stream.write(&data) {
-            Ok(n) if n == data.len() => {
+        match stream.write_chunks(&mut [data]) {
+            Ok(n) if n.bytes == len => {
                 if fin {
                     if let Err(e) = stream.finish() {
                         error!("Failed to finish stream {:?}: {:?}", stream_handle, e);
@@ -246,8 +247,8 @@ impl QuicDriver {
                 error!(
                     "Stream {:?} flow control limit reached ({} < {}), resetting",
                     stream_handle,
-                    n,
-                    data.len()
+                    n.bytes,
+                    len
                 );
                 let _ = stream.reset(0u32.into());
             }
