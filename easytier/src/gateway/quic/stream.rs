@@ -1,6 +1,7 @@
 use crate::gateway::quic::cmd::{QuicCmd, QuicCmdTx};
 use crate::gateway::quic::evt::{QuicStreamEvt, QuicStreamEvtRx};
 use bytes::{Bytes, BytesMut};
+use derive_more::{From, Into};
 use futures::SinkExt;
 use quinn_proto::{ConnectionHandle, StreamId};
 use std::cmp::min;
@@ -8,7 +9,6 @@ use std::io::{Error, ErrorKind};
 use std::pin::Pin;
 use std::task::ready;
 use std::task::{Context, Poll};
-use derive_more::{From, Into};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio_util::sync::PollSender;
 
@@ -115,24 +115,6 @@ impl QuicStream {
 
         self.ready = true;
         Ok(())
-    }
-}
-
-impl QuicStream {
-    pub fn put_back(&mut self, data: Bytes) {
-        if data.is_empty() {
-            return;
-        }
-
-        self.read_pending = match self.read_pending.take() {
-            Some(pending) => {
-                let mut new_pending = BytesMut::with_capacity(data.len() + pending.len());
-                new_pending.extend_from_slice(&data);
-                new_pending.extend_from_slice(&pending);
-                Some(new_pending.freeze())
-            }
-            None => Some(data),
-        };
     }
 }
 
