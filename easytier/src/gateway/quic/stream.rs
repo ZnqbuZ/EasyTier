@@ -12,6 +12,9 @@ use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio_util::sync::PollSender;
 
+const QUIC_STREAM_FLUSH_THRESHOLD: usize = 1200;
+const QUIC_STREAM_WRITE_BUFFER_CAPACITY: usize = 2 * QUIC_STREAM_FLUSH_THRESHOLD;
+
 macro_rules! check_tx {
     ($e:expr) => {
         $e.map_err(|e| {
@@ -62,13 +65,14 @@ pub struct QuicStream {
     ready: bool,
 
     read_pending: Option<Bytes>,
-    write_pool: QuicBufferPool,
+    write_buf: BytesMut,
 
     fin_sent: bool,
     fin_received: bool,
 }
 
 impl QuicStream {
+    #[inline]
     pub fn handle(&self) -> QuicStreamHandle {
         self.stream_handle
     }
@@ -87,7 +91,7 @@ impl QuicStream {
             cmd_tx: PollSender::new(cmd_tx),
             ready,
             read_pending: None,
-            write_pool: QuicBufferPool::new(8192),
+            write_buf: BytesMut::with_capacity(QUIC_STREAM_WRITE_BUFFER_CAPACITY),
             fin_sent: false,
             fin_received: false,
         }
@@ -149,16 +153,6 @@ impl QuicStream {
     }
 }
 
-impl QuicStream {
-    fn new_write_cmd(&self, data: Bytes, fin: bool) -> QuicCmd {
-        QuicCmd::StreamWrite {
-            stream_handle: self.stream_handle,
-            data,
-            fin,
-        }
-    }
-}
-
 impl AsyncRead for QuicStream {
     fn poll_read(
         mut self: Pin<&mut Self>,
@@ -206,6 +200,25 @@ impl AsyncRead for QuicStream {
     }
 }
 
+impl QuicStream {
+    #[inline]
+    fn send_write_cmd(mut self: Pin<&mut Self>, data: Bytes, fin: bool) -> Result<(), Error> {
+        let cmd = QuicCmd::StreamWrite {
+            stream_handle: self.stream_handle,
+            data,
+            fin,
+        };
+        check_tx!(self.cmd_tx.start_send_unpin(cmd))
+    }
+
+    #[inline]
+    fn send_write_buf(mut self: Pin<&mut Self>) -> Result<(), Error> {
+        let data = self.write_buf.split().freeze();
+        self.write_buf.reserve(QUIC_STREAM_WRITE_BUFFER_CAPACITY);
+        self.send_write_cmd(data, false)
+    }
+}
+
 impl AsyncWrite for QuicStream {
     fn poll_write(
         mut self: Pin<&mut Self>,
@@ -213,14 +226,22 @@ impl AsyncWrite for QuicStream {
         buf: &[u8],
     ) -> Poll<Result<usize, Error>> {
         ready_tx!(self.cmd_tx.poll_ready_unpin(cx))?;
-        let data = self.write_pool.buf(buf, (0, 0).into()).freeze();
-        let cmd = self.new_write_cmd(data, false);
-        check_tx!(self.cmd_tx.start_send_unpin(cmd))?;
+        self.write_buf.extend_from_slice(buf);
+        if self.write_buf.len() >= QUIC_STREAM_FLUSH_THRESHOLD {
+            self.as_mut().send_write_buf()?;
+        }
+
         Poll::Ready(Ok(buf.len()))
     }
 
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Error>> {
-        ready_tx!(self.cmd_tx.poll_flush_unpin(cx)).into()
+        if !self.write_buf.is_empty() {
+            ready_tx!(self.cmd_tx.poll_ready_unpin(cx))?;
+            self.as_mut().send_write_buf()?;
+        }
+        ready_tx!(self.cmd_tx.poll_flush_unpin(cx))?;
+
+        Poll::Ready(Ok(()))
     }
 
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Error>> {
@@ -228,13 +249,13 @@ impl AsyncWrite for QuicStream {
             return Poll::Ready(Ok(()));
         }
 
-        ready_tx!(self.cmd_tx.poll_flush_unpin(cx))?;
+        ready!(self.as_mut().poll_flush(cx))?;
         ready_tx!(self.cmd_tx.poll_ready_unpin(cx))?;
-        let cmd = self.new_write_cmd(Bytes::new(), true);
-        check_tx!(self.cmd_tx.start_send_unpin(cmd))?;
+        self.as_mut().send_write_cmd(Bytes::new(), true)?;
         ready_tx!(self.cmd_tx.poll_flush_unpin(cx))?;
 
         self.fin_sent = true;
+
         Poll::Ready(Ok(()))
     }
 }
