@@ -151,39 +151,46 @@ impl AsyncRead for QuicStream {
         let mut written: bool = false;
 
         loop {
-            if let Some(mut pending) = self.read_pending.take() {
-                let len = min(pending.len(), buf.remaining());
-                buf.put_slice(&pending.split_to(len));
-                written = true;
-                if !pending.is_empty() {
-                    self.read_pending = Some(pending);
+            let mut chunk = if let Some(pending) = self.read_pending.take() {
+                pending
+            } else {
+                if self.fin_received {
                     return Poll::Ready(Ok(()));
                 }
-                if buf.remaining() == 0 {
-                    return Poll::Ready(Ok(()));
-                }
-            }
 
-            if self.fin_received {
+                loop {
+                    match self.ctx.rx.poll_recv(cx) {
+                        Poll::Ready(Some(QuicStreamEvt::Fin)) | Poll::Ready(None) => {
+                            self.fin_received = true;
+                            return Poll::Ready(Ok(()));
+                        }
+                        Poll::Ready(Some(event)) => match event {
+                            QuicStreamEvt::Data(data) => {
+                                if data.is_empty() {
+                                    continue;
+                                }
+                                break data;
+                            }
+                            QuicStreamEvt::Reset(e) => {
+                                return Poll::Ready(Err(Error::new(ErrorKind::ConnectionReset, e)));
+                            }
+                            _ => continue,
+                        },
+                        Poll::Pending if !written => return Poll::Pending,
+                        _ => return Poll::Ready(Ok(())),
+                    }
+                }
+            };
+
+            let len = min(chunk.len(), buf.remaining());
+            buf.put_slice(&chunk.split_to(len));
+            written = true;
+            if !chunk.is_empty() {
+                self.read_pending = Some(chunk);
                 return Poll::Ready(Ok(()));
             }
-
-            match self.ctx.rx.poll_recv(cx) {
-                Poll::Ready(Some(event)) => match event {
-                    QuicStreamEvt::Data(data) => {
-                        if data.is_empty() {
-                            continue;
-                        }
-                        self.read_pending = Some(data);
-                    }
-                    QuicStreamEvt::Fin => self.fin_received = true,
-                    QuicStreamEvt::Reset(e) => {
-                        return Poll::Ready(Err(Error::new(ErrorKind::ConnectionReset, e)))
-                    }
-                    _ => continue,
-                },
-                Poll::Pending if !written => return Poll::Pending,
-                _ => return Poll::Ready(Ok(())),
+            if buf.remaining() == 0 {
+                return Poll::Ready(Ok(()));
             }
         }
     }
