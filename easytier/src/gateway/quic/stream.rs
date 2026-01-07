@@ -15,9 +15,10 @@ use futures::task::AtomicWaker;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio_util::sync::PollSender;
 
-const QUIC_STREAM_WRITE_POOL_CAPACITY: usize = 16;
-const QUIC_STREAM_FLUSH_THRESHOLD: usize = 1200;
-const QUIC_STREAM_WRITE_BUFFER_CAPACITY: usize = 2 * QUIC_STREAM_FLUSH_THRESHOLD;
+const QUIC_STREAM_WRITE_BUFFER_FLUSH_THRESHOLD: usize = 1200;
+const QUIC_STREAM_WRITE_BUFFER_RESERVE_THRESHOLD: usize =
+    2 * QUIC_STREAM_WRITE_BUFFER_FLUSH_THRESHOLD;
+const QUIC_STREAM_WRITE_BUFFER_CAPACITY: usize = 64 * QUIC_STREAM_WRITE_BUFFER_FLUSH_THRESHOLD;
 
 macro_rules! check_tx {
     ($e:expr) => {
@@ -202,7 +203,9 @@ impl QuicStream {
     #[inline]
     fn send_write_buf(mut self: Pin<&mut Self>) -> Result<(), Error> {
         let data = self.write_buf.split().freeze();
-        self.write_buf.reserve(QUIC_STREAM_WRITE_BUFFER_CAPACITY);
+        if self.write_buf.capacity() < QUIC_STREAM_WRITE_BUFFER_RESERVE_THRESHOLD {
+            self.write_buf.reserve(QUIC_STREAM_WRITE_BUFFER_CAPACITY);
+        }
         self.send_write_cmd(data, false)
     }
 }
