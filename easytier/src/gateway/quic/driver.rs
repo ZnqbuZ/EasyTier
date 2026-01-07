@@ -6,13 +6,16 @@ use crate::gateway::quic::utils::QuicBufferPool;
 use crate::gateway::quic::{SwitchedReceiver, SwitchedSender};
 use anyhow::{anyhow, Error};
 use bytes::Bytes;
-use quinn_proto::{ClientConfig, ConnectError, Connection, ConnectionHandle, DatagramEvent, Dir, Endpoint, Event, ReadError, ReadableError, StreamEvent, StreamId, WriteError};
+use derive_more::{Deref, DerefMut, From, Into};
+use quinn_proto::{
+    ClientConfig, ConnectError, Connection, ConnectionHandle, DatagramEvent, Dir, Endpoint, Event,
+    ReadError, ReadableError, StreamEvent, StreamId, WriteError,
+};
 use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Instant;
-use derive_more::{Deref, DerefMut, From, Into};
 use tokio::sync::mpsc;
 use tracing::{error, trace, warn};
 
