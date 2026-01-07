@@ -659,7 +659,7 @@ pub async fn subnet_proxy_three_node_test(
             assert_eq!(1, metric.value);
             assert!(metric.labels.labels().iter().any(|l| {
                 let t =
-                    LabelType::Protocol(TcpProxyEntryTransportType::Quic.as_str_name().to_string());
+                    LabelType::Protocol(TcpProxyEntryTransportType::Kcp.as_str_name().to_string());
                 t.key() == l.key && t.value() == l.value
             }));
         }
