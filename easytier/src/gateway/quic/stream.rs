@@ -2,16 +2,16 @@ use crate::gateway::quic::cmd::{QuicCmd, QuicCmdTx};
 use crate::gateway::quic::evt::{QuicStreamEvt, QuicStreamEvtRx};
 use bytes::{Bytes, BytesMut};
 use derive_more::{From, Into};
+use futures::task::AtomicWaker;
 use futures::SinkExt;
 use quinn_proto::{ConnectionHandle, StreamId};
 use std::cmp::min;
 use std::io::{Error, ErrorKind};
 use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
 use std::task::ready;
 use std::task::{Context, Poll};
-use futures::task::AtomicWaker;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio_util::sync::PollSender;
 
@@ -45,8 +45,8 @@ pub struct QuicStreamHdl {
 
 #[derive(Debug)]
 pub(super) struct QuicStreamFlowCtrl {
-    blocked: AtomicBool,
-    waker: AtomicWaker,
+    pub(super) blocked: AtomicBool,
+    pub(super) waker: AtomicWaker,
 }
 
 impl QuicStreamFlowCtrl {
@@ -55,6 +55,17 @@ impl QuicStreamFlowCtrl {
             blocked: AtomicBool::new(false),
             waker: AtomicWaker::new(),
         }
+    }
+
+    #[inline]
+    pub fn poll_ready(&self, cx: &mut Context<'_>) -> Poll<()> {
+        if self.blocked.load(Ordering::Acquire) {
+            self.waker.register(cx.waker());
+            if self.blocked.load(Ordering::Acquire) {
+                return Poll::Pending;
+            }
+        }
+        Poll::Ready(())
     }
 }
 
@@ -68,7 +79,7 @@ pub(super) struct QuicStreamCtx {
 #[derive(Debug)]
 pub struct QuicStream {
     ctx: QuicStreamCtx,
-    
+
     cmd_tx: PollSender<QuicCmd>,
 
     ready: bool,
@@ -88,11 +99,7 @@ impl QuicStream {
 }
 
 impl QuicStream {
-    pub(super) fn new(
-        ctx: QuicStreamCtx,
-        cmd_tx: QuicCmdTx,
-        ready: bool,
-    ) -> Self {
+    pub(super) fn new(ctx: QuicStreamCtx, cmd_tx: QuicCmdTx, ready: bool) -> Self {
         Self {
             ctx,
             cmd_tx: PollSender::new(cmd_tx),
@@ -223,10 +230,14 @@ impl AsyncWrite for QuicStream {
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<Result<usize, Error>> {
-        ready_tx!(self.cmd_tx.poll_ready_unpin(cx))?;
+        ready!(self.ctx.ctrl.poll_ready(cx));
+        let flush = (self.write_buf.len() + buf.len()) >= QUIC_STREAM_WRITE_BUFFER_FLUSH_THRESHOLD;
+        if flush {
+            ready_tx!(self.cmd_tx.poll_ready_unpin(cx))?;
+        }
         self.write_buf.extend_from_slice(buf);
-        if self.write_buf.len() >= QUIC_STREAM_FLUSH_THRESHOLD {
-            self.as_mut().send_write_buf()?;
+        if flush {
+            self.send_write_buf()?;
         }
 
         Poll::Ready(Ok(buf.len()))

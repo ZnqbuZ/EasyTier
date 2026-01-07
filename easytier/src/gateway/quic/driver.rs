@@ -6,14 +6,13 @@ use crate::gateway::quic::utils::QuicBufferPool;
 use crate::gateway::quic::{SwitchedReceiver, SwitchedSender};
 use anyhow::{anyhow, Error};
 use bytes::Bytes;
-use quinn_proto::{
-    ClientConfig, ConnectError, Connection, ConnectionHandle, DatagramEvent, Dir, Endpoint, Event,
-    ReadError, ReadableError, StreamEvent, StreamId,
-};
-use std::collections::HashMap;
+use quinn_proto::{ClientConfig, ConnectError, Connection, ConnectionHandle, DatagramEvent, Dir, Endpoint, Event, ReadError, ReadableError, StreamEvent, StreamId, WriteError};
+use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Instant;
+use derive_more::{Deref, DerefMut, From, Into};
 use tokio::sync::mpsc;
 use tracing::{error, trace, warn};
 
@@ -23,10 +22,28 @@ const QUIC_PACKET_POOL_MIN_CAPACITY: usize = 64 * 1024;
 pub type QuicStreamCtxTx = SwitchedSender<QuicStreamCtx>;
 pub type QuicStreamCtxRx = SwitchedReceiver<QuicStreamCtx>;
 
+#[derive(Debug, Deref, DerefMut)]
+struct QuicStreamWritePending {
+    #[deref]
+    #[deref_mut]
+    chunks: VecDeque<Bytes>,
+    fin: bool,
+}
+
+impl QuicStreamWritePending {
+    fn new() -> Self {
+        Self {
+            chunks: VecDeque::new(),
+            fin: false,
+        }
+    }
+}
+
 #[derive(Debug)]
 struct QuicStreamDrvCtx {
     tx: QuicStreamEvtTx,
     ctrl: Arc<QuicStreamFlowCtrl>,
+    pending: QuicStreamWritePending,
 }
 
 pub(super) struct QuicDriver {
@@ -195,7 +212,11 @@ impl QuicDriver {
                 rx,
                 ctrl: ctrl.clone(),
             },
-            QuicStreamDrvCtx { tx, ctrl },
+            QuicStreamDrvCtx {
+                tx,
+                ctrl,
+                pending: QuicStreamWritePending::new(),
+            },
         )
     }
 
@@ -232,38 +253,46 @@ impl QuicDriver {
     fn write_stream(&mut self, stream_hdl: QuicStreamHdl, data: Bytes, fin: bool) {
         let conn_hdl = stream_hdl.conn_hdl;
 
-        let (conn, _) = match self.conns.get_mut(&conn_hdl) {
-            Some(c) => c,
-            None => {
-                warn!("write_stream ignored: connection {:?} not found", conn_hdl);
+        let (conn, ctx) = if let Some((conn, streams)) = self.conns.get_mut(&conn_hdl) {
+            if let Some(ctx) = streams.get_mut(&stream_hdl.stream_id) {
+                (conn, ctx)
+            } else {
+                warn!("write_stream ignored: stream {:?} not found", stream_hdl);
                 return;
             }
+        } else {
+            warn!("write_stream ignored: connection {:?} not found", conn_hdl);
+            return;
         };
 
-        let mut stream = conn.send_stream(stream_hdl.stream_id);
-        let len = data.len();
+        if ctx.ctrl.blocked.load(Ordering::Acquire) {
+            ctx.pending.push_back(data);
+        } else {
+            let mut stream = conn.send_stream(stream_hdl.stream_id);
+            let len = data.len();
+            let mut chunks = vec![data];
 
-        match stream.write_chunks(&mut [data]) {
-            Ok(n) if n.bytes == len => {
-                if fin {
-                    if let Err(e) = stream.finish() {
-                        error!("Failed to finish stream {:?}: {:?}", stream_hdl, e);
+            match stream.write_chunks(&mut chunks) {
+                Ok(written) if written.bytes == len => {
+                    if fin {
+                        if let Err(e) = stream.finish() {
+                            error!("Failed to finish stream {:?}: {:?}", stream_hdl, e);
+                        }
                     }
                 }
-            }
 
-            Ok(n) => {
-                //TODO: flow control
-                error!(
-                    "Stream {:?} flow control limit reached ({} < {}), resetting",
-                    stream_hdl, n.bytes, len
-                );
-                let _ = stream.reset(0u32.into());
-            }
+                Ok(_) => {
+                    ctx.ctrl.blocked.store(true, Ordering::Release);
+                    for chunk in chunks.drain(..).rev() {
+                        ctx.pending.push_back(chunk);
+                    }
+                    ctx.pending.fin = true;
+                }
 
-            Err(e) => {
-                error!("Failed to write to stream {:?}: {:?}", stream_hdl, e);
-                let _ = stream.reset(0u32.into());
+                Err(e) => {
+                    error!("Failed to write to stream {:?}: {:?}", stream_hdl, e);
+                    let _ = stream.reset(0u32.into());
+                }
             }
         }
 
@@ -309,20 +338,11 @@ impl QuicDriver {
                                 conn_hdl
                             );
 
-                            let (evt_tx, evt_rx) = mpsc::channel(QUIC_STREAM_EVT_BUFFER);
-                            let flow_ctrl: Arc<_> = QuicStreamFlowCtrl::new().into();
-                            if let Err(e) = self.incoming_stream_tx.try_send(
-                                ((conn_hdl, stream_id).into(), evt_rx, flow_ctrl.clone()).into(),
-                            ) {
+                            let (ctx, drv_ctx) = Self::new_stream_ctx((conn_hdl, stream_id).into());
+                            if let Err(e) = self.incoming_stream_tx.try_send(ctx) {
                                 error!("Failed to hand off stream: {:?}", e);
                             } else {
-                                streams.insert(
-                                    stream_id,
-                                    QuicStreamDrvCtx {
-                                        tx: evt_tx,
-                                        ctrl: flow_ctrl,
-                                    },
-                                );
+                                streams.insert(stream_id, drv_ctx);
                             }
                         }
                     }
@@ -360,14 +380,46 @@ impl QuicDriver {
                                         if let ReadError::Reset(code) = e {
                                             if let Err(e) =
                                                 ctx.tx.try_send(QuicStreamEvt::Reset(format!(
-                                                "Failed to read from stream. Error code: {code}"
-                                            ))) {
+                                                    "Failed to read from stream. Error code: {code}"
+                                                )))
+                                            {
                                                 error!("Failed to send reset to stream: {:?}", e);
                                             }
                                         }
                                         break;
                                     }
                                 }
+                            }
+                        }
+                    }
+
+                    StreamEvent::Writable { id } => {
+                        if let Some(ctx) = streams.get_mut(&id) {
+                            let mut stream = conn.send_stream(id);
+                            let mut flushed = false;
+                            let pending = &mut ctx.pending;
+                            let chunks = pending.make_contiguous();
+                            match stream.write_chunks(chunks) {
+                                Ok(written) => {
+                                    pending.drain(..written.chunks);
+                                    if pending.is_empty() {
+                                        flushed = true;
+                                    }
+                                }
+                                Err(WriteError::Blocked) => {}
+                                Err(e) => {
+                                    error!("Stream {:?} write error: {:?}", id, e);
+                                    flushed = true;
+                                }
+                            }
+                            if flushed {
+                                if pending.fin {
+                                    if let Err(e) = stream.finish() {
+                                        error!("Failed to finish stream {:?}: {:?}", id, e);
+                                    }
+                                }
+                                ctx.ctrl.blocked.store(false, Ordering::Release);
+                                ctx.ctrl.waker.wake();
                             }
                         }
                     }
