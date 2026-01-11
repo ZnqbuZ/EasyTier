@@ -1,226 +1,83 @@
-use crate::gateway::quic::cmd::{QuicCmd, QuicCmdTx};
-use crate::gateway::quic::evt::{QuicStreamEvt, QuicStreamEvtRx};
-use bytes::{Bytes, BytesMut};
-use derive_more::{From, Into};
-use futures::task::AtomicWaker;
-use futures::SinkExt;
-use quinn_proto::{ConnectionHandle, StreamId};
-use std::cmp::min;
 use std::io::{Error, ErrorKind};
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
-use std::task::ready;
 use std::task::{Context, Poll};
+use quinn_proto::{FinishError, ReadError, ReadableError, StreamId, WriteError};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
-use tokio_util::sync::PollSender;
+use tokio::sync::mpsc;
+use crate::gateway::quic::conn::{ConnCtrl, ConnState};
+use crate::gateway::quic::utils::{QuicBufferPool, SwitchedReceiver, SwitchedSender};
 
-const QUIC_STREAM_WRITE_BUFFER_FLUSH_THRESHOLD: usize = 1200;
-const QUIC_STREAM_WRITE_BUFFER_RESERVE_THRESHOLD: usize =
-    2 * QUIC_STREAM_WRITE_BUFFER_FLUSH_THRESHOLD;
-const QUIC_STREAM_WRITE_BUFFER_CAPACITY: usize = 64 * QUIC_STREAM_WRITE_BUFFER_FLUSH_THRESHOLD;
+pub(super) type QuicStreamTx = SwitchedSender<QuicStream>;
+pub type QuicStreamRx = SwitchedReceiver<QuicStream>;
 
-macro_rules! check_tx {
-    ($e:expr) => {
-        $e.map_err(|e| {
-            Error::new(
-                ErrorKind::BrokenPipe,
-                format!("Failed to send command to quic driver: {:?}", e),
-            )
-        })
-    };
-}
-
-macro_rules! ready_tx {
-    ($e:expr) => {
-        check_tx!(ready!($e))
-    };
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, From, Into)]
-pub struct QuicStreamHdl {
-    pub(super) conn_hdl: ConnectionHandle,
-    pub(super) stream_id: StreamId,
-}
-
-#[derive(Debug)]
-pub(super) struct QuicStreamFlowCtrl {
-    pub(super) blocked: AtomicBool,
-    pub(super) waker: AtomicWaker,
-}
-
-impl QuicStreamFlowCtrl {
-    pub fn new() -> Self {
-        Self {
-            blocked: AtomicBool::new(false),
-            waker: AtomicWaker::new(),
-        }
-    }
-
-    #[inline]
-    pub fn poll_ready(&self, cx: &mut Context<'_>) -> Poll<()> {
-        if self.blocked.load(Ordering::Acquire) {
-            self.waker.register(cx.waker());
-            if self.blocked.load(Ordering::Acquire) {
-                return Poll::Pending;
-            }
-        }
-        Poll::Ready(())
-    }
-}
-
-#[derive(Debug, From, Into)]
-pub(super) struct QuicStreamCtx {
-    pub(super) hdl: QuicStreamHdl,
-    pub(super) rx: QuicStreamEvtRx,
-    pub(super) ctrl: Arc<QuicStreamFlowCtrl>,
-}
+pub(super) type StreamDropTx = mpsc::Sender<StreamId>;
+pub(super) type StreamDropRx = mpsc::Receiver<StreamId>;
 
 #[derive(Debug)]
 pub struct QuicStream {
-    ctx: QuicStreamCtx,
-
-    cmd_tx: PollSender<QuicCmd>,
-
-    ready: bool,
-
-    read_pending: Option<Bytes>,
-    write_buf: BytesMut,
-
-    fin_sent: bool,
-    fin_received: bool,
+    pub(crate) id: StreamId,
+    ctrl: ConnCtrl,
+    pool: QuicBufferPool,
 }
 
 impl QuicStream {
-    #[inline]
-    pub fn handle(&self) -> QuicStreamHdl {
-        self.ctx.hdl
-    }
-}
-
-impl QuicStream {
-    pub(super) fn new(ctx: QuicStreamCtx, cmd_tx: QuicCmdTx, ready: bool) -> Self {
+    pub(super) fn new(id: StreamId, ctrl: ConnCtrl) -> Self {
         Self {
-            ctx,
-            cmd_tx: PollSender::new(cmd_tx),
-            ready,
-            read_pending: None,
-            write_buf: BytesMut::with_capacity(QUIC_STREAM_WRITE_BUFFER_CAPACITY),
-            fin_sent: false,
-            fin_received: false,
+            id,
+            ctrl,
+            pool: QuicBufferPool::new(2048),
         }
-    }
-
-    pub async fn reset(&mut self, error_code: u32) -> Result<(), Error> {
-        check_tx!(
-            self.cmd_tx
-                .send(QuicCmd::ResetStream {
-                    stream_hdl: self.ctx.hdl,
-                    error_code,
-                })
-                .await
-        )
-    }
-
-    pub async fn ready(&mut self) -> Result<(), Error> {
-        if self.ready {
-            return Ok(());
-        }
-
-        let evt = self.ctx.rx.recv().await.ok_or_else(|| {
-            Error::new(
-                ErrorKind::UnexpectedEof,
-                "Quic stream event channel closed before ready",
-            )
-        })?;
-
-        match evt {
-            QuicStreamEvt::Ready => {}
-            _ => {
-                return Err(Error::new(
-                    ErrorKind::InvalidData,
-                    format!("Unexpected event {:?} before ready", evt),
-                ))
-            }
-        }
-
-        self.ready = true;
-        Ok(())
     }
 }
 
 impl AsyncRead for QuicStream {
     fn poll_read(
-        mut self: Pin<&mut Self>,
+        self: Pin<&mut Self>,
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
-    ) -> Poll<Result<(), Error>> {
-        let mut written: bool = false;
-
-        loop {
-            let mut chunk = if let Some(pending) = self.read_pending.take() {
-                pending
-            } else {
-                if self.fin_received {
-                    return Poll::Ready(Ok(()));
-                }
-
-                loop {
-                    match self.ctx.rx.poll_recv(cx) {
-                        Poll::Ready(Some(QuicStreamEvt::Fin)) | Poll::Ready(None) => {
-                            self.fin_received = true;
-                            return Poll::Ready(Ok(()));
-                        }
-                        Poll::Ready(Some(event)) => match event {
-                            QuicStreamEvt::Data(data) => {
-                                if data.is_empty() {
-                                    continue;
-                                }
-                                break data;
-                            }
-                            QuicStreamEvt::Reset(e) => {
-                                return Poll::Ready(Err(Error::new(ErrorKind::ConnectionReset, e)));
-                            }
-                            _ => continue,
-                        },
-                        Poll::Pending if !written => return Poll::Pending,
-                        _ => return Poll::Ready(Ok(())),
-                    }
-                }
-            };
-
-            let len = min(chunk.len(), buf.remaining());
-            buf.put_slice(&chunk.split_to(len));
-            written = true;
-            if !chunk.is_empty() {
-                self.read_pending = Some(chunk);
-                return Poll::Ready(Ok(()));
+    ) -> Poll<std::io::Result<()>> {
+        let mut state = self.ctrl.state.lock();
+        let ConnState {
+            ref mut conn,
+            ref mut readers,
+            ..
+        } = *state;
+        let mut stream = conn.recv_stream(self.id);
+        let mut chunks = match stream.read(true) {
+            Ok(chunks) => chunks,
+            Err(ReadableError::ClosedStream) => return Poll::Ready(Ok(())),
+            Err(ReadableError::IllegalOrderedRead) => {
+                return Poll::Ready(Err(Error::new(
+                    ErrorKind::InvalidData,
+                    "QUIC illegal ordered read",
+                )));
             }
-            if buf.remaining() == 0 {
-                return Poll::Ready(Ok(()));
-            }
-        }
-    }
-}
-
-impl QuicStream {
-    #[inline]
-    fn send_write_cmd(mut self: Pin<&mut Self>, data: Bytes, fin: bool) -> Result<(), Error> {
-        let cmd = QuicCmd::StreamWrite {
-            stream_hdl: self.ctx.hdl,
-            data,
-            fin,
         };
-        check_tx!(self.cmd_tx.start_send_unpin(cmd))
-    }
 
-    #[inline]
-    fn send_write_buf(mut self: Pin<&mut Self>) -> Result<(), Error> {
-        let data = self.write_buf.split().freeze();
-        if self.write_buf.capacity() < QUIC_STREAM_WRITE_BUFFER_RESERVE_THRESHOLD {
-            self.write_buf.reserve(QUIC_STREAM_WRITE_BUFFER_CAPACITY);
+        let data = match chunks.next(buf.remaining()) {
+            Ok(Some(chunk)) => chunk.bytes,
+            Ok(None) => return Poll::Ready(Ok(())), // ChunksState::Finished 流关闭
+            Err(ReadError::Blocked) => {
+                readers.insert(self.id, cx.waker().clone());
+                return Poll::Pending;
+            }
+            Err(ReadError::Reset(err)) => {
+                return Poll::Ready(Err(Error::new(
+                    ErrorKind::ConnectionReset,
+                    format!("QUIC stream reset: {}", err),
+                )));
+            }
+        };
+
+        let transmit = chunks.finalize().should_transmit();
+
+        drop(state);
+
+        buf.put_slice(&data);
+        if transmit {
+            self.ctrl.notify.notify_one();
         }
-        self.send_write_cmd(data, false)
+        Poll::Ready(Ok(()))
     }
 }
 
@@ -229,42 +86,53 @@ impl AsyncWrite for QuicStream {
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
         buf: &[u8],
-    ) -> Poll<Result<usize, Error>> {
-        ready!(self.ctx.ctrl.poll_ready(cx));
-        let flush = (self.write_buf.len() + buf.len()) >= QUIC_STREAM_WRITE_BUFFER_FLUSH_THRESHOLD;
-        if flush {
-            ready_tx!(self.cmd_tx.poll_ready_unpin(cx))?;
+    ) -> Poll<std::io::Result<usize>> {
+        let data = self.pool.buf(buf, (0, 0).into()).freeze();
+        let mut state = self.ctrl.state.lock();
+        let ConnState {
+            ref mut conn,
+            ref mut writers,
+            ..
+        } = *state;
+        match conn.send_stream(self.id).write_chunks(&mut [data]) {
+            Ok(written) => {
+                drop(state);
+                self.ctrl.notify.notify_one();
+                Poll::Ready(Ok(written.bytes))
+            }
+            Err(WriteError::Blocked) => {
+                writers.insert(self.id, cx.waker().clone());
+                Poll::Pending
+            }
+            Err(_) => Poll::Ready(Err(Error::new(
+                ErrorKind::BrokenPipe,
+                "QUIC stream closed or stopped by peer",
+            ))),
         }
-        self.write_buf.extend_from_slice(buf);
-        if flush {
-            self.send_write_buf()?;
-        }
-
-        Poll::Ready(Ok(buf.len()))
     }
 
-    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Error>> {
-        if !self.write_buf.is_empty() {
-            ready_tx!(self.cmd_tx.poll_ready_unpin(cx))?;
-            self.as_mut().send_write_buf()?;
-        }
-        ready_tx!(self.cmd_tx.poll_flush_unpin(cx))?;
-
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        self.ctrl.notify.notify_one();
         Poll::Ready(Ok(()))
     }
 
-    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Error>> {
-        if self.fin_sent {
-            return Poll::Ready(Ok(()));
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        match self.ctrl.state.lock().conn.send_stream(self.id).finish() {
+            Ok(()) => {
+                self.ctrl.notify.notify_one();
+                Poll::Ready(Ok(()))
+            }
+            Err(FinishError::ClosedStream) => Poll::Ready(Ok(())),
+            Err(FinishError::Stopped(error)) => Poll::Ready(Err(Error::new(
+                ErrorKind::BrokenPipe,
+                format!("QUIC stream has been stopped by peer: {:?}", error),
+            ))),
         }
+    }
+}
 
-        ready!(self.as_mut().poll_flush(cx))?;
-        ready_tx!(self.cmd_tx.poll_ready_unpin(cx))?;
-        self.as_mut().send_write_cmd(Bytes::new(), true)?;
-        ready_tx!(self.cmd_tx.poll_flush_unpin(cx))?;
-
-        self.fin_sent = true;
-
-        Poll::Ready(Ok(()))
+impl Drop for QuicStream {
+    fn drop(&mut self) {
+        self.ctrl.close(self.id);
     }
 }
