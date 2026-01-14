@@ -2,7 +2,7 @@ use crate::common::acl_processor::PacketInfo;
 use crate::common::global_ctx::{ArcGlobalCtx, GlobalCtx};
 use crate::common::PeerId;
 use crate::gateway::kcp_proxy::{ProxyAclHandler, TcpProxyForKcpSrcTrait};
-use crate::gateway::quic::{QuicEndpoint, QuicOutputRx, QuicPacket, QuicPacketRx, QuicStream, QuicStreamRx};
+use crate::gateway::quic::{QuicEndpoint, QuicOutputRx, QuicPacketRx, QuicStreamRx};
 use crate::gateway::tcp_proxy::{NatDstConnector, TcpProxy};
 use crate::gateway::CidrSet;
 use crate::peers::peer_manager::PeerManager;
@@ -20,56 +20,168 @@ use anyhow::{anyhow, Context, Error};
 use bytes::{BufMut, Bytes, BytesMut};
 use dashmap::DashMap;
 use derivative::Derivative;
+use derive_more::{Constructor, Deref, DerefMut, From, Into};
+use parking_lot::Mutex;
 use pnet::packet::ipv4::Ipv4Packet;
 use prost::Message;
+use quinn::udp::{EcnCodepoint, RecvMeta, Transmit};
+use quinn::{AsyncUdpSocket, Connecting, Endpoint, RecvStream, SendStream, UdpPoller};
+use quinn_proto::{ConnectError, StreamId};
+use std::future::Future;
+use std::io::IoSliceMut;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::sync::{Arc, Weak};
+use std::ops::DerefMut;
+use std::pin::Pin;
 use std::sync::atomic::Ordering;
+use std::sync::{Arc, Weak};
+use std::task::Poll;
 use std::time::Duration;
-use parking_lot::Mutex;
-use quinn_proto::StreamId;
-use tokio::io::AsyncReadExt;
-use tokio::select;
+use tokio::io::{join, AsyncReadExt, Join};
+use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::task::JoinSet;
-use tokio::time::sleep;
-use tracing::{debug, error, instrument, trace};
+use tokio::time::{sleep, Instant};
+use tokio::{join, pin, select};
+use tokio_util::sync::PollSender;
+use tracing::{debug, error, instrument, trace, warn};
 
-//This helper class encodes/decodes peer_id and packet_type into/from SocketAddr.
+//region packet
+#[derive(Debug, Constructor)]
+struct QuicPacket {
+    addr: SocketAddr,
+    payload: BytesMut,
+    ecn: Option<EcnCodepoint>,
+}
+//endregion
+
+//region socket
 #[derive(Debug)]
-struct QuicPacketMeta {
+pub struct QuicSocketPoller {
+    tx: PollSender<QuicPacket>,
+}
+
+impl UdpPoller for QuicSocketPoller {
+    fn poll_writable(
+        self: Pin<&mut Self>,
+        cx: &mut std::task::Context,
+    ) -> Poll<std::io::Result<()>> {
+        self.get_mut()
+            .tx
+            .poll_reserve(cx)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::BrokenPipe, e))
+    }
+}
+
+#[derive(Debug)]
+pub struct QuicSocket {
+    addr: SocketAddr,
+    rx: Mutex<Receiver<QuicPacket>>,
+    tx: Sender<QuicPacket>,
+}
+
+impl AsyncUdpSocket for QuicSocket {
+    fn create_io_poller(self: Arc<Self>) -> Pin<Box<dyn UdpPoller>> {
+        Box::into_pin(Box::new(QuicSocketPoller {
+            tx: PollSender::new(self.tx.clone()),
+        }))
+    }
+
+    fn try_send(&self, transmit: &Transmit) -> std::io::Result<()> {
+        match transmit.destination {
+            SocketAddr::V4(addr) => {
+                trace!(
+                    "{:?} sending {:?} bytes to {:?}",
+                    self.addr,
+                    transmit.contents.len(),
+                    addr
+                );
+                if self.tx.capacity() > 0
+                    && self
+                        .tx
+                        .try_send(QuicPacket {
+                            addr: transmit.destination,
+                            payload: BytesMut::from(transmit.contents),
+                            ecn: transmit.ecn,
+                        })
+                        .is_ok()
+                {
+                    Ok(())
+                } else {
+                    //Err(std::io::ErrorKind::WouldBlock.into())
+                    //TODO avoid fake send success, need to implement awake mechanism
+                    Ok(())
+                }
+            }
+            _ => Err(std::io::ErrorKind::ConnectionRefused.into()),
+        }
+    }
+
+    fn poll_recv(
+        &self,
+        cx: &mut std::task::Context,
+        bufs: &mut [IoSliceMut<'_>],
+        meta: &mut [RecvMeta],
+    ) -> Poll<std::io::Result<usize>> {
+        let mut rx = self.rx.lock();
+        match rx.poll_recv(cx) {
+            Poll::Ready(Some(packet)) => {
+                if bufs.is_empty() || meta.is_empty() {
+                    return Poll::Ready(Ok(0));
+                }
+
+                let len = packet.payload.len();
+                if len > bufs[0].len() {
+                    warn!(
+                        "buffer too small for packet: {:?} < {:?}, dropping",
+                        bufs[0].len(),
+                        len,
+                    );
+                    return Poll::Pending;
+                }
+                trace!(
+                    "{} received {} bytes from {:?}",
+                    self.addr,
+                    len,
+                    packet.addr
+                );
+                bufs[0].deref_mut()[0..len].copy_from_slice(&packet.payload);
+                meta[0] = RecvMeta {
+                    addr: packet.addr,
+                    len,
+                    stride: len,
+                    ecn: packet.ecn,
+                    dst_ip: None,
+                };
+                Poll::Ready(Ok(1))
+            }
+            Poll::Ready(None) => Poll::Ready(Err(std::io::Error::new(
+                std::io::ErrorKind::ConnectionAborted,
+                "socket closed",
+            ))),
+            Poll::Pending => Poll::Pending,
+        }
+    }
+
+    fn local_addr(&self) -> std::io::Result<SocketAddr> {
+        Ok(self.addr)
+    }
+}
+//endregion
+
+//region addr
+#[derive(Debug, Clone, Constructor)]
+struct QuicAddr {
     peer_id: PeerId,
     packet_type: PacketType,
 }
 
-impl QuicPacketMeta {
+impl From<QuicAddr> for SocketAddr {
     #[inline]
-    fn new(peer_id: PeerId, packet_type: PacketType) -> Self {
-        Self {
-            peer_id,
-            packet_type,
-        }
-    }
-
-    #[inline]
-    fn pack(self, data: BytesMut) -> QuicPacket {
-        QuicPacket::new(self.into(), data)
-    }
-
-    #[inline]
-    fn unpack(packet: QuicPacket) -> Option<(Self, BytesMut)> {
-        let packet_info = packet.addr.try_into().ok()?;
-        Some((packet_info, packet.payload))
+    fn from(value: QuicAddr) -> Self {
+        SocketAddr::new(IpAddr::V4(value.peer_id.into()), value.packet_type as u16)
     }
 }
 
-impl From<QuicPacketMeta> for SocketAddr {
-    #[inline]
-    fn from(meta: QuicPacketMeta) -> Self {
-        SocketAddr::new(IpAddr::V4(meta.peer_id.into()), meta.packet_type as u16)
-    }
-}
-
-impl TryFrom<SocketAddr> for QuicPacketMeta {
+impl TryFrom<SocketAddr> for QuicAddr {
     type Error = ();
 
     #[inline]
@@ -91,18 +203,39 @@ impl TryFrom<SocketAddr> for QuicPacketMeta {
         })
     }
 }
+//endregion
+
+type QuicStreamInner = Join<RecvStream, SendStream>;
+#[derive(Debug, Deref, DerefMut, From, Into)]
+struct QuicStream {
+    #[deref]
+    #[deref_mut]
+    inner: QuicStreamInner,
+}
+
+impl QuicStream {
+    fn id(&self) -> (StreamId, StreamId) {
+        (self.reader().id(), self.writer().id())
+    }
+}
+
+impl From<(SendStream, RecvStream)> for QuicStream {
+    fn from(value: (SendStream, RecvStream)) -> Self {
+        join(value.1, value.0).into()
+    }
+}
 
 type QuicConnData = KcpConnData;
 
 #[derive(Debug, Clone)]
 pub struct NatDstQuicConnector {
-    pub(crate) endpoint: Arc<Mutex<QuicEndpoint>>,
+    pub(crate) endpoint: Endpoint,
     pub(crate) peer_mgr: Weak<PeerManager>,
 }
 
 #[async_trait::async_trait]
 impl NatDstConnector for NatDstQuicConnector {
-    type DstStream = QuicStream;
+    type DstStream = QuicStreamInner;
 
     async fn connect(
         &self,
@@ -122,7 +255,7 @@ impl NatDstConnector for NatDstQuicConnector {
 
         trace!("quic nat dst: {:?}, dst peers: {:?}", nat_dst, dst_peer_id);
 
-        let addr = QuicPacketMeta::new(dst_peer_id, PacketType::QuicSrc).into();
+        let addr = QuicAddr::new(dst_peer_id, PacketType::QuicSrc).into();
         let header = {
             let conn_data = QuicConnData {
                 src: Some(src.into()),
@@ -139,17 +272,52 @@ impl NatDstConnector for NatDstQuicConnector {
             buf.put_u16(len as u16);
             conn_data.encode(&mut buf).unwrap();
 
-            buf
+            buf.freeze()
         };
 
-        let mut retry = 5;
+        let mut connect_tasks = JoinSet::<Result<QuicStream, Error>>::new();
+        let connect = |tasks: &mut JoinSet<_>| {
+            let endpoint = self.endpoint.clone();
+            let header = header.clone();
+
+            tasks.spawn(async move {
+                let connection = endpoint.connect(addr, "")?.await?;
+                let mut stream: QuicStream = connection.open_bi().await?.into();
+                stream.writer_mut().write_chunk(header).await?;
+                Ok(stream)
+            });
+        };
+
+        connect(&mut connect_tasks);
+
+        let timer = tokio::time::sleep(Duration::from_millis(200));
+        pin!(timer);
+
+        let mut retry_remain = 5;
         loop {
-            retry -= 1;
-            let stream = self.endpoint.lock().open(addr, Some(header.clone()));
-            if stream.is_ok() || retry < 0 {
-                return stream.map_err(|e| anyhow!("failed to connect to nat dst {:?}: {:?}", nat_dst, e).into())
+            select! {
+                Some(result) = connect_tasks.join_next() => {
+                    match result {
+                        Ok(Ok(stream)) => return Ok(stream.into()),
+                        _ => {
+                            if connect_tasks.is_empty() {
+                                if retry_remain == 0 {
+                                    return Err(anyhow!("failed to connect to nat dst: {}", nat_dst).into())
+                                }
+
+                                retry_remain -= 1;
+                                connect(&mut connect_tasks);
+                                timer.as_mut().reset(Instant::now() + Duration::from_millis(200))
+                            }
+                        }
+                    }
+                }
+                _ = &mut timer, if retry_remain > 0 => {
+                    retry_remain -= 1;
+                    connect(&mut connect_tasks);
+                    timer.as_mut().reset(Instant::now() + Duration::from_millis(200));
+                }
             }
-            sleep(Duration::from_millis(200)).await;
         }
     }
 
@@ -225,7 +393,7 @@ impl QuicProxyRole {
 // Receive packets from peers and forward them to the QUIC endpoint
 #[derive(Debug)]
 struct QuicPacketReceiver {
-    endpoint: Arc<Mutex<QuicEndpoint>>,
+    tx: Sender<QuicPacket>,
     role: QuicProxyRole,
 }
 
@@ -238,13 +406,15 @@ impl PeerPacketFilter for QuicPacketReceiver {
             return Some(packet);
         }
 
-        let _ = self
-            .endpoint
-            .lock()
-            .send(
-                QuicPacketMeta::new(header.from_peer_id.get(), self.role.outgoing()).into(),
-                   packet.payload_bytes(),
-            );
+        let addr = QuicAddr::new(header.from_peer_id.get(), self.role.outgoing());
+
+        if let Err(e) = self
+            .tx
+            .send(QuicPacket::new(addr.into(), packet.payload_bytes(), None))
+            .await
+        {
+            debug!("failed to send quic packet to endpoint: {:?}", e);
+        }
 
         None
     }
@@ -254,7 +424,7 @@ impl PeerPacketFilter for QuicPacketReceiver {
 #[derive(Debug)]
 struct QuicPacketSender {
     peer_mgr: Arc<PeerManager>,
-    packet_rx: QuicPacketRx,
+    rx: Receiver<QuicPacket>,
 
     header: Bytes,
     zc_packet_type: ZCPacketType,
@@ -263,23 +433,23 @@ struct QuicPacketSender {
 impl QuicPacketSender {
     #[instrument]
     pub async fn run(mut self) {
-        while let Some(packet) = self.packet_rx.recv().await {
-            let (packet_info, mut payload) = match QuicPacketMeta::unpack(packet) {
-                Some(v) => v,
-                None => {
-                    error!("failed to extract metadata from quic packet");
-                    continue;
-                }
+        while let Some(packet) = self.rx.recv().await {
+            let Some(addr) = QuicAddr::try_from(packet.addr) else {
+                error!("invalid quic packet addr: {:?}", packet.addr);
+                continue;
             };
 
+            let payload = packet.payload;
             payload[..self.header.len()].copy_from_slice(&self.header);
             let mut packet = ZCPacket::new_from_buf(payload, self.zc_packet_type);
 
-            let peer_id = packet_info.peer_id;
-            let packet_type = packet_info.packet_type;
-            packet.fill_peer_manager_hdr(self.peer_mgr.my_peer_id(), peer_id, packet_type as u8);
+            packet.fill_peer_manager_hdr(
+                self.peer_mgr.my_peer_id(),
+                addr.peer_id,
+                addr.packet_type as u8,
+            );
 
-            if let Err(e) = self.peer_mgr.send_msg_for_proxy(packet, peer_id).await {
+            if let Err(e) = self.peer_mgr.send_msg_for_proxy(packet, addr.peer_id).await {
                 error!("failed to send QUIC packet to peer: {:?}", e);
             }
         }
@@ -290,7 +460,7 @@ impl QuicPacketSender {
 #[derivative(Debug)]
 struct QuicStreamContext {
     global_ctx: ArcGlobalCtx,
-    proxy_entries: Arc<DashMap<StreamId, TcpProxyEntry>>,
+    proxy_entries: Arc<DashMap<(StreamId, StreamId), TcpProxyEntry>>,
     cidr_set: Arc<CidrSet>,
     #[derivative(Debug = "ignore")]
     route: Arc<dyn crate::peers::route_trait::Route + Send + Sync + 'static>,
@@ -309,17 +479,63 @@ impl QuicStreamContext {
 }
 
 struct QuicStreamReceiver {
-    stream_rx: QuicStreamRx,
-    stream_ctx: Arc<QuicStreamContext>,
+    endpoint: Endpoint,
+    tasks: JoinSet<()>,
+    ctx: Arc<QuicStreamContext>,
 }
 
 impl QuicStreamReceiver {
     async fn run(mut self) {
-        while let Some(stream) = self.stream_rx.recv().await {
-            let stream_ctx = self.stream_ctx.clone();
-            tokio::spawn(async move {
-                if let Err(e) = Self::establish_stream(stream, stream_ctx).await {
-                    error!("Failed to establish stream: {:?}", e);
+        while let Some(incoming) = self.endpoint.accept().await {
+            let connection = match incoming.accept() {
+                Ok(connection) => connection,
+                Err(e) => {
+                    error!(
+                        "failed to accept quic connection from {:?}: {:?}",
+                        incoming.remote_address(),
+                        e
+                    );
+                    continue;
+                }
+            };
+
+            let connection = match connection.await {
+                Ok(connection) => connection,
+                Err(e) => {
+                    error!(
+                        "failed to accept quic connection from {:?}: {:?}",
+                        connection.remote_address(),
+                        e
+                    );
+                    continue;
+                }
+            };
+
+            let ctx = self.ctx.clone();
+            self.tasks.spawn(async move {
+                let mut tasks = JoinSet::new();
+                loop {
+                    let stream = select! {
+                        stream = connection.accept_bi() => {
+                            match stream {
+                                Ok(stream) => stream.into(),
+                                Err(e) => {
+                                    warn!("failed to accept bi stream from {:?}: {:?}", connection.remote_address(), e);
+                                    continue;
+                                }
+                            }
+                        }
+
+                        stream = connection.accept_uni() => {
+                            warn!("uni stream is not supported (stream from {:?}): {:?}", connection.remote_address(), stream);
+                            continue;
+                        }
+                    };
+
+                    match Self::establish_stream(stream, &mut tasks, ctx.clone()).await {
+                        Ok(stream) => drop(tasks.spawn(stream)),
+                        Err(e) => warn!("failed to establish quic stream from {:?}: {:?}", connection.remote_address(), e),
+                    }
                 }
             });
         }
@@ -328,21 +544,25 @@ impl QuicStreamReceiver {
     async fn read_stream_header(stream: &mut QuicStream) -> Result<Bytes, Error> {
         let len = stream.read_u16().await?;
         let mut header = Vec::with_capacity(len as usize);
-        stream.take(len as u64).read_to_end(&mut header).await?;
+        stream
+            .reader_mut()
+            .take(len as u64)
+            .read_to_end(&mut header)
+            .await?;
         Ok(header.into())
     }
 
-    #[instrument(ret)]
     async fn establish_stream(
         mut stream: QuicStream,
-        stream_ctx: Arc<QuicStreamContext>,
-    ) -> crate::common::error::Result<()> {
+        tasks: &mut JoinSet<()>,
+        ctx: Arc<QuicStreamContext>,
+    ) -> Result<impl Future<Output = crate::common::error::Result<()>>, Error> {
         let conn_data = Self::read_stream_header(&mut stream).await?;
         let conn_data_parsed = QuicConnData::decode(conn_data.as_ref())
             .context("failed to decode quic stream header")?;
 
-        let handle = stream.id;
-        let proxy_entries = &stream_ctx.proxy_entries;
+        let handle = stream.id();
+        let proxy_entries = &ctx.proxy_entries;
         proxy_entries.insert(
             handle,
             TcpProxyEntry {
@@ -371,7 +591,7 @@ impl QuicStreamReceiver {
 
         if let IpAddr::V4(dst_v4_ip) = dst_socket.ip() {
             let mut real_ip = dst_v4_ip;
-            if stream_ctx.cidr_set.contains_v4(dst_v4_ip, &mut real_ip) {
+            if ctx.cidr_set.contains_v4(dst_v4_ip, &mut real_ip) {
                 dst_socket.set_ip(real_ip.into());
             }
         };
@@ -379,13 +599,13 @@ impl QuicStreamReceiver {
         let src_ip = src_socket.ip();
         let dst_ip = dst_socket.ip();
 
-        let route = stream_ctx.route.clone();
-        let (src_groups, dst_groups) = tokio::join!(
+        let route = ctx.route.clone();
+        let (src_groups, dst_groups) = join!(
             route.get_peer_groups_by_ip(&src_ip),
             route.get_peer_groups_by_ip(&dst_ip)
         );
 
-        let global_ctx = stream_ctx.global_ctx.clone();
+        let global_ctx = ctx.global_ctx.clone();
         let send_to_self =
             Some(dst_socket.ip()) == global_ctx.get_ipv4().map(|ip| IpAddr::V4(ip.address()));
 
@@ -426,21 +646,17 @@ impl QuicStreamReceiver {
 
         let _g = global_ctx.net_ns.guard();
         let connector = crate::gateway::tcp_proxy::NatDstTcpConnector {};
-        let ret = match connector
-            .connect("0.0.0.0:0".parse().unwrap(), dst_socket)
-            .await
-        {
-            Ok(s) => s,
-            Err(e) => return Err(e),
-        };
+        let ret = connector.connect("0.0.0.0:0".parse()?, dst_socket).await?;
 
         if let Some(mut e) = proxy_entries.get_mut(&handle) {
             e.state = TcpProxyEntryState::Connected.into();
         }
 
-        acl_handler.copy_bidirection_with_acl(stream, ret).await?;
-
-        Ok(())
+        Ok(async move {
+            acl_handler
+                .copy_bidirection_with_acl(stream.inner, ret)
+                .await
+        })
     }
 }
 
@@ -470,7 +686,8 @@ impl QuicProxy {
 
 impl QuicProxy {
     pub fn new(peer_mgr: Arc<PeerManager>) -> Self {
-        let (endpoint, rx) = QuicEndpoint::new((ZCPacket::new_with_payload(&[]).payload_offset(),0).into());
+        let (endpoint, rx) =
+            QuicEndpoint::new((ZCPacket::new_with_payload(&[]).payload_offset(), 0).into());
         Self {
             endpoint: Arc::new(Mutex::new(endpoint)),
             peer_mgr,
@@ -493,7 +710,10 @@ impl QuicProxy {
                 zc_packet_type,
             )
         };
-        let QuicOutputRx {packet: packet_rx, stream: stream_rx} = self.rx.take().unwrap();
+        let QuicOutputRx {
+            packet: packet_rx,
+            stream: stream_rx,
+        } = self.rx.take().unwrap();
         let peer_mgr = self.peer_mgr.clone();
         self.tasks.spawn(
             QuicPacketSender {
