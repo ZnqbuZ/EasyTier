@@ -2,7 +2,6 @@ use crate::common::acl_processor::PacketInfo;
 use crate::common::global_ctx::{ArcGlobalCtx, GlobalCtx};
 use crate::common::PeerId;
 use crate::gateway::kcp_proxy::{ProxyAclHandler, TcpProxyForKcpSrcTrait};
-use crate::gateway::quic::{QuicEndpoint, QuicOutputRx, QuicPacketRx, QuicStreamRx};
 use crate::gateway::tcp_proxy::{NatDstConnector, TcpProxy};
 use crate::gateway::CidrSet;
 use crate::peers::peer_manager::PeerManager;
@@ -26,26 +25,21 @@ use pnet::packet::ipv4::Ipv4Packet;
 use prost::Message;
 use quinn::congestion::BbrConfig;
 use quinn::udp::{EcnCodepoint, RecvMeta, Transmit};
-use quinn::{
-    AsyncUdpSocket, Connecting, Endpoint, RecvStream, SendStream, TokioRuntime, UdpPoller,
-};
-use quinn::{
-    ClientConfig, ConnectError, EndpointConfig, ServerConfig, StreamId, TransportConfig, VarInt,
-};
+use quinn::{AsyncUdpSocket, Endpoint, RecvStream, SendStream, TokioRuntime, UdpPoller};
+use quinn::{ClientConfig, EndpointConfig, ServerConfig, StreamId, TransportConfig, VarInt};
 use quinn_plaintext::{client_config, server_config};
 use std::future::Future;
 use std::io::IoSliceMut;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::ops::DerefMut;
 use std::pin::Pin;
-use std::sync::atomic::Ordering;
 use std::sync::{Arc, Weak};
 use std::task::Poll;
 use std::time::Duration;
 use tokio::io::{join, AsyncReadExt, Join};
 use tokio::sync::mpsc::{channel, Receiver, Sender};
 use tokio::task::JoinSet;
-use tokio::time::{sleep, Instant};
+use tokio::time::Instant;
 use tokio::{join, pin, select};
 use tokio_util::sync::PollSender;
 use tracing::{debug, error, instrument, trace, warn};
@@ -497,11 +491,7 @@ impl QuicStreamReceiver {
             let connection = match incoming.accept() {
                 Ok(connection) => connection,
                 Err(e) => {
-                    error!(
-                        "failed to accept quic connection from {:?}: {:?}",
-                        addr,
-                        e
-                    );
+                    error!("failed to accept quic connection from {:?}: {:?}", addr, e);
                     continue;
                 }
             };
@@ -510,11 +500,7 @@ impl QuicStreamReceiver {
             let connection = match connection.await {
                 Ok(connection) => connection,
                 Err(e) => {
-                    error!(
-                        "failed to accept quic connection from {:?}: {:?}",
-                        addr,
-                        e
-                    );
+                    error!("failed to accept quic connection from {:?}: {:?}", addr, e);
                     continue;
                 }
             };
@@ -623,10 +609,9 @@ impl QuicStreamReceiver {
                 return Err(anyhow::anyhow!(
                     "dst socket {:?} is in running listeners, ignore it",
                     dst_socket
-                )
-                .into());
+                ));
             }
-            dst_socket = format!("127.0.0.1:{}", dst_socket.port()).parse().unwrap();
+            dst_socket = format!("127.0.0.1:{}", dst_socket.port()).parse()?;
         }
 
         let acl_handler = ProxyAclHandler {

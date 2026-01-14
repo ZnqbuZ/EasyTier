@@ -18,7 +18,6 @@ pub mod socks5;
 
 pub mod kcp_proxy;
 
-mod quic;
 pub mod quic_proxy;
 
 #[derive(Debug)]
