@@ -505,9 +505,6 @@ async fn subnet_proxy_test_icmp(target_ip: &str) {
 
 #[tokio::test]
 pub async fn quic_proxy() {
-    tracing_subscriber::fmt::Subscriber::builder()
-        .with_env_filter(tracing_subscriber::EnvFilter::new("info"))
-        .init();
     let insts = init_three_node_ex(
         "udp",
         |cfg| {
@@ -566,9 +563,6 @@ pub async fn subnet_proxy_three_node_test(
     #[values(true, false)] dst_enable_kcp_proxy: bool,
     #[values(true, false)] dst_enable_quic_proxy: bool,
 ) {
-    tracing_subscriber::fmt::Subscriber::builder()
-        .with_env_filter(tracing_subscriber::EnvFilter::new("debug,easytier::peers::peer_ospf_route=warn,easytier::tunnel=warn,easytier::peers::peer_map=warn,easytier::common::stun=error,hickory_proto=error,hickory_resolver=error,easytier::peers::peer_conn_ping=warn,easytier::connector::manual=error,easytier::common::dns=error"))
-        .init();
     let insts = init_three_node_ex(
         "udp",
         |cfg| {
