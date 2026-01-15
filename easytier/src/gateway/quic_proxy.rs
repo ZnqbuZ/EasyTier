@@ -20,7 +20,7 @@ use bytes::{BufMut, Bytes, BytesMut};
 use dashmap::DashMap;
 use derivative::Derivative;
 use derive_more::{Constructor, Deref, DerefMut, From, Into};
-use parking_lot::Mutex;
+use futures::StreamExt;
 use pnet::packet::ipv4::Ipv4Packet;
 use prost::Message;
 use quinn::congestion::BbrConfig;
@@ -28,15 +28,17 @@ use quinn::udp::{EcnCodepoint, RecvMeta, Transmit};
 use quinn::{AsyncUdpSocket, Endpoint, RecvStream, SendStream, TokioRuntime, UdpPoller};
 use quinn::{ClientConfig, EndpointConfig, ServerConfig, StreamId, TransportConfig, VarInt};
 use quinn_plaintext::{client_config, server_config};
+use std::cell::RefCell;
+use std::cmp::max;
 use std::future::Future;
 use std::io::IoSliceMut;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::ops::DerefMut;
 use std::pin::Pin;
 use std::sync::{Arc, Weak};
 use std::task::Poll;
 use std::time::Duration;
 use tokio::io::{join, AsyncReadExt, Join};
+use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::mpsc::{channel, Receiver, Sender};
 use tokio::task::JoinSet;
 use tokio::time::Instant;
@@ -50,6 +52,53 @@ struct QuicPacket {
     addr: SocketAddr,
     payload: BytesMut,
     ecn: Option<EcnCodepoint>,
+}
+//endregion
+
+//region utils
+#[derive(Debug, Clone, Copy, From, Into)]
+pub struct BufMargins {
+    pub header: usize,
+    pub trailer: usize,
+}
+
+impl BufMargins {
+    pub fn len(&self) -> usize {
+        self.header + self.trailer
+    }
+}
+
+#[derive(Debug)]
+pub(super) struct BufPool {
+    pool: BytesMut,
+    min_capacity: usize,
+}
+
+impl BufPool {
+    #[inline]
+    fn new(min_capacity: usize) -> Self {
+        Self {
+            pool: BytesMut::new(),
+            min_capacity,
+        }
+    }
+
+    fn buf(&mut self, data: &[u8], margins: BufMargins) -> BytesMut {
+        let len = margins.len() + data.len();
+
+        if len > self.pool.capacity() {
+            let additional = max(len * 4, self.min_capacity);
+            self.pool.reserve(additional);
+            unsafe {
+                self.pool.set_len(self.pool.capacity());
+            }
+        }
+
+        let mut buf = self.pool.split_to(len);
+        let (header, trailer) = margins.into();
+        buf[header..len - trailer].copy_from_slice(data);
+        buf
+    }
 }
 //endregion
 
@@ -71,11 +120,16 @@ impl UdpPoller for QuicSocketPoller {
     }
 }
 
+thread_local! {
+    static PACKET_POOL: RefCell<BufPool> = BufPool::new(1024 * 1024).into();
+}
+
 #[derive(Debug)]
 pub struct QuicSocket {
     addr: SocketAddr,
-    rx: Mutex<Receiver<QuicPacket>>,
+    rx: kanal::AsyncReceiver<QuicPacket>,
     tx: Sender<QuicPacket>,
+    margins: BufMargins,
 }
 
 impl AsyncUdpSocket for QuicSocket {
@@ -94,22 +148,20 @@ impl AsyncUdpSocket for QuicSocket {
                     transmit.contents.len(),
                     addr
                 );
-                if self.tx.capacity() > 0
-                    && self
-                        .tx
-                        .try_send(QuicPacket {
-                            addr: transmit.destination,
-                            payload: BytesMut::from(transmit.contents),
-                            ecn: transmit.ecn,
-                        })
-                        .is_ok()
-                {
-                    Ok(())
-                } else {
-                    //Err(std::io::ErrorKind::WouldBlock.into())
-                    //TODO avoid fake send success, need to implement awake mechanism
-                    Ok(())
-                }
+
+                let payload =
+                    PACKET_POOL.with_borrow_mut(|pool| pool.buf(transmit.contents, self.margins));
+
+                self.tx
+                    .try_send(QuicPacket {
+                        addr: transmit.destination,
+                        payload,
+                        ecn: transmit.ecn,
+                    })
+                    .map_err(|e| match e {
+                        TrySendError::Full(_) => std::io::ErrorKind::WouldBlock.into(),
+                        TrySendError::Closed(_) => std::io::ErrorKind::BrokenPipe.into(),
+                    })
             }
             _ => Err(std::io::ErrorKind::ConnectionRefused.into()),
         }
@@ -121,43 +173,56 @@ impl AsyncUdpSocket for QuicSocket {
         bufs: &mut [IoSliceMut<'_>],
         meta: &mut [RecvMeta],
     ) -> Poll<std::io::Result<usize>> {
-        let mut rx = self.rx.lock();
-        match rx.poll_recv(cx) {
-            Poll::Ready(Some(packet)) => {
-                if bufs.is_empty() || meta.is_empty() {
-                    return Poll::Ready(Ok(0));
-                }
+        if bufs.is_empty() || meta.is_empty() {
+            return Poll::Ready(Ok(0));
+        }
 
-                let len = packet.payload.len();
-                if len > bufs[0].len() {
-                    warn!(
-                        "buffer too small for packet: {:?} < {:?}, dropping",
-                        bufs[0].len(),
+        let mut stream = self.rx.stream();
+        let mut count = 0;
+
+        for (buf, meta) in bufs.iter_mut().zip(meta.iter_mut()) {
+            match stream.poll_next_unpin(cx) {
+                Poll::Ready(Some(packet)) => {
+                    let len = packet.payload.len();
+                    if len > buf.len() {
+                        warn!(
+                            "buffer too small for packet: {:?} < {:?}, dropped",
+                            buf.len(),
+                            len,
+                        );
+                        continue;
+                    }
+                    trace!(
+                        "{:?} received {:?} bytes from {:?}",
+                        self.addr,
                         len,
+                        packet.addr
                     );
-                    return Poll::Pending;
+                    buf[0..len].copy_from_slice(&packet.payload);
+                    *meta = RecvMeta {
+                        addr: packet.addr,
+                        len,
+                        stride: len,
+                        ecn: packet.ecn,
+                        dst_ip: None,
+                    };
+                    count += 1;
                 }
-                trace!(
-                    "{} received {} bytes from {:?}",
-                    self.addr,
-                    len,
-                    packet.addr
-                );
-                bufs[0].deref_mut()[0..len].copy_from_slice(&packet.payload);
-                meta[0] = RecvMeta {
-                    addr: packet.addr,
-                    len,
-                    stride: len,
-                    ecn: packet.ecn,
-                    dst_ip: None,
-                };
-                Poll::Ready(Ok(1))
+                Poll::Ready(None) if count > 0 => break,
+                Poll::Ready(None) => {
+                    return Poll::Ready(Err(std::io::Error::new(
+                        std::io::ErrorKind::ConnectionAborted,
+                        "socket closed",
+                    )))
+                }
+                Poll::Pending => break,
             }
-            Poll::Ready(None) => Poll::Ready(Err(std::io::Error::new(
-                std::io::ErrorKind::ConnectionAborted,
-                "socket closed",
-            ))),
-            Poll::Pending => Poll::Pending,
+        }
+
+        if count > 0 {
+            Poll::Ready(Ok(count))
+        } else {
+            Poll::Pending
         }
     }
 
@@ -302,7 +367,7 @@ impl NatDstConnector for NatDstQuicConnector {
                         _ => {
                             if connect_tasks.is_empty() {
                                 if retry_remain == 0 {
-                                    return Err(anyhow!("failed to connect to nat dst: {}", nat_dst).into())
+                                    return Err(anyhow!("failed to connect to nat dst: {:?}", nat_dst).into())
                                 }
 
                                 retry_remain -= 1;
@@ -393,7 +458,7 @@ impl QuicProxyRole {
 // Receive packets from peers and forward them to the QUIC endpoint
 #[derive(Debug)]
 struct QuicPacketReceiver {
-    tx: Sender<QuicPacket>,
+    tx: kanal::AsyncSender<QuicPacket>,
     role: QuicProxyRole,
 }
 
@@ -728,13 +793,24 @@ impl QuicProxy {
             return;
         }
 
-        let (in_tx, in_rx) = channel(1024);
+        let (header, zc_packet_type) = {
+            let header = ZCPacket::new_with_payload(&[]);
+            let zc_packet_type = header.packet_type();
+            let payload_offset = header.payload_offset();
+            (
+                header.inner().split_to(payload_offset).freeze(),
+                zc_packet_type,
+            )
+        };
+
+        let (in_tx, in_rx) = kanal::bounded_async(1024);
         let (out_tx, out_rx) = channel(1024);
 
         let socket = QuicSocket {
             addr: SocketAddr::new(Ipv4Addr::from(self.peer_mgr.my_peer_id()).into(), 0),
-            rx: Mutex::new(in_rx),
+            rx: in_rx,
             tx: out_tx,
+            margins: (header.len(), 0).into(),
         };
 
         let (endpoint_config, server_config, client_config) = Self::config();
@@ -747,16 +823,6 @@ impl QuicProxy {
         .unwrap();
         endpoint.set_default_client_config(client_config);
         self.endpoint = Some(endpoint.clone());
-
-        let (header, zc_packet_type) = {
-            let header = ZCPacket::new_with_payload(&[]);
-            let zc_packet_type = header.packet_type();
-            let payload_offset = header.payload_offset();
-            (
-                header.inner().split_to(payload_offset).freeze(),
-                zc_packet_type,
-            )
-        };
 
         let peer_mgr = self.peer_mgr.clone();
         self.tasks.spawn(
@@ -828,7 +894,7 @@ pub struct QuicProxySrc {
     peer_mgr: Arc<PeerManager>,
     tcp_proxy: TcpProxyForQuicSrc,
 
-    tx: Sender<QuicPacket>,
+    tx: kanal::AsyncSender<QuicPacket>,
 }
 
 impl QuicProxySrc {
@@ -860,7 +926,7 @@ impl QuicProxySrc {
 pub struct QuicProxyDst {
     peer_mgr: Arc<PeerManager>,
 
-    tx: Sender<QuicPacket>,
+    tx: kanal::AsyncSender<QuicPacket>,
     stream_ctx: Arc<QuicStreamContext>,
 }
 
