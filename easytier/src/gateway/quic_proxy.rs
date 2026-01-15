@@ -16,11 +16,11 @@ use crate::proto::rpc_types;
 use crate::proto::rpc_types::controller::BaseController;
 use crate::tunnel::packet_def::{PacketType, PeerManagerHeader, ZCPacket, ZCPacketType};
 use anyhow::{anyhow, Context, Error};
+use atomic_refcell::AtomicRefCell;
 use bytes::{BufMut, Bytes, BytesMut};
 use dashmap::DashMap;
 use derivative::Derivative;
 use derive_more::{Constructor, Deref, DerefMut, From, Into};
-use futures::StreamExt;
 use pnet::packet::ipv4::Ipv4Packet;
 use prost::Message;
 use quinn::congestion::BbrConfig;
@@ -104,7 +104,7 @@ impl BufPool {
 
 //region socket
 #[derive(Debug)]
-pub struct QuicSocketPoller {
+struct QuicSocketPoller {
     tx: PollSender<QuicPacket>,
 }
 
@@ -127,7 +127,7 @@ thread_local! {
 #[derive(Debug)]
 pub struct QuicSocket {
     addr: SocketAddr,
-    rx: kanal::AsyncReceiver<QuicPacket>,
+    rx: AtomicRefCell<Receiver<QuicPacket>>,
     tx: Sender<QuicPacket>,
     margins: BufMargins,
 }
@@ -177,11 +177,11 @@ impl AsyncUdpSocket for QuicSocket {
             return Poll::Ready(Ok(0));
         }
 
-        let mut stream = self.rx.stream();
+        let mut rx = self.rx.borrow_mut();
         let mut count = 0;
 
         for (buf, meta) in bufs.iter_mut().zip(meta.iter_mut()) {
-            match stream.poll_next_unpin(cx) {
+            match rx.poll_recv(cx) {
                 Poll::Ready(Some(packet)) => {
                     let len = packet.payload.len();
                     if len > buf.len() {
@@ -234,10 +234,10 @@ impl AsyncUdpSocket for QuicSocket {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use quinn::{ClientConfig, Endpoint, EndpointConfig, ServerConfig};
+    use quinn_plaintext::{client_config, server_config};
     use std::sync::Arc;
     use std::time::Duration;
-    use quinn::{Endpoint, EndpointConfig, ServerConfig, ClientConfig};
-    use quinn_plaintext::{client_config, server_config};
     use tokio::sync::mpsc;
     use tracing::info;
 
@@ -256,26 +256,26 @@ mod tests {
         // 两个方向的通道：A->B 和 B->A
         // 容量给够，防止高并发时丢包
         let (tx_a_out, rx_a_out) = mpsc::channel::<QuicPacket>(50_000);
-        let (tx_b_in, rx_b_in) = kanal::bounded_async::<QuicPacket>(50_000);
+        let (tx_b_in, rx_b_in) = mpsc::channel::<QuicPacket>(50_000);
 
         let (tx_b_out, rx_b_out) = mpsc::channel::<QuicPacket>(50_000);
-        let (tx_a_in, rx_a_in) = kanal::bounded_async::<QuicPacket>(50_000);
+        let (tx_a_in, rx_a_in) = mpsc::channel::<QuicPacket>(50_000);
 
         forward(rx_a_out, tx_b_in, addr_a);
         forward(rx_b_out, tx_a_in, addr_b);
 
         let socket_a = QuicSocket {
             addr: addr_a,
-            rx: rx_a_in,
+            rx: AtomicRefCell::new(rx_a_in),
             tx: tx_a_out,
-            margins: (0,0).into()
+            margins: (0, 0).into(),
         };
 
         let socket_b = QuicSocket {
             addr: addr_b,
-            rx: rx_b_in,
+            rx: AtomicRefCell::new(rx_b_in),
             tx: tx_b_out,
-            margins: (0,0).into()
+            margins: (0, 0).into(),
         };
 
         (socket_a, socket_b)
@@ -333,7 +333,8 @@ mod tests {
             Some(server_config.clone()),
             socket_client.clone(),
             Arc::new(quinn::TokioRuntime),
-        ).unwrap();
+        )
+        .unwrap();
         client_endpoint.set_default_client_config(client_config.clone());
 
         // 2. 配置 Server Endpoint
@@ -342,13 +343,14 @@ mod tests {
             Some(server_config.clone()),
             socket_server.clone(),
             Arc::new(quinn::TokioRuntime),
-        ).unwrap();
+        )
+        .unwrap();
         server_endpoint.set_default_client_config(client_config.clone());
 
         (client_endpoint, server_endpoint)
     }
 
-    fn forward(mut rx: Receiver<QuicPacket>, tx: kanal::AsyncSender<QuicPacket>, addr: SocketAddr) {
+    fn forward(mut rx: Receiver<QuicPacket>, tx: Sender<QuicPacket>, addr: SocketAddr) {
         const BATCH_SIZE: usize = 128;
         tokio::spawn(async move {
             // 关键优化：使用 buffer 批量处理
@@ -382,7 +384,10 @@ mod tests {
             println!("Server: Waiting for connection...");
             if let Some(conn) = server_endpoint.accept().await {
                 let connection = conn.await.unwrap();
-                println!("Server: Connection accepted from {}", connection.remote_address());
+                println!(
+                    "Server: Connection accepted from {}",
+                    connection.remote_address()
+                );
 
                 // 接收双向流
                 let (mut send, mut recv) = connection.accept_bi().await.unwrap();
@@ -509,7 +514,7 @@ mod tests {
     #[tokio::test]
     async fn test_bandwidth_parallel() -> anyhow::Result<()> {
         // --- 1. 配置参数 ---
-        const STREAM_COUNT: usize = 16;    // 并发流数量
+        const STREAM_COUNT: usize = 16; // 并发流数量
         const STREAM_SIZE: usize = 1024 * 1024 * 1024; // 每个流发送 256KB
 
         let (client_endpoint, server_endpoint) = endpoint();
@@ -534,13 +539,18 @@ mod tests {
                                 match recv.read_to_end(usize::MAX).await {
                                     Ok(data) => {
                                         // 校验长度
-                                        assert_eq!(data.len(), STREAM_SIZE, "Stream {} length mismatch", i);
+                                        assert_eq!(
+                                            data.len(),
+                                            STREAM_SIZE,
+                                            "Stream {} length mismatch",
+                                            i
+                                        );
                                         // 校验数据内容 (验证数据隔离性)
                                         // 我们约定数据的第一个字节是 (stream_index % 255)
                                         // 这样可以确保流的数据没串
                                         let expected_byte = (data[0]) as usize; // 获取实际收到的标记
-                                        // 这里只是简单校验首尾，实际生产可以使用 CRC
-                                        if data[data.len()-1] != data[0] {
+                                                                                // 这里只是简单校验首尾，实际生产可以使用 CRC
+                                        if data[data.len() - 1] != data[0] {
                                             panic!("Stream data corruption");
                                         }
                                         expected_byte // 返回标记用于统计
@@ -558,13 +568,21 @@ mod tests {
                 let results = futures::future::join_all(stream_handles).await;
                 let duration = start.elapsed();
 
-                let speed = ((STREAM_COUNT * STREAM_SIZE) as f64 * 8.0) / (duration.as_secs_f64() * 1_000_000.0);
+                let speed = ((STREAM_COUNT * STREAM_SIZE) as f64 * 8.0)
+                    / (duration.as_secs_f64() * 1_000_000.0);
 
                 println!("--------------------------------------------------");
                 println!("Server: All {} streams received processing.", results.len());
                 println!("Total Time: {:.2?}", duration);
-                println!("Total Data: {} MB", (STREAM_COUNT * STREAM_SIZE) / 1024 / 1024);
-                println!("Average Speed: {:.2} Gbps ({:.2} Mbps)", speed / 1024.0, speed);
+                println!(
+                    "Total Data: {} MB",
+                    (STREAM_COUNT * STREAM_SIZE) / 1024 / 1024
+                );
+                println!(
+                    "Average Speed: {:.2} Gbps ({:.2} Mbps)",
+                    speed / 1024.0,
+                    speed
+                );
                 println!("--------------------------------------------------");
 
                 // 保持连接直到 Client 断开
@@ -574,7 +592,10 @@ mod tests {
 
         // --- 4. Client 端 (并发发送器) ---
         let connection = client_endpoint.connect(server_addr, "localhost")?.await?;
-        println!("Client: Connected, starting {} parallel streams...", STREAM_COUNT);
+        println!(
+            "Client: Connected, starting {} parallel streams...",
+            STREAM_COUNT
+        );
 
         let start_send = std::time::Instant::now();
         let mut client_tasks = Vec::new();
@@ -842,7 +863,7 @@ impl QuicProxyRole {
 // Receive packets from peers and forward them to the QUIC endpoint
 #[derive(Debug)]
 struct QuicPacketReceiver {
-    tx: kanal::AsyncSender<QuicPacket>,
+    tx: Sender<QuicPacket>,
     role: QuicProxyRole,
 }
 
@@ -1187,12 +1208,12 @@ impl QuicProxy {
             )
         };
 
-        let (in_tx, in_rx) = kanal::bounded_async(1024);
+        let (in_tx, in_rx) = channel(1024);
         let (out_tx, out_rx) = channel(1024);
 
         let socket = QuicSocket {
             addr: SocketAddr::new(Ipv4Addr::from(self.peer_mgr.my_peer_id()).into(), 0),
-            rx: in_rx,
+            rx: AtomicRefCell::new(in_rx),
             tx: out_tx,
             margins: (header.len(), 0).into(),
         };
@@ -1278,7 +1299,7 @@ pub struct QuicProxySrc {
     peer_mgr: Arc<PeerManager>,
     tcp_proxy: TcpProxyForQuicSrc,
 
-    tx: kanal::AsyncSender<QuicPacket>,
+    tx: Sender<QuicPacket>,
 }
 
 impl QuicProxySrc {
@@ -1310,7 +1331,7 @@ impl QuicProxySrc {
 pub struct QuicProxyDst {
     peer_mgr: Arc<PeerManager>,
 
-    tx: kanal::AsyncSender<QuicPacket>,
+    tx: Sender<QuicPacket>,
     stream_ctx: Arc<QuicStreamContext>,
 }
 
