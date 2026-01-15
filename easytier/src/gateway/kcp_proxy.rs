@@ -307,7 +307,7 @@ impl<C: NatDstConnector, T: TcpProxyForKcpSrcTrait<Connector = C>> NicPacketFilt
         hdr.to_peer_id = self.get_tcp_proxy().get_my_peer_id().into();
         match self.get_tcp_proxy().get_transport_type() {
             TcpProxyEntryTransportType::Kcp => { hdr.set_kcp_src_modified(true); }
-            TcpProxyEntryTransportType::Quic => { hdr.set_quic_src_modified(false); }
+            TcpProxyEntryTransportType::Quic => { hdr.set_quic_src_modified(true); }
             _ => {}
         }
         true

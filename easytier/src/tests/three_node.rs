@@ -505,6 +505,9 @@ async fn subnet_proxy_test_icmp(target_ip: &str) {
 
 #[tokio::test]
 pub async fn quic_proxy() {
+    tracing_subscriber::fmt::Subscriber::builder()
+        .with_env_filter(tracing_subscriber::EnvFilter::new("info"))
+        .init();
     let insts = init_three_node_ex(
         "udp",
         |cfg| {
@@ -563,6 +566,9 @@ pub async fn subnet_proxy_three_node_test(
     #[values(true, false)] dst_enable_kcp_proxy: bool,
     #[values(true, false)] dst_enable_quic_proxy: bool,
 ) {
+    tracing_subscriber::fmt::Subscriber::builder()
+        .with_env_filter(tracing_subscriber::EnvFilter::new("debug,easytier::peers::peer_ospf_route=warn,easytier::tunnel=warn,easytier::peers::peer_map=warn,easytier::common::stun=error,hickory_proto=error,hickory_resolver=error,easytier::peers::peer_conn_ping=warn,easytier::connector::manual=error,easytier::common::dns=error"))
+        .init();
     let insts = init_three_node_ex(
         "udp",
         |cfg| {
@@ -624,7 +630,7 @@ pub async fn subnet_proxy_three_node_test(
     )
     .await;
 
-    for target_ip in ["10.1.3.4", "10.1.2.4", "10.144.144.3"] {
+    for target_ip in ["10.144.144.3", "10.1.3.4", "10.1.2.4"] {
         subnet_proxy_test_icmp(target_ip).await;
         let listen_ip = if target_ip == "10.144.144.3" {
             "0.0.0.0"
@@ -659,7 +665,7 @@ pub async fn subnet_proxy_three_node_test(
             assert_eq!(1, metric.value);
             assert!(metric.labels.labels().iter().any(|l| {
                 let t =
-                    LabelType::Protocol(TcpProxyEntryTransportType::Kcp.as_str_name().to_string());
+                    LabelType::Protocol(TcpProxyEntryTransportType::Quic.as_str_name().to_string());
                 t.key() == l.key && t.value() == l.value
             }));
         }
