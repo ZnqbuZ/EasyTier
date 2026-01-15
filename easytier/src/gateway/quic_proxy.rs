@@ -43,7 +43,7 @@ use tokio::task::JoinSet;
 use tokio::time::Instant;
 use tokio::{join, pin, select};
 use tokio_util::sync::PollSender;
-use tracing::{debug, error, instrument, trace, warn};
+use tracing::{debug, error, info, instrument, trace, warn};
 
 //region packet
 #[derive(Debug, Constructor)]
@@ -119,7 +119,11 @@ impl AsyncUdpSocket for QuicSocket {
                     let mut payload = BytesMut::with_capacity(payload_len);
                     unsafe {
                         payload.set_len(payload_len);
-                        copy_nonoverlapping(chunk.as_ptr(), payload.as_mut_ptr().add(self.margins.header), len);
+                        copy_nonoverlapping(
+                            chunk.as_ptr(),
+                            payload.as_mut_ptr().add(self.margins.header),
+                            len,
+                        );
                     }
 
                     if let Err(e) = self.tx.try_send(QuicPacket {
@@ -210,11 +214,11 @@ impl AsyncUdpSocket for QuicSocket {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bytes::Buf;
     use quinn::{ClientConfig, Endpoint, EndpointConfig, ServerConfig};
     use quinn_plaintext::{client_config, server_config};
     use std::sync::Arc;
     use std::time::Duration;
-    use bytes::Buf;
     use tokio::sync::mpsc;
     use tracing::info;
 
@@ -329,7 +333,12 @@ mod tests {
         (client_endpoint, server_endpoint)
     }
 
-    fn forward(mut rx: Receiver<QuicPacket>, tx: Sender<QuicPacket>, addr: SocketAddr, margins: PacketMargins) {
+    fn forward(
+        mut rx: Receiver<QuicPacket>,
+        tx: Sender<QuicPacket>,
+        addr: SocketAddr,
+        margins: PacketMargins,
+    ) {
         const BATCH_SIZE: usize = 128;
         tokio::spawn(async move {
             // 关键优化：使用 buffer 批量处理
@@ -342,7 +351,9 @@ mod tests {
                     // 【过滤逻辑】：在此处修改地址
                     packet.addr = addr;
                     packet.payload.advance(margins.header);
-                    packet.payload.truncate(packet.payload.len() - margins.trailer);
+                    packet
+                        .payload
+                        .truncate(packet.payload.len() - margins.trailer);
                 }
                 // 批量转发
                 for packet in buffer.drain(..) {
@@ -656,6 +667,7 @@ impl TryFrom<SocketAddr> for QuicAddr {
 }
 //endregion
 
+//region stream
 type QuicStreamInner = Join<RecvStream, SendStream>;
 #[derive(Debug, Deref, DerefMut, From, Into)]
 struct QuicStream {
@@ -675,6 +687,7 @@ impl From<(SendStream, RecvStream)> for QuicStream {
         join(value.1, value.0).into()
     }
 }
+//endregion
 
 type QuicConnData = KcpConnData;
 
@@ -937,52 +950,68 @@ struct QuicStreamReceiver {
 
 impl QuicStreamReceiver {
     async fn run(mut self) {
-        while let Some(incoming) = self.endpoint.accept().await {
-            let addr = incoming.remote_address();
-            let connection = match incoming.accept() {
-                Ok(connection) => connection,
-                Err(e) => {
-                    error!("failed to accept quic connection from {:?}: {:?}", addr, e);
-                    continue;
-                }
-            };
+        loop {
+            select! {
+                biased;
 
-            let addr = connection.remote_address();
-            let connection = match connection.await {
-                Ok(connection) => connection,
-                Err(e) => {
-                    error!("failed to accept quic connection from {:?}: {:?}", addr, e);
-                    continue;
-                }
-            };
-
-            let ctx = self.ctx.clone();
-            self.tasks.spawn(async move {
-                let mut tasks = JoinSet::new();
-                loop {
-                    let stream = select! {
-                        stream = connection.accept_bi() => {
-                            match stream {
-                                Ok(stream) => stream.into(),
-                                Err(e) => {
-                                    warn!("failed to accept bi stream from {:?}: {:?}", connection.remote_address(), e);
-                                    continue;
-                                }
-                            }
-                        }
-
-                        stream = connection.accept_uni() => {
-                            warn!("uni stream is not supported (stream from {:?}): {:?}", connection.remote_address(), stream);
+                Some(incoming) = self.endpoint.accept() => {
+                    let addr = incoming.remote_address();
+                    let connection = match incoming.accept() {
+                        Ok(connection) => connection,
+                        Err(e) => {
+                            error!("failed to accept quic connection from {:?}: {:?}", addr, e);
                             continue;
                         }
                     };
 
-                    match Self::establish_stream(stream, ctx.clone()).await {
-                        Ok(stream) => drop(tasks.spawn(stream)),
-                        Err(e) => warn!("failed to establish quic stream from {:?}: {:?}", connection.remote_address(), e),
-                    }
+                    let addr = connection.remote_address();
+                    let connection = match connection.await {
+                        Ok(connection) => connection,
+                        Err(e) => {
+                            error!("failed to accept quic connection from {:?}: {:?}", addr, e);
+                            continue;
+                        }
+                    };
+
+                    let ctx = self.ctx.clone();
+                    self.tasks.spawn(async move {
+                        let mut tasks = JoinSet::new();
+                        loop {
+                            select! {
+                                biased;
+
+                                e = connection.closed() => {
+                                    info!("connection to {:?} closed: {:?}", addr, e);
+                                    break;
+                                }
+
+                                stream = connection.accept_bi() => {
+                                    let stream = match stream {
+                                        Ok(stream) => stream.into(),
+                                        Err(e) => {
+                                            warn!("failed to accept bi stream from {:?}: {:?}", connection.remote_address(), e);
+                                            break;
+                                        }
+                                    };
+
+                                    match Self::establish_stream(stream, ctx.clone()).await {
+                                        Ok(stream) => drop(tasks.spawn(stream)),
+                                        Err(e) => warn!("failed to establish quic stream from {:?}: {:?}", connection.remote_address(), e),
+                                    }
+                                }
+
+                                res = tasks.join_next(), if !tasks.is_empty() => {
+                                    debug!("quic stream task completed for {:?}: {:?}", addr, res);
+                                }
+                            }
+                        }
+
+                        connection.close(1u32.into(), b"error");
+                    });
                 }
-            });
+
+                _ = self.tasks.join_next(), if !self.tasks.is_empty() => {}
+            }
         }
     }
 
@@ -1148,7 +1177,7 @@ impl QuicProxy {
         transport_config.send_window(64 * 1024 * 1024);
 
         transport_config.max_concurrent_bidi_streams(VarInt::from_u32(1024));
-        transport_config.max_concurrent_uni_streams(VarInt::from_u32(1024));
+        transport_config.max_concurrent_uni_streams(VarInt::from_u32(0));
 
         transport_config.datagram_receive_buffer_size(None);
 
