@@ -1447,7 +1447,6 @@ impl PeerManager {
         true
     }
 
-    //TODO: add feature flag for QUIC
     pub async fn check_allow_quic_to_dst(&self, dst_ip: &IpAddr) -> bool {
         let route = self.get_route();
         let Some(dst_peer_id) = route.get_peer_id_by_ip(dst_ip).await else {

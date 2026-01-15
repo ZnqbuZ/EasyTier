@@ -799,12 +799,12 @@ impl NatDstConnector for NatDstQuicConnector {
         _ipv4: &Ipv4Packet,
         _real_dst_ip: &mut Ipv4Addr,
     ) -> bool {
-        hdr.from_peer_id == hdr.to_peer_id && hdr.is_kcp_src_modified()
-    } //TODO: Can we use the same flag?
+        hdr.from_peer_id == hdr.to_peer_id && hdr.is_quic_src_modified()
+    }
 
     #[inline]
     fn transport_type(&self) -> TcpProxyEntryTransportType {
-        TcpProxyEntryTransportType::Kcp
+        TcpProxyEntryTransportType::Quic
     }
 }
 
