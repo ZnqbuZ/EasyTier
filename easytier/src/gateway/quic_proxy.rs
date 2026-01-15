@@ -119,7 +119,7 @@ impl AsyncUdpSocket for QuicSocket {
                     let mut payload = BytesMut::with_capacity(payload_len);
                     unsafe {
                         payload.set_len(payload_len);
-                        copy_nonoverlapping(chunk.as_ptr(), payload.as_mut_ptr(), len);
+                        copy_nonoverlapping(chunk.as_ptr(), payload.as_mut_ptr().add(self.margins.header), len);
                     }
 
                     if let Err(e) = self.tx.try_send(QuicPacket {
@@ -214,6 +214,7 @@ mod tests {
     use quinn_plaintext::{client_config, server_config};
     use std::sync::Arc;
     use std::time::Duration;
+    use bytes::Buf;
     use tokio::sync::mpsc;
     use tracing::info;
 
@@ -237,21 +238,23 @@ mod tests {
         let (tx_b_out, rx_b_out) = mpsc::channel::<QuicPacket>(50_000);
         let (tx_a_in, rx_a_in) = mpsc::channel::<QuicPacket>(50_000);
 
-        forward(rx_a_out, tx_b_in, addr_a);
-        forward(rx_b_out, tx_a_in, addr_b);
+        let margins = (20, 25).into();
+
+        forward(rx_a_out, tx_b_in, addr_a, margins);
+        forward(rx_b_out, tx_a_in, addr_b, margins);
 
         let socket_a = QuicSocket {
             addr: addr_a,
             rx: AtomicRefCell::new(rx_a_in),
             tx: tx_a_out,
-            margins: (0, 0).into(),
+            margins,
         };
 
         let socket_b = QuicSocket {
             addr: addr_b,
             rx: AtomicRefCell::new(rx_b_in),
             tx: tx_b_out,
-            margins: (0, 0).into(),
+            margins,
         };
 
         (socket_a, socket_b)
@@ -326,7 +329,7 @@ mod tests {
         (client_endpoint, server_endpoint)
     }
 
-    fn forward(mut rx: Receiver<QuicPacket>, tx: Sender<QuicPacket>, addr: SocketAddr) {
+    fn forward(mut rx: Receiver<QuicPacket>, tx: Sender<QuicPacket>, addr: SocketAddr, margins: PacketMargins) {
         const BATCH_SIZE: usize = 128;
         tokio::spawn(async move {
             // 关键优化：使用 buffer 批量处理
@@ -338,6 +341,8 @@ mod tests {
                 for packet in buffer.iter_mut() {
                     // 【过滤逻辑】：在此处修改地址
                     packet.addr = addr;
+                    packet.payload.advance(margins.header);
+                    packet.payload.truncate(packet.payload.len() - margins.trailer);
                 }
                 // 批量转发
                 for packet in buffer.drain(..) {
