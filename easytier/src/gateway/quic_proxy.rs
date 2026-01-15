@@ -230,6 +230,390 @@ impl AsyncUdpSocket for QuicSocket {
         Ok(self.addr)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+    use std::time::Duration;
+    use quinn::{Endpoint, EndpointConfig, ServerConfig, ClientConfig};
+    use quinn_plaintext::{client_config, server_config};
+    use tokio::sync::mpsc;
+    use tracing::info;
+
+    fn init() {
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter("debug")
+            .try_init();
+    }
+
+    /// 辅助函数：创建一对相互连接的 QuicSocket
+    /// socket_a 发送的数据会进入 socket_b 的 rx，反之亦然。
+    fn make_socket_pair() -> (QuicSocket, QuicSocket) {
+        let addr_a: SocketAddr = "127.0.0.1:5000".parse().unwrap();
+        let addr_b: SocketAddr = "127.0.0.1:5001".parse().unwrap();
+
+        // 两个方向的通道：A->B 和 B->A
+        // 容量给够，防止高并发时丢包
+        let (tx_a_out, rx_a_out) = mpsc::channel::<QuicPacket>(50_000);
+        let (tx_b_in, rx_b_in) = kanal::bounded_async::<QuicPacket>(50_000);
+
+        let (tx_b_out, rx_b_out) = mpsc::channel::<QuicPacket>(50_000);
+        let (tx_a_in, rx_a_in) = kanal::bounded_async::<QuicPacket>(50_000);
+
+        forward(rx_a_out, tx_b_in, addr_a);
+        forward(rx_b_out, tx_a_in, addr_b);
+
+        let socket_a = QuicSocket {
+            addr: addr_a,
+            rx: rx_a_in,
+            tx: tx_a_out,
+            margins: (0,0).into()
+        };
+
+        let socket_b = QuicSocket {
+            addr: addr_b,
+            rx: rx_b_in,
+            tx: tx_b_out,
+            margins: (0,0).into()
+        };
+
+        (socket_a, socket_b)
+    }
+
+    fn config() -> (EndpointConfig, ServerConfig, ClientConfig) {
+        let mut transport_config = TransportConfig::default();
+
+        transport_config.initial_mtu(65535);
+        transport_config.min_mtu(65535);
+
+        transport_config.stream_receive_window(VarInt::from_u32(64 * 1024 * 1024));
+        transport_config.receive_window(VarInt::from_u32(64 * 1024 * 1024));
+        transport_config.send_window(64 * 1024 * 1024);
+
+        transport_config.max_concurrent_bidi_streams(VarInt::from_u32(1024));
+        transport_config.max_concurrent_uni_streams(VarInt::from_u32(1024));
+
+        transport_config.datagram_receive_buffer_size(None);
+
+        transport_config.congestion_controller_factory(Arc::new(BbrConfig::default()));
+
+        transport_config.keep_alive_interval(Some(Duration::from_secs(15)));
+        transport_config.max_idle_timeout(Some(VarInt::from_u32(3_000).into()));
+
+        transport_config.enable_segmentation_offload(false);
+
+        transport_config.mtu_discovery_config(None);
+
+        let transport_config = Arc::new(transport_config);
+
+        let mut server_config = server_config();
+        server_config.transport = transport_config.clone();
+
+        let mut client_config = client_config();
+        client_config.transport_config(transport_config.clone());
+
+        let mut endpoint_config = EndpointConfig::default();
+        endpoint_config.max_udp_payload_size(65507).unwrap();
+
+        (endpoint_config, server_config, client_config)
+    }
+
+    fn endpoint() -> (Endpoint, Endpoint) {
+        let (endpoint_config, server_config, client_config) = config();
+
+        // 1. 创建内存 Socket 对
+        let (socket_client, socket_server) = make_socket_pair();
+        let socket_client = Arc::new(socket_client);
+        let socket_server = Arc::new(socket_server);
+
+        // 3. 配置 Client Endpoint
+        let mut client_endpoint = Endpoint::new_with_abstract_socket(
+            endpoint_config.clone(),
+            Some(server_config.clone()),
+            socket_client.clone(),
+            Arc::new(quinn::TokioRuntime),
+        ).unwrap();
+        client_endpoint.set_default_client_config(client_config.clone());
+
+        // 2. 配置 Server Endpoint
+        let mut server_endpoint = Endpoint::new_with_abstract_socket(
+            endpoint_config.clone(),
+            Some(server_config.clone()),
+            socket_server.clone(),
+            Arc::new(quinn::TokioRuntime),
+        ).unwrap();
+        server_endpoint.set_default_client_config(client_config.clone());
+
+        (client_endpoint, server_endpoint)
+    }
+
+    fn forward(mut rx: Receiver<QuicPacket>, tx: kanal::AsyncSender<QuicPacket>, addr: SocketAddr) {
+        const BATCH_SIZE: usize = 128;
+        tokio::spawn(async move {
+            // 关键优化：使用 buffer 批量处理
+            let mut buffer = Vec::with_capacity(BATCH_SIZE);
+
+            // recv_many 会在有数据时唤醒，一次最多拿 100 个包
+            // 这比每次拿 1 个包减少了 99 次上下文切换开销
+            while rx.recv_many(&mut buffer, BATCH_SIZE).await > 0 {
+                for packet in buffer.iter_mut() {
+                    // 【过滤逻辑】：在此处修改地址
+                    packet.addr = addr;
+                }
+                // 批量转发
+                for packet in buffer.drain(..) {
+                    if let Err(e) = tx.send(packet).await {
+                        info!("{:?}", e);
+                        return; // 通道已关闭
+                    }
+                }
+            }
+        });
+    }
+
+    #[tokio::test]
+    async fn test_ping() -> anyhow::Result<()> {
+        let (client_endpoint, server_endpoint) = endpoint();
+        let server_addr = server_endpoint.local_addr()?;
+
+        // 4. Server 接收任务
+        let server_handle = tokio::spawn(async move {
+            println!("Server: Waiting for connection...");
+            if let Some(conn) = server_endpoint.accept().await {
+                let connection = conn.await.unwrap();
+                println!("Server: Connection accepted from {}", connection.remote_address());
+
+                // 接收双向流
+                let (mut send, mut recv) = connection.accept_bi().await.unwrap();
+
+                // 读取数据
+                let mut buf = vec![0u8; 10];
+                recv.read_exact(&mut buf).await.unwrap();
+                assert_eq!(&buf, b"ping______");
+                println!("Server: Received 'ping______'");
+
+                // 发送回复
+                send.write_all(b"pong______").await.unwrap();
+                send.finish().unwrap();
+
+                let _ = connection.closed().await;
+            }
+        });
+
+        // 5. Client 发起连接
+        // 注意：这里的 connect 地址必须是 V4，因为你的 try_send 限制了 SocketAddr::V4
+        println!("Client: Connecting...");
+        let connection = client_endpoint.connect(server_addr, "localhost")?.await?;
+        println!("Client: Connected!");
+
+        // 打开流并发送数据
+        let (mut send, mut recv) = connection.open_bi().await?;
+        send.write_all(b"ping______").await?;
+        send.finish()?;
+
+        // 读取回复
+        let mut buf = vec![0u8; 10];
+        recv.read_exact(&mut buf).await?;
+        assert_eq!(&buf, b"pong______");
+        println!("Client: Received 'pong______'");
+
+        // 6. 清理
+        connection.close(0u32.into(), b"done");
+        // 等待 Server 结束
+        let _ = tokio::time::timeout(Duration::from_secs(2), server_handle).await;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_bandwidth() -> anyhow::Result<()> {
+        // --- 3. 定义测试数据量 ---
+        // 测试总量: 512 MB
+        const TOTAL_SIZE: usize = 32768 * 1024 * 1024;
+        // 每次写入块大小: 1 MB (模拟大块写入)
+        const CHUNK_SIZE: usize = 1024 * 1024;
+
+        let (client_endpoint, server_endpoint) = endpoint();
+        let server_addr = server_endpoint.local_addr()?;
+
+        // --- 4. Server 端 (接收并计时) ---
+        let server_handle = tokio::spawn(async move {
+            if let Some(conn) = server_endpoint.accept().await {
+                let connection = conn.await.unwrap();
+                // 接收单向流
+                let mut recv = connection.accept_uni().await.unwrap();
+
+                let start = std::time::Instant::now();
+                let mut received = 0;
+
+                // 循环读取直到流结束
+                // read_chunk 比 read_exact 性能稍好，因为它减少了内部 buffer拷贝
+                while let Some(chunk) = recv.read_chunk(usize::MAX, true).await.unwrap() {
+                    received += chunk.bytes.len();
+                }
+
+                let duration = start.elapsed();
+                assert_eq!(received, TOTAL_SIZE, "Data length mismatch");
+
+                let seconds = duration.as_secs_f64();
+                let mbps = (received as f64 * 8.0) / (1_000_000.0 * seconds);
+                let gbps = mbps / 1000.0;
+
+                println!("--------------------------------------------------");
+                println!("Server Recv Statistics:");
+                println!("  Total Data: {} MB", received / 1024 / 1024);
+                println!("  Duration  : {:.2?}", duration);
+                println!("  Throughput: {:.2} Gbps ({:.2} Mbps)", gbps, mbps);
+                println!("--------------------------------------------------");
+
+                // 保持连接直到 Client 断开
+                let _ = connection.closed().await;
+            }
+        });
+
+        // --- 5. Client 端 (发送) ---
+        let connection = client_endpoint.connect(server_addr, "localhost")?.await?;
+        let mut send = connection.open_uni().await?;
+
+        // 构造一个 1MB 的数据块
+        let data_chunk = vec![0u8; CHUNK_SIZE];
+        let bytes_data = bytes::Bytes::from(data_chunk); // 使用 Bytes 避免重复分配
+
+        println!("Client: Start sending {} MB...", TOTAL_SIZE / 1024 / 1024);
+        let start_send = std::time::Instant::now();
+
+        let chunks = TOTAL_SIZE / CHUNK_SIZE;
+        for _ in 0..chunks {
+            // write_chunk 配合 Bytes 使用效率最高
+            send.write_chunk(bytes_data.clone()).await?;
+        }
+
+        // 告诉对端发送完毕
+        send.finish()?;
+        // 等待流彻底关闭（确保对方收到了 FIN）
+        send.stopped().await?;
+
+        let send_duration = start_send.elapsed();
+        println!("Client: Send finished in {:.2?}", send_duration);
+
+        // 关闭连接
+        connection.close(0u32.into(), b"done");
+
+        // 等待 Server 打印结果
+        let _ = tokio::time::timeout(Duration::from_secs(5), server_handle).await;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_bandwidth_parallel() -> anyhow::Result<()> {
+        // --- 1. 配置参数 ---
+        const STREAM_COUNT: usize = 16;    // 并发流数量
+        const STREAM_SIZE: usize = 1024 * 1024 * 1024; // 每个流发送 256KB
+
+        let (client_endpoint, server_endpoint) = endpoint();
+        let server_addr = server_endpoint.local_addr()?;
+
+        // --- 3. Server 端 (并发接收器) ---
+        let server_handle = tokio::spawn(async move {
+            if let Some(conn) = server_endpoint.accept().await {
+                let connection = conn.await.unwrap();
+                println!("Server: Accepted connection");
+
+                let mut stream_handles = Vec::new();
+                let start = std::time::Instant::now();
+
+                // 接收预期数量的流
+                for i in 0..STREAM_COUNT {
+                    match connection.accept_uni().await {
+                        Ok(mut recv) => {
+                            // 为每个流启动一个独立的处理任务
+                            let handle = tokio::spawn(async move {
+                                // 读取所有数据
+                                match recv.read_to_end(usize::MAX).await {
+                                    Ok(data) => {
+                                        // 校验长度
+                                        assert_eq!(data.len(), STREAM_SIZE, "Stream {} length mismatch", i);
+                                        // 校验数据内容 (验证数据隔离性)
+                                        // 我们约定数据的第一个字节是 (stream_index % 255)
+                                        // 这样可以确保流的数据没串
+                                        let expected_byte = (data[0]) as usize; // 获取实际收到的标记
+                                        // 这里只是简单校验首尾，实际生产可以使用 CRC
+                                        if data[data.len()-1] != data[0] {
+                                            panic!("Stream data corruption");
+                                        }
+                                        expected_byte // 返回标记用于统计
+                                    }
+                                    Err(e) => panic!("Stream read error: {}", e),
+                                }
+                            });
+                            stream_handles.push(handle);
+                        }
+                        Err(e) => panic!("Failed to accept stream {}: {}", i, e),
+                    }
+                }
+
+                // 等待所有流处理完毕
+                let results = futures::future::join_all(stream_handles).await;
+                let duration = start.elapsed();
+
+                let speed = ((STREAM_COUNT * STREAM_SIZE) as f64 * 8.0) / (duration.as_secs_f64() * 1_000_000.0);
+
+                println!("--------------------------------------------------");
+                println!("Server: All {} streams received processing.", results.len());
+                println!("Total Time: {:.2?}", duration);
+                println!("Total Data: {} MB", (STREAM_COUNT * STREAM_SIZE) / 1024 / 1024);
+                println!("Average Speed: {:.2} Gbps ({:.2} Mbps)", speed / 1024.0, speed);
+                println!("--------------------------------------------------");
+
+                // 保持连接直到 Client 断开
+                let _ = connection.closed().await;
+            }
+        });
+
+        // --- 4. Client 端 (并发发送器) ---
+        let connection = client_endpoint.connect(server_addr, "localhost")?.await?;
+        println!("Client: Connected, starting {} parallel streams...", STREAM_COUNT);
+
+        let start_send = std::time::Instant::now();
+        let mut client_tasks = Vec::new();
+
+        // 并发启动发送任务
+        for i in 0..STREAM_COUNT {
+            let conn = connection.clone();
+            client_tasks.push(tokio::spawn(async move {
+                // 打开单向流
+                let mut send = conn.open_uni().await.expect("Failed to open stream");
+
+                // 构造数据：为了验证隔离性，我们用 i 作为填充标记
+                // 所有的字节都填成 (i % 255)
+                let fill_byte = (i % 255) as u8;
+                let data = vec![fill_byte; STREAM_SIZE];
+                let bytes_data = bytes::Bytes::from(data);
+
+                send.write_chunk(bytes_data).await.expect("Write failed");
+                send.finish().expect("Finish failed");
+                // 等待 Server 确认收到 FIN
+                send.stopped().await.expect("Stopped failed");
+            }));
+        }
+
+        // 等待所有发送任务完成
+        futures::future::join_all(client_tasks).await;
+
+        let send_duration = start_send.elapsed();
+        println!("Client: All streams sent in {:.2?}", send_duration);
+
+        // 关闭连接
+        connection.close(0u32.into(), b"done");
+
+        // 等待 Server 结束
+        let _ = tokio::time::timeout(Duration::from_secs(10), server_handle).await;
+
+        Ok(())
+    }
+}
 //endregion
 
 //region addr
@@ -751,7 +1135,7 @@ impl QuicProxy {
         }
     }
 
-    fn config() -> (EndpointConfig, ServerConfig, ClientConfig) {
+    fn new_config() -> (EndpointConfig, ServerConfig, ClientConfig) {
         let mut transport_config = TransportConfig::default();
 
         transport_config.initial_mtu(1200);
@@ -813,7 +1197,7 @@ impl QuicProxy {
             margins: (header.len(), 0).into(),
         };
 
-        let (endpoint_config, server_config, client_config) = Self::config();
+        let (endpoint_config, server_config, client_config) = Self::new_config();
         let mut endpoint = Endpoint::new_with_abstract_socket(
             endpoint_config,
             Some(server_config),
