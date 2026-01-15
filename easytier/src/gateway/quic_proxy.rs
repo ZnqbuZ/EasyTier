@@ -28,12 +28,11 @@ use quinn::udp::{EcnCodepoint, RecvMeta, Transmit};
 use quinn::{AsyncUdpSocket, Endpoint, RecvStream, SendStream, TokioRuntime, UdpPoller};
 use quinn::{ClientConfig, EndpointConfig, ServerConfig, StreamId, TransportConfig, VarInt};
 use quinn_plaintext::{client_config, server_config};
-use std::cell::RefCell;
-use std::cmp::max;
 use std::future::Future;
 use std::io::IoSliceMut;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::pin::Pin;
+use std::ptr::copy_nonoverlapping;
 use std::sync::{Arc, Weak};
 use std::task::Poll;
 use std::time::Duration;
@@ -53,51 +52,16 @@ struct QuicPacket {
     payload: BytesMut,
     ecn: Option<EcnCodepoint>,
 }
-//endregion
 
-//region utils
 #[derive(Debug, Clone, Copy, From, Into)]
-pub struct BufMargins {
+pub struct PacketMargins {
     pub header: usize,
     pub trailer: usize,
 }
 
-impl BufMargins {
+impl PacketMargins {
     pub fn len(&self) -> usize {
         self.header + self.trailer
-    }
-}
-
-#[derive(Debug)]
-pub(super) struct BufPool {
-    pool: BytesMut,
-    min_capacity: usize,
-}
-
-impl BufPool {
-    #[inline]
-    fn new(min_capacity: usize) -> Self {
-        Self {
-            pool: BytesMut::new(),
-            min_capacity,
-        }
-    }
-
-    fn buf(&mut self, data: &[u8], margins: BufMargins) -> BytesMut {
-        let len = margins.len() + data.len();
-
-        if len > self.pool.capacity() {
-            let additional = max(len * 4, self.min_capacity);
-            self.pool.reserve(additional);
-            unsafe {
-                self.pool.set_len(self.pool.capacity());
-            }
-        }
-
-        let mut buf = self.pool.split_to(len);
-        let (header, trailer) = margins.into();
-        buf[header..len - trailer].copy_from_slice(data);
-        buf
     }
 }
 //endregion
@@ -120,16 +84,12 @@ impl UdpPoller for QuicSocketPoller {
     }
 }
 
-thread_local! {
-    static PACKET_POOL: RefCell<BufPool> = BufPool::new(1024 * 1024).into();
-}
-
 #[derive(Debug)]
 pub struct QuicSocket {
     addr: SocketAddr,
     rx: AtomicRefCell<Receiver<QuicPacket>>,
     tx: Sender<QuicPacket>,
-    margins: BufMargins,
+    margins: PacketMargins,
 }
 
 impl AsyncUdpSocket for QuicSocket {
@@ -142,26 +102,33 @@ impl AsyncUdpSocket for QuicSocket {
     fn try_send(&self, transmit: &Transmit) -> std::io::Result<()> {
         match transmit.destination {
             SocketAddr::V4(addr) => {
-                trace!(
-                    "{:?} sending {:?} bytes to {:?}",
-                    self.addr,
-                    transmit.contents.len(),
-                    addr
-                );
+                let len = transmit.contents.len();
+                trace!("{:?} sending {:?} bytes to {:?}", self.addr, len, addr);
 
-                let payload =
-                    PACKET_POOL.with_borrow_mut(|pool| pool.buf(transmit.contents, self.margins));
+                let segment_size = transmit.segment_size.unwrap_or(len);
 
-                self.tx
-                    .try_send(QuicPacket {
-                        addr: transmit.destination,
-                        payload,
-                        ecn: transmit.ecn,
-                    })
-                    .map_err(|e| match e {
-                        TrySendError::Full(_) => std::io::ErrorKind::WouldBlock.into(),
-                        TrySendError::Closed(_) => std::io::ErrorKind::BrokenPipe.into(),
-                    })
+                for chunk in transmit.contents.chunks(segment_size) {
+                    let len = chunk.len();
+                    let payload_len = len + self.margins.len();
+                    let mut payload = BytesMut::with_capacity(payload_len);
+                    unsafe {
+                        payload.set_len(payload_len);
+                        copy_nonoverlapping(chunk.as_ptr(), payload.as_mut_ptr(), len);
+                    }
+
+                    self.tx
+                        .try_send(QuicPacket {
+                            addr: transmit.destination,
+                            payload,
+                            ecn: transmit.ecn,
+                        })
+                        .map_err(|e| match e {
+                            TrySendError::Full(_) => std::io::ErrorKind::WouldBlock,
+                            TrySendError::Closed(_) => std::io::ErrorKind::BrokenPipe,
+                        })?;
+                }
+
+                Ok(())
             }
             _ => Err(std::io::ErrorKind::ConnectionRefused.into()),
         }
