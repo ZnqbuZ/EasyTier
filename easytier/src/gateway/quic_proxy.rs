@@ -105,7 +105,13 @@ impl AsyncUdpSocket for QuicSocket {
                 let len = transmit.contents.len();
                 trace!("{:?} sending {:?} bytes to {:?}", self.addr, len, addr);
 
+                let mut sent = false;
                 let segment_size = transmit.segment_size.unwrap_or(len);
+                let chunks = transmit.contents.chunks(segment_size);
+
+                if self.tx.capacity() < chunks.len() {
+                    return Err(std::io::ErrorKind::WouldBlock.into());
+                }
 
                 for chunk in transmit.contents.chunks(segment_size) {
                     let len = chunk.len();
@@ -116,16 +122,19 @@ impl AsyncUdpSocket for QuicSocket {
                         copy_nonoverlapping(chunk.as_ptr(), payload.as_mut_ptr(), len);
                     }
 
-                    self.tx
-                        .try_send(QuicPacket {
-                            addr: transmit.destination,
-                            payload,
-                            ecn: transmit.ecn,
-                        })
-                        .map_err(|e| match e {
-                            TrySendError::Full(_) => std::io::ErrorKind::WouldBlock,
-                            TrySendError::Closed(_) => std::io::ErrorKind::BrokenPipe,
-                        })?;
+                    if let Err(e) = self.tx.try_send(QuicPacket {
+                        addr: transmit.destination,
+                        payload,
+                        ecn: transmit.ecn,
+                    }) {
+                        return match e {
+                            TrySendError::Full(_) if sent => Ok(()),
+                            TrySendError::Full(_) => Err(std::io::ErrorKind::WouldBlock.into()),
+                            TrySendError::Closed(_) => Err(std::io::ErrorKind::BrokenPipe.into()),
+                        };
+                    }
+
+                    sent = true;
                 }
 
                 Ok(())
