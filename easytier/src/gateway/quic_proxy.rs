@@ -424,6 +424,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "consumes massive memory (~16GB)"]
     async fn test_bandwidth() -> anyhow::Result<()> {
         // --- 3. 定义测试数据量 ---
         // 测试总量: 512 MB
@@ -504,6 +505,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "consumes massive memory (~16GB)"]
     async fn test_bandwidth_parallel() -> anyhow::Result<()> {
         // --- 1. 配置参数 ---
         const STREAM_COUNT: usize = 16; // 并发流数量
