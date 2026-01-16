@@ -4,10 +4,10 @@ use pnet::packet::ipv4::Ipv4Packet;
 use prost::Message as _;
 use quinn::congestion::BbrConfig;
 use quinn::{
-    Connection, ConnectionId, Endpoint, EndpointConfig, Incoming, TokioRuntime, TransportConfig,
-    VarInt,
+    ClientConfig, Connection, ConnectionId, Endpoint, EndpointConfig, Incoming, TokioRuntime,
+    TransportConfig, VarInt,
 };
-use quinn_plaintext::{client_config, server_config};
+use quinn_plaintext::server_config;
 use std::net::{AddrParseError, IpAddr, Ipv4Addr};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
@@ -194,6 +194,12 @@ fn transport_config() -> Arc<TransportConfig> {
     Arc::new(transport_config)
 }
 
+fn client_config() -> ClientConfig {
+    let mut client_config = quinn_plaintext::client_config();
+    client_config.transport_config(transport_config());
+    client_config
+}
+
 pub struct QUICProxySrc {
     peer_manager: Arc<PeerManager>,
     tcp_proxy: TcpProxyForQUICSrc,
@@ -201,10 +207,8 @@ pub struct QUICProxySrc {
 
 impl QUICProxySrc {
     pub async fn new(peer_manager: Arc<PeerManager>) -> Self {
-        let mut client_config = client_config();
-        client_config.transport_config(transport_config());
         let mut endpoint = Endpoint::client("0.0.0.0:0".parse().unwrap()).unwrap();
-        endpoint.set_default_client_config(client_config);
+        endpoint.set_default_client_config(client_config());
 
         let tcp_proxy = TcpProxy::new(
             peer_manager.clone(),
@@ -249,25 +253,16 @@ impl QUICProxyDst {
         route: Arc<dyn crate::peers::route_trait::Route + Send + Sync + 'static>,
     ) -> Result<Self> {
         let _g = global_ctx.net_ns.guard();
-        let bind_addr = format!("0.0.0.0:{}", global_ctx.config.get_flags().quic_listen_port)
+        let addr = format!("0.0.0.0:{}", global_ctx.config.get_flags().quic_listen_port)
             .parse()
             .map_err::<anyhow::Error, _>(Into::into)?;
-        let socket2_socket = socket2::Socket::new(
-            socket2::Domain::for_address(bind_addr),
-            socket2::Type::DGRAM,
-            Some(socket2::Protocol::UDP),
-        )?;
-        setup_sokcet2(&socket2_socket, &bind_addr)?;
-        let socket = std::net::UdpSocket::from(socket2_socket);
         let mut server_config = server_config();
         server_config.transport_config(transport_config());
-        let endpoint_config = EndpointConfig::default();
-        let endpoint = Endpoint::new(
-            endpoint_config,
-            Some(server_config),
-            socket,
-            Arc::new(TokioRuntime),
+        let mut endpoint = Endpoint::server(
+            server_config,
+            addr,
         )?;
+        endpoint.set_default_client_config(client_config());
         let tasks = Arc::new(Mutex::new(JoinSet::new()));
         join_joinset_background(tasks.clone(), "QUICProxyDst tasks".to_string());
         Ok(Self {
@@ -349,7 +344,7 @@ impl QUICProxyDst {
                 route,
             ),
         )
-        .await;
+            .await;
 
         match ret {
             Ok(Ok((quic_stream, conn, tcp_stream, acl))) => {
@@ -420,7 +415,7 @@ impl QUICProxyDst {
                 "dst socket {:?} is in running listeners, ignore it",
                 dst_socket
             )
-            .into());
+                .into());
         }
 
         let send_to_self = ctx.is_ip_local_virtual_ip(&dst_ip.into());
