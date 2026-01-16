@@ -23,7 +23,7 @@ use derivative::Derivative;
 use derive_more::{Constructor, Deref, DerefMut, From, Into};
 use pnet::packet::ipv4::Ipv4Packet;
 use prost::Message;
-use quinn::congestion::BbrConfig;
+use quinn::congestion::CubicConfig;
 use quinn::udp::{EcnCodepoint, RecvMeta, Transmit};
 use quinn::{AsyncUdpSocket, Endpoint, RecvStream, SendStream, TokioRuntime, UdpPoller};
 use quinn::{ClientConfig, EndpointConfig, ServerConfig, StreamId, TransportConfig, VarInt};
@@ -215,6 +215,7 @@ impl AsyncUdpSocket for QuicSocket {
 mod tests {
     use super::*;
     use bytes::Buf;
+    use quinn::congestion::BbrConfig;
     use quinn::{ClientConfig, Endpoint, EndpointConfig, ServerConfig};
     use quinn_plaintext::{client_config, server_config};
     use std::sync::Arc;
@@ -236,11 +237,11 @@ mod tests {
 
         // 两个方向的通道：A->B 和 B->A
         // 容量给够，防止高并发时丢包
-        let (tx_a_out, rx_a_out) = mpsc::channel::<QuicPacket>(50_000);
-        let (tx_b_in, rx_b_in) = mpsc::channel::<QuicPacket>(50_000);
+        let (tx_a_out, rx_a_out) = channel::<QuicPacket>(50_000);
+        let (tx_b_in, rx_b_in) = channel::<QuicPacket>(50_000);
 
-        let (tx_b_out, rx_b_out) = mpsc::channel::<QuicPacket>(50_000);
-        let (tx_a_in, rx_a_in) = mpsc::channel::<QuicPacket>(50_000);
+        let (tx_b_out, rx_b_out) = channel::<QuicPacket>(50_000);
+        let (tx_a_in, rx_a_in) = channel::<QuicPacket>(50_000);
 
         let margins = (20, 25).into();
 
@@ -315,7 +316,7 @@ mod tests {
             endpoint_config.clone(),
             Some(server_config.clone()),
             socket_client.clone(),
-            Arc::new(quinn::TokioRuntime),
+            Arc::new(TokioRuntime),
         )
         .unwrap();
         client_endpoint.set_default_client_config(client_config.clone());
@@ -325,7 +326,7 @@ mod tests {
             endpoint_config.clone(),
             Some(server_config.clone()),
             socket_server.clone(),
-            Arc::new(quinn::TokioRuntime),
+            Arc::new(TokioRuntime),
         )
         .unwrap();
         server_endpoint.set_default_client_config(client_config.clone());
@@ -476,7 +477,7 @@ mod tests {
 
         // 构造一个 1MB 的数据块
         let data_chunk = vec![0u8; CHUNK_SIZE];
-        let bytes_data = bytes::Bytes::from(data_chunk); // 使用 Bytes 避免重复分配
+        let bytes_data = Bytes::from(data_chunk); // 使用 Bytes 避免重复分配
 
         println!("Client: Start sending {} MB...", TOTAL_SIZE / 1024 / 1024);
         let start_send = std::time::Instant::now();
@@ -542,8 +543,8 @@ mod tests {
                                         // 校验数据内容 (验证数据隔离性)
                                         // 我们约定数据的第一个字节是 (stream_index % 255)
                                         // 这样可以确保流的数据没串
-                                        let expected_byte = (data[0]) as usize; // 获取实际收到的标记
-                                                                                // 这里只是简单校验首尾，实际生产可以使用 CRC
+                                        let expected_byte = data[0] as usize; // 获取实际收到的标记
+                                                                              // 这里只是简单校验首尾，实际生产可以使用 CRC
                                         if data[data.len() - 1] != data[0] {
                                             panic!("Stream data corruption");
                                         }
@@ -605,7 +606,7 @@ mod tests {
                 // 所有的字节都填成 (i % 255)
                 let fill_byte = (i % 255) as u8;
                 let data = vec![fill_byte; STREAM_SIZE];
-                let bytes_data = bytes::Bytes::from(data);
+                let bytes_data = Bytes::from(data);
 
                 send.write_chunk(bytes_data).await.expect("Write failed");
                 send.finish().expect("Finish failed");
@@ -878,8 +879,7 @@ impl PeerPacketFilter for QuicPacketReceiver {
 
         if let Err(e) = self
             .tx
-            .send(QuicPacket::new(addr.into(), packet.payload_bytes(), None))
-            .await
+            .try_send(QuicPacket::new(addr.into(), packet.payload_bytes(), None))
         {
             debug!("failed to send quic packet to endpoint: {:?}", e);
         }
@@ -1088,7 +1088,7 @@ impl QuicStreamReceiver {
                 "dst socket {:?} is in running listeners, ignore it",
                 dst_socket
             )
-                .into());
+            .into());
         }
 
         let send_to_self = global_ctx.is_ip_local_virtual_ip(&dst_ip);
@@ -1171,22 +1171,23 @@ impl QuicProxy {
     fn new_config() -> (EndpointConfig, ServerConfig, ClientConfig) {
         let mut transport_config = TransportConfig::default();
 
-        transport_config.initial_mtu(1200);
-        transport_config.min_mtu(1200);
-
-        transport_config.stream_receive_window(VarInt::from_u32(64 * 1024 * 1024));
-        transport_config.receive_window(VarInt::from_u32(64 * 1024 * 1024));
-        transport_config.send_window(64 * 1024 * 1024);
+        // TODO: subject to change
+        transport_config.stream_receive_window(VarInt::from_u32(2 * 1024 * 1024));
+        transport_config.receive_window(VarInt::from_u32(256 * 1024 * 1024));
+        transport_config.send_window(256 * 1024 * 1024);
 
         transport_config.max_concurrent_bidi_streams(VarInt::from_u32(1024));
         transport_config.max_concurrent_uni_streams(VarInt::from_u32(0));
 
         transport_config.datagram_receive_buffer_size(None);
 
-        transport_config.congestion_controller_factory(Arc::new(BbrConfig::default()));
-
         transport_config.keep_alive_interval(Some(Duration::from_secs(15)));
         transport_config.max_idle_timeout(Some(VarInt::from_u32(30_000).into()));
+
+        transport_config.initial_mtu(1200);
+        transport_config.min_mtu(1200);
+
+        transport_config.congestion_controller_factory(Arc::new(CubicConfig::default()));
 
         let transport_config = Arc::new(transport_config);
 
@@ -1197,7 +1198,7 @@ impl QuicProxy {
         client_config.transport_config(transport_config.clone());
 
         let mut endpoint_config = EndpointConfig::default();
-        endpoint_config.max_udp_payload_size(65527).unwrap();
+        endpoint_config.max_udp_payload_size(1500).unwrap();
 
         (endpoint_config, server_config, client_config)
     }
@@ -1220,8 +1221,9 @@ impl QuicProxy {
             )
         };
 
-        let (in_tx, in_rx) = channel(1024);
-        let (out_tx, out_rx) = channel(1024);
+        // TODO: subject to change
+        let (in_tx, in_rx) = channel(1 << 20);
+        let (out_tx, out_rx) = channel(1 << 20);
 
         let socket = QuicSocket {
             addr: SocketAddr::new(Ipv4Addr::from(self.peer_mgr.my_peer_id()).into(), 0),
