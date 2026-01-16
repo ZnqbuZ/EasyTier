@@ -1,12 +1,12 @@
 use anyhow::Context;
-use dashmap::DashMap;
+use dashmap::{DashMap, DashSet};
 use pnet::packet::ipv4::Ipv4Packet;
 use prost::Message as _;
-use quinn::{Endpoint, Incoming};
+use quinn::{Connection, ConnectionId, Endpoint, Incoming};
 use std::net::{IpAddr, Ipv4Addr};
 use std::sync::{Arc, Mutex, Weak};
 use std::{net::SocketAddr, pin::Pin};
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite};
+use tokio::io::{join, AsyncRead, AsyncReadExt, AsyncWrite, Join};
 use tokio::net::TcpStream;
 use tokio::task::JoinSet;
 use tokio::time::timeout;
@@ -32,50 +32,7 @@ use crate::proto::rpc_types::controller::BaseController;
 use crate::tunnel::packet_def::PeerManagerHeader;
 use crate::tunnel::quic::{configure_client, make_server_endpoint};
 
-pub struct QUICStream {
-    endpoint: Option<quinn::Endpoint>,
-    connection: Option<quinn::Connection>,
-    sender: quinn::SendStream,
-    receiver: quinn::RecvStream,
-}
-
-impl AsyncRead for QUICStream {
-    fn poll_read(
-        self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-        buf: &mut tokio::io::ReadBuf<'_>,
-    ) -> std::task::Poll<std::io::Result<()>> {
-        let this = self.get_mut();
-        Pin::new(&mut this.receiver).poll_read(cx, buf)
-    }
-}
-
-impl AsyncWrite for QUICStream {
-    fn poll_write(
-        self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-        buf: &[u8],
-    ) -> std::task::Poll<std::io::Result<usize>> {
-        let this = self.get_mut();
-        AsyncWrite::poll_write(Pin::new(&mut this.sender), cx, buf)
-    }
-
-    fn poll_flush(
-        self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<std::io::Result<()>> {
-        let this = self.get_mut();
-        Pin::new(&mut this.sender).poll_flush(cx)
-    }
-
-    fn poll_shutdown(
-        self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<std::io::Result<()>> {
-        let this = self.get_mut();
-        Pin::new(&mut this.sender).poll_shutdown(cx)
-    }
-}
+type QuicStreamInner = Join<quinn::RecvStream, quinn::SendStream>;
 
 #[derive(Debug, Clone)]
 pub struct NatDstQUICConnector {
@@ -84,7 +41,7 @@ pub struct NatDstQUICConnector {
 
 #[async_trait::async_trait]
 impl NatDstConnector for NatDstQUICConnector {
-    type DstStream = QUICStream;
+    type DstStream = QuicStreamInner;
 
     #[tracing::instrument(skip(self), level = "debug", name = "NatDstQUICConnector::connect")]
     async fn connect(&self, src: SocketAddr, nat_dst: SocketAddr) -> Result<Self::DstStream> {
@@ -152,12 +109,7 @@ impl NatDstConnector for NatDstQUICConnector {
             .await
             .with_context(|| "failed to write proxy dst info to QUIC stream")?;
 
-        Ok(QUICStream {
-            endpoint: Some(endpoint),
-            connection: Some(connection),
-            sender: w,
-            receiver: r,
-        })
+        Ok(join(r, w))
     }
 
     fn check_packet_from_peer_fast(&self, _cidr_set: &CidrSet, _global_ctx: &GlobalCtx) -> bool {
@@ -353,8 +305,8 @@ impl QUICProxyDst {
         .await;
 
         match ret {
-            Ok(Ok((quic_stream, tcp_stream, acl))) => {
-                let remote_addr = quic_stream.connection.as_ref().map(|c| c.remote_address());
+            Ok(Ok((quic_stream, conn, tcp_stream, acl))) => {
+                let remote_addr = conn.remote_address();
                 let ret = acl.copy_bidirection_with_acl(quic_stream, tcp_stream).await;
                 tracing::info!(
                     "QUIC connection handled, result: {:?}, remote addr: {:?}",
@@ -378,7 +330,7 @@ impl QUICProxyDst {
         proxy_entry_key: SocketAddr,
         proxy_entries: Arc<DashMap<SocketAddr, TcpProxyEntry>>,
         route: Arc<dyn crate::peers::route_trait::Route + Send + Sync + 'static>,
-    ) -> Result<(QUICStream, TcpStream, ProxyAclHandler)> {
+    ) -> Result<(QuicStreamInner, Connection, TcpStream, ProxyAclHandler)> {
         let conn = incoming.await.with_context(|| "accept failed")?;
         let addr = conn.remote_address();
         tracing::info!("Accepted QUIC connection from {}", addr);
@@ -473,14 +425,7 @@ impl QUICProxyDst {
             e.state = TcpProxyEntryState::Connected.into();
         }
 
-        let quic_stream = QUICStream {
-            endpoint: None,
-            connection: Some(conn),
-            sender: w,
-            receiver: r,
-        };
-
-        Ok((quic_stream, dst_stream, acl_handler))
+        Ok((join(r, w), conn, dst_stream, acl_handler))
     }
 }
 
