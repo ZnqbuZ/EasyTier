@@ -1181,7 +1181,7 @@ impl QuicProxy {
 
         transport_config.datagram_receive_buffer_size(None);
 
-        transport_config.keep_alive_interval(Some(Duration::from_secs(15)));
+        transport_config.keep_alive_interval(Some(Duration::from_secs(5)));
         transport_config.max_idle_timeout(Some(VarInt::from_u32(30_000).into()));
 
         transport_config.initial_mtu(1200);
