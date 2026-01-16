@@ -8,7 +8,7 @@ use quinn::{
     VarInt,
 };
 use quinn_plaintext::{client_config, server_config};
-use std::net::{IpAddr, Ipv4Addr};
+use std::net::{AddrParseError, IpAddr, Ipv4Addr};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 use std::{net::SocketAddr, pin::Pin};
@@ -35,6 +35,7 @@ use crate::proto::api::instance::{
 use crate::proto::common::ProxyDstInfo;
 use crate::proto::rpc_types;
 use crate::proto::rpc_types::controller::BaseController;
+use crate::tunnel::common::setup_sokcet2;
 use crate::tunnel::packet_def::PeerManagerHeader;
 use crate::tunnel::quic::{configure_client, make_server_endpoint};
 
@@ -248,13 +249,23 @@ impl QUICProxyDst {
         route: Arc<dyn crate::peers::route_trait::Route + Send + Sync + 'static>,
     ) -> Result<Self> {
         let _g = global_ctx.net_ns.guard();
+        let bind_addr = format!("0.0.0.0:{}", global_ctx.config.get_flags().quic_listen_port)
+            .parse()
+            .map_err::<anyhow::Error, _>(Into::into)?;
+        let socket2_socket = socket2::Socket::new(
+            socket2::Domain::for_address(bind_addr),
+            socket2::Type::DGRAM,
+            Some(socket2::Protocol::UDP),
+        )?;
+        setup_sokcet2(&socket2_socket, &bind_addr)?;
+        let socket = std::net::UdpSocket::from(socket2_socket);
         let mut server_config = server_config();
         server_config.transport_config(transport_config());
         let endpoint_config = EndpointConfig::default();
         let endpoint = Endpoint::new(
             endpoint_config,
             Some(server_config),
-            format!("0.0.0.0:{}", global_ctx.config.get_flags().quic_listen_port).parse()?,
+            socket,
             Arc::new(TokioRuntime),
         )?;
         let tasks = Arc::new(Mutex::new(JoinSet::new()));
