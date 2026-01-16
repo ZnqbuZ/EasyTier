@@ -220,7 +220,6 @@ mod tests {
     use quinn_plaintext::{client_config, server_config};
     use std::sync::Arc;
     use std::time::Duration;
-    use tokio::sync::mpsc;
     use tracing::info;
 
     fn init() {
@@ -680,12 +679,14 @@ struct QuicStream {
 }
 
 impl QuicStream {
+    #[inline]
     fn id(&self) -> (StreamId, StreamId) {
         (self.reader().id(), self.writer().id())
     }
 }
 
 impl From<(SendStream, RecvStream)> for QuicStream {
+    #[inline]
     fn from(value: (SendStream, RecvStream)) -> Self {
         join(value.1, value.0).into()
     }
