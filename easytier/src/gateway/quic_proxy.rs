@@ -2,9 +2,15 @@ use anyhow::Context;
 use dashmap::{DashMap, DashSet};
 use pnet::packet::ipv4::Ipv4Packet;
 use prost::Message as _;
-use quinn::{Connection, ConnectionId, Endpoint, Incoming};
+use quinn::congestion::BbrConfig;
+use quinn::{
+    Connection, ConnectionId, Endpoint, EndpointConfig, Incoming, TokioRuntime, TransportConfig,
+    VarInt,
+};
+use quinn_plaintext::{client_config, server_config};
 use std::net::{IpAddr, Ipv4Addr};
 use std::sync::{Arc, Mutex, Weak};
+use std::time::Duration;
 use std::{net::SocketAddr, pin::Pin};
 use tokio::io::{join, AsyncRead, AsyncReadExt, AsyncWrite, Join};
 use tokio::net::TcpStream;
@@ -37,6 +43,7 @@ type QuicStreamInner = Join<quinn::RecvStream, quinn::SendStream>;
 #[derive(Debug, Clone)]
 pub struct NatDstQUICConnector {
     pub(crate) peer_mgr: Weak<PeerManager>,
+    endpoint: Endpoint,
 }
 
 #[async_trait::async_trait]
@@ -70,14 +77,10 @@ impl NatDstConnector for NatDstQUICConnector {
             return Err(anyhow::anyhow!("no quic port found for dst peer: {}", dst_peer).into());
         };
 
-        let mut endpoint = Endpoint::client("0.0.0.0:0".parse().unwrap())
-            .with_context(|| format!("failed to create QUIC endpoint for src: {}", src))?;
-        endpoint.set_default_client_config(configure_client());
-
         // connect to server
         let connection = {
             let _g = peer_mgr.get_global_ctx().net_ns.guard();
-            endpoint
+            self.endpoint
                 .connect(
                     SocketAddr::new(dst_ipv4.into(), quic_port as u16),
                     "localhost",
@@ -166,6 +169,30 @@ impl TcpProxyForKcpSrcTrait for TcpProxyForQUICSrc {
     }
 }
 
+fn transport_config() -> Arc<TransportConfig> {
+    let mut transport_config = TransportConfig::default();
+
+    // TODO: subject to change
+    transport_config.stream_receive_window(VarInt::from_u32(64 * 1024 * 1024));
+    transport_config.receive_window(VarInt::from_u32(1024 * 1024 * 1024));
+    transport_config.send_window(1024 * 1024 * 1024);
+
+    transport_config.max_concurrent_bidi_streams(VarInt::from_u32(1024));
+    transport_config.max_concurrent_uni_streams(VarInt::from_u32(0));
+
+    transport_config.datagram_receive_buffer_size(None);
+
+    transport_config.keep_alive_interval(Some(Duration::from_secs(5)));
+    transport_config.max_idle_timeout(Some(VarInt::from_u32(30_000).into()));
+
+    transport_config.initial_mtu(1200);
+    transport_config.min_mtu(1200);
+
+    transport_config.congestion_controller_factory(Arc::new(BbrConfig::default()));
+
+    Arc::new(transport_config)
+}
+
 pub struct QUICProxySrc {
     peer_manager: Arc<PeerManager>,
     tcp_proxy: TcpProxyForQUICSrc,
@@ -173,10 +200,16 @@ pub struct QUICProxySrc {
 
 impl QUICProxySrc {
     pub async fn new(peer_manager: Arc<PeerManager>) -> Self {
+        let mut client_config = client_config();
+        client_config.transport_config(transport_config());
+        let mut endpoint = Endpoint::client("0.0.0.0:0".parse().unwrap()).unwrap();
+        endpoint.set_default_client_config(client_config);
+
         let tcp_proxy = TcpProxy::new(
             peer_manager.clone(),
             NatDstQUICConnector {
                 peer_mgr: Arc::downgrade(&peer_manager),
+                endpoint,
             },
         );
 
@@ -203,7 +236,7 @@ impl QUICProxySrc {
 
 pub struct QUICProxyDst {
     global_ctx: Arc<GlobalCtx>,
-    endpoint: Arc<quinn::Endpoint>,
+    endpoint: Endpoint,
     proxy_entries: Arc<DashMap<SocketAddr, TcpProxyEntry>>,
     tasks: Arc<Mutex<JoinSet<()>>>,
     route: Arc<dyn crate::peers::route_trait::Route + Send + Sync + 'static>,
@@ -215,17 +248,20 @@ impl QUICProxyDst {
         route: Arc<dyn crate::peers::route_trait::Route + Send + Sync + 'static>,
     ) -> Result<Self> {
         let _g = global_ctx.net_ns.guard();
-        let (endpoint, _) = make_server_endpoint(
-            format!("0.0.0.0:{}", global_ctx.config.get_flags().quic_listen_port)
-                .parse()
-                .unwrap(),
-        )
-        .map_err(|e| anyhow::anyhow!("failed to create QUIC endpoint: {}", e))?;
+        let mut server_config = server_config();
+        server_config.transport_config(transport_config());
+        let endpoint_config = EndpointConfig::default();
+        let endpoint = Endpoint::new(
+            endpoint_config,
+            Some(server_config),
+            format!("0.0.0.0:{}", global_ctx.config.get_flags().quic_listen_port).parse()?,
+            Arc::new(TokioRuntime),
+        )?;
         let tasks = Arc::new(Mutex::new(JoinSet::new()));
         join_joinset_background(tasks.clone(), "QUICProxyDst tasks".to_string());
         Ok(Self {
             global_ctx,
-            endpoint: Arc::new(endpoint),
+            endpoint,
             proxy_entries: Arc::new(DashMap::new()),
             tasks,
             route,
