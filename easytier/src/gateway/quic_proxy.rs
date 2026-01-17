@@ -23,7 +23,7 @@ use derivative::Derivative;
 use derive_more::{Constructor, Deref, DerefMut, From, Into};
 use pnet::packet::ipv4::Ipv4Packet;
 use prost::Message;
-use quinn::congestion::CubicConfig;
+use quinn::congestion::{BbrConfig, CubicConfig};
 use quinn::udp::{EcnCodepoint, RecvMeta, Transmit};
 use quinn::{AsyncUdpSocket, Endpoint, RecvStream, SendStream, TokioRuntime, UdpPoller};
 use quinn::{ClientConfig, EndpointConfig, ServerConfig, StreamId, TransportConfig, VarInt};
@@ -753,22 +753,22 @@ impl QuicProxy {
         let mut transport_config = TransportConfig::default();
 
         // TODO: subject to change
-        transport_config.stream_receive_window(VarInt::from_u32(2 * 1024 * 1024));
-        transport_config.receive_window(VarInt::from_u32(256 * 1024 * 1024));
-        transport_config.send_window(256 * 1024 * 1024);
-
-        transport_config.max_concurrent_bidi_streams(VarInt::from_u32(1024));
-        transport_config.max_concurrent_uni_streams(VarInt::from_u32(0));
-
-        transport_config.datagram_receive_buffer_size(None);
-
-        transport_config.keep_alive_interval(Some(Duration::from_secs(5)));
-        transport_config.max_idle_timeout(Some(VarInt::from_u32(30_000).into()));
+        transport_config.stream_receive_window(VarInt::from_u32(4 * 1024 * 1024));
+        transport_config.receive_window(VarInt::from_u32(8 * 1024 * 1024));
+        transport_config.send_window(8 * 1024 * 1024);
+        //
+        // transport_config.max_concurrent_bidi_streams(VarInt::from_u32(1024));
+        // transport_config.max_concurrent_uni_streams(VarInt::from_u32(0));
+        //
+        // transport_config.datagram_receive_buffer_size(None);
+        //
+        // transport_config.keep_alive_interval(Some(Duration::from_secs(5)));
+        // transport_config.max_idle_timeout(Some(VarInt::from_u32(30_000).into()));
 
         transport_config.initial_mtu(1200);
         transport_config.min_mtu(1200);
 
-        transport_config.congestion_controller_factory(Arc::new(CubicConfig::default()));
+        transport_config.congestion_controller_factory(Arc::new(BbrConfig::default()));
 
         let transport_config = Arc::new(transport_config);
 
@@ -803,8 +803,8 @@ impl QuicProxy {
         };
 
         // TODO: subject to change
-        let (in_tx, in_rx) = channel(1 << 20);
-        let (out_tx, out_rx) = channel(1 << 20);
+        let (in_tx, in_rx) = channel(1 << 15);
+        let (out_tx, out_rx) = channel(1 << 15);
 
         let socket = QuicSocket {
             addr: SocketAddr::new(Ipv4Addr::from(self.peer_mgr.my_peer_id()).into(), 0),
