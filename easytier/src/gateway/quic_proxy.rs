@@ -205,6 +205,8 @@ fn transport_config() -> Arc<TransportConfig> {
     transport_config.initial_mtu(1200);
     transport_config.min_mtu(1200);
 
+    transport_config.enable_segmentation_offload(false);
+
     transport_config.congestion_controller_factory(Arc::new(BbrConfig::default()));
 
     Arc::new(transport_config)
