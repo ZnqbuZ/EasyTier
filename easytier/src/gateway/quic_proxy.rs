@@ -96,7 +96,7 @@ type QuicConnData = KcpConnData;
 
 #[derive(Debug, Clone)]
 pub struct NatDstQuicConnector {
-    pub(crate) endpoint: Arc<Mutex<QuicEndpoint>>,
+    pub(crate) endpoint: Arc<QuicEndpoint>,
     pub(crate) peer_mgr: Weak<PeerManager>,
 }
 
@@ -145,7 +145,7 @@ impl NatDstConnector for NatDstQuicConnector {
         let mut retry = 5;
         loop {
             retry -= 1;
-            let stream = self.endpoint.lock().open(addr, Some(header.clone()));
+            let stream = self.endpoint.open(addr, Some(header.clone())).await;
             if stream.is_ok() || retry < 0 {
                 return stream.map_err(|e| anyhow!("failed to connect to nat dst {:?}: {:?}", nat_dst, e).into())
             }
@@ -225,7 +225,7 @@ impl QuicProxyRole {
 // Receive packets from peers and forward them to the QUIC endpoint
 #[derive(Debug)]
 struct QuicPacketReceiver {
-    endpoint: Arc<Mutex<QuicEndpoint>>,
+    endpoint: Arc<QuicEndpoint>,
     role: QuicProxyRole,
 }
 
@@ -240,11 +240,11 @@ impl PeerPacketFilter for QuicPacketReceiver {
 
         let _ = self
             .endpoint
-            .lock()
             .send(
                 QuicPacketMeta::new(header.from_peer_id.get(), self.role.outgoing()).into(),
                    packet.payload_bytes(),
-            );
+            )
+            .await;
 
         None
     }
@@ -445,7 +445,7 @@ impl QuicStreamReceiver {
 }
 
 pub struct QuicProxy {
-    endpoint: Arc<Mutex<QuicEndpoint>>,
+    endpoint: Arc<QuicEndpoint>,
     peer_mgr: Arc<PeerManager>,
 
     rx: Option<QuicOutputRx>,
@@ -472,7 +472,7 @@ impl QuicProxy {
     pub fn new(peer_mgr: Arc<PeerManager>) -> Self {
         let (endpoint, rx) = QuicEndpoint::new((ZCPacket::new_with_payload(&[]).payload_offset(),0).into());
         Self {
-            endpoint: Arc::new(Mutex::new(endpoint)),
+            endpoint: Arc::new(endpoint),
             peer_mgr,
             rx: Some(rx),
             src: None,
@@ -551,7 +551,7 @@ impl QuicProxy {
 }
 
 pub struct QuicProxySrc {
-    endpoint: Arc<Mutex<QuicEndpoint>>,
+    endpoint: Arc<QuicEndpoint>,
     peer_mgr: Arc<PeerManager>,
 
     tcp_proxy: TcpProxyForQuicSrc,
@@ -584,7 +584,7 @@ impl QuicProxySrc {
 }
 
 pub struct QuicProxyDst {
-    endpoint: Arc<Mutex<QuicEndpoint>>,
+    endpoint: Arc<QuicEndpoint>,
     peer_mgr: Arc<PeerManager>,
 
     stream_ctx: Arc<QuicStreamContext>,

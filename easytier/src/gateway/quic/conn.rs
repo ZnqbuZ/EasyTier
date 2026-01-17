@@ -1,14 +1,14 @@
+use crate::gateway::quic::stream::QuicStream;
+use crossbeam::queue::{ArrayQueue, SegQueue};
+use parking_lot::Mutex;
 use quinn_proto::{Connection, ConnectionEvent, Dir, StreamId, VarInt};
 use std::collections::HashMap;
-use std::io::{Result, Error, ErrorKind};
-use std::iter::chain;
+use std::io::{Error, Result};
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::task::Waker;
 use std::time::Instant;
-use derive_more::{Deref, DerefMut};
-use parking_lot::Mutex;
-use tokio::sync::Notify;
-use crate::gateway::quic::stream::{QuicStream, StreamDropTx};
+use tokio::sync::{oneshot, Notify};
 
 #[derive(Debug)]
 pub(super) struct ConnState {
@@ -27,43 +27,39 @@ impl ConnState {
     }
 
     pub(super) fn open(&mut self, dir: Dir) -> Result<StreamId> {
-        self.conn.streams().open(dir).ok_or(Error::new(
-            ErrorKind::Other,
-            format!(
-                "Failed to open new QUIC stream in direction {:?}: exhausted",
-                dir
-            ),
-        ))
+        self.conn.streams().open(dir).ok_or(Error::other(format!(
+            "Failed to open new QUIC stream in direction {:?}: exhausted",
+            dir
+        )))
     }
 
     pub(super) fn accept(&mut self, dir: Dir) -> Result<StreamId> {
-        self.conn.streams().accept(dir).ok_or(Error::new(
-            ErrorKind::Other,
-            format!(
-                "Failed to accept new QUIC stream in direction {:?}: no incoming",
-                dir
-            ),
-        ))
+        self.conn.streams().accept(dir).ok_or(Error::other(format!(
+            "Failed to accept new QUIC stream in direction {:?}: no incoming",
+            dir
+        )))
     }
 
-    pub(super) fn close(&mut self, id: StreamId) {
+    pub(super) fn close(&mut self, id: StreamId, reset: bool) {
         let _ = self.conn.recv_stream(id).stop(VarInt::from_u32(0));
         if let Some(waker) = self.readers.remove(&id) {
             waker.wake();
         }
-        let _ = self.conn.send_stream(id).reset(VarInt::from_u32(0));
+        if reset {
+            let _ = self.conn.send_stream(id).reset(VarInt::from_u32(0));
+        }
         if let Some(waker) = self.writers.remove(&id) {
             waker.wake();
         }
     }
 
-    pub(super) fn clear(&mut self) {
-        for (_, waker) in chain(self.readers.drain(), self.writers.drain()) {
+    pub(crate) fn clear(&mut self) {
+        for (_, waker) in self.readers.drain().chain(self.writers.drain()) {
             waker.wake();
         }
     }
 
-    pub(super) fn destroy(&mut self) {
+    pub(crate) fn destroy(&mut self) {
         self.conn.close(
             Instant::now(),
             VarInt::from_u32(1),
@@ -87,61 +83,56 @@ impl From<ConnState> for SharedConnState {
     }
 }
 
-#[derive(Debug, Clone, Deref, DerefMut)]
-pub(super) struct SharedConnInbox(Arc<Mutex<Vec<ConnectionEvent>>>);
+// type ConnEvtQueue = Arc<ArrayQueue<ConnectionEvent>>;
+type ConnEvtQueue = Arc<SegQueue<ConnectionEvent>>;
+type StreamOpenQueue = Arc<SegQueue<(Dir, oneshot::Sender<Result<StreamId>>)>>;
+type StreamCloseQueue = Arc<SegQueue<StreamId>>;
 
-impl From<Vec<ConnectionEvent>> for SharedConnInbox {
-    fn from(inbox: Vec<ConnectionEvent>) -> Self {
-        SharedConnInbox(Arc::new(Mutex::new(inbox)))
-    }
-}
-
-const QUIC_CONN_INBOX_CAPACITY: usize = 1024;
+const QUIC_CONN_EVT_QUEUE_CAPACITY: usize = 1024;
 
 #[derive(Debug, Clone)]
 pub(super) struct ConnCtrl {
     pub(super) state: SharedConnState,
-    pub(super) inbox: SharedConnInbox,
+    pub(super) inbox: ConnEvtQueue,
+    pub(super) open: StreamOpenQueue,
+    pub(super) close: StreamCloseQueue,
     pub(super) notify: Arc<Notify>,
-    drop_tx: StreamDropTx,
+    pub(super) shutdown: Arc<AtomicBool>,
 }
 
 impl ConnCtrl {
-    pub(super) fn new(conn: Connection, drop_tx: StreamDropTx) -> Self {
+    pub(super) fn new(conn: Connection) -> Self {
         Self {
             state: ConnState::new(conn).into(),
-            inbox: SharedConnInbox::from(Vec::with_capacity(QUIC_CONN_INBOX_CAPACITY)),
+            // inbox: ArrayQueue::new(QUIC_CONN_EVT_QUEUE_CAPACITY).into(),
+            inbox: SegQueue::new().into(),
+            open: SegQueue::new().into(),
+            close: SegQueue::new().into(),
             notify: Arc::new(Notify::new()),
-            drop_tx,
+            shutdown: Arc::new(AtomicBool::new(false)),
         }
     }
 
     pub(super) fn send(&self, evt: ConnectionEvent) {
-        if let Some(mut inner) = self.state.try_lock() {
-            inner.conn.handle_event(evt);
-        } else {
-            let mut inbox = self.inbox.lock();
-            if inbox.len() >= QUIC_CONN_INBOX_CAPACITY {
-                return;
-            }
-            inbox.push(evt);
-        }
+        let _ = self.inbox.push(evt);
         self.notify.notify_one();
     }
 
-    pub(super) fn open(&self, dir: Dir) -> Result<QuicStream> {
-        let id = self.state.lock().open(dir)?;
+    pub(super) async fn open(&self, dir: Dir) -> Result<QuicStream> {
+        let (tx, rx) = oneshot::channel();
+        self.open.push((dir, tx));
         self.notify.notify_one();
+        let id = rx.await.map_err(|e| Error::other(format!("Failed to receive stream ID from runner: {:?}", e)))??;
         Ok(QuicStream::new(id, self.clone()))
     }
 
     pub(super) fn close(&self, id: StreamId) {
-        match self.state.try_lock() {
-            Some(mut state) => state.close(id),
-            None => {
-                let _ = self.drop_tx.try_send(id);
-            }
-        }
+        self.close.push(id);
+        self.notify.notify_one();
+    }
+
+    pub(super) fn shutdown(&self) {
+        self.shutdown.store(true, std::sync::atomic::Ordering::SeqCst);
         self.notify.notify_one();
     }
 }

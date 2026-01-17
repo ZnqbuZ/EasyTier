@@ -1,10 +1,9 @@
-use bytes::{Bytes, BytesMut};
+use bytes::BytesMut;
 use derive_more::{Deref, DerefMut, From, Into};
-use std::cmp::{max, min};
-use std::mem::MaybeUninit;
+use std::cmp::max;
+use std::mem::ManuallyDrop;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
-use tokio::io::ReadBuf;
 use tokio::sync::mpsc;
 
 #[derive(Debug, Clone, Deref, DerefMut)]
@@ -15,8 +14,8 @@ pub struct Tagged<I, T> {
     pub tag: T,
 }
 
-pub(super) type TaggedSender<I, T> = Tagged<mpsc::Sender<I>, T>;
-pub(super) type TaggedReceiver<I, T> = Tagged<mpsc::Receiver<I>, T>;
+pub(crate) type TaggedSender<I, T> = Tagged<mpsc::Sender<I>, T>;
+pub(crate) type TaggedReceiver<I, T> = Tagged<mpsc::Receiver<I>, T>;
 
 #[macro_export]
 macro_rules! tagged_channel {
@@ -50,30 +49,34 @@ pub fn switched_channel<I>(size: usize) -> (SwitchedSender<I>, SwitchedReceiver<
 }
 
 #[derive(Debug, Clone, Copy, From, Into)]
-pub struct QuicBufferMargins {
+pub struct BufMargins {
     pub header: usize,
     pub trailer: usize,
 }
 
-#[derive(Debug)]
-pub(super) struct QuicBufferPool {
-    pool: BytesMut,
-    pub(crate) min_capacity: usize,
+impl BufMargins {
+    pub fn len(&self) -> usize {
+        self.header + self.trailer
+    }
 }
 
-impl QuicBufferPool {
+#[derive(Debug)]
+pub(super) struct BufPool {
+    pool: BytesMut,
+    pub(super) min_capacity: usize,
+}
+
+impl BufPool {
     #[inline]
-    pub(crate) fn new(min_capacity: usize) -> Self {
+    pub(super) fn new(min_capacity: usize) -> Self {
         Self {
             pool: BytesMut::new(),
             min_capacity,
         }
     }
 
-    pub(crate) fn buf(&mut self, data: &[u8], margins: QuicBufferMargins) -> BytesMut {
-        let (header, trailer) = margins.into();
-
-        let len = header + data.len() + trailer;
+    pub(super) fn buf(&mut self, data: &[u8], margins: BufMargins) -> BytesMut {
+        let len = margins.len() + data.len();
 
         if len > self.pool.capacity() {
             let additional = max(len * 4, self.min_capacity);
@@ -84,131 +87,84 @@ impl QuicBufferPool {
         }
 
         let mut buf = self.pool.split_to(len);
+        let (header, trailer) = margins.into();
         buf[header..len - trailer].copy_from_slice(data);
         buf
     }
 }
 
-#[derive(Debug)]
-pub(super) struct QuicBytesRingBuf<const length: usize, const size: usize> {
-    inner: [MaybeUninit<Bytes>; length],
-    head: usize,
-    tail: usize,
-    pub bytes: usize,
+#[derive(Debug, Deref)]
+pub(super) struct BufAcc {
+    #[deref]
+    acc: BytesMut,
+    pub(super) capacity: usize,
 }
 
-impl<const length: usize, const size: usize> QuicBytesRingBuf<length, size> {
-    pub fn new() -> Self {
-        const { assert!(length > 0 && length <= size); }
-
+impl BufAcc {
+    pub(super) fn new(capacity: usize) -> Self {
         Self {
-            inner: unsafe { MaybeUninit::uninit().assume_init() },
-            head: 0,
-            tail: 0,
-            bytes: 0,
+            acc: BytesMut::with_capacity(capacity),
+            capacity,
         }
     }
 
-    pub fn new_boxed() -> Box<Self> {
-        const { assert!(length > 0 && length <= size); }
-
-        let mut b: Box<MaybeUninit<Self>> = Box::new_uninit();
-        unsafe {
-            b.as_mut_ptr().write(Self {
-                inner: MaybeUninit::uninit().assume_init(),
-                head: 0,
-                tail: 0,
-                bytes: 0,
-            });
-            b.assume_init()
-        }
-    }
-
-    #[inline]
-    pub fn is_empty(&self) -> bool {
-        if self.head == self.tail {
-            debug_assert!(self.bytes == 0);
-            true
-        } else {
-            false
-        }
-    }
-
-    #[inline]
-    pub fn is_full(&self) -> bool {
-        (self.tail + 1) % length == self.head || self.bytes >= size
-    }
-
-    #[inline]
-    pub fn pop_front(&mut self) -> Bytes {
-        debug_assert!(!self.is_empty());
-
-        let chunk = unsafe { self.inner[self.head].assume_init_read() };
-        self.bytes -= chunk.len();
-        self.head = (self.head + 1) % length;
-        chunk
-    }
-
-    #[inline]
-    pub fn pop_back(&mut self) -> Bytes {
-        debug_assert!(!self.is_empty());
-
-        self.tail = (self.tail + length - 1) % length;
-        let chunk = unsafe { self.inner[self.tail].assume_init_read() };
-        self.bytes -= chunk.len();
-        chunk
-    }
-
-    #[inline]
-    pub fn push_front(&mut self, data: Bytes) {
-        debug_assert!(!self.is_full());
-
-        self.bytes += data.len();
-        self.head = (self.head + length - 1) % length;
-        self.inner[self.head].write(data);
-    }
-
-    #[inline]
-    pub fn push_back(&mut self, data: Bytes) {
-        debug_assert!(!self.is_full());
-
-        self.bytes += data.len();
-        self.inner[self.tail].write(data);
-        self.tail = (self.tail + 1) % length;
-    }
-
-    pub fn read(&mut self, buf: &mut ReadBuf<'_>) -> usize {
-        let bytes = self.bytes;
-        while !self.is_empty() && buf.remaining() > 0 {
-            let chunk = unsafe { self.inner[self.head].assume_init_mut() };
-            let len = min(chunk.len(), buf.remaining());
-            self.bytes -= len;
-            buf.put_slice(&chunk.split_to(len));
-            if chunk.is_empty() {
-                self.pop_front();
-            } else {
-                break;
-            }
+    pub(super) fn buf(&mut self, capacity: usize, margins: BufMargins) -> Option<BufAccWriter<'_>> {
+        if self.acc.len() + margins.len() + capacity >= self.acc.capacity() {
+            return None;
         }
 
-        bytes - self.bytes
+        let buf = unsafe {
+            let ptr = self
+                .acc
+                .as_mut_ptr()
+                .add(self.acc.len())
+                .add(margins.header);
+            ManuallyDrop::new(Vec::from_raw_parts(ptr, 0, capacity))
+        };
+
+        Some(BufAccWriter {
+            acc: &mut self.acc,
+            ptr: buf.as_ptr(),
+            buf,
+            capacity,
+            margins,
+        })
     }
 
-    pub fn write(&mut self, buf: &[u8]) -> usize {
-        if self.is_full() {
-            return 0;
-        }
-        let len = min(buf.len(), size - self.bytes);
-        self.push_back(Bytes::copy_from_slice(&buf[..len]));
-        len
+    pub(super) fn renew(&mut self) -> BytesMut {
+        std::mem::replace(&mut self.acc, BytesMut::with_capacity(self.capacity))
+    }
+
+    pub(super) fn take(self) -> BytesMut {
+        self.acc
     }
 }
 
-impl<const length: usize, const size: usize> Drop for QuicBytesRingBuf<length, size> {
-    #[inline]
-    fn drop(&mut self) {
-        while !self.is_empty() {
-            let _ = self.pop_front();
-        }
+impl From<BufAcc> for BytesMut {
+    fn from(value: BufAcc) -> Self {
+        value.acc
+    }
+}
+
+#[derive(Debug, Deref, DerefMut)]
+pub(super) struct BufAccWriter<'t> {
+    acc: &'t mut BytesMut,
+    ptr: *const u8,
+    #[deref]
+    #[deref_mut]
+    buf: ManuallyDrop<Vec<u8>>,
+    capacity: usize,
+    margins: BufMargins,
+}
+
+impl<'t> BufAccWriter<'t> {
+    pub(super) fn commit(self) {
+        debug_assert!(self.buf.as_ptr() == self.ptr);
+        let written = self.buf.len();
+        debug_assert!(written <= self.capacity);
+        unsafe {
+            self.acc
+                .set_len(self.acc.len() + self.margins.len() + written)
+        };
     }
 }
