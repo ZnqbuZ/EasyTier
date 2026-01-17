@@ -1,20 +1,18 @@
 use anyhow::Context;
-use dashmap::{DashMap, DashSet};
-use hashbrown::HashMap;
+use dashmap::DashMap;
 use pnet::packet::ipv4::Ipv4Packet;
 use prost::Message as _;
 use quinn::congestion::BbrConfig;
 use quinn::{
-    Connection, ConnectionId, Endpoint, EndpointConfig, Incoming, TokioRuntime, TransportConfig,
-    VarInt,
+    Connection, Endpoint, EndpointConfig, Incoming, RecvStream, SendStream, TokioRuntime,
+    TransportConfig, VarInt,
 };
 use quinn_plaintext::{client_config, server_config};
-use std::net::{AddrParseError, IpAddr, Ipv4Addr};
+use std::net::SocketAddr;
+use std::net::{IpAddr, Ipv4Addr};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
-use std::{net::SocketAddr, pin::Pin};
-use tokio::io::{join, AsyncRead, AsyncReadExt, AsyncWrite, Join};
-use tokio::net::TcpStream;
+use tokio::io::{join, AsyncReadExt, Join};
 use tokio::task::JoinSet;
 use tokio::time::timeout;
 
@@ -38,9 +36,8 @@ use crate::proto::rpc_types;
 use crate::proto::rpc_types::controller::BaseController;
 use crate::tunnel::common::setup_sokcet2;
 use crate::tunnel::packet_def::PeerManagerHeader;
-use crate::tunnel::quic::{configure_client, make_server_endpoint};
 
-type QuicStreamInner = Join<quinn::RecvStream, quinn::SendStream>;
+type QuicStreamInner = Join<RecvStream, SendStream>;
 
 #[derive(Debug, Clone)]
 pub struct NatDstQUICConnector {
@@ -59,7 +56,8 @@ impl NatDstQUICConnector {
                 .upgrade()
                 .ok_or(anyhow::anyhow!("peer manager is not available"))?;
             let _g = peer_mgr.get_global_ctx().net_ns.guard();
-            let connection = self.endpoint
+            let connection = self
+                .endpoint
                 .connect(addr, "localhost")
                 .map_err(anyhow::Error::from)?
                 .await
@@ -357,28 +355,21 @@ impl QUICProxyDst {
                 proxy_entries.shrink_to_fit();
             }
         );
-        let ret = timeout(
-            std::time::Duration::from_secs(10),
-            Self::handle_connection(
-                conn,
-                ctx,
-                cidr_set,
-                remote_addr,
-                proxy_entries.clone(),
-                route,
-            ),
-        )
-        .await;
+        let ret = timeout(Duration::from_secs(10), conn).await;
 
         match ret {
-            Ok(Ok((quic_stream, conn, tcp_stream, acl))) => {
-                let remote_addr = conn.remote_address();
-                let ret = acl.copy_bidirection_with_acl(quic_stream, tcp_stream).await;
-                tracing::info!(
-                    "QUIC connection handled, result: {:?}, remote addr: {:?}",
-                    ret,
-                    remote_addr,
-                );
+            Ok(Ok(conn)) => {
+                let mut tasks = JoinSet::new();
+                while let Ok(stream) = conn.accept_bi().await {
+                    tasks.spawn(Self::handle_connection(
+                        stream,
+                        ctx.clone(),
+                        cidr_set.clone(),
+                        remote_addr,
+                        proxy_entries.clone(),
+                        route.clone(),
+                    ));
+                }
             }
             Ok(Err(e)) => {
                 tracing::error!("Failed to handle QUIC connection: {}", e);
@@ -390,17 +381,14 @@ impl QUICProxyDst {
     }
 
     async fn handle_connection(
-        incoming: Incoming,
+        stream: (SendStream, RecvStream),
         ctx: ArcGlobalCtx,
         cidr_set: Arc<CidrSet>,
-        proxy_entry_key: SocketAddr,
+        addr: SocketAddr,
         proxy_entries: Arc<DashMap<SocketAddr, TcpProxyEntry>>,
         route: Arc<dyn crate::peers::route_trait::Route + Send + Sync + 'static>,
-    ) -> Result<(QuicStreamInner, Connection, TcpStream, ProxyAclHandler)> {
-        let conn = incoming.await.with_context(|| "accept failed")?;
-        let addr = conn.remote_address();
-        tracing::info!("Accepted QUIC connection from {}", addr);
-        let (w, mut r) = conn.accept_bi().await.with_context(|| "accept_bi failed")?;
+    ) -> Result<()> {
+        let (w, mut r) = stream;
         let len = r
             .read_u8()
             .await
@@ -448,7 +436,7 @@ impl QUICProxyDst {
         }
 
         proxy_entries.insert(
-            proxy_entry_key,
+            addr,
             TcpProxyEntry {
                 src: Some(addr.into()),
                 dst: Some(SocketAddr::V4(dst_socket).into()),
@@ -487,11 +475,13 @@ impl QUICProxyDst {
                 .await?
         };
 
-        if let Some(mut e) = proxy_entries.get_mut(&proxy_entry_key) {
+        if let Some(mut e) = proxy_entries.get_mut(&addr) {
             e.state = TcpProxyEntryState::Connected.into();
         }
 
-        Ok((join(r, w), conn, dst_stream, acl_handler))
+        acl_handler
+            .copy_bidirection_with_acl(join(r, w), dst_stream)
+            .await
     }
 }
 
