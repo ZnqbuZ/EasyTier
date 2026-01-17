@@ -1,5 +1,6 @@
 use anyhow::Context;
 use dashmap::{DashMap, DashSet};
+use hashbrown::HashMap;
 use pnet::packet::ipv4::Ipv4Packet;
 use prost::Message as _;
 use quinn::congestion::BbrConfig;
@@ -45,6 +46,28 @@ type QuicStreamInner = Join<quinn::RecvStream, quinn::SendStream>;
 pub struct NatDstQUICConnector {
     pub(crate) peer_mgr: Weak<PeerManager>,
     endpoint: Endpoint,
+    connections: DashMap<SocketAddr, Connection>,
+}
+
+impl NatDstQUICConnector {
+    async fn connect(&self, addr: SocketAddr) -> Result<Connection> {
+        if let Some(connection) = self.connections.get(&addr) {
+            Ok(connection.clone())
+        } else {
+            let peer_mgr = self
+                .peer_mgr
+                .upgrade()
+                .ok_or(anyhow::anyhow!("peer manager is not available"))?;
+            let _g = peer_mgr.get_global_ctx().net_ns.guard();
+            let connection = self.endpoint
+                .connect(addr, "localhost")
+                .map_err(anyhow::Error::from)?
+                .await
+                .map_err(anyhow::Error::from)?;
+            self.connections.insert(addr, connection.clone());
+            Ok(connection)
+        }
+    }
 }
 
 #[async_trait::async_trait]
@@ -79,22 +102,15 @@ impl NatDstConnector for NatDstQUICConnector {
         };
 
         // connect to server
-        let connection = {
-            let _g = peer_mgr.get_global_ctx().net_ns.guard();
-            self.endpoint
-                .connect(
-                    SocketAddr::new(dst_ipv4.into(), quic_port as u16),
-                    "localhost",
+        let connection = self
+            .connect(SocketAddr::new(dst_ipv4.into(), quic_port as u16))
+            .await
+            .with_context(|| {
+                format!(
+                    "failed to connect to NAT destination {} from {}, real dst: {}",
+                    nat_dst, src, dst_ipv4
                 )
-                .unwrap()
-                .await
-                .with_context(|| {
-                    format!(
-                        "failed to connect to NAT destination {} from {}, real dst: {}",
-                        nat_dst, src, dst_ipv4
-                    )
-                })?
-        };
+            })?;
 
         let (mut w, r) = connection
             .open_bi()
@@ -211,6 +227,7 @@ impl QUICProxySrc {
             NatDstQUICConnector {
                 peer_mgr: Arc::downgrade(&peer_manager),
                 endpoint,
+                connections: DashMap::new(),
             },
         );
 
