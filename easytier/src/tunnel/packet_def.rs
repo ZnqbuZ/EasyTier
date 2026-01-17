@@ -56,7 +56,7 @@ pub struct WGTunnelHeader {
 }
 pub const WG_TUNNEL_HEADER_SIZE: usize = std::mem::size_of::<WGTunnelHeader>();
 
-#[derive(AsBytes, FromZeroes, Clone, Debug)]
+#[derive(AsBytes, FromZeroes, Clone, Copy, Debug)]
 #[repr(u8)]
 pub enum PacketType {
     Invalid = 0,

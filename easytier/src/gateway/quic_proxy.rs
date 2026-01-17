@@ -50,6 +50,7 @@ use tracing::{debug, error, info, instrument, trace, warn};
 struct QuicPacket {
     addr: SocketAddr,
     payload: BytesMut,
+    segment: Option<usize>,
     ecn: Option<EcnCodepoint>,
 }
 
@@ -105,41 +106,34 @@ impl AsyncUdpSocket for QuicSocket {
                 let len = transmit.contents.len();
                 trace!("{:?} sending {:?} bytes to {:?}", self.addr, len, addr);
 
-                let mut sent = false;
+                let permit = self.tx.try_reserve().map_err(|e| match e {
+                    TrySendError::Full(_) => std::io::ErrorKind::WouldBlock,
+                    TrySendError::Closed(_) => std::io::ErrorKind::BrokenPipe,
+                })?;
+
                 let segment_size = transmit.segment_size.unwrap_or(len);
                 let chunks = transmit.contents.chunks(segment_size);
 
-                if self.tx.capacity() < chunks.len() {
-                    return Err(std::io::ErrorKind::WouldBlock.into());
-                }
+                let mut payload = BytesMut::with_capacity(chunks.len() * (segment_size + self.margins.len()));
 
                 for chunk in transmit.contents.chunks(segment_size) {
                     let len = chunk.len();
-                    let payload_len = len + self.margins.len();
-                    let mut payload = BytesMut::with_capacity(payload_len);
                     unsafe {
-                        payload.set_len(payload_len);
                         copy_nonoverlapping(
                             chunk.as_ptr(),
                             payload.as_mut_ptr().add(self.margins.header),
                             len,
                         );
+                        payload.advance_mut(len + self.margins.len());
                     }
-
-                    if let Err(e) = self.tx.try_send(QuicPacket {
-                        addr: transmit.destination,
-                        payload,
-                        ecn: transmit.ecn,
-                    }) {
-                        return match e {
-                            TrySendError::Full(_) if sent => Ok(()),
-                            TrySendError::Full(_) => Err(std::io::ErrorKind::WouldBlock.into()),
-                            TrySendError::Closed(_) => Err(std::io::ErrorKind::BrokenPipe.into()),
-                        };
-                    }
-
-                    sent = true;
                 }
+
+                permit.send(QuicPacket {
+                    addr: transmit.destination,
+                    payload,
+                    segment: Some(segment_size + self.margins.len()),
+                    ecn: transmit.ecn,
+                });
 
                 Ok(())
             }
@@ -632,7 +626,7 @@ mod tests {
 //endregion
 
 //region addr
-#[derive(Debug, Clone, Constructor)]
+#[derive(Debug, Clone, Copy, Constructor)]
 struct QuicAddr {
     peer_id: PeerId,
     packet_type: PacketType,
@@ -880,7 +874,7 @@ impl PeerPacketFilter for QuicPacketReceiver {
 
         if let Err(e) = self
             .tx
-            .try_send(QuicPacket::new(addr.into(), packet.payload_bytes(), None))
+            .try_send(QuicPacket::new(addr.into(), packet.payload_bytes(), None, None))
         {
             debug!("failed to send quic packet to endpoint: {:?}", e);
         }
@@ -909,17 +903,22 @@ impl QuicPacketSender {
             };
 
             let mut payload = packet.payload;
-            payload[..self.header.len()].copy_from_slice(&self.header);
-            let mut packet = ZCPacket::new_from_buf(payload, self.zc_packet_type);
+            let segment = packet.segment.expect("segment size must be set for outgoing quic packet");
 
-            packet.fill_peer_manager_hdr(
-                self.peer_mgr.my_peer_id(),
-                addr.peer_id,
-                addr.packet_type as u8,
-            );
+            while !payload.is_empty() {
+                let mut payload = payload.split_to(segment);
+                payload[..self.header.len()].copy_from_slice(&self.header);
+                let mut packet = ZCPacket::new_from_buf(payload, self.zc_packet_type);
 
-            if let Err(e) = self.peer_mgr.send_msg_for_proxy(packet, addr.peer_id).await {
-                error!("failed to send QUIC packet to peer: {:?}", e);
+                packet.fill_peer_manager_hdr(
+                    self.peer_mgr.my_peer_id(),
+                    addr.peer_id,
+                    addr.packet_type as u8,
+                );
+
+                if let Err(e) = self.peer_mgr.send_msg_for_proxy(packet, addr.peer_id).await {
+                    error!("failed to send QUIC packet to peer: {:?}", e);
+                }
             }
         }
     }
