@@ -1,5 +1,11 @@
 use bytes::Bytes;
 use bytes::BytesMut;
+use pnet::packet::ip::IpNextHeaderProtocols;
+use pnet::packet::ipv4::Ipv4Packet;
+use pnet::packet::tcp::TcpPacket;
+use pnet::packet::udp::UdpPacket;
+use pnet::packet::Packet;
+use std::fmt::Debug;
 use zerocopy::byteorder::*;
 use zerocopy::AsBytes;
 use zerocopy::FromBytes;
@@ -414,10 +420,61 @@ impl ZCPacketType {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ZCPacket {
     inner: BytesMut,
     packet_type: ZCPacketType,
+}
+
+impl ZCPacket {
+    fn info(&self) -> String {
+        let ip = match Ipv4Packet::new(&self.inner) {
+            Some(p) => p,
+            None => return "<invalid ipv4>".to_string(),
+        };
+
+        let src = ip.get_source();
+        let dst = ip.get_destination();
+        let payload = ip.payload();
+
+        match ip.get_next_level_protocol() {
+            IpNextHeaderProtocols::Tcp => TcpPacket::new(payload)
+                .map(|t| {
+                    format!(
+                        "<TCP> {}:{} -> {}:{}",
+                        src,
+                        t.get_source(),
+                        dst,
+                        t.get_destination()
+                    )
+                })
+                .unwrap_or_else(|| format!("<TCP> (invalid) {} -> {}", src, dst)),
+
+            IpNextHeaderProtocols::Udp => UdpPacket::new(payload)
+                .map(|u| {
+                    format!(
+                        "<UDP> {}:{} -> {}:{}",
+                        src,
+                        u.get_source(),
+                        dst,
+                        u.get_destination()
+                    )
+                })
+                .unwrap_or_else(|| format!("<UDP> (invalid) {} -> {}", src, dst)),
+
+            proto => format!("<{:?}> {} -> {}", proto, src, dst),
+        }
+    }
+}
+
+impl Debug for ZCPacket {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ZCPacket")
+            .field("packet_type", &self.packet_type)
+            .field("info", &self.info())
+            .field("payload_len", &self.payload_len())
+            .finish()
+    }
 }
 
 impl ZCPacket {
