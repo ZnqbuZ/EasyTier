@@ -1,3 +1,4 @@
 [submodule "easytier/src/gateway/netstack-smoltcp"]
 	path = easytier/src/gateway/netstack-smoltcp
 	url = git@github.com:ZnqbuZ/netstack-smoltcp
+	branch = main
