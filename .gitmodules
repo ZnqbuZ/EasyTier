@@ -5,4 +5,4 @@
 [submodule "easytier/src/gateway/smoltcp"]
 	path = easytier/src/gateway/smoltcp
 	url = git@github.com:ZnqbuZ/smoltcp
-	branch = main
+	branch = master
