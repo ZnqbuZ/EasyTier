@@ -13,12 +13,13 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::sync::atomic::{AtomicBool, AtomicU16};
 use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
+use futures::{SinkExt, StreamExt};
 use tokio::io::{copy_bidirectional, AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpSocket, TcpStream};
 use tokio::sync::{mpsc, Mutex};
 use tokio::task::JoinSet;
 use tokio::time::timeout;
-use tracing::Instrument;
+use tracing::{debug, Instrument};
 
 use crate::common::error::Result;
 use crate::common::global_ctx::{ArcGlobalCtx, GlobalCtx};
@@ -38,7 +39,7 @@ use crate::tunnel::packet_def::{PacketType, PeerManagerHeader, ZCPacket};
 use super::CidrSet;
 
 #[cfg(feature = "smoltcp")]
-use super::tokio_smoltcp::{self, channel_device, Net, NetConfig};
+use netstack_smoltcp::tcp::TcpStream as SmolTcpStream;
 
 #[async_trait::async_trait]
 pub(crate) trait NatDstConnector: Send + Sync + Clone + 'static {
@@ -98,8 +99,8 @@ impl NatDstConnector for NatDstTcpConnector {
         if !(cidr_set.contains_v4(ipv4.get_destination(), real_dst_ip)
             || is_exit_node
             || global_ctx.no_tun()
-                && Some(ipv4.get_destination())
-                    == global_ctx.get_ipv4().as_ref().map(Ipv4Inet::address))
+            && Some(ipv4.get_destination())
+            == global_ctx.get_ipv4().as_ref().map(Ipv4Inet::address))
         {
             return false;
         }
@@ -154,7 +155,7 @@ impl NatDstEntry {
 enum ProxyTcpStream {
     KernelTcpStream(TcpStream),
     #[cfg(feature = "smoltcp")]
-    SmolTcpStream(tokio_smoltcp::TcpStream),
+    SmolTcpStream(SmolTcpStream),
 }
 
 impl ProxyTcpStream {
@@ -201,7 +202,7 @@ impl ProxyTcpStream {
     }
 }
 
-type SmolTcpAcceptResult = Result<(tokio_smoltcp::TcpStream, SocketAddr)>;
+type SmolTcpAcceptResult = Result<(SmolTcpStream, SocketAddr)>;
 #[cfg(feature = "smoltcp")]
 struct SmolTcpListener {
     stream_tx: mpsc::UnboundedSender<SmolTcpAcceptResult>,
@@ -231,31 +232,6 @@ impl SmolTcpListener {
 
     pub fn stream_tx(&self) -> mpsc::UnboundedSender<SmolTcpAcceptResult> {
         self.stream_tx.clone()
-    }
-
-    pub async fn add_listener(
-        tx: mpsc::UnboundedSender<SmolTcpAcceptResult>,
-        net: Arc<Mutex<Option<Net>>>,
-        tasks: Arc<std::sync::Mutex<JoinSet<()>>>,
-    ) {
-        let locked_net = net.lock().await;
-        let mut tcp = locked_net
-            .as_ref()
-            .unwrap()
-            .tcp_bind("0.0.0.0:8899".parse().unwrap())
-            .await
-            .unwrap();
-        tasks.lock().unwrap().spawn(async move {
-            let ret = timeout(Duration::from_secs(10), tcp.accept()).await;
-            if let Ok(accept_ret) = ret {
-                tx.send(accept_ret.map_err(|e| {
-                    anyhow::anyhow!("smol tcp listener accept failed: {:?}", e).into()
-                }))
-                .unwrap();
-            } else {
-                tracing::error!("smol tcp listener accept timeout");
-            }
-        });
     }
 }
 
@@ -329,9 +305,6 @@ pub struct TcpProxy<C: NatDstConnector> {
 
     smoltcp_stack_sender: Option<mpsc::Sender<ZCPacket>>,
     smoltcp_stack_receiver: Arc<Mutex<Option<mpsc::Receiver<ZCPacket>>>>,
-    #[cfg(feature = "smoltcp")]
-    smoltcp_net: Arc<Mutex<Option<Net>>>,
-    smoltcp_listener_tx: std::sync::Mutex<Option<mpsc::UnboundedSender<SmolTcpAcceptResult>>>,
     enable_smoltcp: Arc<AtomicBool>,
 
     connector: C,
@@ -459,10 +432,6 @@ impl<C: NatDstConnector> TcpProxy<C> {
             smoltcp_stack_sender: Some(smoltcp_stack_sender),
             smoltcp_stack_receiver: Arc::new(Mutex::new(Some(smoltcp_stack_receiver))),
 
-            #[cfg(feature = "smoltcp")]
-            smoltcp_net: Arc::new(Mutex::new(None)),
-            smoltcp_listener_tx: std::sync::Mutex::new(None),
-
             enable_smoltcp: Arc::new(AtomicBool::new(true)),
 
             connector,
@@ -542,22 +511,34 @@ impl<C: NatDstConnector> TcpProxy<C> {
             ))
         {
             // use smoltcp network stack
+            use netstack_smoltcp::StackBuilder;
 
-            use crate::gateway::tokio_smoltcp::BufferSize;
             self.local_port
                 .store(8899, std::sync::atomic::Ordering::Relaxed);
 
-            let mut cap = smoltcp::phy::DeviceCapabilities::default();
-            cap.max_transmission_unit = 1280;
-            cap.medium = smoltcp::phy::Medium::Ip;
-            let (dev, stack_sink, mut stack_stream) = channel_device::ChannelDevice::new(cap);
+            let (stack, runner, _, tcp_listener) = StackBuilder::default()
+                .enable_tcp(true)
+                .tcp_buffer_size(1024 * 64)
+                .stack_buffer_size(1024)
+                .build()
+                .map_err(|e| anyhow::anyhow!("netstack build failed: {}", e))?;
+
+            let (mut stack_sink, mut stack_stream) = stack.split();
+            let runner = runner.unwrap();
+            let mut tcp_listener = tcp_listener.unwrap();
+
+            self.tasks.lock().unwrap().spawn(async move {
+                if let Err(e) = runner.await {
+                    tracing::error!("netstack runner exited with error: {:?}", e);
+                }
+            });
 
             let mut smoltcp_stack_receiver =
                 self.smoltcp_stack_receiver.lock().await.take().unwrap();
             self.tasks.lock().unwrap().spawn(async move {
                 while let Some(packet) = smoltcp_stack_receiver.recv().await {
                     tracing::trace!(?packet, "receive from peer send to smoltcp packet");
-                    if let Err(e) = stack_sink.send(Ok(packet.payload().to_vec())).await {
+                    if let Err(e) = stack_sink.send(packet.payload().to_vec()).await {
                         tracing::error!("send to smoltcp stack failed: {:?}", e);
                     }
                 }
@@ -566,7 +547,7 @@ impl<C: NatDstConnector> TcpProxy<C> {
 
             let peer_mgr = self.peer_manager.clone();
             self.tasks.lock().unwrap().spawn(async move {
-                while let Some(data) = stack_stream.recv().await {
+                while let Some(Ok(data)) = stack_stream.next().await {
                     tracing::trace!(
                         ?data,
                         "receive from smoltcp stack and send to peer mgr packet"
@@ -592,34 +573,22 @@ impl<C: NatDstConnector> TcpProxy<C> {
                 tracing::error!("smoltcp stack stream exited");
             });
 
-            let interface_config = smoltcp::iface::Config::new(smoltcp::wire::HardwareAddress::Ip);
-            let net = Net::new(
-                dev,
-                NetConfig::new(
-                    interface_config,
-                    format!("{}/24", self.get_local_ip().unwrap())
-                        .parse()
-                        .unwrap(),
-                    vec![format!("{}", self.get_local_ip().unwrap()).parse().unwrap()],
-                    Some(BufferSize {
-                        tcp_rx_size: 1024 * 16,
-                        tcp_tx_size: 1024 * 16,
-                        ..Default::default()
-                    }),
-                ),
-            );
-            net.set_any_ip(true);
-            self.smoltcp_net.lock().await.replace(net);
-            let tcp = SmolTcpListener::new().await;
-            self.smoltcp_listener_tx
-                .lock()
-                .unwrap()
-                .replace(tcp.stream_tx());
-
             self.enable_smoltcp
                 .store(true, std::sync::atomic::Ordering::Relaxed);
 
-            return Ok(ProxyTcpListener::SmolTcpListener(tcp));
+            let listener = SmolTcpListener::new().await;
+            let stream_tx = listener.stream_tx();
+
+            self.tasks.lock().unwrap().spawn(async move {
+                while let Some((stream, local_addr, remote_addr)) = tcp_listener.next().await {
+                    // local_addr: 发起请求的源地址 (例如 10.0.0.2:54321)
+                    // remote_addr: 用户想要访问的目标地址 (例如 1.1.1.1:80)
+                    debug!("^ 捕获 TCP: {} -> {}", local_addr, remote_addr);
+                    stream_tx.send(Ok((stream, local_addr))).unwrap();
+                }
+            });
+
+            return Ok(ProxyTcpListener::SmolTcpListener(listener));
         }
 
         {
@@ -802,7 +771,7 @@ impl<C: NatDstConnector> TcpProxy<C> {
             addr_conn_map,
             nat_entry,
         )
-        .await;
+            .await;
     }
 
     async fn handle_nat_connection(
@@ -928,18 +897,6 @@ impl<C: NatDstConnector> TcpProxy<C> {
                 .syn_map
                 .insert(src, Arc::new(NatDstEntry::new(src, real_dst, mapped_dst)));
             tracing::info!(src = ?src, ?real_dst, ?mapped_dst, old_entry = ?old_val, "tcp syn received");
-
-            // if smoltcp is enabled, add the listener to the net
-            if self.is_smoltcp_enabled() {
-                let smoltcp_listener_tx = self.smoltcp_listener_tx.lock().unwrap().clone().unwrap();
-                SmolTcpListener::add_listener(
-                    smoltcp_listener_tx,
-                    self.smoltcp_net.clone(),
-                    self.tasks.clone(),
-                )
-                .await;
-                tracing::info!("smol tcp listener added for src: {:?}", src);
-            }
         } else if !self.addr_conn_map.contains_key(&src) && !self.syn_map.contains_key(&src) {
             // if not in syn map and addr conn map, may forwarding n2n packet
             return None;
