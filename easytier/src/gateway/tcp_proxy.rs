@@ -316,7 +316,7 @@ impl<C: NatDstConnector> PeerPacketFilter for TcpProxy<C> {
         if self.try_handle_peer_packet(&mut packet).await.is_some() {
             if self.is_smoltcp_enabled() {
                 let smoltcp_stack_sender = self.smoltcp_stack_sender.as_ref().unwrap();
-                if let Err(e) = smoltcp_stack_sender.try_send(packet) {
+                if let Err(e) = smoltcp_stack_sender.send(packet).await {
                     tracing::error!("send to smoltcp stack failed: {:?}", e);
                 }
             } else if let Some(peer_manager) = self.get_peer_manager() {
