@@ -67,6 +67,8 @@ pin-project-lite = "0.2.13"
 quinn = { version = "0.11.8", optional = true, features = ["ring"] }
 quinn-plaintext = "0.3.0"
 
+netstack-smoltcp = { path = "src/gateway/netstack-smoltcp" }
+
 rustls = { version = "0.23.0", features = [
     "ring",
 ], default-features = false, optional = true }
