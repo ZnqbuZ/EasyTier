@@ -428,7 +428,7 @@ pub struct ZCPacket {
 
 impl ZCPacket {
     fn info(&self) -> String {
-        let ip = match Ipv4Packet::new(&self.inner) {
+        let ip = match Ipv4Packet::new(&self.payload()) {
             Some(p) => p,
             None => return "<invalid ipv4>".to_string(),
         };
@@ -472,6 +472,7 @@ impl Debug for ZCPacket {
         f.debug_struct("ZCPacket")
             .field("packet_type", &self.packet_type)
             .field("info", &self.info())
+            .field("peer_manager_header", &self.peer_manager_header())
             .field("payload_len", &self.payload_len())
             .finish()
     }
