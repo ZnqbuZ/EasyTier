@@ -26,7 +26,7 @@ use tokio::{
     task::JoinSet,
 };
 use tokio_util::io::InspectReader;
-
+use tracing::debug;
 use super::{
     tcp_proxy::{NatDstConnector, NatDstTcpConnector, TcpProxy},
     CidrSet,
@@ -68,6 +68,8 @@ struct KcpEndpointFilter {
 #[async_trait::async_trait]
 impl PeerPacketFilter for KcpEndpointFilter {
     async fn try_process_packet_from_peer(&self, packet: ZCPacket) -> Option<ZCPacket> {
+        debug!("[try_process_packet_from_peer] filtering packet: {:?}", packet);
+        
         let t = packet.peer_manager_header().unwrap().packet_type;
         if t == PacketType::KcpSrc as u8 && !self.is_src {
             // src packet, but we are dst
@@ -242,6 +244,8 @@ impl TcpProxyForKcpSrcTrait for TcpProxyForKcpSrc {
 #[async_trait::async_trait]
 impl<C: NatDstConnector, T: TcpProxyForKcpSrcTrait<Connector = C>> NicPacketFilter for T {
     async fn try_process_packet_from_nic(&self, zc_packet: &mut ZCPacket) -> bool {
+        debug!("[try_process_packet_from_nic] filtering packet: {:?}", zc_packet);
+        
         let ret = self
             .get_tcp_proxy()
             .try_process_packet_from_nic(zc_packet)

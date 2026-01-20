@@ -1,19 +1,21 @@
 use anyhow::Context;
 use cidr::Ipv4Inet;
 use core::panic;
+use std::fmt::format;
 use crossbeam::atomic::AtomicCell;
 use dashmap::DashMap;
+use futures::{SinkExt, StreamExt};
 use pnet::packet::ip::IpNextHeaderProtocols;
 use pnet::packet::ipv4::{Ipv4Packet, MutableIpv4Packet};
 use pnet::packet::tcp::{ipv4_checksum, MutableTcpPacket, TcpPacket};
 use pnet::packet::MutablePacket;
 use pnet::packet::Packet;
 use socket2::{SockRef, TcpKeepalive};
+use std::mem;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::sync::atomic::{AtomicBool, AtomicU16};
 use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
-use futures::{SinkExt, StreamExt};
 use tokio::io::{copy_bidirectional, AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpSocket, TcpStream};
 use tokio::sync::{mpsc, Mutex};
@@ -99,8 +101,8 @@ impl NatDstConnector for NatDstTcpConnector {
         if !(cidr_set.contains_v4(ipv4.get_destination(), real_dst_ip)
             || is_exit_node
             || global_ctx.no_tun()
-            && Some(ipv4.get_destination())
-            == global_ctx.get_ipv4().as_ref().map(Ipv4Inet::address))
+                && Some(ipv4.get_destination())
+                    == global_ctx.get_ipv4().as_ref().map(Ipv4Inet::address))
         {
             return false;
         }
@@ -313,6 +315,8 @@ pub struct TcpProxy<C: NatDstConnector> {
 #[async_trait::async_trait]
 impl<C: NatDstConnector> PeerPacketFilter for TcpProxy<C> {
     async fn try_process_packet_from_peer(&self, mut packet: ZCPacket) -> Option<ZCPacket> {
+        debug!("[try_process_packet_from_peer] filtering packet: {:?}", packet);
+
         if self.try_handle_peer_packet(&mut packet).await.is_some() {
             if self.is_smoltcp_enabled() {
                 let smoltcp_stack_sender = self.smoltcp_stack_sender.as_ref().unwrap();
@@ -334,6 +338,8 @@ impl<C: NatDstConnector> PeerPacketFilter for TcpProxy<C> {
 #[async_trait::async_trait]
 impl<C: NatDstConnector> NicPacketFilter for TcpProxy<C> {
     async fn try_process_packet_from_nic(&self, zc_packet: &mut ZCPacket) -> bool {
+        debug!("[try_process_packet_from_nic] filtering packet: {:?}", zc_packet);
+
         let Some(my_ipv4_inet) = self.get_local_inet() else {
             return false;
         };
@@ -406,6 +412,18 @@ impl<C: NatDstConnector> NicPacketFilter for TcpProxy<C> {
         Self::update_ip_packet_checksum(&mut ip_packet);
 
         tracing::trace!(dst_addr = ?dst_addr, nat_entry = ?nat_entry, packet = ?ip_packet, "tcp packet after modified");
+
+        if self.is_smoltcp_enabled() {
+            if let Some(sender) = &self.smoltcp_stack_sender {
+                debug!("[ShortCircuit] {:?}", zc_packet);
+                let mut dummy_packet = ZCPacket::new_with_payload(&[]);
+                mem::swap(zc_packet, &mut dummy_packet);
+                if let Err(e) = sender.send(dummy_packet).await {
+                    tracing::error!("[ShortCircuit] failed to send packet to smoltcp: {:?}", e);
+                }
+                return true;
+            }
+        }
 
         true
     }
@@ -537,9 +555,10 @@ impl<C: NatDstConnector> TcpProxy<C> {
                 self.smoltcp_stack_receiver.lock().await.take().unwrap();
             self.tasks.lock().unwrap().spawn(async move {
                 while let Some(packet) = smoltcp_stack_receiver.recv().await {
-                    tracing::trace!(?packet, "receive from peer send to smoltcp packet");
+                    let info = format!("{:?}", packet);
+                    debug!("receive from peer send to smoltcp packet: {info}");
                     if let Err(e) = stack_sink.send(packet.payload().to_vec()).await {
-                        tracing::error!("send to smoltcp stack failed: {:?}", e);
+                        tracing::error!("send to smoltcp stack failed: {:?}, packet: {info}", e);
                     }
                 }
                 tracing::error!("smoltcp stack sink exited");
@@ -548,17 +567,17 @@ impl<C: NatDstConnector> TcpProxy<C> {
             let peer_mgr = self.peer_manager.clone();
             self.tasks.lock().unwrap().spawn(async move {
                 while let Some(Ok(data)) = stack_stream.next().await {
-                    tracing::trace!(
-                        ?data,
-                        "receive from smoltcp stack and send to peer mgr packet"
+                    let packet = ZCPacket::new_with_payload(&data);
+                    let info = format!("{:?}", packet);
+                    debug!(
+                        "receive from smoltcp stack and send to peer mgr packet: {info}"
                     );
                     let Some(ipv4) = Ipv4Packet::new(&data) else {
-                        tracing::error!(?data, "smoltcp stack stream get non ipv4 packet");
+                        tracing::error!("smoltcp stack stream get non ipv4 packet: {info}");
                         continue;
                     };
 
                     let dst = ipv4.get_destination();
-                    let packet = ZCPacket::new_with_payload(&data);
                     let Some(peer_mgr) = peer_mgr.upgrade() else {
                         tracing::warn!("peer manager is gone, smoltcp sender exited");
                         return;
@@ -567,7 +586,7 @@ impl<C: NatDstConnector> TcpProxy<C> {
                         .send_msg_by_ip(packet, IpAddr::V4(dst), false)
                         .await
                     {
-                        tracing::error!("send to peer failed in smoltcp sender: {:?}", e);
+                        tracing::error!("send to peer failed in smoltcp sender: {:?}, packet: {info}", e);
                     }
                 }
                 tracing::error!("smoltcp stack stream exited");
@@ -771,7 +790,7 @@ impl<C: NatDstConnector> TcpProxy<C> {
             addr_conn_map,
             nat_entry,
         )
-            .await;
+        .await;
     }
 
     async fn handle_nat_connection(
@@ -902,22 +921,7 @@ impl<C: NatDstConnector> TcpProxy<C> {
             return None;
         }
 
-        let mut ip_packet = MutableIpv4Packet::new(payload_bytes).unwrap();
-        if !self.is_smoltcp_enabled() && source_ip == ipv4_addr {
-            // modify the source so the response packet can be handled by tun device
-            ip_packet.set_source(Self::get_fake_local_ipv4(&ipv4_inet));
-        }
-        ip_packet.set_destination(ipv4_addr);
-        let source = ip_packet.get_source();
-
-        let mut tcp_packet = MutableTcpPacket::new(ip_packet.payload_mut()).unwrap();
-        tcp_packet.set_destination(self.get_local_port());
-
-        Self::update_tcp_packet_checksum(&mut tcp_packet, &source, &ipv4_addr);
-        drop(tcp_packet);
-        Self::update_ip_packet_checksum(&mut ip_packet);
-
-        tracing::trace!(?source, ?ipv4_addr, ?packet, "tcp packet after modified");
+        debug!("Skip modifying packet: {:?}", packet);
 
         Some(())
     }
