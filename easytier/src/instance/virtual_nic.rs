@@ -147,7 +147,7 @@ fn infer_proto(buf: &[u8]) -> PacketProtocol {
     }
 }
 
-struct TunZCPacketToBytes {
+pub struct TunZCPacketToBytes {
     has_packet_info: bool,
 }
 
@@ -194,7 +194,7 @@ impl ZCPacketToBytes for TunZCPacketToBytes {
 pin_project! {
     pub struct TunAsyncWrite {
         #[pin]
-        l: BiLock<AsyncDevice>,
+        pub l: BiLock<AsyncDevice>,
     }
 }
 

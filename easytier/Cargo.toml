@@ -23,6 +23,11 @@ test = false
 name = "easytier-cli"
 path = "src/easytier-cli.rs"
 
+[[bin]]
+name = "proxy"
+path = "src/proxy.rs"
+test = false
+
 [lib]
 name = "easytier"
 path = "src/lib.rs"
@@ -64,7 +69,7 @@ zerocopy = { version = "0.7.32", features = ["derive", "simd"] }
 bytes = "1.5.0"
 pin-project-lite = "0.2.13"
 
-quinn = { version = "0.11.8", optional = true, features = ["ring"] }
+quinn = { version = "0.11.9", optional = true, features = ["ring", "qlog"] }
 quinn-plaintext = "0.3.0"
 
 netstack-smoltcp = { path = "src/gateway/netstack-smoltcp" }
