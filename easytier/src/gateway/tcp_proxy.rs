@@ -538,7 +538,7 @@ impl<C: NatDstConnector> TcpProxy<C> {
             let (stack, runner, _, tcp_listener) = StackBuilder::default()
                 .enable_tcp(true)
                 .tcp_buffer_size(1024 * 64)
-                .stack_buffer_size(1024)
+                .stack_buffer_size(2048)
                 .build()
                 .map_err(|e| anyhow::anyhow!("netstack build failed: {}", e))?;
 
