@@ -36,6 +36,7 @@ use crate::proto::rpc_types;
 use crate::proto::rpc_types::controller::BaseController;
 use crate::tunnel::common::setup_sokcet2;
 use crate::tunnel::packet_def::PeerManagerHeader;
+use crate::utils::MonitoredStream;
 
 type QuicStreamInner = Join<RecvStream, SendStream>;
 
@@ -479,8 +480,11 @@ impl QUICProxyDst {
             e.state = TcpProxyEntryState::Connected.into();
         }
 
+        let src = MonitoredStream::new(join(r, w), format!("QUIC FROM {:?}", addr).as_str());
+        let dst = MonitoredStream::new(dst_stream, format!("QUIC TO {:?}", dst_socket).as_str());
+
         acl_handler
-            .copy_bidirection_with_acl(join(r, w), dst_stream)
+            .copy_bidirection_with_acl(src, dst)
             .await
     }
 }

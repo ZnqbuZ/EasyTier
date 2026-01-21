@@ -40,6 +40,7 @@ use crate::tunnel::packet_def::{PacketType, PeerManagerHeader, ZCPacket};
 
 use super::CidrSet;
 
+use crate::utils::MonitoredStream;
 #[cfg(feature = "smoltcp")]
 use netstack_smoltcp::tcp::TcpStream as SmolTcpStream;
 
@@ -802,7 +803,15 @@ impl<C: NatDstConnector> TcpProxy<C> {
     ) {
         let nat_entry_clone = nat_entry.clone();
         nat_entry.tasks.lock().await.spawn(async move {
-            let ret = src_tcp_stream.copy_bidirectional(&mut dst_tcp_stream).await;
+            let (mut src_tcp_stream, mut dst_tcp_stream) = match src_tcp_stream {
+                #[cfg(feature = "smoltcp")]
+                ProxyTcpStream::SmolTcpStream(stream) => (
+                    MonitoredStream::new(stream, format!("NAT FROM {:?}", nat_entry_clone.src).as_str()),
+                    MonitoredStream::new(dst_tcp_stream, format!("NAT TO {:?}", nat_entry_clone.real_dst).as_str()),
+                ),
+                _ => unreachable!(),
+            };
+            let ret = copy_bidirectional(&mut src_tcp_stream, &mut dst_tcp_stream).await;
             tracing::info!(nat_entry = ?nat_entry_clone, ret = ?ret, "nat tcp connection closed");
 
             nat_entry_clone.state.store(NatDstEntryState::ClosingSrc);
