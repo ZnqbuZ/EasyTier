@@ -24,8 +24,8 @@ name = "easytier-cli"
 path = "src/easytier-cli.rs"
 
 [[bin]]
-name = "proxy"
-path = "src/proxy.rs"
+name = "qs"
+path = "src/qs.rs"
 test = false
 
 [lib]
