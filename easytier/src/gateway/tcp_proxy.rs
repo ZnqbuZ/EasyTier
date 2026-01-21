@@ -15,7 +15,7 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::sync::atomic::{AtomicBool, AtomicU16};
 use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
-use tokio::io::{copy_bidirectional, AsyncRead, AsyncWrite, AsyncWriteExt};
+use tokio::io::{copy_bidirectional, copy_bidirectional_with_sizes, AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpSocket, TcpStream};
 use tokio::sync::{mpsc, Mutex};
 use tokio::task::JoinSet;
@@ -830,7 +830,7 @@ impl<C: NatDstConnector> TcpProxy<C> {
                 ),
                 _ => unreachable!(),
             };
-            let ret = copy_bidirectional(&mut src_tcp_stream, &mut dst_tcp_stream).await;
+            let ret = copy_bidirectional_with_sizes(&mut src_tcp_stream, &mut dst_tcp_stream, 1 << 20, 1 << 20).await;
             tracing::info!(nat_entry = ?nat_entry_clone, ret = ?ret, "nat tcp connection closed");
 
             nat_entry_clone.state.store(NatDstEntryState::ClosingSrc);

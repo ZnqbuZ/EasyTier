@@ -21,10 +21,11 @@ use pnet::packet::{
 };
 use prost::Message;
 use tokio::{
-    io::{copy_bidirectional, AsyncRead, AsyncWrite},
+    io::{AsyncRead, AsyncWrite},
     select,
     task::JoinSet,
 };
+use tokio::io::copy_bidirectional_with_sizes;
 use tokio_util::io::InspectReader;
 use tracing::debug;
 use super::{
@@ -430,7 +431,7 @@ impl ProxyAclHandler {
         });
         let mut src = tokio::io::join(src_reader, src_writer);
 
-        copy_bidirectional(&mut src, &mut dst).await?;
+        copy_bidirectional_with_sizes(&mut src, &mut dst, 1 << 20, 1 << 20).await?;
         Ok(())
     }
 }
