@@ -799,12 +799,15 @@ impl NicCtx {
         };
         let close_notifier = self.close_notifier.clone();
         self.tasks.spawn(async move {
+            let mut stream = stream.ready_chunks(16);
             while let Some(ret) = stream.next().await {
-                if ret.is_err() {
-                    tracing::error!("read from nic failed: {:?}", ret);
-                    break;
+                for ret in ret {
+                    if ret.is_err() {
+                        tracing::error!("read from nic failed: {:?}", ret);
+                        break;
+                    }
+                    Self::do_forward_nic_to_peers(ret.unwrap(), mgr.as_ref()).await;
                 }
-                Self::do_forward_nic_to_peers(ret.unwrap(), mgr.as_ref()).await;
             }
             close_notifier.notify_one();
             tracing::error!("nic closed when recving from it");
