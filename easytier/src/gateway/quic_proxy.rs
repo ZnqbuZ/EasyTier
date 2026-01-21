@@ -12,11 +12,10 @@ use std::net::SocketAddr;
 use std::net::{IpAddr, Ipv4Addr};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
-use tokio::io::{join, AsyncReadExt, Join};
+use tokio::io::{copy_bidirectional_with_sizes, join, AsyncReadExt, Join};
 use tokio::task::JoinSet;
 use tokio::time::timeout;
-
-use crate::common::acl_processor::PacketInfo;
+use tracing::info;
 use crate::common::config::ConfigLoader;
 use crate::common::error::Result;
 use crate::common::global_ctx::{ArcGlobalCtx, GlobalCtx};
@@ -389,6 +388,8 @@ impl QUICProxyDst {
         proxy_entries: Arc<DashMap<SocketAddr, TcpProxyEntry>>,
         route: Arc<dyn crate::peers::route_trait::Route + Send + Sync + 'static>,
     ) -> Result<()> {
+        info!("incoming connection from {addr}");
+
         let (w, mut r) = stream;
         let len = r
             .read_u8()
@@ -447,26 +448,6 @@ impl QUICProxyDst {
             },
         );
 
-        let acl_handler = ProxyAclHandler {
-            acl_filter: ctx.get_acl_filter().clone(),
-            packet_info: PacketInfo {
-                src_ip,
-                dst_ip: dst_ip.into(),
-                src_port: Some(addr.port()),
-                dst_port: Some(dst_socket.port()),
-                protocol: Protocol::Tcp,
-                packet_size: len as usize,
-                src_groups,
-                dst_groups,
-            },
-            chain_type: if send_to_self {
-                ChainType::Inbound
-            } else {
-                ChainType::Forward
-            },
-        };
-        acl_handler.handle_packet(&buf)?;
-
         let connector = NatDstTcpConnector {};
 
         let dst_stream = {
@@ -480,12 +461,11 @@ impl QUICProxyDst {
             e.state = TcpProxyEntryState::Connected.into();
         }
 
-        let src = MonitoredStream::new(join(r, w), format!("QUIC FROM {:?}", addr).as_str());
-        let dst = MonitoredStream::new(dst_stream, format!("QUIC TO {:?}", dst_socket).as_str());
+        let mut src = MonitoredStream::new(join(r, w), format!("QUIC FROM {:?}", addr).as_str());
+        let mut dst = MonitoredStream::new(dst_stream, format!("QUIC TO {:?}", dst_socket).as_str());
 
-        acl_handler
-            .copy_bidirection_with_acl(src, dst)
-            .await
+        copy_bidirectional_with_sizes(&mut src, &mut dst, 1 << 20, 1 << 20).await?;
+        Ok(())
     }
 }
 
