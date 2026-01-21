@@ -407,22 +407,6 @@ impl<C: NatDstConnector> NicPacketFilter for TcpProxy<C> {
             zc_packet.mut_peer_manager_header().unwrap().to_peer_id = self.get_my_peer_id().into();
         }
 
-        let mut ip_packet = MutableIpv4Packet::new(zc_packet.mut_payload()).unwrap();
-        ip_packet.set_source(ip);
-        if need_transform_dst {
-            ip_packet.set_destination(my_ipv4);
-        }
-        let dst = ip_packet.get_destination();
-
-        let mut tcp_packet = MutableTcpPacket::new(ip_packet.payload_mut()).unwrap();
-        tcp_packet.set_source(nat_entry.real_dst.port());
-
-        Self::update_tcp_packet_checksum(&mut tcp_packet, &ip, &dst);
-        drop(tcp_packet);
-        Self::update_ip_packet_checksum(&mut ip_packet);
-
-        tracing::trace!(dst_addr = ?dst_addr, nat_entry = ?nat_entry, packet = ?ip_packet, "tcp packet after modified");
-
         if self.is_smoltcp_enabled() {
             if let Some(sender) = &self.smoltcp_stack_sender {
                 debug!("[ShortCircuit] {:?}", zc_packet);
@@ -433,6 +417,22 @@ impl<C: NatDstConnector> NicPacketFilter for TcpProxy<C> {
                 }
                 return true;
             }
+        } else {
+            let mut ip_packet = MutableIpv4Packet::new(zc_packet.mut_payload()).unwrap();
+            ip_packet.set_source(ip);
+            if need_transform_dst {
+                ip_packet.set_destination(my_ipv4);
+            }
+            let dst = ip_packet.get_destination();
+
+            let mut tcp_packet = MutableTcpPacket::new(ip_packet.payload_mut()).unwrap();
+            tcp_packet.set_source(nat_entry.real_dst.port());
+
+            Self::update_tcp_packet_checksum(&mut tcp_packet, &ip, &dst);
+            drop(tcp_packet);
+            Self::update_ip_packet_checksum(&mut ip_packet);
+
+            tracing::trace!(dst_addr = ?dst_addr, nat_entry = ?nat_entry, packet = ?ip_packet, "tcp packet after modified");
         }
 
         true
@@ -600,7 +600,7 @@ impl<C: NatDstConnector> TcpProxy<C> {
                         tracing::warn!("peer manager is gone, smoltcp sender exited");
                         return;
                     };
-                    
+
                     if let Err(e) = peer_mgr.get_nic_channel().send(packet).await
                     {
                         tracing::error!(
