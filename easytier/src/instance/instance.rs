@@ -516,6 +516,7 @@ pub struct Instance {
     nic_ctx: ArcNicCtx,
 
     peer_packet_receiver: Arc<Mutex<PacketRecvChanReceiver>>,
+    peer_packet_receiver_2: Arc<Mutex<PacketRecvChanReceiver>>,
     peer_manager: Arc<PeerManager>,
     listener_manager: Arc<Mutex<ListenerManager<PeerManager>>>,
     conn_manager: Arc<ManualConnectorManager>,
@@ -553,6 +554,7 @@ impl Instance {
         );
 
         let (peer_packet_sender, peer_packet_receiver) = create_packet_recv_chan();
+        let (peer_packet_sender_2, peer_packet_receiver_2) = create_packet_recv_chan();
 
         let id = global_ctx.get_id();
 
@@ -560,6 +562,7 @@ impl Instance {
             RouteAlgoType::Ospf,
             global_ctx.clone(),
             peer_packet_sender,
+            peer_packet_sender_2
         ));
 
         peer_manager.set_allow_loopback_tunnel(false);
@@ -596,6 +599,7 @@ impl Instance {
             id,
 
             peer_packet_receiver: Arc::new(Mutex::new(peer_packet_receiver)),
+            peer_packet_receiver_2: Arc::new(Mutex::new(peer_packet_receiver_2)),
             nic_ctx: Arc::new(Mutex::new(None)),
 
             peer_manager,
@@ -703,6 +707,7 @@ impl Instance {
         let global_ctx_c = self.get_global_ctx();
         let nic_ctx = self.nic_ctx.clone();
         let _peer_packet_receiver = self.peer_packet_receiver.clone();
+        let _peer_packet_receiver_2 = self.peer_packet_receiver_2.clone();
         tokio::spawn(async move {
             let default_ipv4_addr = Ipv4Inet::new(Ipv4Addr::new(10, 126, 126, 0), 24).unwrap();
             let mut current_dhcp_ip: Option<Ipv4Inet> = None;
@@ -786,6 +791,7 @@ impl Instance {
                             global_ctx_c.clone(),
                             &peer_manager_c,
                             _peer_packet_receiver.clone(),
+                            _peer_packet_receiver_2.clone(),
                             nic_closed_notifier.clone(),
                         );
                         if let Err(e) = new_nic_ctx.run(Some(ip), global_ctx_c.get_ipv6()).await {
@@ -832,6 +838,7 @@ impl Instance {
         let nic_ctx = self.nic_ctx.clone();
         let peer_mgr = Arc::downgrade(&self.peer_manager);
         let peer_packet_receiver = self.peer_packet_receiver.clone();
+        let peer_packet_receiver_2 = self.peer_packet_receiver_2.clone();
 
         tokio::spawn(async move {
             let mut output_tx = Some(first_round_output);
@@ -850,6 +857,7 @@ impl Instance {
                     peer_manager.get_global_ctx(),
                     &peer_manager,
                     peer_packet_receiver.clone(),
+                    peer_packet_receiver_2.clone(),
                     close_notifier.clone(),
                 );
 

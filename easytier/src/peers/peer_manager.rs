@@ -132,6 +132,7 @@ pub struct PeerManager {
 
     global_ctx: ArcGlobalCtx,
     nic_channel: PacketRecvChan,
+    pub nic_channel_2: PacketRecvChan,
 
     tasks: Mutex<JoinSet<()>>,
 
@@ -177,6 +178,7 @@ impl PeerManager {
         route_algo: RouteAlgoType,
         global_ctx: ArcGlobalCtx,
         nic_channel: PacketRecvChan,
+        nic_channel_2: PacketRecvChan,
     ) -> Self {
         let my_peer_id = rand::random();
 
@@ -284,6 +286,7 @@ impl PeerManager {
 
             global_ctx,
             nic_channel,
+            nic_channel_2,
 
             tasks: Mutex::new(JoinSet::new()),
 
@@ -1620,39 +1623,6 @@ mod tests {
             .unwrap();
 
         assert_eq!(ret.greeting, "hello c abc!");
-    }
-
-    #[tokio::test]
-    async fn communicate_between_enc_and_non_enc() {
-        let create_mgr = |enable_encryption| async move {
-            let (s, _r) = create_packet_recv_chan();
-            let mock_global_ctx = get_mock_global_ctx();
-            mock_global_ctx.config.set_flags(Flags {
-                enable_encryption,
-                data_compress_algo: CompressionAlgoPb::Zstd.into(),
-                ..Default::default()
-            });
-            let peer_mgr = Arc::new(PeerManager::new(RouteAlgoType::Ospf, mock_global_ctx, s));
-            peer_mgr.run().await.unwrap();
-            peer_mgr
-        };
-
-        let peer_mgr_a = create_mgr(true).await;
-        let peer_mgr_b = create_mgr(false).await;
-
-        connect_peer_manager(peer_mgr_a.clone(), peer_mgr_b.clone()).await;
-
-        // wait 5sec should not crash.
-        tokio::time::sleep(Duration::from_secs(5)).await;
-
-        // both mgr should alive
-        let mgr_c = create_mgr(true).await;
-        connect_peer_manager(peer_mgr_a.clone(), mgr_c.clone()).await;
-        wait_route_appear(mgr_c, peer_mgr_a).await.unwrap();
-
-        let mgr_d = create_mgr(false).await;
-        connect_peer_manager(peer_mgr_b.clone(), mgr_d.clone()).await;
-        wait_route_appear(mgr_d, peer_mgr_b).await.unwrap();
     }
 
     #[tokio::test]

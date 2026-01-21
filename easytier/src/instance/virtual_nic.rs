@@ -631,6 +631,7 @@ pub struct NicCtx {
     global_ctx: ArcGlobalCtx,
     peer_mgr: Weak<PeerManager>,
     peer_packet_receiver: Arc<Mutex<PacketRecvChanReceiver>>,
+    peer_packet_receiver_2: Arc<Mutex<PacketRecvChanReceiver>>,
 
     close_notifier: Arc<Notify>,
 
@@ -643,12 +644,14 @@ impl NicCtx {
         global_ctx: ArcGlobalCtx,
         peer_manager: &Arc<PeerManager>,
         peer_packet_receiver: Arc<Mutex<PacketRecvChanReceiver>>,
+        peer_packet_receiver_2: Arc<Mutex<PacketRecvChanReceiver>>,
         close_notifier: Arc<Notify>,
     ) -> Self {
         NicCtx {
             global_ctx: global_ctx.clone(),
             peer_mgr: Arc::downgrade(peer_manager),
             peer_packet_receiver,
+            peer_packet_receiver_2,
 
             close_notifier,
 
@@ -818,11 +821,20 @@ impl NicCtx {
 
     fn do_forward_peers_to_nic(&mut self, mut sink: Pin<Box<dyn ZCPacketSink>>) {
         let channel = self.peer_packet_receiver.clone();
+        let channel_2 = self.peer_packet_receiver_2.clone();
         let close_notifier = self.close_notifier.clone();
         self.tasks.spawn(async move {
             // unlock until coroutine finished
             let mut channel = channel.lock().await;
-            while let Ok(packet) = recv_packet_from_chan(&mut channel).await {
+            let mut channel_2 = channel_2.lock().await;
+            loop {
+                let packet = tokio::select! {
+                    biased;
+                    
+                    packet = recv_packet_from_chan(&mut channel_2) => { packet },
+                    packet = recv_packet_from_chan(&mut channel) => { packet },
+                };
+                let Ok(packet) = packet else { break };
                 tracing::trace!(
                     "[USER_PACKET] forward packet from peers to nic. packet: {:?}",
                     packet
