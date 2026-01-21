@@ -20,7 +20,7 @@ use tokio::net::{TcpListener, TcpSocket, TcpStream};
 use tokio::sync::{mpsc, Mutex};
 use tokio::task::JoinSet;
 use tokio::time::timeout;
-use tracing::{debug, Instrument};
+use tracing::{debug, error, Instrument};
 
 use crate::common::error::Result;
 use crate::common::global_ctx::{ArcGlobalCtx, GlobalCtx};
@@ -319,6 +319,10 @@ impl<C: NatDstConnector> PeerPacketFilter for TcpProxy<C> {
             "[try_process_packet_from_peer] filtering packet: {:?}",
             packet
         );
+        error!(
+            "[try_process_packet_from_peer] filtering packet: {:?}",
+            packet
+        );
 
         if self.try_handle_peer_packet(&mut packet).await.is_some() {
             if self.is_smoltcp_enabled() {
@@ -542,7 +546,7 @@ impl<C: NatDstConnector> TcpProxy<C> {
 
             let (stack, runner, _, tcp_listener) = StackBuilder::default()
                 .enable_tcp(true)
-                .tcp_buffer_size(1024 * 64)
+                .tcp_buffer_size(1024 * 1024)
                 .stack_buffer_size(2048)
                 .build()
                 .map_err(|e| anyhow::anyhow!("netstack build failed: {}", e))?;
@@ -596,9 +600,8 @@ impl<C: NatDstConnector> TcpProxy<C> {
                         tracing::warn!("peer manager is gone, smoltcp sender exited");
                         return;
                     };
-                    if let Err(e) = peer_mgr
-                        .send_msg_by_ip(packet, IpAddr::V4(dst), false)
-                        .await
+                    
+                    if let Err(e) = peer_mgr.get_nic_channel().send(packet).await
                     {
                         tracing::error!(
                             "send to peer failed in smoltcp sender: {:?}, packet: {info}",
