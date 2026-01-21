@@ -794,24 +794,41 @@ impl NicCtx {
 
     fn do_forward_nic_to_peers_task(
         &mut self,
-        mut stream: Pin<Box<dyn ZCPacketStream>>,
+        stream: Pin<Box<dyn ZCPacketStream>>,
     ) -> Result<(), Error> {
         // read from nic and write to corresponding tunnel
         let Some(mgr) = self.peer_mgr.upgrade() else {
             return Err(anyhow::anyhow!("peer manager not available").into());
         };
         let close_notifier = self.close_notifier.clone();
+
         self.tasks.spawn(async move {
-            let mut stream = stream.ready_chunks(16);
-            while let Some(ret) = stream.next().await {
-                for ret in ret {
-                    if ret.is_err() {
-                        tracing::error!("read from nic failed: {:?}", ret);
-                        break;
+            // 设定并发窗口大小。
+            // 假设延迟 1ms，要跑满 1Gbps (约 80k pps)，窗口至少需要 80。
+            // 设置为 4096 可以轻松应对更高的延迟或带宽抖动。
+            const MAX_CONCURRENT_PACKETS: usize = 4096;
+
+            // 使用 for_each_concurrent 替代 while let 循环
+            // 这允许 stream 继续读取下一个包，而不需要等待前一个包处理完成
+            stream
+                .for_each_concurrent(MAX_CONCURRENT_PACKETS, |ret| {
+                    let mgr = mgr.clone();
+                    async move {
+                        match ret {
+                            Ok(packet) => {
+                                // 这里的 await 现在是并行的了。
+                                // 即使这里卡了 1ms，也不会阻塞下一个包的读取和处理。
+                                NicCtx::do_forward_nic_to_peers(packet, &mgr).await;
+                            }
+                            Err(e) => {
+                                // 读取错误通常是致命的或者偶发的，记录日志即可
+                                tracing::error!("read from nic failed: {:?}", e);
+                            }
+                        }
                     }
-                    Self::do_forward_nic_to_peers(ret.unwrap(), mgr.as_ref()).await;
-                }
-            }
+                })
+                .await;
+
             close_notifier.notify_one();
             tracing::error!("nic closed when recving from it");
         });
@@ -824,25 +841,30 @@ impl NicCtx {
         let channel_2 = self.peer_packet_receiver_2.clone();
         let close_notifier = self.close_notifier.clone();
         self.tasks.spawn(async move {
+            const BATCH_SIZE: usize = 32;
+            let mut buf = Vec::with_capacity(BATCH_SIZE);
+            let mut buf_2 = Vec::with_capacity(BATCH_SIZE);
             // unlock until coroutine finished
             let mut channel = channel.lock().await;
             let mut channel_2 = channel_2.lock().await;
             loop {
-                let packet = tokio::select! {
+                let packets = tokio::select! {
                     biased;
-                    
-                    packet = recv_packet_from_chan(&mut channel_2) => { packet },
-                    packet = recv_packet_from_chan(&mut channel) => { packet },
+
+                    _ = channel_2.recv_many(&mut buf_2, BATCH_SIZE) => { &mut buf_2 },
+                    _ = channel.recv_many(&mut buf, BATCH_SIZE) => { &mut buf },
                 };
-                let Ok(packet) = packet else { break };
-                tracing::trace!(
-                    "[USER_PACKET] forward packet from peers to nic. packet: {:?}",
-                    packet
-                );
-                let ret = sink.send(packet).await;
-                if ret.is_err() {
-                    tracing::error!(?ret, "do_forward_tunnel_to_nic sink error");
+                for packet in packets.drain(..) {
+                    tracing::trace!(
+                        "[USER_PACKET] forward packet from peers to nic. packet: {:?}",
+                        packet
+                    );
+                    let ret = sink.send(packet).await;
+                    if ret.is_err() {
+                        tracing::error!(?ret, "do_forward_tunnel_to_nic sink error");
+                    }
                 }
+                sink.flush().await.unwrap();
             }
             close_notifier.notify_one();
             tracing::error!("nic closed when sending to it");

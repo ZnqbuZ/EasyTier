@@ -9,7 +9,7 @@ use anyhow::Context;
 use async_trait::async_trait;
 
 use dashmap::DashMap;
-
+use futures::StreamExt;
 use tokio::{
     sync::{
         mpsc::{self, UnboundedReceiver, UnboundedSender},
@@ -17,7 +17,7 @@ use tokio::{
     },
     task::JoinSet,
 };
-
+use tokio_stream::wrappers::ReceiverStream;
 use crate::{
     common::{
         compressor::{Compressor as _, DefaultCompressor},
@@ -606,7 +606,11 @@ impl PeerManager {
     }
 
     async fn start_peer_recv(&self) {
-        let mut recv = self.packet_recv.lock().await.take().unwrap();
+        let recv = self.packet_recv.lock().await.take().unwrap();
+        // 将 Receiver 包装为 Stream
+        let stream = ReceiverStream::new(recv);
+
+        // 预先克隆需要在整个生命周期内使用的变量
         let my_peer_id = self.my_peer_id;
         let peers = self.peers.clone();
         let pipe_line = self.peer_packet_process_pipeline.clone();
@@ -617,133 +621,162 @@ impl PeerManager {
         let acl_filter = self.global_ctx.get_acl_filter().clone();
         let global_ctx = self.global_ctx.clone();
         let stats_mgr = self.global_ctx.stats_manager().clone();
-        let route = self.get_route();
+        let route = Arc::new(self.get_route());
 
-        let label_set =
-            LabelSet::new().with_label_type(LabelType::NetworkName(global_ctx.get_network_name()));
+        let label_set = LabelSet::new()
+            .with_label_type(LabelType::NetworkName(global_ctx.get_network_name()));
 
-        let self_tx_bytes = self.self_tx_counters.self_tx_bytes.clone();
-        let self_tx_packets = self.self_tx_counters.self_tx_packets.clone();
-        let self_rx_bytes =
-            stats_mgr.get_counter(MetricName::TrafficBytesSelfRx, label_set.clone());
-        let self_rx_packets =
-            stats_mgr.get_counter(MetricName::TrafficPacketsSelfRx, label_set.clone());
-        let forward_tx_bytes =
-            stats_mgr.get_counter(MetricName::TrafficBytesForwarded, label_set.clone());
-        let forward_tx_packets =
-            stats_mgr.get_counter(MetricName::TrafficPacketsForwarded, label_set.clone());
+        // 统计指标相关的克隆
+        let self_tx_counters = &self.self_tx_counters;
+        let self_tx_bytes = self_tx_counters.self_tx_bytes.clone();
+        let self_tx_packets = self_tx_counters.self_tx_packets.clone();
+        let compress_tx_bytes_before = self_tx_counters.compress_tx_bytes_before.clone();
+        let compress_tx_bytes_after = self_tx_counters.compress_tx_bytes_after.clone();
 
-        let compress_tx_bytes_before = self.self_tx_counters.compress_tx_bytes_before.clone();
-        let compress_tx_bytes_after = self.self_tx_counters.compress_tx_bytes_after.clone();
-        let compress_rx_bytes_before =
-            stats_mgr.get_counter(MetricName::CompressionBytesRxBefore, label_set.clone());
-        let compress_rx_bytes_after =
-            stats_mgr.get_counter(MetricName::CompressionBytesRxAfter, label_set.clone());
+        let self_rx_bytes = stats_mgr.get_counter(MetricName::TrafficBytesSelfRx, label_set.clone());
+        let self_rx_packets = stats_mgr.get_counter(MetricName::TrafficPacketsSelfRx, label_set.clone());
+        let forward_tx_bytes = stats_mgr.get_counter(MetricName::TrafficBytesForwarded, label_set.clone());
+        let forward_tx_packets = stats_mgr.get_counter(MetricName::TrafficPacketsForwarded, label_set.clone());
+        let compress_rx_bytes_before = stats_mgr.get_counter(MetricName::CompressionBytesRxBefore, label_set.clone());
+        let compress_rx_bytes_after = stats_mgr.get_counter(MetricName::CompressionBytesRxAfter, label_set.clone());
 
         self.tasks.lock().await.spawn(async move {
             tracing::trace!("start_peer_recv");
-            while let Ok(ret) = recv_packet_from_chan(&mut recv).await {
-                let Err(mut ret) =
-                    Self::try_handle_foreign_network_packet(ret, my_peer_id, &peers, &foreign_mgr)
+
+            // 设置并发限制。None 表示无限制（只要内存够），也可以设置为 Some(100) 来限制最大并发任务数
+            const CONCURRENCY_LIMIT: Option<usize> = None;
+
+            stream.for_each_concurrent(CONCURRENCY_LIMIT, move |ret| {
+                // 注意：在这里（闭包内部，async 块外部）克隆所有需要在 async 块中使用的变量。
+                // 每次处理一个包，都需要这些句柄的一份拷贝。
+                let peers = peers.clone();
+                let foreign_mgr = foreign_mgr.clone();
+                let pipe_line = pipe_line.clone();
+                let foreign_client = foreign_client.clone();
+                let encryptor = encryptor.clone();
+                let acl_filter = acl_filter.clone();
+                let global_ctx = global_ctx.clone();
+                let route = route.clone();
+
+                let self_tx_bytes = self_tx_bytes.clone();
+                let self_tx_packets = self_tx_packets.clone();
+                let forward_tx_bytes = forward_tx_bytes.clone();
+                let forward_tx_packets = forward_tx_packets.clone();
+
+                let compress_tx_bytes_before = compress_tx_bytes_before.clone();
+                let compress_tx_bytes_after = compress_tx_bytes_after.clone();
+                let compress_rx_bytes_before = compress_rx_bytes_before.clone();
+                let compress_rx_bytes_after = compress_rx_bytes_after.clone();
+
+                let self_rx_bytes = self_rx_bytes.clone();
+                let self_rx_packets = self_rx_packets.clone();
+
+                async move {
+                    // 原有的逻辑处理。注意：原来的 'continue' 在这里需要变成 'return'。
+
+                    let Err(mut ret) = Self::try_handle_foreign_network_packet(ret, my_peer_id, &peers, &foreign_mgr)
                         .await
-                else {
-                    continue;
-                };
+                    else {
+                        return; // 对应原来的 continue
+                    };
 
-                let buf_len = ret.buf_len();
-                let Some(hdr) = ret.mut_peer_manager_header() else {
-                    tracing::warn!(?ret, "invalid packet, skip");
-                    continue;
-                };
+                    let buf_len = ret.buf_len();
+                    let Some(hdr) = ret.mut_peer_manager_header() else {
+                        tracing::warn!(?ret, "invalid packet, skip");
+                        return; // 对应原来的 continue
+                    };
 
-                tracing::trace!(?hdr, "peer recv a packet...");
-                let from_peer_id = hdr.from_peer_id.get();
-                let to_peer_id = hdr.to_peer_id.get();
-                if to_peer_id != my_peer_id {
-                    if hdr.forward_counter > 7 {
-                        tracing::warn!(?hdr, "forward counter exceed, drop packet");
-                        continue;
-                    }
+                    tracing::trace!(?hdr, "peer recv a packet...");
+                    let from_peer_id = hdr.from_peer_id.get();
+                    let to_peer_id = hdr.to_peer_id.get();
 
-                    if hdr.forward_counter > 2 && hdr.is_latency_first() {
-                        tracing::trace!(?hdr, "set_latency_first false because too many hop");
-                        hdr.set_latency_first(false);
-                    }
-
-                    hdr.forward_counter += 1;
-
-                    if from_peer_id == my_peer_id {
-                        compress_tx_bytes_before.add(buf_len as u64);
-
-                        if hdr.packet_type == PacketType::Data as u8
-                            || hdr.packet_type == PacketType::KcpSrc as u8
-                            || hdr.packet_type == PacketType::KcpDst as u8
-                        {
-                            let _ =
-                                Self::try_compress_and_encrypt(compress_algo, &encryptor, &mut ret)
-                                    .await;
+                    if to_peer_id != my_peer_id {
+                        // === 转发逻辑 ===
+                        if hdr.forward_counter > 7 {
+                            tracing::warn!(?hdr, "forward counter exceed, drop packet");
+                            return;
                         }
 
-                        compress_tx_bytes_after.add(ret.buf_len() as u64);
-                        self_tx_bytes.add(ret.buf_len() as u64);
-                        self_tx_packets.inc();
+                        if hdr.forward_counter > 2 && hdr.is_latency_first() {
+                            tracing::trace!(?hdr, "set_latency_first false because too many hop");
+                            hdr.set_latency_first(false);
+                        }
+
+                        hdr.forward_counter += 1;
+
+                        if from_peer_id == my_peer_id {
+                            compress_tx_bytes_before.add(buf_len as u64);
+
+                            if hdr.packet_type == PacketType::Data as u8
+                                || hdr.packet_type == PacketType::KcpSrc as u8
+                                || hdr.packet_type == PacketType::KcpDst as u8
+                            {
+                                let _ = Self::try_compress_and_encrypt(compress_algo, &encryptor, &mut ret).await;
+                            }
+
+                            compress_tx_bytes_after.add(ret.buf_len() as u64);
+                            self_tx_bytes.add(ret.buf_len() as u64);
+                            self_tx_packets.inc();
+                        } else {
+                            forward_tx_bytes.add(buf_len as u64);
+                            forward_tx_packets.inc();
+                        }
+
+                        tracing::trace!(?to_peer_id, ?my_peer_id, "need forward");
+                        let ret = Self::send_msg_internal(&peers, &foreign_client, ret, to_peer_id).await;
+                        if ret.is_err() {
+                            tracing::error!(?ret, ?to_peer_id, ?from_peer_id, "forward packet error");
+                        }
                     } else {
-                        forward_tx_bytes.add(buf_len as u64);
-                        forward_tx_packets.inc();
-                    }
-
-                    tracing::trace!(?to_peer_id, ?my_peer_id, "need forward");
-                    let ret =
-                        Self::send_msg_internal(&peers, &foreign_client, ret, to_peer_id).await;
-                    if ret.is_err() {
-                        tracing::error!(?ret, ?to_peer_id, ?from_peer_id, "forward packet error");
-                    }
-                } else {
-                    if let Err(e) = encryptor.decrypt(&mut ret) {
-                        tracing::error!(?e, "decrypt failed");
-                        continue;
-                    }
-
-                    self_rx_bytes.add(buf_len as u64);
-                    self_rx_packets.inc();
-                    compress_rx_bytes_before.add(buf_len as u64);
-
-                    let compressor = DefaultCompressor {};
-                    if let Err(e) = compressor.decompress(&mut ret).await {
-                        tracing::error!(?e, "decompress failed");
-                        continue;
-                    }
-
-                    compress_rx_bytes_after.add(ret.buf_len() as u64);
-
-                    if !acl_filter.process_packet_with_acl(
-                        &ret,
-                        true,
-                        global_ctx.get_ipv4().map(|x| x.address()),
-                        global_ctx.get_ipv6().map(|x| x.address()),
-                        &route,
-                    ) {
-                        continue;
-                    }
-
-                    let mut processed = false;
-                    let mut zc_packet = Some(ret);
-                    tracing::trace!(?zc_packet, "try_process_packet_from_peer");
-                    for pipeline in pipe_line.read().await.iter().rev() {
-                        zc_packet = pipeline
-                            .try_process_packet_from_peer(zc_packet.unwrap())
-                            .await;
-                        if zc_packet.is_none() {
-                            processed = true;
-                            break;
+                        // === 本地接收逻辑 ===
+                        if let Err(e) = encryptor.decrypt(&mut ret) {
+                            tracing::error!(?e, "decrypt failed");
+                            return;
                         }
-                    }
-                    if !processed {
-                        tracing::error!(?zc_packet, "unhandled packet");
+
+                        self_rx_bytes.add(buf_len as u64);
+                        self_rx_packets.inc();
+                        compress_rx_bytes_before.add(buf_len as u64);
+
+                        let compressor = DefaultCompressor {};
+                        if let Err(e) = compressor.decompress(&mut ret).await {
+                            tracing::error!(?e, "decompress failed");
+                            return;
+                        }
+
+                        compress_rx_bytes_after.add(ret.buf_len() as u64);
+
+                        if !acl_filter.process_packet_with_acl(
+                            &ret,
+                            true,
+                            global_ctx.get_ipv4().map(|x| x.address()),
+                            global_ctx.get_ipv6().map(|x| x.address()),
+                            &route,
+                        ) {
+                            return;
+                        }
+
+                        let mut processed = false;
+                        let mut zc_packet = Some(ret);
+                        tracing::trace!(?zc_packet, "try_process_packet_from_peer");
+
+                        for pipeline in pipe_line.read().await.iter().rev() {
+                            zc_packet = pipeline
+                                .try_process_packet_from_peer(zc_packet.unwrap())
+                                .await;
+                            if zc_packet.is_none() {
+                                processed = true;
+                                break;
+                            }
+                        }
+                        if !processed {
+                            tracing::error!(?zc_packet, "unhandled packet");
+                        }
                     }
                 }
-            }
-            panic!("done_peer_recv");
+            }).await;
+
+            panic!("done_peer_recv"); // 正常退出时打印
         });
     }
 
