@@ -552,17 +552,27 @@ impl<C: NatDstConnector> TcpProxy<C> {
                 }
             });
 
+            const BATCH_SIZE: usize = 32;
+
             let mut smoltcp_stack_receiver =
                 self.smoltcp_stack_receiver.lock().await.take().unwrap();
             self.tasks.lock().unwrap().spawn(async move {
-                while let Some(packet) = smoltcp_stack_receiver.recv().await {
-                    let info = format!("{:?}", packet);
-                    debug!("receive from peer send to smoltcp packet: {info}");
-                    if let Err(e) = stack_sink.send(packet.payload().to_vec()).await {
-                        tracing::error!("send to smoltcp stack failed: {:?}, packet: {info}", e);
+                let mut buf = Vec::with_capacity(BATCH_SIZE);
+                loop {
+                    let count = smoltcp_stack_receiver.recv_many(&mut buf, BATCH_SIZE).await;
+                    if count == 0 {
+                        tracing::error!("smoltcp stack channel closed");
+                        return;
+                    }
+                    for packet in buf.drain(..) {
+                        if let Err(e) = stack_sink.send(packet.payload().to_vec()).await {
+                            tracing::error!(
+                                "send to smoltcp stack failed: {:?}, packet: {packet:?}",
+                                e
+                            );
+                        }
                     }
                 }
-                tracing::error!("smoltcp stack sink exited");
             });
 
             let peer_mgr = self.peer_manager.clone();
