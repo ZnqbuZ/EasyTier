@@ -1,7 +1,6 @@
 use anyhow::Context;
 use cidr::Ipv4Inet;
 use core::panic;
-use std::fmt::format;
 use crossbeam::atomic::AtomicCell;
 use dashmap::DashMap;
 use futures::{SinkExt, StreamExt};
@@ -316,7 +315,10 @@ pub struct TcpProxy<C: NatDstConnector> {
 #[async_trait::async_trait]
 impl<C: NatDstConnector> PeerPacketFilter for TcpProxy<C> {
     async fn try_process_packet_from_peer(&self, mut packet: ZCPacket) -> Option<ZCPacket> {
-        debug!("[try_process_packet_from_peer] filtering packet: {:?}", packet);
+        debug!(
+            "[try_process_packet_from_peer] filtering packet: {:?}",
+            packet
+        );
 
         if self.try_handle_peer_packet(&mut packet).await.is_some() {
             if self.is_smoltcp_enabled() {
@@ -339,7 +341,10 @@ impl<C: NatDstConnector> PeerPacketFilter for TcpProxy<C> {
 #[async_trait::async_trait]
 impl<C: NatDstConnector> NicPacketFilter for TcpProxy<C> {
     async fn try_process_packet_from_nic(&self, zc_packet: &mut ZCPacket) -> bool {
-        debug!("[try_process_packet_from_nic] filtering packet: {:?}", zc_packet);
+        debug!(
+            "[try_process_packet_from_nic] filtering packet: {:?}",
+            zc_packet
+        );
 
         let Some(my_ipv4_inet) = self.get_local_inet() else {
             return false;
@@ -580,9 +585,7 @@ impl<C: NatDstConnector> TcpProxy<C> {
                 while let Some(Ok(data)) = stack_stream.next().await {
                     let packet = ZCPacket::new_with_payload(&data);
                     let info = format!("{:?}", packet);
-                    debug!(
-                        "receive from smoltcp stack and send to peer mgr packet: {info}"
-                    );
+                    debug!("receive from smoltcp stack and send to peer mgr packet: {info}");
                     let Some(ipv4) = Ipv4Packet::new(&data) else {
                         tracing::error!("smoltcp stack stream get non ipv4 packet: {info}");
                         continue;
@@ -597,7 +600,10 @@ impl<C: NatDstConnector> TcpProxy<C> {
                         .send_msg_by_ip(packet, IpAddr::V4(dst), false)
                         .await
                     {
-                        tracing::error!("send to peer failed in smoltcp sender: {:?}, packet: {info}", e);
+                        tracing::error!(
+                            "send to peer failed in smoltcp sender: {:?}, packet: {info}",
+                            e
+                        );
                     }
                 }
                 tracing::error!("smoltcp stack stream exited");
