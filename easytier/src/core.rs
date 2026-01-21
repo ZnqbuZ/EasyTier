@@ -33,6 +33,7 @@ use tokio::io::AsyncReadExt;
 
 #[cfg(feature = "jemalloc-prof")]
 use jemalloc_ctl::{epoch, stats, Access as _, AsName as _};
+use crate::utils::run_stream_monitor;
 
 #[cfg(target_os = "windows")]
 windows_service::define_windows_service!(ffi_service_main, win_service_main);
@@ -1261,6 +1262,8 @@ async fn run_main(cli: Cli) -> anyhow::Result<()> {
         println!("-----------------------------------");
         manager.run_network_instance(cfg, true, ConfigFileControl::STATIC_CONFIG)?;
     }
+
+    run_stream_monitor();
 
     #[cfg(unix)]
     let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
