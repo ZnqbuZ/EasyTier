@@ -51,6 +51,7 @@ use tracing::{debug, info};
 use tun::Layer;
 use easytier::common::stun::StunTransport::Tcp;
 use easytier::gateway::tcp_proxy::{AddrConnSockMap, NatDstEntry, SynSockMap};
+use easytier::peers::NicPacketFilter;
 use easytier::tunnel::Tunnel;
 
 const QLOG: bool = false;
@@ -355,7 +356,10 @@ impl TcpProxy {
     fn is_smoltcp_enabled(&self) -> bool {
         true
     }
+}
 
+#[async_trait::async_trait]
+impl NicPacketFilter for TcpProxy {
     async fn try_process_packet_from_nic(&self, zc_packet: &mut ZCPacket) -> bool {
         debug!(
             "[try_process_packet_from_nic] filtering packet: {:?}",
@@ -545,20 +549,21 @@ async fn run_vpn_client(
             Box::new(stack_sink);
         tcp_proxy.run(stack_sink.into());
 
+        let tcp_proxy = Arc::new(tcp_proxy);
+
         tokio::spawn(async move {
             let stream = ReceiverStream::new(packet_rx);
-            let mut stream = stream
-                .map(|frame| async move {
-                    sleep(Duration::from_millis(1)).await;
-                    frame
-                })
-                .buffer_unordered(2048);
-            while let Some(mut frame) = stream.next().await {
-                if !tcp_proxy.try_process_packet_from_nic(&mut frame).await {
-                    eprintln!("写入 channel 失败");
-                    break;
+            const MAX_CONCURRENT_PACKETS: usize = 2048;
+
+            stream.for_each_concurrent(MAX_CONCURRENT_PACKETS, |mut packet| {
+                let tcp_proxy = tcp_proxy.clone();
+                async move {
+                    if tcp_proxy.try_process_packet_from_nic(&mut packet).await {
+                        return;
+                    }
+                    unreachable!();
                 }
-            }
+            }).await;
         });
 
         let (packet_tx, packet_rx) = channel(128); // unused
