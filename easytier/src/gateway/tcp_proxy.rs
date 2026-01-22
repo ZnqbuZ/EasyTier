@@ -341,6 +341,7 @@ impl<C: NatDstConnector> PeerPacketFilter for TcpProxy<C> {
 #[async_trait::async_trait]
 impl<C: NatDstConnector> NicPacketFilter for TcpProxy<C> {
     async fn try_process_packet_from_nic(&self, zc_packet: &mut ZCPacket) -> bool {
+        let info = zc_packet.info();
         debug!(
             "[try_process_packet_from_nic] filtering packet: {:?}",
             zc_packet
@@ -361,10 +362,11 @@ impl<C: NatDstConnector> NicPacketFilter for TcpProxy<C> {
         }
 
         let tcp_packet = TcpPacket::new(ip_packet.payload()).unwrap();
-        if tcp_packet.get_source() != self.get_local_port() {
-            return false;
-        }
 
+        let mut src_addr = SocketAddr::V4(SocketAddrV4::new(
+            ip_packet.get_source(),
+            tcp_packet.get_source(),
+        ));
         let mut dst_addr = SocketAddr::V4(SocketAddrV4::new(
             ip_packet.get_destination(),
             tcp_packet.get_destination(),
@@ -378,18 +380,18 @@ impl<C: NatDstConnector> NicPacketFilter for TcpProxy<C> {
             need_transform_dst = true;
         }
 
-        tracing::trace!(dst_addr = ?dst_addr, "tcp packet try find entry");
-        let entry = if let Some(entry) = self.addr_conn_map.get(&dst_addr) {
+        tracing::trace!(src_addr = ?src_addr, dst_addr = ?dst_addr, "tcp packet try find entry");
+        let entry = if let Some(entry) = self.addr_conn_map.get(&src_addr) {
             entry
         } else {
-            let Some(syn_entry) = self.syn_map.get(&dst_addr) else {
+            let Some(syn_entry) = self.syn_map.get(&src_addr) else {
                 return false;
             };
             syn_entry
         };
         let nat_entry = entry.clone();
         drop(entry);
-        assert_eq!(nat_entry.src, dst_addr);
+        assert_eq!(nat_entry.src, src_addr);
 
         let IpAddr::V4(ip) = nat_entry.mapped_dst.ip() else {
             panic!("v4 nat entry src ip is not v4");
@@ -896,11 +898,7 @@ impl<C: NatDstConnector> TcpProxy<C> {
     }
 
     pub fn get_local_inet(&self) -> Option<Ipv4Inet> {
-        if self.is_smoltcp_enabled() {
-            Some(Ipv4Inet::new(Ipv4Addr::new(192, 88, 99, 254), 24).unwrap())
-        } else {
-            self.global_ctx.get_ipv4().as_ref().cloned()
-        }
+        self.global_ctx.get_ipv4().as_ref().cloned()
     }
 
     pub fn get_global_ctx(&self) -> &ArcGlobalCtx {
