@@ -3,11 +3,11 @@ use bytes::BytesMut;
 use chrono::Utc;
 use clap::{Parser, Subcommand};
 use dashmap::DashMap;
-use easytier::instance::virtual_nic::{TunAsyncWrite, TunStream, TunZCPacketToBytes};
+use easytier::instance::virtual_nic::{NicCtx, TunAsyncWrite, TunStream, TunZCPacketToBytes};
 use easytier::proto::common::ProxyDstInfo;
-use easytier::tunnel::common::FramedWriter;
+use easytier::tunnel::common::{FramedWriter, TunnelWrapper};
 use easytier::tunnel::packet_def::ZCPacket;
-use easytier::utils::{run_stream_monitor, Monitored};
+use easytier::utils::{run_stream_monitor, Content, Monitored};
 use futures::lock::BiLock;
 use futures::{SinkExt, StreamExt};
 use netstack_smoltcp::{AnyIpPktFrame, StackBuilder};
@@ -34,9 +34,13 @@ use std::task::Poll;
 use std::time::Duration;
 use tokio::io::{join, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::sync::mpsc::channel;
+use tokio::sync::Mutex;
+use tokio::task::JoinSet;
 use tokio::time::sleep;
 use tokio_stream::wrappers::ReceiverStream;
 use tracing::{debug, info};
+use tun::Layer;
+use easytier::tunnel::Tunnel;
 
 const QLOG: bool = false;
 
@@ -266,12 +270,14 @@ async fn run_vpn_server(listen_addr: SocketAddr, tun_ip: Ipv4Addr, smoltcp: bool
                                     let mut real_tcp = Monitored::new(
                                         real_tcp,
                                         format!("TCP TO: {}", target_addr).as_str(),
+                                        Content::Byte,
                                     );
 
                                     let quic_stream = join(recv_stream, send_stream);
                                     let mut quic_stream = Monitored::new(
                                         quic_stream,
                                         format!("QUIC FROM: {}", remote_addr).as_str(),
+                                        Content::Byte,
                                     );
 
                                     // 3. 双向转发
@@ -318,6 +324,8 @@ async fn run_vpn_client(
     // 1. 创建 TUN
     let mut config = tun::Configuration::default();
     config
+        .layer(Layer::L3)
+        .tun_name("qs-client")
         .address(tun_ip)
         .netmask((255, 255, 255, 0))
         .mtu(TUN_MTU)
@@ -381,11 +389,16 @@ async fn run_vpn_client(
         // TUN 和 Stack 都需要拆分成 Read/Write (Stream/Sink)
         let has_packet_info = cfg!(target_os = "macos");
         let (tun_read, tun_write) = BiLock::new(tun_dev);
-        let mut tun_read = TunStream::new(tun_read, has_packet_info);
-        let mut tun_write = FramedWriter::new_with_converter(
-            TunAsyncWrite { l: tun_write },
-            TunZCPacketToBytes::new(has_packet_info),
+        let fd = TunnelWrapper::new(
+            TunStream::new(tun_read, has_packet_info),
+            FramedWriter::new_with_converter(
+                TunAsyncWrite { l: tun_write },
+                TunZCPacketToBytes::new(has_packet_info),
+            ),
+            None,
         );
+        let mut fd = Box::new(fd) as Box<dyn Tunnel>;
+        let (mut tun_stream, mut tun_sink) = fd.split();
         let (mut stack_sink, mut stack_stream) = stack.split();
 
         let (packet_tx, packet_rx) = channel(128);
@@ -393,7 +406,7 @@ async fn run_vpn_client(
         // 任务 A: TUN -> Stack (读取操作系统发来的 IP 包 -> 写入用户态协议栈)
         tokio::spawn(async move {
             loop {
-                match tun_read.next().await {
+                match tun_stream.next().await {
                     Some(Ok(buf)) => {
                         // stack_sink 需要 Vec<u8>
                         if let Err(e) = packet_tx.send(buf).await {
@@ -425,7 +438,14 @@ async fn run_vpn_client(
             }
         });
 
-        let (packet_tx, packet_rx) = channel(128);
+        let (packet_tx, packet_rx) = channel(128); // unused
+
+        let mut tasks = JoinSet::new();
+        let packet_rx = Mutex::new(packet_rx);
+        let packet_counter = AtomicU64::new(0);
+        let (packet_tx_2, packet_rx_2) = channel(128);
+        let packet_rx_2 = Mutex::new(packet_rx_2);
+        let packet_counter_2 = AtomicU64::new(0);
 
         // 任务 B: Stack -> TUN (协议栈产生的 IP 包，如 SYN-ACK -> 写入 TUN 让操作系统接收)
         tokio::spawn(async move {
@@ -433,7 +453,7 @@ async fn run_vpn_client(
                 match pkt {
                     Ok(frame) => {
                         let packet = ZCPacket::new_with_payload(frame.as_ref());
-                        if let Err(e) = packet_tx.send(packet).await {
+                        if let Err(e) = packet_tx_2.send(packet).await {
                             eprintln!("写入 channel 失败: {}", e);
                             break;
                         }
@@ -443,21 +463,14 @@ async fn run_vpn_client(
             }
         });
 
-        tokio::spawn(async move {
-            let stream = ReceiverStream::new(packet_rx);
-            let mut stream = stream
-                .map(|frame| async move {
-                    sleep(Duration::from_millis(1)).await;
-                    frame
-                })
-                .buffer_unordered(2048);
-            while let Some(frame) = stream.next().await {
-                if let Err(e) = tun_write.send(frame).await {
-                    eprintln!("写入 channel 失败: {}", e);
-                    break;
-                }
-            }
-        });
+        NicCtx::do_forward_peers_to_nic_inner(
+            tun_sink.into(),
+            &mut tasks,
+            packet_counter.into(),
+            packet_counter_2.into(),
+            packet_rx.into(),
+            packet_rx_2.into(),
+        );
 
         // 5. 处理拦截到的 TCP 连接
         // 这个循环会源源不断地吐出新的 TcpStream
@@ -467,7 +480,11 @@ async fn run_vpn_client(
 
             println!("^ 捕获 TCP: {} -> {}", local_addr, remote_addr);
 
-            let stream = Monitored::new(stream, format!("TCP FROM: {}", local_addr).as_str());
+            let stream = Monitored::new(
+                stream,
+                format!("TCP FROM: {}", local_addr).as_str(),
+                Content::Byte,
+            );
 
             let connection = connection.clone();
             tokio::spawn(async move {
@@ -525,8 +542,11 @@ async fn handle_client_stream(
     // 3. 双向转发
     // NetstackTcpStream 实现了 Tokio AsyncRead/AsyncWrite，可以直接 copy
     let quic_stream = join(recv_quic, send_quic);
-    let mut quic_stream =
-        Monitored::new(quic_stream, format!("QUIC TO: {}", target_addr).as_str());
+    let mut quic_stream = Monitored::new(
+        quic_stream,
+        format!("QUIC TO: {}", target_addr).as_str(),
+        Content::Byte,
+    );
 
     // netstack-smoltcp 的流完全兼容 tokio，不需要 compat()
     let _ = tokio::io::copy_bidirectional(&mut tun_stream, &mut quic_stream).await?;
