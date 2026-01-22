@@ -151,7 +151,7 @@ impl NatDstConnector for NatDstQUICConnector {
 }
 
 #[derive(Clone)]
-struct TcpProxyForQUICSrc(Arc<TcpProxy<NatDstQUICConnector>>);
+pub struct TcpProxyForQUICSrc(Arc<TcpProxy<NatDstQUICConnector>>);
 
 #[async_trait::async_trait]
 impl TcpProxyForKcpSrcTrait for TcpProxyForQUICSrc {
@@ -212,7 +212,7 @@ fn transport_config() -> Arc<TransportConfig> {
 
 pub struct QUICProxySrc {
     peer_manager: Arc<PeerManager>,
-    tcp_proxy: TcpProxyForQUICSrc,
+    pub tcp_proxy: TcpProxyForQUICSrc,
 }
 
 impl QUICProxySrc {

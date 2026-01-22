@@ -529,7 +529,7 @@ pub struct Instance {
     kcp_proxy_src: Option<KcpProxySrc>,
     kcp_proxy_dst: Option<KcpProxyDst>,
 
-    quic_proxy_src: Option<QUICProxySrc>,
+    quic_proxy_src: Option<Arc<QUICProxySrc>>,
     quic_proxy_dst: Option<QUICProxyDst>,
 
     peer_center: Arc<PeerCenterInstance>,
@@ -839,6 +839,8 @@ impl Instance {
         let peer_mgr = Arc::downgrade(&self.peer_manager);
         let peer_packet_receiver = self.peer_packet_receiver.clone();
         let peer_packet_receiver_2 = self.peer_packet_receiver_2.clone();
+        let quic_proxy_src = self.quic_proxy_src.clone();
+        assert!(quic_proxy_src.is_some());
 
         tokio::spawn(async move {
             let mut output_tx = Some(first_round_output);
@@ -860,6 +862,7 @@ impl Instance {
                     peer_packet_receiver_2.clone(),
                     close_notifier.clone(),
                 );
+                new_nic_ctx.quic_proxy_src = quic_proxy_src.clone();
 
                 if let Err(e) = new_nic_ctx.run(ipv4_addr, ipv6_addr).await {
                     if let Some(output_tx) = output_tx.take() {
@@ -921,6 +924,11 @@ impl Instance {
 
         Self::clear_nic_ctx(self.nic_ctx.clone(), self.peer_packet_receiver.clone()).await;
 
+        if self.global_ctx.get_flags().enable_quic_proxy {
+            let quic_src = QUICProxySrc::new(self.get_peer_manager()).await;
+            self.quic_proxy_src = Some(quic_src.into());
+        }
+
         if !self.global_ctx.config.get_flags().no_tun {
             #[cfg(not(any(target_os = "android", target_os = "ios", target_env = "ohos")))]
             {
@@ -946,10 +954,8 @@ impl Instance {
             self.kcp_proxy_dst = Some(dst_proxy);
         }
 
-        if self.global_ctx.get_flags().enable_quic_proxy {
-            let quic_src = QUICProxySrc::new(self.get_peer_manager()).await;
+        if let Some(quic_src) = &self.quic_proxy_src {
             quic_src.start().await;
-            self.quic_proxy_src = Some(quic_src);
         }
 
         if !self.global_ctx.get_flags().disable_quic_input {

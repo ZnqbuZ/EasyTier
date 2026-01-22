@@ -40,6 +40,9 @@ use zerocopy::{NativeEndian, NetworkEndian};
 
 #[cfg(target_os = "windows")]
 use crate::common::ifcfg::RegistryManager;
+use crate::gateway::kcp_proxy::TcpProxyForKcpSrcTrait;
+use crate::gateway::quic_proxy::QUICProxySrc;
+use crate::peers::NicPacketFilter;
 
 pin_project! {
     pub struct TunStream {
@@ -643,6 +646,8 @@ pub struct NicCtx {
 
     nic: Arc<Mutex<VirtualNic>>,
     tasks: JoinSet<()>,
+
+    pub quic_proxy_src: Option<Arc<QUICProxySrc>>
 }
 
 impl NicCtx {
@@ -668,6 +673,8 @@ impl NicCtx {
 
             nic: Arc::new(Mutex::new(VirtualNic::new(global_ctx))),
             tasks: JoinSet::new(),
+
+            quic_proxy_src: None,
         }
     }
 
@@ -826,6 +833,20 @@ impl NicCtx {
         let close_notifier = self.close_notifier.clone();
 
         let nic_packet_counter = self.nic_packet_counter.clone();
+        let short_circuit_counter = Arc::new(AtomicU64::new(0));
+        let short_circuit_counter_clone = short_circuit_counter.clone();
+        let quic_proxy_src = self.quic_proxy_src.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(1));
+            loop {
+                interval.tick().await;
+                println!(
+                    "TCP proxy packets short circuit: {}",
+                    short_circuit_counter_clone.load(std::sync::atomic::Ordering::Relaxed)
+                );
+            }
+        });
+        let short_circuit_counter_clone = short_circuit_counter.clone();
         self.tasks.spawn(async move {
             // 设定并发窗口大小。
             // 假设延迟 1ms，要跑满 1Gbps (约 80k pps)，窗口至少需要 80。
@@ -838,12 +859,22 @@ impl NicCtx {
                 .for_each_concurrent(MAX_CONCURRENT_PACKETS, |ret| {
                     let mgr = mgr.clone();
                     let nic_packet_counter = nic_packet_counter.clone();
+                    let quic_proxy_src = quic_proxy_src.clone();
+                    let short_circuit_counter_clone = short_circuit_counter_clone.clone();
                     async move {
                         match ret {
-                            Ok(packet) => {
+                            Ok(mut packet) => {
                                 nic_packet_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                                 // 这里的 await 现在是并行的了。
                                 // 即使这里卡了 1ms，也不会阻塞下一个包的读取和处理。
+                                if let Some(quic_proxy_src) = quic_proxy_src {
+                                    let tcp_proxy = quic_proxy_src.tcp_proxy.get_tcp_proxy();
+                                    let ret = tcp_proxy.try_process_packet_from_nic(&mut packet).await;
+                                    if ret && packet.payload_len() == 0 {
+                                        short_circuit_counter_clone.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                        return;
+                                    }
+                                }
                                 NicCtx::do_forward_nic_to_peers(packet, &mgr).await;
                             }
                             Err(e) => {
@@ -863,8 +894,26 @@ impl NicCtx {
     }
 
     fn do_forward_peers_to_nic(&mut self, mut sink: Pin<Box<dyn ZCPacketSink>>) {
-        let counter = self.peer_packet_counter.clone();
-        let counter_2 = self.peer_packet_counter_2.clone();
+        Self::do_forward_peers_to_nic_inner(
+            sink,
+            &mut self.tasks,
+            self.peer_packet_counter.clone(),
+            self.peer_packet_counter_2.clone(),
+            self.peer_packet_receiver.clone(),
+            self.peer_packet_receiver_2.clone(),
+        )
+    }
+
+    pub fn do_forward_peers_to_nic_inner(
+        mut sink: Pin<Box<dyn ZCPacketSink>>,
+        tasks: &mut JoinSet<()>,
+        peer_packet_counter: Arc<AtomicU64>,
+        peer_packet_counter_2: Arc<AtomicU64>,
+        peer_packet_receiver: Arc<Mutex<PacketRecvChanReceiver>>,
+        peer_packet_receiver_2: Arc<Mutex<PacketRecvChanReceiver>>,
+    ) {
+        let counter = peer_packet_counter.clone();
+        let counter_2 = peer_packet_counter_2.clone();
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_secs(1));
             loop {
@@ -879,12 +928,11 @@ impl NicCtx {
                 );
             }
         });
-        let counter = self.peer_packet_counter.clone();
-        let counter_2 = self.peer_packet_counter_2.clone();
-        let channel = self.peer_packet_receiver.clone();
-        let channel_2 = self.peer_packet_receiver_2.clone();
-        let close_notifier = self.close_notifier.clone();
-        self.tasks.spawn(async move {
+        let counter = peer_packet_counter.clone();
+        let counter_2 = peer_packet_counter_2.clone();
+        let channel = peer_packet_receiver.clone();
+        let channel_2 = peer_packet_receiver_2.clone();
+        tasks.spawn(async move {
             const BATCH_SIZE: usize = 32;
             let mut buf = Vec::with_capacity(BATCH_SIZE);
             let mut buf_2 = Vec::with_capacity(BATCH_SIZE);
@@ -916,7 +964,6 @@ impl NicCtx {
                 }
                 sink.flush().await.unwrap();
             }
-            close_notifier.notify_one();
             tracing::error!("nic closed when sending to it");
         });
     }

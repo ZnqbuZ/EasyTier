@@ -427,7 +427,7 @@ pub struct ZCPacket {
 }
 
 impl ZCPacket {
-    fn info(&self) -> String {
+    pub fn info(&self) -> String {
         let ip = match Ipv4Packet::new(&self.payload()) {
             Some(p) => p,
             None => return "<invalid ipv4>".to_string(),
