@@ -12,7 +12,7 @@ use pnet::packet::Packet;
 use socket2::{SockRef, TcpKeepalive};
 use std::mem;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4};
-use std::sync::atomic::{AtomicBool, AtomicU16};
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicUsize};
 use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 use tokio::io::{copy_bidirectional, copy_bidirectional_with_sizes, AsyncRead, AsyncWrite, AsyncWriteExt};
@@ -39,7 +39,7 @@ use crate::tunnel::packet_def::{PacketType, PeerManagerHeader, ZCPacket};
 
 use super::CidrSet;
 
-use crate::utils::MonitoredStream;
+use crate::utils::{Content, Monitored};
 #[cfg(feature = "smoltcp")]
 use netstack_smoltcp::tcp::TcpStream as SmolTcpStream;
 
@@ -547,6 +547,7 @@ impl<C: NatDstConnector> TcpProxy<C> {
                 .build()
                 .map_err(|e| anyhow::anyhow!("netstack build failed: {}", e))?;
 
+            let stack = Monitored::new(stack, "netstack-smoltcp", Content::Item);
             let (mut stack_sink, mut stack_stream) = stack.split();
             let runner = runner.unwrap();
             let mut tcp_listener = tcp_listener.unwrap();
@@ -557,8 +558,21 @@ impl<C: NatDstConnector> TcpProxy<C> {
                 }
             });
 
-            const BATCH_SIZE: usize = 32;
+            let counter = Arc::new(AtomicUsize::new(0));
+            let smoltcp_rx_count = counter.clone();
+            tokio::spawn(async move {
+                let mut interval = tokio::time::interval(Duration::from_secs(1));
+                loop {
+                    interval.tick().await;
+                    println!(
+                        "TCP proxy -> netstack-smoltcp: {}",
+                        smoltcp_rx_count.load(std::sync::atomic::Ordering::Relaxed)
+                    );
+                }
+            });
 
+            let smoltcp_rx_count = counter.clone();
+            const BATCH_SIZE: usize = 32;
             let mut smoltcp_stack_receiver =
                 self.smoltcp_stack_receiver.lock().await.take().unwrap();
             self.tasks.lock().unwrap().spawn(async move {
@@ -575,11 +589,27 @@ impl<C: NatDstConnector> TcpProxy<C> {
                                 "send to smoltcp stack failed: {:?}, packet: {packet:?}",
                                 e
                             );
+                        } else {
+                            smoltcp_rx_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         }
                     }
                 }
             });
 
+            let counter = Arc::new(AtomicUsize::new(0));
+            let smoltcp_tx_count = counter.clone();
+            tokio::spawn(async move {
+                let mut interval = tokio::time::interval(Duration::from_secs(1));
+                loop {
+                    interval.tick().await;
+                    println!(
+                        "netstack-smoltcp -> nic_channel_2: {}",
+                        smoltcp_tx_count.load(std::sync::atomic::Ordering::Relaxed)
+                    );
+                }
+            });
+
+            let smoltcp_tx_count = counter.clone();
             let peer_mgr = self.peer_manager.clone();
             self.tasks.lock().unwrap().spawn(async move {
                 while let Some(Ok(data)) = stack_stream.next().await {
@@ -603,6 +633,8 @@ impl<C: NatDstConnector> TcpProxy<C> {
                             "send to peer failed in smoltcp sender: {:?}, packet: {info}",
                             e
                         );
+                    } else {
+                        smoltcp_tx_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     }
                 }
                 tracing::error!("smoltcp stack stream exited");
@@ -821,8 +853,8 @@ impl<C: NatDstConnector> TcpProxy<C> {
             let (mut src_tcp_stream, mut dst_tcp_stream) = match src_tcp_stream {
                 #[cfg(feature = "smoltcp")]
                 ProxyTcpStream::SmolTcpStream(stream) => (
-                    MonitoredStream::new(stream, format!("NAT FROM {:?}", nat_entry_clone.src).as_str()),
-                    MonitoredStream::new(dst_tcp_stream, format!("NAT TO {:?}", nat_entry_clone.real_dst).as_str()),
+                    Monitored::new(stream, format!("NAT FROM {:?}", nat_entry_clone.src).as_str(), Content::Byte),
+                    Monitored::new(dst_tcp_stream, format!("NAT TO {:?}", nat_entry_clone.real_dst).as_str(), Content::Byte),
                 ),
                 _ => unreachable!(),
             };

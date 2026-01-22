@@ -1,15 +1,18 @@
-use std::{fs::OpenOptions, str::FromStr};
-use std::pin::Pin;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::task::Poll;
 use anyhow::Context;
 use dashmap::DashMap;
+use futures::{Sink, Stream};
 use once_cell::sync::Lazy;
+use std::pin::Pin;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::Arc;
+use std::task::Poll;
+use std::{fs::OpenOptions, str::FromStr};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tracing::info;
 use tracing::level_filters::LevelFilter;
-use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter, Layer, Registry};
+use tracing_subscriber::{
+    layer::SubscriberExt, util::SubscriberInitExt, EnvFilter, Layer, Registry,
+};
 
 use crate::common::{
     config::LoggingConfigLoader, get_logger_timer_rfc3339, tracing_rolling_appender::*,
@@ -263,7 +266,7 @@ pub fn weak_upgrade<T>(weak: &std::sync::Weak<T>) -> anyhow::Result<std::sync::A
 }
 
 static NEXT_STREAM_ID: AtomicUsize = AtomicUsize::new(0);
-pub static STREAM_MONITOR: Lazy<DashMap<usize, Arc<StreamStats>>> = Lazy::new(|| DashMap::new());
+pub static STREAM_MONITOR: Lazy<DashMap<usize, Arc<Stats>>> = Lazy::new(|| DashMap::new());
 
 pub fn run_stream_monitor() {
     tokio::spawn(async {
@@ -281,85 +284,141 @@ pub fn run_stream_monitor() {
 
             for item in STREAM_MONITOR.iter() {
                 let stats = item.value();
-                let curr_rx = stats.total_rx.load(Ordering::Relaxed);
-                let curr_tx = stats.total_tx.load(Ordering::Relaxed);
-                let curr_pending = stats.total_write_pending.load(Ordering::Relaxed);
+                let curr_read = stats.total_read.load(Ordering::Relaxed);
+                let curr_write = stats.total_write.load(Ordering::Relaxed);
+                let curr_read_pending = stats.total_read_pending.load(Ordering::Relaxed);
+                let curr_write_pending = stats.total_write_pending.load(Ordering::Relaxed);
 
-                let prev_rx = stats.last_rx.swap(curr_rx, Ordering::Relaxed);
-                let prev_tx = stats.last_tx.swap(curr_tx, Ordering::Relaxed);
-                let prev_pending = stats.last_write_pending.swap(curr_pending, Ordering::Relaxed);
+                let prev_read = stats.last_read.swap(curr_read, Ordering::Relaxed);
+                let prev_write = stats.last_write.swap(curr_write, Ordering::Relaxed);
+                let prev_read_pending = stats
+                    .last_read_pending
+                    .swap(curr_read_pending, Ordering::Relaxed);
+                let prev_write_pending = stats
+                    .last_write_pending
+                    .swap(curr_write_pending, Ordering::Relaxed);
 
-                let rate_rx = curr_rx.saturating_sub(prev_rx);
-                let rate_tx = curr_tx.saturating_sub(prev_tx);
-                let delta_pending = curr_pending.saturating_sub(prev_pending);
+                let rate_read = curr_read.saturating_sub(prev_read);
+                let rate_write = curr_write.saturating_sub(prev_write);
+                let delta_read_pending = curr_read_pending.saturating_sub(prev_read_pending);
+                let delta_write_pending = curr_write_pending.saturating_sub(prev_write_pending);
 
-
-                snapshot.push((stats.id, stats.name.clone(), rate_rx + rate_tx, rate_rx, rate_tx, delta_pending));
+                snapshot.push((
+                    stats.id,
+                    stats.name.clone(),
+                    stats.content,
+                    rate_read,
+                    rate_write,
+                    delta_read_pending,
+                    delta_write_pending,
+                    curr_read,
+                    curr_write,
+                    stats.total_read_error.load(Ordering::Relaxed),
+                    stats.total_write_error.load(Ordering::Relaxed),
+                ));
             }
 
             snapshot.sort_by_key(|k| k.0);
 
-            let to_mbps = |bytes: u64| -> String {
+            let to_mb = |bytes: u64| -> String {
                 let bits = bytes as f64 * 8.0;
-                let mbps = bits / 1_000_000.0; // 网络常用 1000 进制，如果习惯系统进制可用 1024.0 * 1024.0
-                if mbps < 0.01 && bytes > 0 {
-                    format!("{:.4} Mbps", mbps) // 极小流量保留更多小数
+                let mb = bits / 1_000_000.0; // 网络常用 1000 进制，如果习惯系统进制可用 1024.0 * 1024.0
+                if mb < 0.01 && bytes > 0 {
+                    format!("{:.4}", mb) // 极小流量保留更多小数
                 } else {
-                    format!("{:.2} Mbps", mbps) // 正常保留两位小数
+                    format!("{:.2}", mb) // 正常保留两位小数
                 }
             };
 
-            for (_, tag, total, rx, tx, pending) in snapshot {
-                println!("[{}]: {} (Rx: {}, Tx: {}) | Write Blocked: {} s^-1", tag, to_mbps(total), to_mbps(rx), to_mbps(tx), pending);
+            for (_, name, content, r, w, r_pending, w_pending, r_total, w_total, r_error, w_error) in snapshot
+            {
+                match content {
+                    Content::Byte => {
+                        println!(
+                            "[{}]: Rate (R: {} Mbps, W: {} Mbps) | Blocked (R: {} s^-1, W: {} s^-1) | Total (R: {} Mb, W: {} Mb) | Error (R: {}, W: {})",
+                            name,
+                            to_mb(r),
+                            to_mb(w),
+                            r_pending,
+                            w_pending,
+                            to_mb(r_total),
+                            to_mb(w_total),
+                            r_error,
+                            w_error,
+                        );
+                    }
+                    Content::Item => {
+                        println!(
+                            "[{}]: Rate (R: {} s^-1, W: {} s^-1) | Blocked (R: {} s^-1, W: {} s^-1) | Total (R: {}, W: {}) | Error (R: {}, W: {})",
+                            name,
+                            r,
+                            w,
+                            r_pending,
+                            w_pending,
+                            r_total,
+                            w_total,
+                            r_error,
+                            w_error,
+                        );
+                    }
+                }
             }
             println!("--------------------------------");
         }
     });
 }
 
-#[derive(Debug)]
-pub struct StreamStats {
+#[derive(Debug, Clone, Copy, Default)]
+pub enum Content {
+    #[default]
+    Byte,
+    Item,
+}
+
+#[derive(Debug, Default)]
+pub struct Stats {
     pub id: usize,
-    pub name: String,        // 标识：如 "192.168.1.5 <-> 8.8.8.8"
-    pub total_rx: AtomicU64, // 总接收字节
-    pub total_tx: AtomicU64, // 总发送字节
-    pub last_rx: AtomicU64,  // 上一次采样的接收字节（用于算速率）
-    pub last_tx: AtomicU64,  // 上一次采样的发送字节
+    pub name: String, // 标识：如 "192.168.1.5 <-> 8.8.8.8"
+    pub content: Content,
+    pub total_read: AtomicU64,  // 总接收字节
+    pub total_write: AtomicU64, // 总发送字节
+    pub last_read: AtomicU64,   // 上一次采样的接收字节（用于算速率）
+    pub last_write: AtomicU64,  // 上一次采样的发送字节
+    pub total_read_pending: AtomicUsize,
+    pub last_read_pending: AtomicUsize,
     pub total_write_pending: AtomicUsize, // 总共遇到了多少次写阻塞
     pub last_write_pending: AtomicUsize,  // 上一次采样的阻塞次数（用于计算增量）
+    pub total_read_error: AtomicUsize,
+    pub total_write_error: AtomicUsize,
 }
 
-pub struct MonitoredStream<T> {
+pub struct Monitored<T> {
     inner: T,
-    stats: Arc<StreamStats>,
+    stats: Arc<Stats>,
 }
 
-impl<T> MonitoredStream<T> {
-    pub fn new(inner: T, name: &str) -> Self {
+impl<T> Monitored<T> {
+    pub fn new(inner: T, name: &str, content: Content) -> Self {
         let id = NEXT_STREAM_ID.fetch_add(1, Ordering::Relaxed);
-        let stats = Arc::new(StreamStats {
+        let stats = Arc::new(Stats {
             id,
             name: name.to_string(),
-            total_rx: AtomicU64::new(0),
-            total_tx: AtomicU64::new(0),
-            last_rx: AtomicU64::new(0),
-            last_tx: AtomicU64::new(0),
-            total_write_pending: AtomicUsize::new(0),
-            last_write_pending: AtomicUsize::new(0),
+            content,
+            ..Default::default()
         });
         STREAM_MONITOR.insert(id, stats.clone());
         Self { inner, stats }
     }
 }
 
-impl<T> Drop for MonitoredStream<T> {
+impl<T> Drop for Monitored<T> {
     fn drop(&mut self) {
         info!("Stream dropped, stats: {:?}", self.stats);
         STREAM_MONITOR.remove(&self.stats.id);
     }
 }
 
-impl<T: AsyncRead + Unpin> AsyncRead for MonitoredStream<T> {
+impl<T: AsyncRead + Unpin> AsyncRead for Monitored<T> {
     fn poll_read(
         mut self: Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
@@ -370,10 +429,15 @@ impl<T: AsyncRead + Unpin> AsyncRead for MonitoredStream<T> {
         match poll {
             Poll::Ready(Ok(())) => {
                 let n = (buf.filled().len() - before) as u64;
-                self.stats.total_rx.fetch_add(n, Ordering::Relaxed);
+                self.stats.total_read.fetch_add(n, Ordering::Relaxed);
+            }
+            Poll::Ready(Err(_)) => {
+                self.stats.total_read_error.fetch_add(1, Ordering::Relaxed);
             }
             Poll::Pending => {
-                self.stats.total_write_pending.fetch_add(1, Ordering::Relaxed);
+                self.stats
+                    .total_read_pending
+                    .fetch_add(1, Ordering::Relaxed);
             }
             _ => {}
         }
@@ -381,15 +445,27 @@ impl<T: AsyncRead + Unpin> AsyncRead for MonitoredStream<T> {
     }
 }
 
-impl<T: AsyncWrite + Unpin> AsyncWrite for MonitoredStream<T> {
+impl<T: AsyncWrite + Unpin> AsyncWrite for Monitored<T> {
     fn poll_write(
         mut self: Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
         buf: &[u8],
     ) -> Poll<Result<usize, std::io::Error>> {
         let poll = Pin::new(&mut self.inner).poll_write(cx, buf);
-        if let Poll::Ready(Ok(n)) = &poll {
-            self.stats.total_tx.fetch_add(*n as u64, Ordering::Relaxed);
+        match poll {
+            Poll::Ready(Ok(n)) => {
+                self.stats
+                    .total_write
+                    .fetch_add(n as u64, Ordering::Relaxed);
+            }
+            Poll::Ready(Err(_)) => {
+                self.stats.total_write_error.fetch_add(1, Ordering::Relaxed);
+            }
+            Poll::Pending => {
+                self.stats
+                    .total_write_pending
+                    .fetch_add(1, Ordering::Relaxed);
+            }
         }
         poll
     }
@@ -406,6 +482,94 @@ impl<T: AsyncWrite + Unpin> AsyncWrite for MonitoredStream<T> {
         cx: &mut std::task::Context<'_>,
     ) -> Poll<Result<(), std::io::Error>> {
         Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+}
+
+impl<T: Stream + Unpin> Stream for Monitored<T> {
+    type Item = T::Item;
+
+    fn poll_next(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> Poll<Option<Self::Item>> {
+        let poll = Pin::new(&mut self.inner).poll_next(cx);
+
+        match &poll {
+            Poll::Ready(Some(_)) => {
+                // 成功接收到一个消息 (Item)
+                self.stats.total_read.fetch_add(1, Ordering::Relaxed);
+                // 可以在这里更新 last_rx 时间戳
+            }
+            Poll::Ready(None) => {
+                // 流结束了 (EOF)，不做特殊统计
+            }
+            Poll::Pending => {
+                self.stats
+                    .total_read_pending
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        poll
+    }
+}
+
+impl<T, Item> Sink<Item> for Monitored<T>
+where
+    T: Sink<Item> + Unpin,
+{
+    type Error = T::Error;
+
+    // 1. 检查底层是否准备好发送
+    fn poll_ready(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> Poll<Result<(), Self::Error>> {
+        let poll = Pin::new(&mut self.inner).poll_ready(cx);
+        if poll.is_pending() {
+            // 只有当 Sink 还没准备好接收数据时（背压），才算 Write Pending
+            self.stats
+                .total_write_pending
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        poll
+    }
+
+    // 2. 开始发送消息
+    fn start_send(mut self: Pin<&mut Self>, item: Item) -> Result<(), Self::Error> {
+        // 调用底层发送
+        let res = Pin::new(&mut self.inner).start_send(item);
+        match res {
+            Ok(_) => {
+                self.stats.total_write.fetch_add(1, Ordering::Relaxed);
+            }
+            Err(_) => {
+                self.stats.total_write_error.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        res
+    }
+
+    // 3. 刷新缓冲区
+    fn poll_flush(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> Poll<Result<(), Self::Error>> {
+        let poll = Pin::new(&mut self.inner).poll_flush(cx);
+        if poll.is_pending() {
+            // Flush 等待也算 Write Pending
+            self.stats
+                .total_write_pending
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        poll
+    }
+
+    // 4. 关闭流
+    fn poll_close(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> Poll<Result<(), Self::Error>> {
+        Pin::new(&mut self.inner).poll_close(cx)
     }
 }
 

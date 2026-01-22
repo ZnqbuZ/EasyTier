@@ -7,7 +7,7 @@ use easytier::instance::virtual_nic::{TunAsyncWrite, TunStream, TunZCPacketToByt
 use easytier::proto::common::ProxyDstInfo;
 use easytier::tunnel::common::FramedWriter;
 use easytier::tunnel::packet_def::ZCPacket;
-use easytier::utils::{run_stream_monitor, MonitoredStream};
+use easytier::utils::{run_stream_monitor, Monitored};
 use futures::lock::BiLock;
 use futures::{SinkExt, StreamExt};
 use netstack_smoltcp::{AnyIpPktFrame, StackBuilder};
@@ -263,13 +263,13 @@ async fn run_vpn_server(listen_addr: SocketAddr, tun_ip: Ipv4Addr, smoltcp: bool
                             // 2. 服务端代替客户端连接真实目标
                             match tokio::net::TcpStream::connect(&target_addr).await {
                                 Ok(real_tcp) => {
-                                    let mut real_tcp = MonitoredStream::new(
+                                    let mut real_tcp = Monitored::new(
                                         real_tcp,
                                         format!("TCP TO: {}", target_addr).as_str(),
                                     );
 
                                     let quic_stream = join(recv_stream, send_stream);
-                                    let mut quic_stream = MonitoredStream::new(
+                                    let mut quic_stream = Monitored::new(
                                         quic_stream,
                                         format!("QUIC FROM: {}", remote_addr).as_str(),
                                     );
@@ -467,7 +467,7 @@ async fn run_vpn_client(
 
             println!("^ 捕获 TCP: {} -> {}", local_addr, remote_addr);
 
-            let stream = MonitoredStream::new(stream, format!("TCP FROM: {}", local_addr).as_str());
+            let stream = Monitored::new(stream, format!("TCP FROM: {}", local_addr).as_str());
 
             let connection = connection.clone();
             tokio::spawn(async move {
@@ -526,7 +526,7 @@ async fn handle_client_stream(
     // NetstackTcpStream 实现了 Tokio AsyncRead/AsyncWrite，可以直接 copy
     let quic_stream = join(recv_quic, send_quic);
     let mut quic_stream =
-        MonitoredStream::new(quic_stream, format!("QUIC TO: {}", target_addr).as_str());
+        Monitored::new(quic_stream, format!("QUIC TO: {}", target_addr).as_str());
 
     // netstack-smoltcp 的流完全兼容 tokio，不需要 compat()
     let _ = tokio::io::copy_bidirectional(&mut tun_stream, &mut quic_stream).await?;

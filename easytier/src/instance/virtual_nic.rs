@@ -837,6 +837,7 @@ impl NicCtx {
             stream
                 .for_each_concurrent(MAX_CONCURRENT_PACKETS, |ret| {
                     let mgr = mgr.clone();
+                    let nic_packet_counter = nic_packet_counter.clone();
                     async move {
                         match ret {
                             Ok(packet) => {
@@ -869,11 +870,11 @@ impl NicCtx {
             loop {
                 interval.tick().await;
                 println!(
-                    "PEER packets forwarded: {}",
+                    "nic_channel -> TUN: {}",
                     counter.load(std::sync::atomic::Ordering::Relaxed)
                 );
                 println!(
-                    "PEER_2 packets forwarded: {}",
+                    "nic_channel_2 -> TUN: {}",
                     counter_2.load(std::sync::atomic::Ordering::Relaxed)
                 );
             }

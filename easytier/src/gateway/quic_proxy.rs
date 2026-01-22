@@ -35,7 +35,7 @@ use crate::proto::rpc_types;
 use crate::proto::rpc_types::controller::BaseController;
 use crate::tunnel::common::setup_sokcet2;
 use crate::tunnel::packet_def::PeerManagerHeader;
-use crate::utils::MonitoredStream;
+use crate::utils::{Content, Monitored};
 
 type QuicStreamInner = Join<RecvStream, SendStream>;
 
@@ -461,8 +461,8 @@ impl QUICProxyDst {
             e.state = TcpProxyEntryState::Connected.into();
         }
 
-        let mut src = MonitoredStream::new(join(r, w), format!("QUIC FROM {:?}", addr).as_str());
-        let mut dst = MonitoredStream::new(dst_stream, format!("QUIC TO {:?}", dst_socket).as_str());
+        let mut src = Monitored::new(join(r, w), format!("QUIC FROM {:?}", addr).as_str(), Content::Byte);
+        let mut dst = Monitored::new(dst_stream, format!("QUIC TO {:?}", dst_socket).as_str(), Content::Byte);
 
         copy_bidirectional_with_sizes(&mut src, &mut dst, 1 << 20, 1 << 20).await?;
         Ok(())
