@@ -6,7 +6,8 @@ use std::{
     sync::{Arc, Weak},
     task::{Context, Poll},
 };
-
+use std::sync::atomic::AtomicU64;
+use std::time::Duration;
 use crate::{
     common::{
         error::Error,
@@ -633,6 +634,11 @@ pub struct NicCtx {
     peer_packet_receiver: Arc<Mutex<PacketRecvChanReceiver>>,
     peer_packet_receiver_2: Arc<Mutex<PacketRecvChanReceiver>>,
 
+    peer_packet_counter: Arc<AtomicU64>,
+    peer_packet_counter_2: Arc<AtomicU64>,
+
+    nic_packet_counter: Arc<AtomicU64>,
+
     close_notifier: Arc<Notify>,
 
     nic: Arc<Mutex<VirtualNic>>,
@@ -652,6 +658,11 @@ impl NicCtx {
             peer_mgr: Arc::downgrade(peer_manager),
             peer_packet_receiver,
             peer_packet_receiver_2,
+
+            peer_packet_counter: Default::default(),
+            peer_packet_counter_2: Default::default(),
+
+            nic_packet_counter: Default::default(),
 
             close_notifier,
 
@@ -796,12 +807,25 @@ impl NicCtx {
         &mut self,
         stream: Pin<Box<dyn ZCPacketStream>>,
     ) -> Result<(), Error> {
+        let nic_packet_counter = self.nic_packet_counter.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(1));
+            loop {
+                interval.tick().await;
+                println!(
+                    "NIC packets forwarded: {}",
+                    nic_packet_counter.load(std::sync::atomic::Ordering::Relaxed)
+                );
+            }
+        });
+
         // read from nic and write to corresponding tunnel
         let Some(mgr) = self.peer_mgr.upgrade() else {
             return Err(anyhow::anyhow!("peer manager not available").into());
         };
         let close_notifier = self.close_notifier.clone();
 
+        let nic_packet_counter = self.nic_packet_counter.clone();
         self.tasks.spawn(async move {
             // 设定并发窗口大小。
             // 假设延迟 1ms，要跑满 1Gbps (约 80k pps)，窗口至少需要 80。
@@ -816,6 +840,7 @@ impl NicCtx {
                     async move {
                         match ret {
                             Ok(packet) => {
+                                nic_packet_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                                 // 这里的 await 现在是并行的了。
                                 // 即使这里卡了 1ms，也不会阻塞下一个包的读取和处理。
                                 NicCtx::do_forward_nic_to_peers(packet, &mgr).await;
@@ -837,6 +862,24 @@ impl NicCtx {
     }
 
     fn do_forward_peers_to_nic(&mut self, mut sink: Pin<Box<dyn ZCPacketSink>>) {
+        let counter = self.peer_packet_counter.clone();
+        let counter_2 = self.peer_packet_counter_2.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(1));
+            loop {
+                interval.tick().await;
+                println!(
+                    "PEER packets forwarded: {}",
+                    counter.load(std::sync::atomic::Ordering::Relaxed)
+                );
+                println!(
+                    "PEER_2 packets forwarded: {}",
+                    counter_2.load(std::sync::atomic::Ordering::Relaxed)
+                );
+            }
+        });
+        let counter = self.peer_packet_counter.clone();
+        let counter_2 = self.peer_packet_counter_2.clone();
         let channel = self.peer_packet_receiver.clone();
         let channel_2 = self.peer_packet_receiver_2.clone();
         let close_notifier = self.close_notifier.clone();
@@ -851,8 +894,14 @@ impl NicCtx {
                 let packets = tokio::select! {
                     biased;
 
-                    _ = channel_2.recv_many(&mut buf_2, BATCH_SIZE) => { &mut buf_2 },
-                    _ = channel.recv_many(&mut buf, BATCH_SIZE) => { &mut buf },
+                    n = channel_2.recv_many(&mut buf_2, BATCH_SIZE) => {
+                        counter_2.fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
+                        &mut buf_2
+                    },
+                    n = channel.recv_many(&mut buf, BATCH_SIZE) => {
+                        counter.fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
+                        &mut buf
+                    },
                 };
                 for packet in packets.drain(..) {
                     tracing::trace!(
