@@ -10,6 +10,8 @@ use pnet::packet::tcp::{ipv4_checksum, MutableTcpPacket, TcpPacket};
 use pnet::packet::MutablePacket;
 use pnet::packet::Packet;
 use socket2::{SockRef, TcpKeepalive};
+use std::cell::RefCell;
+use derive_more::Debug;
 use std::mem;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::sync::atomic::{AtomicBool, AtomicU16, AtomicUsize};
@@ -287,12 +289,12 @@ impl ProxyTcpListener {
     }
 }
 
-type ArcNatDstEntry = Arc<NatDstEntry>;
+pub type ArcNatDstEntry = Arc<NatDstEntry>;
 
-type SynSockMap = Arc<DashMap<SocketAddr, ArcNatDstEntry>>;
-type ConnSockMap = Arc<DashMap<uuid::Uuid, ArcNatDstEntry>>;
+pub type SynSockMap = Arc<DashMap<SocketAddr, ArcNatDstEntry>>;
+pub type ConnSockMap = Arc<DashMap<uuid::Uuid, ArcNatDstEntry>>;
 // peer src addr to nat entry, when respond tcp packet, should modify the tcp src addr to the nat entry's dst addr
-type AddrConnSockMap = Arc<DashMap<SocketAddr, ArcNatDstEntry>>;
+pub type AddrConnSockMap = Arc<DashMap<SocketAddr, ArcNatDstEntry>>;
 
 #[derive(Debug)]
 pub struct TcpProxy<C: NatDstConnector> {
@@ -308,8 +310,10 @@ pub struct TcpProxy<C: NatDstConnector> {
 
     cidr_set: CidrSet,
 
+    #[debug(skip)]
     smoltcp_stack_sender: Option<mpsc::Sender<ZCPacket>>,
-    smoltcp_stack_receiver: Arc<Mutex<Option<mpsc::Receiver<ZCPacket>>>>,
+    #[debug(skip)]
+    smoltcp_stack_receiver: AtomicCell<Option<mpsc::Receiver<ZCPacket>>>,
     enable_smoltcp: Arc<AtomicBool>,
 
     connector: C,
@@ -344,7 +348,7 @@ impl<C: NatDstConnector> PeerPacketFilter for TcpProxy<C> {
 #[async_trait::async_trait]
 impl<C: NatDstConnector> NicPacketFilter for TcpProxy<C> {
     async fn try_process_packet_from_nic(&self, zc_packet: &mut ZCPacket) -> bool {
-        let info = zc_packet.info();
+        // let info = zc_packet.info();
         debug!(
             "[try_process_packet_from_nic] filtering packet: {:?}",
             zc_packet
@@ -374,6 +378,36 @@ impl<C: NatDstConnector> NicPacketFilter for TcpProxy<C> {
             ip_packet.get_destination(),
             tcp_packet.get_destination(),
         ));
+
+        if self.is_smoltcp_enabled() {
+
+            let src = src_addr;
+
+            let is_tcp_syn = tcp_packet.get_flags() & pnet::packet::tcp::TcpFlags::SYN != 0;
+            let is_tcp_ack = tcp_packet.get_flags() & pnet::packet::tcp::TcpFlags::ACK != 0;
+            if is_tcp_syn && !is_tcp_ack {
+                let dest_ip = ip_packet.get_destination();
+                let dest_port = tcp_packet.get_destination();
+                let mapped_dst = SocketAddr::V4(SocketAddrV4::new(dest_ip, dest_port));
+                let real_dst = SocketAddr::V4(SocketAddrV4::new(dest_ip, dest_port));
+
+                let old_val = self
+                    .syn_map
+                    .insert(src, Arc::new(NatDstEntry::new(src, real_dst, mapped_dst)));
+                tracing::info!(src = ?src, ?real_dst, ?mapped_dst, old_entry = ?old_val, "tcp syn received");
+            }
+
+            if let Some(sender) = &self.smoltcp_stack_sender {
+                debug!("[ShortCircuit] {:?}", zc_packet);
+                let mut packet = ZCPacket::new_with_payload(&[]);
+                mem::swap(zc_packet, &mut packet);
+                if let Err(e) = sender.send(packet).await {
+                    tracing::error!("[ShortCircuit] failed to send packet to smoltcp: {:?}", e);
+                }
+                return true;
+            }
+        }
+
         let mut need_transform_dst = false;
 
         // for kcp proxy, the src ip of nat entry will be converted from my ip to fake ip
@@ -408,17 +442,7 @@ impl<C: NatDstConnector> NicPacketFilter for TcpProxy<C> {
             zc_packet.mut_peer_manager_header().unwrap().to_peer_id = self.get_my_peer_id().into();
         }
 
-        if self.is_smoltcp_enabled() {
-            if let Some(sender) = &self.smoltcp_stack_sender {
-                debug!("[ShortCircuit] {:?}", zc_packet);
-                let mut dummy_packet = ZCPacket::new_with_payload(&[]);
-                mem::swap(zc_packet, &mut dummy_packet);
-                if let Err(e) = sender.send(dummy_packet).await {
-                    tracing::error!("[ShortCircuit] failed to send packet to smoltcp: {:?}", e);
-                }
-                return true;
-            }
-        } else {
+        {
             let mut ip_packet = MutableIpv4Packet::new(zc_packet.mut_payload()).unwrap();
             ip_packet.set_source(ip);
             if need_transform_dst {
@@ -459,7 +483,7 @@ impl<C: NatDstConnector> TcpProxy<C> {
             cidr_set: CidrSet::new(global_ctx),
 
             smoltcp_stack_sender: Some(smoltcp_stack_sender),
-            smoltcp_stack_receiver: Arc::new(Mutex::new(Some(smoltcp_stack_receiver))),
+            smoltcp_stack_receiver: AtomicCell::new(Some(smoltcp_stack_receiver)),
 
             enable_smoltcp: Arc::new(AtomicBool::new(true)),
 
@@ -574,15 +598,11 @@ impl<C: NatDstConnector> TcpProxy<C> {
 
             let smoltcp_rx_count = counter.clone();
             const BATCH_SIZE: usize = 32;
-            let mut smoltcp_stack_receiver =
-                self.smoltcp_stack_receiver.lock().await.take().unwrap();
+            let mut smoltcp_stack_receiver = self.smoltcp_stack_receiver.take().unwrap();
             self.tasks.lock().unwrap().spawn(async move {
                 while let Some(packet) = smoltcp_stack_receiver.recv().await {
-                    if let Err(e) = stack_sink.send(packet.payload().to_vec()).await {
-                        tracing::error!(
-                            "send to smoltcp stack failed: {:?}, packet: {packet:?}",
-                            e
-                        );
+                    if let Err(e) = stack_sink.send(packet.payload_bytes().into()).await {
+                        tracing::error!("send to smoltcp stack failed: {:?}", e);
                     } else {
                         smoltcp_rx_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     }

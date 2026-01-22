@@ -851,7 +851,7 @@ impl NicCtx {
             // 设定并发窗口大小。
             // 假设延迟 1ms，要跑满 1Gbps (约 80k pps)，窗口至少需要 80。
             // 设置为 4096 可以轻松应对更高的延迟或带宽抖动。
-            const MAX_CONCURRENT_PACKETS: usize = 4096;
+            const MAX_CONCURRENT_PACKETS: usize = 2048;
 
             // 使用 for_each_concurrent 替代 while let 循环
             // 这允许 stream 继续读取下一个包，而不需要等待前一个包处理完成

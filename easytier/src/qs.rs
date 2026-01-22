@@ -9,8 +9,8 @@ use easytier::tunnel::common::{FramedWriter, TunnelWrapper};
 use easytier::tunnel::packet_def::ZCPacket;
 use easytier::utils::{run_stream_monitor, Content, Monitored};
 use futures::lock::BiLock;
-use futures::{SinkExt, StreamExt};
-use netstack_smoltcp::{AnyIpPktFrame, StackBuilder};
+use futures::{Sink, SinkExt, StreamExt};
+use netstack_smoltcp::{AnyIpPktFrame, Stack, StackBuilder};
 use once_cell::sync::Lazy;
 use prost::Message;
 use quinn::congestion::BbrConfig;
@@ -25,21 +25,32 @@ use rand::distributions::Alphanumeric;
 use rand::{thread_rng, Rng};
 use smoltcp::phy::PcapSink;
 use std::fs::File;
-use std::net::{Ipv4Addr, SocketAddr, UdpSocket};
+use std::mem;
+use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, UdpSocket};
 use std::path::Path;
-use std::pin::Pin;
+use std::pin::{pin, Pin};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{ Arc};
 use std::task::Poll;
 use std::time::Duration;
+use cidr::Ipv4Inet;
+use crossbeam::atomic::AtomicCell;
+use netlink_sys::AsyncSocketExt;
+use pnet::packet::ip::IpNextHeaderProtocols;
+use pnet::packet::ipv4::Ipv4Packet;
+use pnet::packet::Packet;
+use pnet::packet::tcp::TcpPacket;
 use tokio::io::{join, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::sync::mpsc::channel;
+use tokio::sync::mpsc;
 use tokio::sync::Mutex;
 use tokio::task::JoinSet;
 use tokio::time::sleep;
 use tokio_stream::wrappers::ReceiverStream;
 use tracing::{debug, info};
 use tun::Layer;
+use easytier::common::stun::StunTransport::Tcp;
+use easytier::gateway::tcp_proxy::{AddrConnSockMap, NatDstEntry, SynSockMap};
 use easytier::tunnel::Tunnel;
 
 const QLOG: bool = false;
@@ -312,6 +323,105 @@ async fn run_vpn_server(listen_addr: SocketAddr, tun_ip: Ipv4Addr, smoltcp: bool
     Ok(())
 }
 
+struct TcpProxy {
+    smoltcp_stack_sender: Option<mpsc::Sender<ZCPacket>>,
+    smoltcp_stack_receiver: AtomicCell<Option<mpsc::Receiver<ZCPacket>>>,
+    tasks: std::sync::Mutex<JoinSet<()>>,
+    local_inet: Ipv4Inet,
+    syn_map: SynSockMap,
+}
+
+impl TcpProxy {
+    fn run(&self, mut stack_sink: Pin<Box<impl Sink<AnyIpPktFrame, Error = std::io::Error> + Send + ?Sized + 'static>>) {
+        let counter = Arc::new(AtomicUsize::new(0));
+        let smoltcp_rx_count = counter.clone();
+
+        let mut smoltcp_stack_receiver = self.smoltcp_stack_receiver.take().unwrap();
+        self.tasks.lock().unwrap().spawn(async move {
+            while let Some(packet) = smoltcp_stack_receiver.recv().await {
+                if let Err(e) = stack_sink.send(packet.payload_bytes().into()).await {
+                    tracing::error!("send to smoltcp stack failed: {:?}", e);
+                } else {
+                    smoltcp_rx_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+            }
+        });
+    }
+
+    pub fn get_local_inet(&self) -> Option<Ipv4Inet> {
+        Some(self.local_inet)
+    }
+
+    fn is_smoltcp_enabled(&self) -> bool {
+        true
+    }
+
+    async fn try_process_packet_from_nic(&self, zc_packet: &mut ZCPacket) -> bool {
+        debug!(
+            "[try_process_packet_from_nic] filtering packet: {:?}",
+            zc_packet
+        );
+
+        let Some(my_ipv4_inet) = self.get_local_inet() else {
+            return false;
+        };
+        let my_ipv4 = my_ipv4_inet.address();
+
+        let data = zc_packet.payload();
+        let ip_packet = Ipv4Packet::new(data).unwrap();
+        if ip_packet.get_version() != 4
+            || ip_packet.get_source() != my_ipv4
+            || ip_packet.get_next_level_protocol() != IpNextHeaderProtocols::Tcp
+        {
+            return false;
+        }
+
+        let tcp_packet = TcpPacket::new(ip_packet.payload()).unwrap();
+
+        let mut src_addr = SocketAddr::V4(SocketAddrV4::new(
+            ip_packet.get_source(),
+            tcp_packet.get_source(),
+        ));
+        let mut dst_addr = SocketAddr::V4(SocketAddrV4::new(
+            ip_packet.get_destination(),
+            tcp_packet.get_destination(),
+        ));
+
+        if self.is_smoltcp_enabled() {
+
+            let src = src_addr;
+
+            let is_tcp_syn = tcp_packet.get_flags() & pnet::packet::tcp::TcpFlags::SYN != 0;
+            let is_tcp_ack = tcp_packet.get_flags() & pnet::packet::tcp::TcpFlags::ACK != 0;
+            if is_tcp_syn && !is_tcp_ack {
+                let dest_ip = ip_packet.get_destination();
+                let dest_port = tcp_packet.get_destination();
+                let mapped_dst = SocketAddr::V4(SocketAddrV4::new(dest_ip, dest_port));
+                let real_dst = SocketAddr::V4(SocketAddrV4::new(dest_ip, dest_port));
+
+                let old_val = self
+                    .syn_map
+                    .insert(src, Arc::new(NatDstEntry::new(src, real_dst, mapped_dst)));
+                tracing::info!(src = ?src, ?real_dst, ?mapped_dst, old_entry = ?old_val, "tcp syn received");
+            }
+
+            if let Some(sender) = &self.smoltcp_stack_sender {
+                debug!("[ShortCircuit] {:?}", zc_packet);
+                let mut packet = ZCPacket::new_with_payload(&[]);
+                mem::swap(zc_packet, &mut packet);
+                if let Err(e) = sender.send(packet).await {
+                    tracing::error!("[ShortCircuit] failed to send packet to smoltcp: {:?}", e);
+                }
+                return true
+            }
+
+            unreachable!()
+        }
+
+        unreachable!()
+    }
+}
+
 // --- VPN 客户端 ---
 async fn run_vpn_client(
     server_addr: SocketAddr,
@@ -422,6 +532,19 @@ async fn run_vpn_client(
             }
         });
 
+        let (smoltcp_stack_sender, smoltcp_stack_receiver) = mpsc::channel::<ZCPacket>(1000);
+        let tcp_proxy = TcpProxy {
+            smoltcp_stack_sender: Some(smoltcp_stack_sender),
+            smoltcp_stack_receiver: AtomicCell::new(Some(smoltcp_stack_receiver)),
+            tasks: std::sync::Mutex::new(JoinSet::new()),
+            local_inet: Ipv4Inet::new(tun_ip.into(), 24)?,
+            syn_map: SynSockMap::new(DashMap::new()),
+        };
+
+        let stack_sink: Box<dyn Sink<AnyIpPktFrame, Error = std::io::Error> + Send + Unpin> =
+            Box::new(stack_sink);
+        tcp_proxy.run(stack_sink.into());
+
         tokio::spawn(async move {
             let stream = ReceiverStream::new(packet_rx);
             let mut stream = stream
@@ -430,9 +553,9 @@ async fn run_vpn_client(
                     frame
                 })
                 .buffer_unordered(2048);
-            while let Some(frame) = stream.next().await {
-                if let Err(e) = stack_sink.send(AnyIpPktFrame::from(frame.payload())).await {
-                    eprintln!("写入 channel 失败: {}", e);
+            while let Some(mut frame) = stream.next().await {
+                if !tcp_proxy.try_process_packet_from_nic(&mut frame).await {
+                    eprintln!("写入 channel 失败");
                     break;
                 }
             }

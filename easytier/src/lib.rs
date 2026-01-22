@@ -6,7 +6,7 @@ use clap::Command;
 use clap_complete::{Generator, Shell};
 
 mod arch;
-mod gateway;
+pub mod gateway;
 pub mod instance;
 mod peer_center;
 mod vpn_portal;
