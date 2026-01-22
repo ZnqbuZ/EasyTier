@@ -812,7 +812,7 @@ impl NicCtx {
 
     fn do_forward_nic_to_peers_task(
         &mut self,
-        stream: Pin<Box<dyn ZCPacketStream>>,
+        mut stream: Pin<Box<dyn ZCPacketStream>>,
     ) -> Result<(), Error> {
         let nic_packet_counter = self.nic_packet_counter.clone();
         tokio::spawn(async move {
@@ -835,7 +835,6 @@ impl NicCtx {
         let nic_packet_counter = self.nic_packet_counter.clone();
         let short_circuit_counter = Arc::new(AtomicU64::new(0));
         let short_circuit_counter_clone = short_circuit_counter.clone();
-        let quic_proxy_src = self.quic_proxy_src.clone();
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_secs(1));
             loop {
@@ -846,46 +845,21 @@ impl NicCtx {
                 );
             }
         });
+        let Some(quic_proxy_src) = self.quic_proxy_src.clone() else {
+            panic!("QUIC proxy not ready");
+        };
+        let tcp_proxy = quic_proxy_src.tcp_proxy.get_tcp_proxy().clone();
         let short_circuit_counter_clone = short_circuit_counter.clone();
         self.tasks.spawn(async move {
-            // 设定并发窗口大小。
-            // 假设延迟 1ms，要跑满 1Gbps (约 80k pps)，窗口至少需要 80。
-            // 设置为 4096 可以轻松应对更高的延迟或带宽抖动。
-            const MAX_CONCURRENT_PACKETS: usize = 4096;
-
-            // 使用 for_each_concurrent 替代 while let 循环
-            // 这允许 stream 继续读取下一个包，而不需要等待前一个包处理完成
-            stream
-                .for_each_concurrent(MAX_CONCURRENT_PACKETS, |ret| {
-                    let mgr = mgr.clone();
-                    let nic_packet_counter = nic_packet_counter.clone();
-                    let quic_proxy_src = quic_proxy_src.clone();
-                    let short_circuit_counter_clone = short_circuit_counter_clone.clone();
-                    async move {
-                        match ret {
-                            Ok(mut packet) => {
-                                nic_packet_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                // 这里的 await 现在是并行的了。
-                                // 即使这里卡了 1ms，也不会阻塞下一个包的读取和处理。
-                                if let Some(quic_proxy_src) = quic_proxy_src {
-                                    let tcp_proxy = quic_proxy_src.tcp_proxy.get_tcp_proxy();
-                                    let ret = tcp_proxy.try_process_packet_from_nic(&mut packet).await;
-                                    if ret && packet.payload_len() == 0 {
-                                        short_circuit_counter_clone.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                        return;
-                                    }
-                                }
-                                NicCtx::do_forward_nic_to_peers(packet, &mgr).await;
-                            }
-                            Err(e) => {
-                                // 读取错误通常是致命的或者偶发的，记录日志即可
-                                tracing::error!("read from nic failed: {:?}", e);
-                            }
-                        }
-                    }
-                })
-                .await;
-
+            while let Some(Ok(mut packet)) = stream.next().await {
+                nic_packet_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let ret = tcp_proxy.try_process_packet_from_nic(&mut packet).await;
+                if ret && packet.payload_len() == 0 {
+                    short_circuit_counter_clone.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    continue;
+                }
+                NicCtx::do_forward_nic_to_peers(packet, &mgr).await;
+            }
             close_notifier.notify_one();
             tracing::error!("nic closed when recving from it");
         });
