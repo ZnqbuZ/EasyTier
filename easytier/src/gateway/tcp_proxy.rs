@@ -15,11 +15,14 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::sync::atomic::{AtomicBool, AtomicU16, AtomicUsize};
 use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
-use tokio::io::{copy_bidirectional, copy_bidirectional_with_sizes, AsyncRead, AsyncWrite, AsyncWriteExt};
+use tokio::io::{
+    copy_bidirectional, copy_bidirectional_with_sizes, AsyncRead, AsyncWrite, AsyncWriteExt,
+};
 use tokio::net::{TcpListener, TcpSocket, TcpStream};
 use tokio::sync::{mpsc, Mutex};
 use tokio::task::JoinSet;
 use tokio::time::timeout;
+use tokio_stream::wrappers::ReceiverStream;
 use tracing::{debug, error, Instrument};
 
 use crate::common::error::Result;
@@ -554,11 +557,7 @@ impl<C: NatDstConnector> TcpProxy<C> {
             let runner = runner.unwrap();
             let mut tcp_listener = tcp_listener.unwrap();
 
-            self.tasks.lock().unwrap().spawn(async move {
-                if let Err(e) = runner.await {
-                    tracing::error!("netstack runner exited with error: {:?}", e);
-                }
-            });
+            tokio::spawn(runner);
 
             let counter = Arc::new(AtomicUsize::new(0));
             let smoltcp_rx_count = counter.clone();
@@ -578,22 +577,14 @@ impl<C: NatDstConnector> TcpProxy<C> {
             let mut smoltcp_stack_receiver =
                 self.smoltcp_stack_receiver.lock().await.take().unwrap();
             self.tasks.lock().unwrap().spawn(async move {
-                let mut buf = Vec::with_capacity(BATCH_SIZE);
-                loop {
-                    let count = smoltcp_stack_receiver.recv_many(&mut buf, BATCH_SIZE).await;
-                    if count == 0 {
-                        tracing::error!("smoltcp stack channel closed");
-                        return;
-                    }
-                    for packet in buf.drain(..) {
-                        if let Err(e) = stack_sink.send(packet.payload().to_vec()).await {
-                            tracing::error!(
-                                "send to smoltcp stack failed: {:?}, packet: {packet:?}",
-                                e
-                            );
-                        } else {
-                            smoltcp_rx_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        }
+                while let Some(packet) = smoltcp_stack_receiver.recv().await {
+                    if let Err(e) = stack_sink.send(packet.payload().to_vec()).await {
+                        tracing::error!(
+                            "send to smoltcp stack failed: {:?}, packet: {packet:?}",
+                            e
+                        );
+                    } else {
+                        smoltcp_rx_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     }
                 }
             });
@@ -629,8 +620,7 @@ impl<C: NatDstConnector> TcpProxy<C> {
                         return;
                     };
 
-                    if let Err(e) = peer_mgr.nic_channel_2.send(packet).await
-                    {
+                    if let Err(e) = peer_mgr.nic_channel_2.send(packet).await {
                         tracing::error!(
                             "send to peer failed in smoltcp sender: {:?}, packet: {info}",
                             e
@@ -855,12 +845,26 @@ impl<C: NatDstConnector> TcpProxy<C> {
             let (mut src_tcp_stream, mut dst_tcp_stream) = match src_tcp_stream {
                 #[cfg(feature = "smoltcp")]
                 ProxyTcpStream::SmolTcpStream(stream) => (
-                    Monitored::new(stream, format!("NAT FROM {:?}", nat_entry_clone.src).as_str(), Content::Byte),
-                    Monitored::new(dst_tcp_stream, format!("NAT TO {:?}", nat_entry_clone.real_dst).as_str(), Content::Byte),
+                    Monitored::new(
+                        stream,
+                        format!("NAT FROM {:?}", nat_entry_clone.src).as_str(),
+                        Content::Byte,
+                    ),
+                    Monitored::new(
+                        dst_tcp_stream,
+                        format!("NAT TO {:?}", nat_entry_clone.real_dst).as_str(),
+                        Content::Byte,
+                    ),
                 ),
                 _ => unreachable!(),
             };
-            let ret = copy_bidirectional_with_sizes(&mut src_tcp_stream, &mut dst_tcp_stream, 1 << 20, 1 << 20).await;
+            let ret = copy_bidirectional_with_sizes(
+                &mut src_tcp_stream,
+                &mut dst_tcp_stream,
+                1 << 20,
+                1 << 20,
+            )
+            .await;
             tracing::info!(nat_entry = ?nat_entry_clone, ret = ?ret, "nat tcp connection closed");
 
             nat_entry_clone.state.store(NatDstEntryState::ClosingSrc);
