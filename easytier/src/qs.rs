@@ -1,17 +1,28 @@
 use anyhow::{Context, Result};
 use bytes::BytesMut;
 use chrono::Utc;
+use cidr::Ipv4Inet;
 use clap::{Parser, Subcommand};
+use crossbeam::atomic::AtomicCell;
 use dashmap::DashMap;
+use easytier::common::stun::StunTransport::Tcp;
+use easytier::gateway::tcp_proxy::{AddrConnSockMap, NatDstEntry, SynSockMap};
 use easytier::instance::virtual_nic::{NicCtx, TunAsyncWrite, TunStream, TunZCPacketToBytes};
+use easytier::peers::NicPacketFilter;
 use easytier::proto::common::ProxyDstInfo;
 use easytier::tunnel::common::{FramedWriter, TunnelWrapper};
 use easytier::tunnel::packet_def::ZCPacket;
+use easytier::tunnel::Tunnel;
 use easytier::utils::{run_stream_monitor, Content, Monitored};
 use futures::lock::BiLock;
 use futures::{Sink, SinkExt, StreamExt};
+use netlink_sys::AsyncSocketExt;
 use netstack_smoltcp::{AnyIpPktFrame, Stack, StackBuilder};
 use once_cell::sync::Lazy;
+use pnet::packet::ip::IpNextHeaderProtocols;
+use pnet::packet::ipv4::Ipv4Packet;
+use pnet::packet::tcp::TcpPacket;
+use pnet::packet::Packet;
 use prost::Message;
 use quinn::congestion::{BbrConfig, CubicConfig};
 use quinn::ClientConfig;
@@ -22,6 +33,7 @@ use quinn::TokioRuntime;
 use quinn::TransportConfig;
 use quinn::VarInt;
 use rand::distributions::Alphanumeric;
+use rand::rngs::StdRng;
 use rand::{thread_rng, Rng, SeedableRng};
 use smoltcp::phy::PcapSink;
 use std::fs::File;
@@ -30,30 +42,18 @@ use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, UdpSocket};
 use std::path::Path;
 use std::pin::{pin, Pin};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::{ Arc};
+use std::sync::Arc;
 use std::task::Poll;
-use std::time::Duration;
-use cidr::Ipv4Inet;
-use crossbeam::atomic::AtomicCell;
-use netlink_sys::AsyncSocketExt;
-use pnet::packet::ip::IpNextHeaderProtocols;
-use pnet::packet::ipv4::Ipv4Packet;
-use pnet::packet::Packet;
-use pnet::packet::tcp::TcpPacket;
-use rand::rngs::StdRng;
+use std::time::{Duration, Instant};
 use tokio::io::{join, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
-use tokio::sync::mpsc::channel;
 use tokio::sync::mpsc;
+use tokio::sync::mpsc::channel;
 use tokio::sync::Mutex;
 use tokio::task::JoinSet;
 use tokio::time::sleep;
 use tokio_stream::wrappers::ReceiverStream;
 use tracing::{debug, info};
 use tun::Layer;
-use easytier::common::stun::StunTransport::Tcp;
-use easytier::gateway::tcp_proxy::{AddrConnSockMap, NatDstEntry, SynSockMap};
-use easytier::peers::NicPacketFilter;
-use easytier::tunnel::Tunnel;
 
 const QLOG: bool = false;
 
@@ -176,8 +176,8 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::Server => unimplemented!(),
-        Commands::Client => unimplemented!(),
+        Commands::Server { .. } => unimplemented!(),
+        Commands::Client { .. } => unimplemented!(),
         Commands::VpnServer {
             listen,
             tun_ip,
@@ -330,7 +330,12 @@ struct TcpProxy {
 }
 
 impl TcpProxy {
-    fn run(&self, mut stack_sink: Pin<Box<impl Sink<AnyIpPktFrame, Error = std::io::Error> + Send + ?Sized + 'static>>) {
+    fn run(
+        &self,
+        mut stack_sink: Pin<
+            Box<impl Sink<AnyIpPktFrame, Error = std::io::Error> + Send + ?Sized + 'static>,
+        >,
+    ) {
         let counter = Arc::new(AtomicUsize::new(0));
         let smoltcp_rx_count = counter.clone();
 
@@ -389,7 +394,6 @@ impl NicPacketFilter for TcpProxy {
         ));
 
         if self.is_smoltcp_enabled() {
-
             let src = src_addr;
 
             let is_tcp_syn = tcp_packet.get_flags() & pnet::packet::tcp::TcpFlags::SYN != 0;
@@ -413,13 +417,20 @@ impl NicPacketFilter for TcpProxy {
                 if let Err(e) = sender.send(packet).await {
                     tracing::error!("[ShortCircuit] failed to send packet to smoltcp: {:?}", e);
                 }
-                return true
+                return true;
             }
 
             unreachable!()
         }
 
         unreachable!()
+    }
+}
+
+pub fn spin(duration: Duration) {
+    let start = Instant::now();
+    while start.elapsed() < duration {
+        std::hint::spin_loop();
     }
 }
 
@@ -554,18 +565,48 @@ async fn run_vpn_client(
         //     }).await;
         // });
 
+        // tokio::spawn(async move {
+        //     let mut stream = tun_stream;
+        //     let tcp_proxy = tcp_proxy.clone();
+        //
+        //     while let Some(Ok(mut packet)) = stream.next().await {
+        //         // serial: extremely sensible to latency, fixed or random
+        //         // tokio::task::yield_now().await;
+        //         // sleep(Duration::from_micros(1)).await;
+        //         spin(Duration::from_micros(1));
+        //         if tcp_proxy.try_process_packet_from_nic(&mut packet).await {
+        //             continue;
+        //         }
+        //         unreachable!();
+        //     }
+        // });
+
         tokio::spawn(async move {
+            const BUFFER_SIZE: usize = 2048;
             let mut stream = tun_stream;
             let tcp_proxy = tcp_proxy.clone();
 
-            while let Some(Ok(mut packet)) = stream.next().await {
-                // serial: extremely sensible to latency, fixed or random
-                sleep(Duration::from_micros(1)).await;
-                if tcp_proxy.try_process_packet_from_nic(&mut packet).await {
-                    continue;
-                }
-                unreachable!();
-            }
+            stream
+                .map(|ret| {
+                    let tcp_proxy = tcp_proxy.clone();
+
+                    async move {
+                        let Ok(mut packet) = ret else {
+                            return;
+                        };
+
+                        // buffered serial: sensible to random latency
+                        sleep(Duration::from_micros(StdRng::from_entropy().gen_range(0..=3_000))).await;
+                        if tcp_proxy.try_process_packet_from_nic(&mut packet).await {
+                            return;
+                        }
+
+                        unreachable!();
+                    }
+                })
+                .buffered(BUFFER_SIZE)
+                .for_each(|_| async {})
+                .await;
         });
 
         let (nic_channel, peer_packet_receiver) = channel(128); // unused
