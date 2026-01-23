@@ -13,7 +13,7 @@ use futures::{Sink, SinkExt, StreamExt};
 use netstack_smoltcp::{AnyIpPktFrame, Stack, StackBuilder};
 use once_cell::sync::Lazy;
 use prost::Message;
-use quinn::congestion::BbrConfig;
+use quinn::congestion::{BbrConfig, CubicConfig};
 use quinn::ClientConfig;
 use quinn::EndpointConfig;
 use quinn::QlogConfig;
@@ -532,38 +532,39 @@ async fn run_vpn_client(
         let tcp_proxy = Arc::new(tcp_proxy);
 
         // 任务 A: TUN -> Stack (读取操作系统发来的 IP 包 -> 写入用户态协议栈)
-        /*
-        tokio::spawn(async move {
-            let stream = tun_stream;
-            const MAX_CONCURRENT_PACKETS: usize = 2048;
-
-            stream.for_each_concurrent(MAX_CONCURRENT_PACKETS, |ret| {
-                let tcp_proxy = tcp_proxy.clone();
-                async move {
-                    sleep(Duration::from_micros(StdRng::from_entropy().gen_range(1_000..=3_000))).await;
-                    match ret {
-                        Ok(mut packet) => {
-                            if tcp_proxy.try_process_packet_from_nic(&mut packet).await {
-                                return;
-                            }
-                            unreachable!();
-                        }
-                        Err(e) => {
-                            // 读取错误通常是致命的或者偶发的，记录日志即可
-                            tracing::error!("read from nic failed: {:?}", e);
-                        }
-                    }
-                }
-            }).await;
-        });
-        */
+        // tokio::spawn(async move {
+        //     let stream = tun_stream;
+        //     const MAX_CONCURRENT_PACKETS: usize = 2048;
+        //
+        //     stream.for_each_concurrent(MAX_CONCURRENT_PACKETS, |ret| {
+        //         let tcp_proxy = tcp_proxy.clone();
+        //         async move {
+        //             // parallel: sensible to random latency
+        //             sleep(Duration::from_micros(StdRng::from_entropy().gen_range(0..=3_000))).await;
+        //             // sleep(Duration::from_micros(3_000)).await;
+        //             match ret {
+        //                 Ok(mut packet) => {
+        //                     if tcp_proxy.try_process_packet_from_nic(&mut packet).await {
+        //                         return;
+        //                     }
+        //                     unreachable!();
+        //                 }
+        //                 Err(e) => {
+        //                     // 读取错误通常是致命的或者偶发的，记录日志即可
+        //                     tracing::error!("read from nic failed: {:?}", e);
+        //                 }
+        //             }
+        //         }
+        //     }).await;
+        // });
 
         tokio::spawn(async move {
             let mut stream = tun_stream;
             let tcp_proxy = tcp_proxy.clone();
 
             while let Some(Ok(mut packet)) = stream.next().await {
-                sleep(Duration::from_micros(StdRng::from_entropy().gen_range(1_000..=3_000))).await;
+                // serial: extremely sensible to latency, fixed or random
+                sleep(Duration::from_micros(1)).await;
                 if tcp_proxy.try_process_packet_from_nic(&mut packet).await {
                     continue;
                 }
