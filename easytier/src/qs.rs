@@ -5,6 +5,7 @@ use cidr::Ipv4Inet;
 use clap::{Parser, Subcommand};
 use crossbeam::atomic::AtomicCell;
 use dashmap::DashMap;
+use derive_more::{From, Into};
 use easytier::common::stun::StunTransport::Tcp;
 use easytier::gateway::tcp_proxy::{AddrConnSockMap, NatDstEntry, SynSockMap};
 use easytier::instance::virtual_nic::{NicCtx, TunAsyncWrite, TunStream, TunZCPacketToBytes};
@@ -21,7 +22,7 @@ use netstack_smoltcp::{AnyIpPktFrame, Stack, StackBuilder};
 use once_cell::sync::Lazy;
 use pnet::packet::ip::IpNextHeaderProtocols;
 use pnet::packet::ipv4::Ipv4Packet;
-use pnet::packet::tcp::TcpPacket;
+use pnet::packet::tcp::{TcpFlags, TcpPacket};
 use pnet::packet::Packet;
 use prost::Message;
 use quinn::congestion::{BbrConfig, CubicConfig};
@@ -36,6 +37,7 @@ use rand::distributions::Alphanumeric;
 use rand::rngs::StdRng;
 use rand::{thread_rng, Rng, SeedableRng};
 use smoltcp::phy::PcapSink;
+use std::collections::{BTreeMap, HashMap};
 use std::fs::File;
 use std::mem;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, UdpSocket};
@@ -329,6 +331,50 @@ struct TcpProxy {
     syn_map: SynSockMap,
 }
 
+#[derive(Debug, From, Into, Clone, Copy, Eq, Hash, PartialEq)]
+struct FlowKey((SocketAddr, SocketAddr));
+
+impl From<(&Ipv4Packet<'_>, &TcpPacket<'_>)> for FlowKey {
+    fn from(packet: (&Ipv4Packet<'_>, &TcpPacket<'_>)) -> Self {
+        let (ip_packet, tcp_packet) = packet;
+        let src_addr = SocketAddr::V4(SocketAddrV4::new(
+            ip_packet.get_source(),
+            tcp_packet.get_source(),
+        ));
+        let dst_addr = SocketAddr::V4(SocketAddrV4::new(
+            ip_packet.get_destination(),
+            tcp_packet.get_destination(),
+        ));
+        (src_addr, dst_addr).into()
+    }
+}
+
+// 定义每个流的状态
+struct FlowState {
+    // 下一个期望接收的序列号
+    expected_seq: u32,
+    // 乱序缓冲：Key=Seq, Value=Packet
+    buffer: BTreeMap<u32, ZCPacket>,
+    // 熔断标志：true 表示进入直通模式，不再缓冲，直到 expected_seq 恢复
+    passthrough: bool,
+    // 是否已初始化（看到过 SYN 或者决定开始追踪）
+    initialized: bool,
+}
+
+impl FlowState {
+    fn new() -> Self {
+        Self {
+            expected_seq: 0,
+            buffer: BTreeMap::new(),
+            passthrough: true, // 默认先直通，直到看到 SYN 或者是我们确定的序列
+            initialized: false,
+        }
+    }
+}
+
+// 缓冲区最大容量，超过这个数说明丢包严重，触发熔断
+const MAX_BUFFER_CAPACITY: usize = 1 << 20;
+
 impl TcpProxy {
     fn run(
         &self,
@@ -340,12 +386,132 @@ impl TcpProxy {
         let smoltcp_rx_count = counter.clone();
 
         let mut smoltcp_stack_receiver = self.smoltcp_stack_receiver.take().unwrap();
+
         self.tasks.lock().unwrap().spawn(async move {
+            // 使用 HashMap 追踪多个流的状态
+            let mut conntrack = HashMap::<FlowKey, FlowState>::new();
+
             while let Some(packet) = smoltcp_stack_receiver.recv().await {
-                if let Err(e) = stack_sink.send(packet.payload_bytes().into()).await {
-                    tracing::error!("send to smoltcp stack failed: {:?}", e);
+                // 1. 解析包头
+                let ip_packet = match Ipv4Packet::new(packet.payload()) {
+                    Some(p) => p,
+                    None => continue, // 非 IPv4 包忽略
+                };
+
+                let tcp_packet = match TcpPacket::new(ip_packet.payload()) {
+                    Some(p) => p,
+                    None => continue, // 非 TCP 包忽略
+                };
+
+                // 2. 提取流 Key
+                let flow_key = (&ip_packet, &tcp_packet).into();
+
+                // 3. 计算包的逻辑长度 (Payload + SYN + FIN)
+                let payload_len = (ip_packet.get_total_length() as u32)
+                    .saturating_sub((ip_packet.get_header_length() as u32) * 4)
+                    .saturating_sub((tcp_packet.get_data_offset() as u32) * 4);
+
+                let is_syn = (tcp_packet.get_flags() & TcpFlags::SYN) != 0;
+                let is_fin = (tcp_packet.get_flags() & TcpFlags::FIN) != 0;
+                let segment_len = payload_len + (if is_syn { 1 } else { 0 }) + (if is_fin { 1 } else { 0 });
+                let seq = tcp_packet.get_sequence();
+
+                // 4. 获取或创建流状态
+                let state = conntrack.entry(flow_key).or_insert_with(FlowState::new);
+
+                // 如果是 SYN，重置状态
+                if is_syn {
+                    state.expected_seq = seq;
+                    state.buffer.clear();
+                    state.initialized = true;
+                    println!("New Strict Flow: {:?}", flow_key);
+                }
+
+                if !state.initialized {
+                    // 没有 SYN 的流，无法得知 expected_seq，只能丢弃或者冒险透传。
+                    // 为了绝对不干扰 CC，这里建议直接丢弃，直到捕获到 SYN 或者重置链接。
+                    // 但如果是长连接中途截获，这里必须做特殊处理（比较复杂），
+                    // 假设我们总能捕获到 SYN，或者你愿意在这里冒险透传一次直到同步。
+                    continue;
+                }
+
+                let expected = state.expected_seq;
+
+                // =========================================================
+                //  严格序列化逻辑 (Strict Serialization)
+                // =========================================================
+
+                if seq == expected {
+                    // --- Case A: 完美的顺序包 ---
+                    // 只有这种包允许通过！
+
+                    // 1. 发送当前包
+                    if let Err(e) = stack_sink.send(packet.payload_bytes().into()).await {
+                        tracing::error!("send failed: {:?}", e);
+                        // 发送失败属于严重错误，这里可能需要断开流
+                        continue;
+                    }
+
+                    // 2. 推进 expected
+                    state.expected_seq = expected.wrapping_add(segment_len);
+
+                    // 3. 极速清理缓冲区 (Drain Buffer)
+                    // 既然补上了缺口，后面缓存的一连串包都可以发了
+                    while let Some(entry) = state.buffer.first_entry() {
+                        if *entry.key() == state.expected_seq {
+                            let buffered_pkt = entry.remove();
+
+                            // 解析长度 (需优化：最好在 insert 时就存好长度，避免重复解析)
+                            let b_ip = Ipv4Packet::new(buffered_pkt.payload()).unwrap();
+                            let b_tcp = TcpPacket::new(b_ip.payload()).unwrap();
+                            let b_payload_len = (b_ip.get_total_length() as u32)
+                                .saturating_sub((b_ip.get_header_length() as u32) * 4)
+                                .saturating_sub((b_tcp.get_data_offset() as u32) * 4);
+                            let b_flags_len = if (b_tcp.get_flags() & (TcpFlags::SYN | TcpFlags::FIN)) != 0 { 1 } else { 0 };
+                            let b_len = b_payload_len + b_flags_len;
+
+                            if let Err(e) = stack_sink.send(buffered_pkt.payload_bytes().into()).await {
+                                tracing::error!("send buffered failed: {:?}", e);
+                            } else {
+                                state.expected_seq = state.expected_seq.wrapping_add(b_len);
+                            }
+                        } else {
+                            // 链条断了，等待下一个缺口被补齐
+                            break;
+                        }
+                    }
+
+                } else if seq.wrapping_sub(expected) > 0x7FFFFFFF {
+                    // --- Case B: 旧包 / 重复包 (Seq < Expected) ---
+
+                    // 【绝对静默】：
+                    // 如果我们转发旧包，smoltcp 会回一个 "ACK=expected" 的包。
+                    // 上游收到这个 ACK，发现和之前收到的 ACK 一样，就会判定为 DupACK。
+                    // 积累 3 个 DupACK 就会降速。
+                    // 所以：必须丢弃，假装没看见。
+
+                    println!("Silently dropping old packet seq: {}", seq);
+                    continue;
+
                 } else {
-                    smoltcp_rx_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    // --- Case C: 未来的包 (Seq > Expected) ---
+
+                    // 【死都不发】：
+                    // 只要不是 expected，就绝对不能发给 smoltcp。
+                    // 必须存起来。
+
+                    // 检查容量防止 OOM (针对本地可靠链路，容量给大点)
+                    // if current_buffer_size > MAX_LIMIT { 
+                    //    这里是个死局。如果缓冲区满了，说明缺口一直没补上。
+                    //    选项1 (为了不触发CC): 停止读取 input (Backpressure)。
+                    //    选项2 (为了保命): 丢弃这个包。上游会超时重传 (RTO)。
+                    //    
+                    //    推荐：丢弃这个包 (Drop Tail)。
+                    //    因为如果是本地链路，极少会出现缓冲几百兆还没补齐缺口的情况。
+                    //    如果真出现了，说明连接已经坏了，触发 RTO 是合理的。
+                    // }
+
+                    state.buffer.insert(seq, packet);
                 }
             }
         });
@@ -441,7 +607,7 @@ async fn run_vpn_client(
     smoltcp: bool,
     test: bool,
 ) -> Result<()> {
-    run_stream_monitor();
+    // run_stream_monitor();
 
     // 1. 创建 TUN
     let mut config = tun::Configuration::default();
