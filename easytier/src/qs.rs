@@ -22,7 +22,7 @@ use quinn::TokioRuntime;
 use quinn::TransportConfig;
 use quinn::VarInt;
 use rand::distributions::Alphanumeric;
-use rand::{thread_rng, Rng};
+use rand::{thread_rng, Rng, SeedableRng};
 use smoltcp::phy::PcapSink;
 use std::fs::File;
 use std::mem;
@@ -40,6 +40,7 @@ use pnet::packet::ip::IpNextHeaderProtocols;
 use pnet::packet::ipv4::Ipv4Packet;
 use pnet::packet::Packet;
 use pnet::packet::tcp::TcpPacket;
+use rand::rngs::StdRng;
 use tokio::io::{join, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::sync::mpsc::channel;
 use tokio::sync::mpsc;
@@ -515,27 +516,6 @@ async fn run_vpn_client(
         let (mut tun_stream, mut tun_sink) = fd.split();
         let (mut stack_sink, mut stack_stream) = stack.split();
 
-        let (packet_tx, packet_rx) = channel(128);
-
-        // 任务 A: TUN -> Stack (读取操作系统发来的 IP 包 -> 写入用户态协议栈)
-        tokio::spawn(async move {
-            loop {
-                match tun_stream.next().await {
-                    Some(Ok(buf)) => {
-                        // stack_sink 需要 Vec<u8>
-                        if let Err(e) = packet_tx.send(buf).await {
-                            eprintln!("写入 Stack 失败: {}", e);
-                            break;
-                        }
-                    }
-                    _ => {
-                        eprintln!("读取 TUN 失败");
-                        break;
-                    }
-                }
-            }
-        });
-
         let (smoltcp_stack_sender, smoltcp_stack_receiver) = mpsc::channel::<ZCPacket>(1000);
         let tcp_proxy = TcpProxy {
             smoltcp_stack_sender: Some(smoltcp_stack_sender),
@@ -551,29 +531,39 @@ async fn run_vpn_client(
 
         let tcp_proxy = Arc::new(tcp_proxy);
 
+        // 任务 A: TUN -> Stack (读取操作系统发来的 IP 包 -> 写入用户态协议栈)
         tokio::spawn(async move {
-            let stream = ReceiverStream::new(packet_rx);
+            let stream = tun_stream;
             const MAX_CONCURRENT_PACKETS: usize = 2048;
 
-            stream.for_each_concurrent(MAX_CONCURRENT_PACKETS, |mut packet| {
+            stream.for_each_concurrent(MAX_CONCURRENT_PACKETS, |ret| {
                 let tcp_proxy = tcp_proxy.clone();
                 async move {
-                    if tcp_proxy.try_process_packet_from_nic(&mut packet).await {
-                        return;
+                    // sleep(Duration::from_micros(StdRng::from_entropy().gen_range(1_000..=3_000))).await;
+                    match ret {
+                        Ok(mut packet) => {
+                            if tcp_proxy.try_process_packet_from_nic(&mut packet).await {
+                                return;
+                            }
+                            unreachable!();
+                        }
+                        Err(e) => {
+                            // 读取错误通常是致命的或者偶发的，记录日志即可
+                            tracing::error!("read from nic failed: {:?}", e);
+                        }
                     }
-                    unreachable!();
                 }
             }).await;
         });
 
-        let (packet_tx, packet_rx) = channel(128); // unused
+        let (nic_channel, peer_packet_receiver) = channel(128); // unused
 
         let mut tasks = JoinSet::new();
-        let packet_rx = Mutex::new(packet_rx);
-        let packet_counter = AtomicU64::new(0);
-        let (packet_tx_2, packet_rx_2) = channel(128);
-        let packet_rx_2 = Mutex::new(packet_rx_2);
-        let packet_counter_2 = AtomicU64::new(0);
+        let peer_packet_receiver = Mutex::new(peer_packet_receiver);
+        let peer_packet_counter = AtomicU64::new(0);
+        let (nic_channel_2, peer_packet_receiver_2) = channel(128);
+        let peer_packet_receiver_2 = Mutex::new(peer_packet_receiver_2);
+        let peer_packet_counter_2 = AtomicU64::new(0);
 
         // 任务 B: Stack -> TUN (协议栈产生的 IP 包，如 SYN-ACK -> 写入 TUN 让操作系统接收)
         tokio::spawn(async move {
@@ -581,7 +571,7 @@ async fn run_vpn_client(
                 match pkt {
                     Ok(frame) => {
                         let packet = ZCPacket::new_with_payload(frame.as_ref());
-                        if let Err(e) = packet_tx_2.send(packet).await {
+                        if let Err(e) = nic_channel_2.send(packet).await {
                             eprintln!("写入 channel 失败: {}", e);
                             break;
                         }
@@ -594,10 +584,10 @@ async fn run_vpn_client(
         NicCtx::do_forward_peers_to_nic_inner(
             tun_sink.into(),
             &mut tasks,
-            packet_counter.into(),
-            packet_counter_2.into(),
-            packet_rx.into(),
-            packet_rx_2.into(),
+            peer_packet_counter.into(),
+            peer_packet_counter_2.into(),
+            peer_packet_receiver.into(),
+            peer_packet_receiver_2.into(),
         );
 
         // 5. 处理拦截到的 TCP 连接
