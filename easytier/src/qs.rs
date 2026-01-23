@@ -539,31 +539,36 @@ async fn run_vpn_client(
         let tcp_proxy = Arc::new(tcp_proxy);
 
         // 任务 A: TUN -> Stack (读取操作系统发来的 IP 包 -> 写入用户态协议栈)
-        // tokio::spawn(async move {
-        //     let stream = tun_stream;
-        //     const MAX_CONCURRENT_PACKETS: usize = 2048;
-        //
-        //     stream.for_each_concurrent(MAX_CONCURRENT_PACKETS, |ret| {
-        //         let tcp_proxy = tcp_proxy.clone();
-        //         async move {
-        //             // parallel: sensible to random latency
-        //             sleep(Duration::from_micros(StdRng::from_entropy().gen_range(0..=3_000))).await;
-        //             // sleep(Duration::from_micros(3_000)).await;
-        //             match ret {
-        //                 Ok(mut packet) => {
-        //                     if tcp_proxy.try_process_packet_from_nic(&mut packet).await {
-        //                         return;
-        //                     }
-        //                     unreachable!();
-        //                 }
-        //                 Err(e) => {
-        //                     // 读取错误通常是致命的或者偶发的，记录日志即可
-        //                     tracing::error!("read from nic failed: {:?}", e);
-        //                 }
-        //             }
-        //         }
-        //     }).await;
-        // });
+        tokio::spawn(async move {
+            let stream = tun_stream;
+            const MAX_CONCURRENT_PACKETS: usize = 2048;
+
+            stream
+                .for_each_concurrent(MAX_CONCURRENT_PACKETS, |ret| {
+                    let tcp_proxy = tcp_proxy.clone();
+                    async move {
+                        // parallel: sensible to random latency
+                        sleep(Duration::from_micros(
+                            StdRng::from_entropy().gen_range(0..=3_000),
+                        ))
+                        .await;
+                        // sleep(Duration::from_micros(3_000)).await;
+                        match ret {
+                            Ok(mut packet) => {
+                                if tcp_proxy.try_process_packet_from_nic(&mut packet).await {
+                                    return;
+                                }
+                                unreachable!();
+                            }
+                            Err(e) => {
+                                // 读取错误通常是致命的或者偶发的，记录日志即可
+                                tracing::error!("read from nic failed: {:?}", e);
+                            }
+                        }
+                    }
+                })
+                .await;
+        });
 
         // tokio::spawn(async move {
         //     let mut stream = tun_stream;
@@ -581,33 +586,33 @@ async fn run_vpn_client(
         //     }
         // });
 
-        tokio::spawn(async move {
-            const BUFFER_SIZE: usize = 2048;
-            let mut stream = tun_stream;
-            let tcp_proxy = tcp_proxy.clone();
-
-            stream
-                .map(|ret| {
-                    let tcp_proxy = tcp_proxy.clone();
-
-                    async move {
-                        let Ok(mut packet) = ret else {
-                            return;
-                        };
-
-                        // buffered serial: sensible to random latency
-                        sleep(Duration::from_micros(StdRng::from_entropy().gen_range(0..=3_000))).await;
-                        if tcp_proxy.try_process_packet_from_nic(&mut packet).await {
-                            return;
-                        }
-
-                        unreachable!();
-                    }
-                })
-                .buffered(BUFFER_SIZE)
-                .for_each(|_| async {})
-                .await;
-        });
+        // tokio::spawn(async move {
+        //     const BUFFER_SIZE: usize = 2048;
+        //     let mut stream = tun_stream;
+        //     let tcp_proxy = tcp_proxy.clone();
+        //
+        //     stream
+        //         .map(|ret| {
+        //             let tcp_proxy = tcp_proxy.clone();
+        //
+        //             async move {
+        //                 let Ok(mut packet) = ret else {
+        //                     return;
+        //                 };
+        //
+        //                 // buffered serial: sensible to random latency
+        //                 sleep(Duration::from_micros(StdRng::from_entropy().gen_range(0..=3_000))).await;
+        //                 if tcp_proxy.try_process_packet_from_nic(&mut packet).await {
+        //                     return;
+        //                 }
+        //
+        //                 unreachable!();
+        //             }
+        //         })
+        //         .buffered(BUFFER_SIZE)
+        //         .for_each(|_| async {})
+        //         .await;
+        // });
 
         let (nic_channel, peer_packet_receiver) = channel(128); // unused
 
