@@ -381,140 +381,152 @@ impl TcpProxy {
         mut stack_sink: Pin<
             Box<impl Sink<AnyIpPktFrame, Error = std::io::Error> + Send + ?Sized + 'static>,
         >,
+        reorder: bool,
     ) {
         let counter = Arc::new(AtomicUsize::new(0));
         let smoltcp_rx_count = counter.clone();
 
         let mut smoltcp_stack_receiver = self.smoltcp_stack_receiver.take().unwrap();
 
-        self.tasks.lock().unwrap().spawn(async move {
-            // 使用 HashMap 追踪多个流的状态
-            let mut conntrack = HashMap::<FlowKey, FlowState>::new();
+        if reorder {
+            self.tasks.lock().unwrap().spawn(async move {
+                // 使用 HashMap 追踪多个流的状态
+                let mut conntrack = HashMap::<FlowKey, FlowState>::new();
 
-            while let Some(packet) = smoltcp_stack_receiver.recv().await {
-                // 1. 解析包头
-                let ip_packet = match Ipv4Packet::new(packet.payload()) {
-                    Some(p) => p,
-                    None => continue, // 非 IPv4 包忽略
-                };
+                while let Some(packet) = smoltcp_stack_receiver.recv().await {
+                    // 1. 解析包头
+                    let ip_packet = match Ipv4Packet::new(packet.payload()) {
+                        Some(p) => p,
+                        None => continue, // 非 IPv4 包忽略
+                    };
 
-                let tcp_packet = match TcpPacket::new(ip_packet.payload()) {
-                    Some(p) => p,
-                    None => continue, // 非 TCP 包忽略
-                };
+                    let tcp_packet = match TcpPacket::new(ip_packet.payload()) {
+                        Some(p) => p,
+                        None => continue, // 非 TCP 包忽略
+                    };
 
-                // 2. 提取流 Key
-                let flow_key = (&ip_packet, &tcp_packet).into();
+                    // 2. 提取流 Key
+                    let flow_key = (&ip_packet, &tcp_packet).into();
 
-                // 3. 计算包的逻辑长度 (Payload + SYN + FIN)
-                let payload_len = (ip_packet.get_total_length() as u32)
-                    .saturating_sub((ip_packet.get_header_length() as u32) * 4)
-                    .saturating_sub((tcp_packet.get_data_offset() as u32) * 4);
+                    // 3. 计算包的逻辑长度 (Payload + SYN + FIN)
+                    let payload_len = (ip_packet.get_total_length() as u32)
+                        .saturating_sub((ip_packet.get_header_length() as u32) * 4)
+                        .saturating_sub((tcp_packet.get_data_offset() as u32) * 4);
 
-                let is_syn = (tcp_packet.get_flags() & TcpFlags::SYN) != 0;
-                let is_fin = (tcp_packet.get_flags() & TcpFlags::FIN) != 0;
-                let segment_len = payload_len + (if is_syn { 1 } else { 0 }) + (if is_fin { 1 } else { 0 });
-                let seq = tcp_packet.get_sequence();
+                    let is_syn = (tcp_packet.get_flags() & TcpFlags::SYN) != 0;
+                    let is_fin = (tcp_packet.get_flags() & TcpFlags::FIN) != 0;
+                    let segment_len = payload_len + (if is_syn { 1 } else { 0 }) + (if is_fin { 1 } else { 0 });
+                    let seq = tcp_packet.get_sequence();
 
-                // 4. 获取或创建流状态
-                let state = conntrack.entry(flow_key).or_insert_with(FlowState::new);
+                    // 4. 获取或创建流状态
+                    let state = conntrack.entry(flow_key).or_insert_with(FlowState::new);
 
-                // 如果是 SYN，重置状态
-                if is_syn {
-                    state.expected_seq = seq;
-                    state.buffer.clear();
-                    state.initialized = true;
-                    println!("New Strict Flow: {:?}", flow_key);
+                    // 如果是 SYN，重置状态
+                    if is_syn {
+                        state.expected_seq = seq;
+                        state.buffer.clear();
+                        state.initialized = true;
+                        println!("New Strict Flow: {:?}", flow_key);
+                    }
+
+                    if !state.initialized {
+                        // 没有 SYN 的流，无法得知 expected_seq，只能丢弃或者冒险透传。
+                        // 为了绝对不干扰 CC，这里建议直接丢弃，直到捕获到 SYN 或者重置链接。
+                        // 但如果是长连接中途截获，这里必须做特殊处理（比较复杂），
+                        // 假设我们总能捕获到 SYN，或者你愿意在这里冒险透传一次直到同步。
+                        continue;
+                    }
+
+                    let expected = state.expected_seq;
+
+                    // =========================================================
+                    //  严格序列化逻辑 (Strict Serialization)
+                    // =========================================================
+
+                    if seq == expected {
+                        // --- Case A: 完美的顺序包 ---
+                        // 只有这种包允许通过！
+
+                        // 1. 发送当前包
+                        if let Err(e) = stack_sink.send(packet.payload_bytes().into()).await {
+                            tracing::error!("send failed: {:?}", e);
+                            // 发送失败属于严重错误，这里可能需要断开流
+                            continue;
+                        }
+
+                        // 2. 推进 expected
+                        state.expected_seq = expected.wrapping_add(segment_len);
+
+                        // 3. 极速清理缓冲区 (Drain Buffer)
+                        // 既然补上了缺口，后面缓存的一连串包都可以发了
+                        while let Some(entry) = state.buffer.first_entry() {
+                            if *entry.key() == state.expected_seq {
+                                let buffered_pkt = entry.remove();
+
+                                // 解析长度 (需优化：最好在 insert 时就存好长度，避免重复解析)
+                                let b_ip = Ipv4Packet::new(buffered_pkt.payload()).unwrap();
+                                let b_tcp = TcpPacket::new(b_ip.payload()).unwrap();
+                                let b_payload_len = (b_ip.get_total_length() as u32)
+                                    .saturating_sub((b_ip.get_header_length() as u32) * 4)
+                                    .saturating_sub((b_tcp.get_data_offset() as u32) * 4);
+                                let b_flags_len = if (b_tcp.get_flags() & (TcpFlags::SYN | TcpFlags::FIN)) != 0 { 1 } else { 0 };
+                                let b_len = b_payload_len + b_flags_len;
+
+                                if let Err(e) = stack_sink.send(buffered_pkt.payload_bytes().into()).await {
+                                    tracing::error!("send buffered failed: {:?}", e);
+                                } else {
+                                    state.expected_seq = state.expected_seq.wrapping_add(b_len);
+                                }
+                            } else {
+                                // 链条断了，等待下一个缺口被补齐
+                                break;
+                            }
+                        }
+                    } else if seq.wrapping_sub(expected) > 0x7FFFFFFF {
+                        // --- Case B: 旧包 / 重复包 (Seq < Expected) ---
+
+                        // 【绝对静默】：
+                        // 如果我们转发旧包，smoltcp 会回一个 "ACK=expected" 的包。
+                        // 上游收到这个 ACK，发现和之前收到的 ACK 一样，就会判定为 DupACK。
+                        // 积累 3 个 DupACK 就会降速。
+                        // 所以：必须丢弃，假装没看见。
+
+                        println!("Silently dropping old packet seq: {}", seq);
+                        continue;
+                    } else {
+                        // --- Case C: 未来的包 (Seq > Expected) ---
+
+                        // 【死都不发】：
+                        // 只要不是 expected，就绝对不能发给 smoltcp。
+                        // 必须存起来。
+
+                        // 检查容量防止 OOM (针对本地可靠链路，容量给大点)
+                        // if current_buffer_size > MAX_LIMIT {
+                        //    这里是个死局。如果缓冲区满了，说明缺口一直没补上。
+                        //    选项1 (为了不触发CC): 停止读取 input (Backpressure)。
+                        //    选项2 (为了保命): 丢弃这个包。上游会超时重传 (RTO)。
+                        //
+                        //    推荐：丢弃这个包 (Drop Tail)。
+                        //    因为如果是本地链路，极少会出现缓冲几百兆还没补齐缺口的情况。
+                        //    如果真出现了，说明连接已经坏了，触发 RTO 是合理的。
+                        // }
+
+                        state.buffer.insert(seq, packet);
+                    }
                 }
-
-                if !state.initialized {
-                    // 没有 SYN 的流，无法得知 expected_seq，只能丢弃或者冒险透传。
-                    // 为了绝对不干扰 CC，这里建议直接丢弃，直到捕获到 SYN 或者重置链接。
-                    // 但如果是长连接中途截获，这里必须做特殊处理（比较复杂），
-                    // 假设我们总能捕获到 SYN，或者你愿意在这里冒险透传一次直到同步。
-                    continue;
-                }
-
-                let expected = state.expected_seq;
-
-                // =========================================================
-                //  严格序列化逻辑 (Strict Serialization)
-                // =========================================================
-
-                if seq == expected {
-                    // --- Case A: 完美的顺序包 ---
-                    // 只有这种包允许通过！
-
-                    // 1. 发送当前包
+            });
+        }
+        else {
+            self.tasks.lock().unwrap().spawn(async move {
+                while let Some(packet) = smoltcp_stack_receiver.recv().await {
                     if let Err(e) = stack_sink.send(packet.payload_bytes().into()).await {
                         tracing::error!("send failed: {:?}", e);
                         // 发送失败属于严重错误，这里可能需要断开流
                         continue;
                     }
-
-                    // 2. 推进 expected
-                    state.expected_seq = expected.wrapping_add(segment_len);
-
-                    // 3. 极速清理缓冲区 (Drain Buffer)
-                    // 既然补上了缺口，后面缓存的一连串包都可以发了
-                    while let Some(entry) = state.buffer.first_entry() {
-                        if *entry.key() == state.expected_seq {
-                            let buffered_pkt = entry.remove();
-
-                            // 解析长度 (需优化：最好在 insert 时就存好长度，避免重复解析)
-                            let b_ip = Ipv4Packet::new(buffered_pkt.payload()).unwrap();
-                            let b_tcp = TcpPacket::new(b_ip.payload()).unwrap();
-                            let b_payload_len = (b_ip.get_total_length() as u32)
-                                .saturating_sub((b_ip.get_header_length() as u32) * 4)
-                                .saturating_sub((b_tcp.get_data_offset() as u32) * 4);
-                            let b_flags_len = if (b_tcp.get_flags() & (TcpFlags::SYN | TcpFlags::FIN)) != 0 { 1 } else { 0 };
-                            let b_len = b_payload_len + b_flags_len;
-
-                            if let Err(e) = stack_sink.send(buffered_pkt.payload_bytes().into()).await {
-                                tracing::error!("send buffered failed: {:?}", e);
-                            } else {
-                                state.expected_seq = state.expected_seq.wrapping_add(b_len);
-                            }
-                        } else {
-                            // 链条断了，等待下一个缺口被补齐
-                            break;
-                        }
-                    }
-
-                } else if seq.wrapping_sub(expected) > 0x7FFFFFFF {
-                    // --- Case B: 旧包 / 重复包 (Seq < Expected) ---
-
-                    // 【绝对静默】：
-                    // 如果我们转发旧包，smoltcp 会回一个 "ACK=expected" 的包。
-                    // 上游收到这个 ACK，发现和之前收到的 ACK 一样，就会判定为 DupACK。
-                    // 积累 3 个 DupACK 就会降速。
-                    // 所以：必须丢弃，假装没看见。
-
-                    println!("Silently dropping old packet seq: {}", seq);
-                    continue;
-
-                } else {
-                    // --- Case C: 未来的包 (Seq > Expected) ---
-
-                    // 【死都不发】：
-                    // 只要不是 expected，就绝对不能发给 smoltcp。
-                    // 必须存起来。
-
-                    // 检查容量防止 OOM (针对本地可靠链路，容量给大点)
-                    // if current_buffer_size > MAX_LIMIT { 
-                    //    这里是个死局。如果缓冲区满了，说明缺口一直没补上。
-                    //    选项1 (为了不触发CC): 停止读取 input (Backpressure)。
-                    //    选项2 (为了保命): 丢弃这个包。上游会超时重传 (RTO)。
-                    //    
-                    //    推荐：丢弃这个包 (Drop Tail)。
-                    //    因为如果是本地链路，极少会出现缓冲几百兆还没补齐缺口的情况。
-                    //    如果真出现了，说明连接已经坏了，触发 RTO 是合理的。
-                    // }
-
-                    state.buffer.insert(seq, packet);
                 }
-            }
-        });
+            });
+        }
     }
 
     pub fn get_local_inet(&self) -> Option<Ipv4Inet> {
@@ -598,6 +610,12 @@ pub fn spin(duration: Duration) {
     while start.elapsed() < duration {
         std::hint::spin_loop();
     }
+}
+
+enum TaskImpl {
+    Parallel,
+    Serial,
+    SerialBuffered,
 }
 
 // --- VPN 客户端 ---
@@ -700,85 +718,94 @@ async fn run_vpn_client(
 
         let stack_sink: Box<dyn Sink<AnyIpPktFrame, Error = std::io::Error> + Send + Unpin> =
             Box::new(stack_sink);
-        tcp_proxy.run(stack_sink.into());
+        tcp_proxy.run(stack_sink.into(), false);
 
         let tcp_proxy = Arc::new(tcp_proxy);
 
-        // 任务 A: TUN -> Stack (读取操作系统发来的 IP 包 -> 写入用户态协议栈)
-        tokio::spawn(async move {
-            let stream = tun_stream;
-            const MAX_CONCURRENT_PACKETS: usize = 2048;
+        let task = TaskImpl::Serial;
 
-            stream
-                .for_each_concurrent(MAX_CONCURRENT_PACKETS, |ret| {
-                    let tcp_proxy = tcp_proxy.clone();
-                    async move {
-                        // parallel: sensible to random latency
-                        sleep(Duration::from_micros(
-                            StdRng::from_entropy().gen_range(0..=3_000),
-                        ))
+        // 任务 A: TUN -> Stack (读取操作系统发来的 IP 包 -> 写入用户态协议栈)
+
+        match task {
+            TaskImpl::Parallel => {
+                tokio::spawn(async move {
+                    let stream = tun_stream;
+                    const MAX_CONCURRENT_PACKETS: usize = 2048;
+
+                    stream
+                        .for_each_concurrent(MAX_CONCURRENT_PACKETS, |ret| {
+                            let tcp_proxy = tcp_proxy.clone();
+                            async move {
+                                // parallel: sensible to random latency
+                                sleep(Duration::from_micros(
+                                    StdRng::from_entropy().gen_range(0..=3_000),
+                                ))
+                                    .await;
+                                // sleep(Duration::from_micros(3_000)).await;
+                                match ret {
+                                    Ok(mut packet) => {
+                                        if tcp_proxy.try_process_packet_from_nic(&mut packet).await {
+                                            return;
+                                        }
+                                        unreachable!();
+                                    }
+                                    Err(e) => {
+                                        // 读取错误通常是致命的或者偶发的，记录日志即可
+                                        tracing::error!("read from nic failed: {:?}", e);
+                                    }
+                                }
+                            }
+                        })
                         .await;
-                        // sleep(Duration::from_micros(3_000)).await;
-                        match ret {
-                            Ok(mut packet) => {
+                });
+            }
+            TaskImpl::Serial => {
+                tokio::spawn(async move {
+                    let mut stream = tun_stream;
+                    let tcp_proxy = tcp_proxy.clone();
+
+                    while let Some(Ok(mut packet)) = stream.next().await {
+                        // serial: extremely sensible to latency, fixed or random
+                        // tokio::task::yield_now().await;
+                        sleep(Duration::from_micros(1)).await;
+                        // spin(Duration::from_micros(1));
+                        if tcp_proxy.try_process_packet_from_nic(&mut packet).await {
+                            continue;
+                        }
+                        unreachable!();
+                    }
+                });
+            }
+            TaskImpl::SerialBuffered => {
+                tokio::spawn(async move {
+                    const BUFFER_SIZE: usize = 2048;
+                    let mut stream = tun_stream;
+                    let tcp_proxy = tcp_proxy.clone();
+
+                    stream
+                        .map(|ret| {
+                            let tcp_proxy = tcp_proxy.clone();
+
+                            async move {
+                                let Ok(mut packet) = ret else {
+                                    return;
+                                };
+
+                                // buffered serial: sensible to random latency
+                                sleep(Duration::from_micros(StdRng::from_entropy().gen_range(0..=3_000))).await;
                                 if tcp_proxy.try_process_packet_from_nic(&mut packet).await {
                                     return;
                                 }
+
                                 unreachable!();
                             }
-                            Err(e) => {
-                                // 读取错误通常是致命的或者偶发的，记录日志即可
-                                tracing::error!("read from nic failed: {:?}", e);
-                            }
-                        }
-                    }
-                })
-                .await;
-        });
-
-        // tokio::spawn(async move {
-        //     let mut stream = tun_stream;
-        //     let tcp_proxy = tcp_proxy.clone();
-        //
-        //     while let Some(Ok(mut packet)) = stream.next().await {
-        //         // serial: extremely sensible to latency, fixed or random
-        //         // tokio::task::yield_now().await;
-        //         // sleep(Duration::from_micros(1)).await;
-        //         spin(Duration::from_micros(1));
-        //         if tcp_proxy.try_process_packet_from_nic(&mut packet).await {
-        //             continue;
-        //         }
-        //         unreachable!();
-        //     }
-        // });
-
-        // tokio::spawn(async move {
-        //     const BUFFER_SIZE: usize = 2048;
-        //     let mut stream = tun_stream;
-        //     let tcp_proxy = tcp_proxy.clone();
-        //
-        //     stream
-        //         .map(|ret| {
-        //             let tcp_proxy = tcp_proxy.clone();
-        //
-        //             async move {
-        //                 let Ok(mut packet) = ret else {
-        //                     return;
-        //                 };
-        //
-        //                 // buffered serial: sensible to random latency
-        //                 sleep(Duration::from_micros(StdRng::from_entropy().gen_range(0..=3_000))).await;
-        //                 if tcp_proxy.try_process_packet_from_nic(&mut packet).await {
-        //                     return;
-        //                 }
-        //
-        //                 unreachable!();
-        //             }
-        //         })
-        //         .buffered(BUFFER_SIZE)
-        //         .for_each(|_| async {})
-        //         .await;
-        // });
+                        })
+                        .buffered(BUFFER_SIZE)
+                        .for_each(|_| async {})
+                        .await;
+                });
+            }
+        }
 
         let (nic_channel, peer_packet_receiver) = channel(128); // unused
 
