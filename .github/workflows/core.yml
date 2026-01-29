@@ -116,14 +116,18 @@ jobs:
             OS: macos-latest
             ARTIFACT_NAME: macos-aarch64
 
-          - TARGET: x86_64-pc-windows-msvc
-            OS: windows-latest
-            ARTIFACT_NAME: windows-x86_64
-          - TARGET: aarch64-pc-windows-msvc
-            OS: windows-latest
+          # --- Windows Targets (All gnullvm, All on Linux) ---
+          # 1. ARM64
+          - TARGET: aarch64-pc-windows-gnullvm
+            OS: ubuntu-22.04
             ARTIFACT_NAME: windows-arm64
-          - TARGET: i686-pc-windows-msvc
-            OS: windows-latest
+          # 2. X64
+          - TARGET: x86_64-pc-windows-gnullvm
+            OS: ubuntu-22.04
+            ARTIFACT_NAME: windows-x86_64
+          # 3. i686 (32-bit)
+          - TARGET: i686-pc-windows-gnullvm
+            OS: ubuntu-22.04
             ARTIFACT_NAME: windows-i686
 
           - TARGET: x86_64-unknown-freebsd
@@ -173,6 +177,66 @@ jobs:
         run: |
           bash ./.github/workflows/install_rust.sh
 
+          # ==============================================================================
+          # Unified LLVM-MinGW Setup for ALL Windows Targets (gnullvm)
+          # ==============================================================================
+          if [[ $TARGET =~ ^.*windows-gnullvm$ ]]; then
+            echo "Configuring LLVM-MinGW environment for $TARGET..."
+
+            # 1. Download LLVM-MinGW Toolchain
+            LLVM_MINGW_VER="20240619"
+            curl -L "https://github.com/mstorsjo/llvm-mingw/releases/download/${LLVM_MINGW_VER}/llvm-mingw-${LLVM_MINGW_VER}-ucrt-ubuntu-20.04-x86_64.tar.xz" | tar -xJ
+            TOOLCHAIN_PATH="$(pwd)/llvm-mingw-${LLVM_MINGW_VER}-ucrt-ubuntu-20.04-x86_64"
+            export PATH="$TOOLCHAIN_PATH/bin:$PATH"
+
+            # 2. Download Npcap SDK (Required for -lPacket)
+            wget https://npcap.com/dist/npcap-sdk-1.13.zip -q
+            unzip -q npcap-sdk-1.13.zip -d npcap-sdk
+            NPCAP_ROOT="$(pwd)/npcap-sdk"
+
+            # 3. Dynamic Configuration based on Arch
+            # We need to set MINGW_ARCH, NPCAP_LIB, and a compatible BINDGEN_TARGET
+            if [[ $TARGET == "aarch64-pc-windows-gnullvm" ]]; then
+                MINGW_ARCH="aarch64"
+                NPCAP_LIB="$NPCAP_ROOT/Lib/ARM64"
+                BINDGEN_TARGET="aarch64-pc-windows-gnu"
+          
+            elif [[ $TARGET == "x86_64-pc-windows-gnullvm" ]]; then
+                MINGW_ARCH="x86_64"
+                NPCAP_LIB="$NPCAP_ROOT/Lib/x64"
+                BINDGEN_TARGET="x86_64-pc-windows-gnu" 
+          
+            elif [[ $TARGET == "i686-pc-windows-gnullvm" ]]; then
+                MINGW_ARCH="i686"
+                NPCAP_LIB="$NPCAP_ROOT/Lib"  # Npcap SDK stores 32-bit libs in root Lib/
+                BINDGEN_TARGET="i686-pc-windows-gnu"
+            fi
+
+            # 4. Export Variables
+            # Convert target string (e.g. x86_64-pc-windows-gnullvm) to env var safe format (X86_64_PC_WINDOWS_GNULLVM)
+            ENV_SUFFIX=$(echo $TARGET | tr '[:lower:]-' '[:upper:]_')
+          
+            # Linker: Force Cargo to use the clang wrapper
+            export CARGO_TARGET_${ENV_SUFFIX}_LINKER="${MINGW_ARCH}-w64-mingw32-clang"
+
+            # CC/CXX/AR for C dependencies
+            # Note: We use the *lower case* with underscores for cc-rs crate (e.g. CC_aarch64_pc_windows_gnullvm)
+            LOWER_ENV_SUFFIX=$(echo $TARGET | tr '-' '_')
+            export CC_${LOWER_ENV_SUFFIX}="${MINGW_ARCH}-w64-mingw32-clang"
+            export CXX_${LOWER_ENV_SUFFIX}="${MINGW_ARCH}-w64-mingw32-clang++"
+            export AR_${LOWER_ENV_SUFFIX}="llvm-ar"
+
+            # RUSTFLAGS: Link Npcap
+            export RUSTFLAGS="-L native=$NPCAP_LIB"
+
+            # BINDGEN: Point to sysroot and set target
+            # Still using "gnu" triple for bindgen target to avoid version errors, but pointing to llvm-mingw sysroot
+            export BINDGEN_EXTRA_CLANG_ARGS_${LOWER_ENV_SUFFIX}="--target=${BINDGEN_TARGET} --sysroot=${TOOLCHAIN_PATH}/${MINGW_ARCH}-w64-mingw32"
+
+            echo "Environment Configured: ARCH=$MINGW_ARCH, NPCAP=$NPCAP_LIB"
+          fi
+          # ==============================================================================
+
           # loongarch need llvm-18
           if [[ $TARGET =~ ^loongarch.*$ ]]; then
             sudo apt-get install -qq llvm-18 clang-18
@@ -188,10 +252,14 @@ jobs:
           if [[ $OS =~ ^ubuntu.*$ && $TARGET =~ ^mips.*$ ]]; then
             cargo +nightly-2025-09-01 build -r --target $TARGET -Z build-std=std,panic_abort --package=easytier --features=jemalloc
           else
-            if [[ $OS =~ ^windows.*$ ]]; then
+            if [[ $TARGET =~ ^.*windows.*$ ]]; then
               SUFFIX=.exe
-              CORE_FEATURES="--features=mimalloc"
-            elif [[ $TARGET =~ ^riscv64.*$ || $TARGET =~ ^loongarch64.*$ || $TARGET =~ ^aarch64.*$ ]]; then
+            else
+              SUFFIX=""
+            fi
+
+            # All Windows (gnullvm) use mimalloc
+            if [[ $TARGET =~ ^.*windows.*$ || $TARGET =~ ^riscv64.*$ || $TARGET =~ ^loongarch64.*$ || $TARGET =~ ^aarch64.*$ ]]; then
               CORE_FEATURES="--features=mimalloc"
             else
               CORE_FEATURES="--features=jemalloc"
@@ -252,17 +320,20 @@ jobs:
       - name: Compress
         run: |
           mkdir -p ./artifacts/objects/
-          # windows is the only OS using a different convention for executable file name
-          if [[ $OS =~ ^windows.*$ && $TARGET =~ ^x86_64.*$ ]]; then
+          
+          # Copy third_party libs (DLLs) for Windows
+          if [[ $TARGET =~ ^.*windows.*$ ]]; then
               SUFFIX=.exe
-              cp easytier/third_party/x86_64/* ./artifacts/objects/
-          elif [[ $OS =~ ^windows.*$ && $TARGET =~ ^i686.*$ ]]; then
-              SUFFIX=.exe
-              cp easytier/third_party/i686/* ./artifacts/objects/
-          elif [[ $OS =~ ^windows.*$ && $TARGET =~ ^aarch64.*$ ]]; then
-              SUFFIX=.exe
-              cp easytier/third_party/arm64/* ./artifacts/objects/
+              # Note: Check if you have i686 dlls in your repo
+              if [[ $TARGET =~ ^x86_64.*$ ]]; then
+                  cp easytier/third_party/x86_64/* ./artifacts/objects/ || true
+              elif [[ $TARGET =~ ^i686.*$ ]]; then
+                  cp easytier/third_party/i686/* ./artifacts/objects/ || true
+              elif [[ $TARGET =~ ^aarch64.*$ ]]; then
+                  cp easytier/third_party/arm64/* ./artifacts/objects/ || true
+              fi
           fi
+
           if [[ $GITHUB_REF_TYPE =~ ^tag$ ]]; then
             TAG=$GITHUB_REF_NAME
           else
