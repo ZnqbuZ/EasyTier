@@ -624,7 +624,7 @@ pub async fn subnet_proxy_three_node_test(
     )
     .await;
 
-    for target_ip in ["10.1.3.4", "10.1.2.4", "10.144.144.3"] {
+    for target_ip in ["10.144.144.3", "10.1.3.4", "10.1.2.4"] {
         subnet_proxy_test_icmp(target_ip).await;
         let listen_ip = if target_ip == "10.144.144.3" {
             "0.0.0.0"
@@ -971,7 +971,7 @@ fn run_wireguard_client(
     } else {
         "utun3".into()
     };
-    let wgapi = WGApi::new(ifname.clone(), false)?;
+    let mut wgapi: WGApi = WGApi::new(ifname.clone())?;
 
     // create interface
     wgapi.create_interface()?;
@@ -991,9 +991,10 @@ fn run_wireguard_client(
     let interface_config = InterfaceConfiguration {
         name: ifname.clone(),
         prvkey: client_private_key.to_string(),
-        address: client_ip,
+        addresses: vec![client_ip.parse()?],
         port: 12345,
         peers: vec![peer],
+        mtu: None,
     };
 
     #[cfg(not(windows))]
