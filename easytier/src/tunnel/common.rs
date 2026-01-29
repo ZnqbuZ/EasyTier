@@ -359,6 +359,13 @@ pub(crate) fn setup_sokcet2_ext(
         socket2_socket.set_only_v6(true)?;
     }
 
+    if let Err(e) = socket2_socket.set_recv_buffer_size(1 << 31) {
+        tracing::warn!("failed to set recv buffer size: {:?}", e);
+    }
+    if let Err(e) = socket2_socket.set_send_buffer_size(1 << 31) {
+        tracing::warn!("failed to set send buffer size: {:?}", e);
+    }
+
     socket2_socket.set_nonblocking(true)?;
     socket2_socket.set_reuse_address(true)?;
     if let Err(e) = socket2_socket.bind(&socket2::SockAddr::from(*bind_addr)) {
