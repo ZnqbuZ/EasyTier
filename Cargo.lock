@@ -824,6 +824,7 @@ dependencies = [
  "cexpr",
  "clang-sys",
  "itertools 0.13.0",
+ "itertools 0.12.1",
  "proc-macro2",
  "quote",
  "regex",
@@ -2309,12 +2310,15 @@ dependencies = [
  "sha2",
  "shellexpand",
  "smoltcp",
+ "snow",
  "socket2 0.5.10",
  "stun_codec",
  "sys-locale",
  "tabled",
  "tempfile",
  "thiserror 1.0.69",
+ "terminal_size",
+ "thiserror 1.0.63",
  "thunk-rs",
  "tikv-jemalloc-ctl",
  "tikv-jemalloc-sys",
@@ -2332,6 +2336,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "tun-easytier",
+ "unicode-width 0.1.11",
  "url",
  "uuid",
  "version-compare",
@@ -2344,6 +2349,8 @@ dependencies = [
  "windows-sys 0.52.0",
  "winreg 0.52.0",
  "zerocopy 0.7.35",
+ "x25519-dalek",
+ "zerocopy",
  "zip",
  "zstd",
 ]
@@ -8167,6 +8174,23 @@ dependencies = [
  "defmt 0.3.100",
  "heapless",
  "managed",
+]
+
+[[package]]
+name = "snow"
+version = "0.10.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "599b506ccc4aff8cf7844bc42cf783009a434c1e26c964432560fb6d6ad02d82"
+dependencies = [
+ "aes-gcm",
+ "blake2",
+ "chacha20poly1305",
+ "curve25519-dalek",
+ "getrandom 0.3.2",
+ "ring",
+ "rustc_version",
+ "sha2",
+ "subtle",
 ]
 
 [[package]]

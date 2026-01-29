@@ -3,6 +3,10 @@ use crate::common::global_ctx::{ArcGlobalCtx, GlobalCtx};
 use crate::common::PeerId;
 use crate::gateway::kcp_proxy::{ProxyAclHandler, TcpProxyForKcpSrcTrait};
 use crate::gateway::tcp_proxy::{NatDstConnector, TcpProxy};
+use crate::common::join_joinset_background;
+use crate::defer;
+use crate::gateway::tcp_proxy::{NatDstConnector, NatDstTcpConnector, TcpProxy};
+use crate::gateway::wrapped_proxy::{ProxyAclHandler, TcpProxyForWrappedSrcTrait};
 use crate::gateway::CidrSet;
 use crate::peers::peer_manager::PeerManager;
 use crate::peers::PeerPacketFilter;
@@ -811,8 +815,8 @@ struct TcpProxyForQuicSrc(Arc<TcpProxy<NatDstQuicConnector>>);
 
 //TODO: rename & move this trait
 #[async_trait::async_trait]
-impl TcpProxyForKcpSrcTrait for TcpProxyForQuicSrc {
-    type Connector = NatDstQuicConnector;
+impl TcpProxyForWrappedSrcTrait for TcpProxyForQUICSrc {
+    type Connector = NatDstQUICConnector;
 
     #[inline]
     fn get_tcp_proxy(&self) -> &Arc<TcpProxy<Self::Connector>> {
@@ -820,7 +824,7 @@ impl TcpProxyForKcpSrcTrait for TcpProxyForQuicSrc {
     }
 
     #[inline]
-    async fn check_dst_allow_kcp_input(&self, dst_ip: &Ipv4Addr) -> bool {
+    async fn check_dst_allow_wrapped_input(&self, dst_ip: &Ipv4Addr) -> bool {
         let Some(peer_manager) = self.0.get_peer_manager() else {
             return false;
         };

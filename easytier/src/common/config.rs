@@ -14,7 +14,7 @@ use crate::{
     instance::dns_server::DEFAULT_ET_DNS_ZONE,
     proto::{
         acl::Acl,
-        common::{CompressionAlgoPb, PortForwardConfigPb, SocketType},
+        common::{CompressionAlgoPb, PortForwardConfigPb, SecureModeConfig, SocketType},
     },
     tunnel::generate_digest_from_str,
 };
@@ -210,6 +210,9 @@ pub trait ConfigLoader: Send + Sync {
     fn get_stun_servers_v6(&self) -> Option<Vec<String>>;
     fn set_stun_servers_v6(&self, servers: Option<Vec<String>>);
 
+    fn get_secure_mode(&self) -> Option<SecureModeConfig>;
+    fn set_secure_mode(&self, secure_mode: Option<SecureModeConfig>);
+
     fn dump(&self) -> String;
 }
 
@@ -301,6 +304,7 @@ impl Default for NetworkIdentity {
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 pub struct PeerConfig {
     pub uri: url::Url,
+    pub peer_public_key: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
@@ -407,6 +411,8 @@ struct Config {
     socks5_proxy: Option<url::Url>,
 
     port_forward: Option<Vec<PortForwardConfig>>,
+
+    secure_mode: Option<SecureModeConfig>,
 
     flags: Option<serde_json::Map<String, serde_json::Value>>,
 
@@ -801,6 +807,14 @@ impl ConfigLoader for TomlConfigLoader {
 
     fn set_stun_servers_v6(&self, servers: Option<Vec<String>>) {
         self.config.lock().unwrap().stun_servers_v6 = servers;
+    }
+
+    fn get_secure_mode(&self) -> Option<SecureModeConfig> {
+        self.config.lock().unwrap().secure_mode.clone()
+    }
+
+    fn set_secure_mode(&self, secure_mode: Option<SecureModeConfig>) {
+        self.config.lock().unwrap().secure_mode = secure_mode;
     }
 
     fn dump(&self) -> String {
