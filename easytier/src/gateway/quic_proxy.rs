@@ -19,14 +19,13 @@ use crate::tunnel::packet_def::{
 };
 use crate::tunnel::quic::{client_config, endpoint_config, server_config};
 use anyhow::{anyhow, Context, Error};
-use atomic_refcell::AtomicRefCell;
 use bytes::{BufMut, Bytes, BytesMut};
 use dashmap::DashMap;
 use derivative::Derivative;
 use derive_more::{Constructor, Deref, DerefMut, From, Into};
 use prost::Message;
 use quinn::udp::{EcnCodepoint, RecvMeta, Transmit};
-use quinn::{AsyncUdpSocket, Endpoint, RecvStream, SendStream, StreamId, TokioRuntime, UdpPoller};
+use quinn::{AsyncUdpSocket, Endpoint, RecvStream, SendStream, StreamId, TokioRuntime, UdpSender};
 use std::cmp::min;
 use std::future::Future;
 use std::io::IoSliceMut;
@@ -34,7 +33,7 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::pin::Pin;
 use std::ptr::copy_nonoverlapping;
 use std::sync::{Arc, Weak};
-use std::task::Poll;
+use std::task::{ready, Poll};
 use std::time::Duration;
 use tokio::io::{join, AsyncReadExt, Join};
 use tokio::sync::mpsc::error::TrySendError;
@@ -69,51 +68,25 @@ impl PacketMargins {
 
 //region socket
 #[derive(Debug)]
-struct QuicSocketPoller {
-    tx: PollSender<QuicPacket>,
-}
-
-impl UdpPoller for QuicSocketPoller {
-    fn poll_writable(
-        self: Pin<&mut Self>,
-        cx: &mut std::task::Context,
-    ) -> Poll<std::io::Result<()>> {
-        let tx = &mut self.get_mut().tx;
-
-        let poll = tx.poll_reserve(cx);
-        if let Poll::Ready(Ok(_)) = poll {
-            tx.abort_send();
-        }
-
-        poll.map_err(|e| std::io::Error::new(std::io::ErrorKind::BrokenPipe, e))
-    }
-}
-
-#[derive(Debug)]
-pub struct QuicSocket {
+struct QuicSocketSender {
     addr: SocketAddr,
-    rx: AtomicRefCell<Receiver<QuicPacket>>,
-    tx: Sender<QuicPacket>,
+    tx: PollSender<QuicPacket>,
     margins: PacketMargins,
 }
 
-impl AsyncUdpSocket for QuicSocket {
-    fn create_io_poller(self: Arc<Self>) -> Pin<Box<dyn UdpPoller>> {
-        Box::into_pin(Box::new(QuicSocketPoller {
-            tx: PollSender::new(self.tx.clone()),
-        }))
-    }
-
-    fn try_send(&self, transmit: &Transmit) -> std::io::Result<()> {
-        match transmit.destination {
+impl UdpSender for QuicSocketSender {
+    fn poll_send(
+        mut self: Pin<&mut Self>,
+        transmit: &Transmit,
+        cx: &mut std::task::Context,
+    ) -> Poll<std::io::Result<()>> {
+        let r = match transmit.destination {
             SocketAddr::V4(addr) => {
                 let len = transmit.contents.len();
                 trace!("{:?} sending {:?} bytes to {:?}", self.addr, len, addr);
 
-                let permit = self.tx.try_reserve().map_err(|e| match e {
-                    TrySendError::Full(_) => std::io::ErrorKind::WouldBlock,
-                    TrySendError::Closed(_) => std::io::ErrorKind::BrokenPipe,
-                })?;
+                ready!(self.tx.poll_reserve(cx))
+                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::BrokenPipe, e))?;
 
                 let segment_size = transmit.segment_size.unwrap_or(len);
                 let chunks = transmit.contents.chunks(segment_size);
@@ -134,21 +107,43 @@ impl AsyncUdpSocket for QuicSocket {
                     }
                 }
 
-                permit.send(QuicPacket {
-                    addr: transmit.destination,
-                    payload,
-                    segment: Some(segment),
-                    ecn: transmit.ecn,
-                });
-
-                Ok(())
+                self.tx
+                    .send_item(QuicPacket {
+                        addr: transmit.destination,
+                        payload,
+                        segment: Some(segment),
+                        ecn: transmit.ecn,
+                    })
+                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::BrokenPipe, e))
             }
             _ => Err(std::io::ErrorKind::ConnectionRefused.into()),
-        }
+        };
+
+        Poll::Ready(r)
+    }
+}
+
+#[derive(Debug)]
+pub struct QuicSocket {
+    addr: SocketAddr,
+    rx: Receiver<QuicPacket>,
+    tx: Sender<QuicPacket>,
+    margins: PacketMargins,
+}
+
+impl QuicSocket {
+    fn boxed(self) -> Box<dyn AsyncUdpSocket> {
+        Box::new(self)
+    }
+}
+
+impl AsyncUdpSocket for QuicSocket {
+    fn create_sender(&self) -> Pin<Box<dyn UdpSender>> {
+        todo!()
     }
 
     fn poll_recv(
-        &self,
+        &mut self,
         cx: &mut std::task::Context,
         bufs: &mut [IoSliceMut<'_>],
         meta: &mut [RecvMeta],
@@ -157,7 +152,7 @@ impl AsyncUdpSocket for QuicSocket {
             return Poll::Ready(Ok(0));
         }
 
-        let mut rx = self.rx.borrow_mut();
+        let mut rx = &mut self.rx;
         let mut count = 0;
 
         for (buf, meta) in bufs.iter_mut().zip(meta.iter_mut()) {
@@ -179,13 +174,11 @@ impl AsyncUdpSocket for QuicSocket {
                         packet.addr
                     );
                     buf[0..len].copy_from_slice(&packet.payload);
-                    *meta = RecvMeta {
-                        addr: packet.addr,
-                        len,
-                        stride: len,
-                        ecn: packet.ecn,
-                        dst_ip: None,
-                    };
+                    *meta = RecvMeta::default();
+                    meta.addr = packet.addr;
+                    meta.len = len;
+                    meta.stride = len;
+                    meta.ecn = packet.ecn;
                     count += 1;
                 }
                 Poll::Ready(None) if count > 0 => break,
@@ -799,7 +792,7 @@ impl QuicProxy {
 
         let socket = QuicSocket {
             addr: SocketAddr::new(Ipv4Addr::from(self.peer_mgr.my_peer_id()).into(), 0),
-            rx: AtomicRefCell::new(in_rx),
+            rx: in_rx,
             tx: out_tx,
             margins,
         };
@@ -807,7 +800,7 @@ impl QuicProxy {
         let mut endpoint = Endpoint::new_with_abstract_socket(
             endpoint_config(),
             Some(server_config()),
-            Arc::new(socket),
+            socket.boxed(),
             Arc::new(TokioRuntime),
         )
         .unwrap();
@@ -992,14 +985,14 @@ mod tests {
 
         let socket_a = QuicSocket {
             addr: addr_a,
-            rx: AtomicRefCell::new(rx_a_in),
+            rx: rx_a_in,
             tx: tx_a_out,
             margins,
         };
 
         let socket_b = QuicSocket {
             addr: addr_b,
-            rx: AtomicRefCell::new(rx_b_in),
+            rx: rx_b_in,
             tx: tx_b_out,
             margins,
         };
