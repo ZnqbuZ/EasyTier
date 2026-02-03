@@ -66,11 +66,6 @@ zerocopy = { version = "0.7.32", features = ["derive", "simd"] }
 bytes = "1.5.0"
 pin-project-lite = "0.2.13"
 
-atomic_refcell = "0.1.13"
-
-quinn = { version = "0.11.8", optional = true, features = ["ring"] }
-quinn-plaintext = { version = "0.3.0", optional = true }
-
 rustls = { version = "0.23.0", features = [
     "ring",
 ], default-features = false, optional = true }
@@ -242,6 +237,13 @@ shellexpand = "3.1.1"
 # for fake tcp
 flume = { version = "0.12", optional = true }
 cfg-if = "1.0"
+
+quinn = { version = "*", optional = true, features = ["ring"] }
+quinn-plaintext = { version = "0.3.0", optional = true }
+
+[patch.crates-io]
+quinn = { git = "https://github.com/quinn-rs/quinn.git", rev = "ac22065c2943e5578d191179d908ffcb0afa1b6e" }
+quinn-proto = { git = "https://github.com/quinn-rs/quinn.git", rev = "ac22065c2943e5578d191179d908ffcb0afa1b6e" }
 
 [target.'cfg(any(target_os = "linux", target_os = "macos", target_os = "windows", target_os = "freebsd"))'.dependencies]
 machine-uid = "0.5.3"
