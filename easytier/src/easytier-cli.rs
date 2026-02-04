@@ -2010,7 +2010,12 @@ async fn main() -> Result<(), Error> {
             for client_type in &["tcp", "kcp_src", "kcp_dst", "quic_src", "quic_dst"] {
                 let client = handler.get_tcp_proxy_client(client_type).await?;
                 let ret = client
-                    .list_tcp_proxy_entry(BaseController::default(), Default::default())
+                    .list_tcp_proxy_entry(
+                        BaseController::default(),
+                        ListTcpProxyEntryRequest {
+                            instance: Some(handler.instance_selector.clone()),
+                        },
+                    )
                     .await;
                 entries.extend(ret.unwrap_or_default().entries);
             }
