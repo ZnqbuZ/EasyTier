@@ -40,6 +40,8 @@ use super::{
     PeerPacketFilter,
 };
 use crate::common::config::ConfigLoader;
+use crate::dns::config::DnsGlobalCtxExt;
+use crate::proto::dns::DeterministicDigest;
 use crate::{
     common::{
         config::NetworkIdentity, constants::EASYTIER_VERSION, global_ctx::ArcGlobalCtx,
@@ -64,7 +66,6 @@ use crate::{
     },
     use_global_var,
 };
-use crate::proto::dns::DeterministicDigest;
 
 static SERVICE_ID: u32 = 7;
 static UPDATE_PEER_INFO_PERIOD: Duration = Duration::from_secs(3600);
@@ -198,7 +199,7 @@ impl RoutePeerInfo {
             ipv6_addr: global_ctx.get_ipv6().map(|x| x.into()),
 
             groups: global_ctx.get_acl_groups(my_peer_id),
-            dns: global_ctx.config.get_dns().export().digest(),
+            dns: global_ctx.dns_export_config().digest(),
 
             ..Default::default()
         }
