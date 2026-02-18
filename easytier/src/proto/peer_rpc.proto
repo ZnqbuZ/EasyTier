@@ -31,7 +31,7 @@ message RoutePeerInfo {
 
   common.NatType tcp_nat_type = 17;
 
-  dns.DnsConfigPb dns = 18;
+  bytes dns = 18;
 }
 
 message PeerIdVersion {
