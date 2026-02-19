@@ -1,6 +1,8 @@
 use std::{fs::OpenOptions, str::FromStr};
 
 use anyhow::Context;
+use serde::Serialize;
+use sha2::{Digest, Sha256};
 use tracing::level_filters::LevelFilter;
 use tracing_subscriber::{
     layer::SubscriberExt, util::SubscriberInitExt, EnvFilter, Layer, Registry,
@@ -257,6 +259,17 @@ pub fn weak_upgrade<T>(weak: &std::sync::Weak<T>) -> anyhow::Result<std::sync::A
     weak.upgrade()
         .ok_or_else(|| anyhow::anyhow!("{} not available", std::any::type_name::<T>()))
 }
+
+pub trait DeterministicDigest: Serialize {
+    fn digest(&self) -> Vec<u8> {
+        let json = serde_json::to_vec(self).expect("failed to serialize the object to json");
+        let mut hasher = Sha256::new();
+        hasher.update(json);
+        hasher.finalize().to_vec()
+    }
+}
+
+impl<S: Serialize> DeterministicDigest for S {}
 
 #[cfg(test)]
 mod tests {
