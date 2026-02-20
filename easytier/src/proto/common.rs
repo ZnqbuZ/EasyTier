@@ -256,15 +256,21 @@ impl FromStr for IpInet {
 
 impl From<url::Url> for Url {
     fn from(value: url::Url) -> Self {
-        Url {
-            url: value.to_string(),
-        }
+        Url { url: value.into() }
+    }
+}
+
+impl TryFrom<&Url> for url::Url {
+    type Error = url::ParseError;
+
+    fn try_from(value: &Url) -> Result<Self, Self::Error> {
+        Ok(value.url.parse()?)
     }
 }
 
 impl From<Url> for url::Url {
     fn from(value: Url) -> Self {
-        url::Url::parse(&value.url).unwrap()
+        value.try_into().unwrap()
     }
 }
 
