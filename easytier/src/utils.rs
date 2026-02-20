@@ -271,6 +271,19 @@ pub trait DeterministicDigest: Serialize {
 
 impl<S: Serialize> DeterministicDigest for S {}
 
+pub trait MapTryInto<S> {
+    fn map_try_into<T: TryFrom<S>>(self) -> impl Iterator<Item = Result<T, T::Error>>;
+}
+
+impl<I, S> MapTryInto<S> for I
+where
+    I: IntoIterator<Item = S>,
+{
+    fn map_try_into<T: TryFrom<S>>(self) -> impl Iterator<Item = Result<T, T::Error>> {
+        self.into_iter().map(T::try_from)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use crate::common::config::{self};
