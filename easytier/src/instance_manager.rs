@@ -298,6 +298,8 @@ fn handle_event(
                         );
                     }
 
+                    GlobalCtxEvent::PeerInfoUpdated(_) => {}
+
                     GlobalCtxEvent::ListenerAddFailed(p, msg) => {
                         print_event(
                             instance_id,

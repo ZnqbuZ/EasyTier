@@ -40,6 +40,7 @@ use super::{
     PeerPacketFilter,
 };
 use crate::common::config::ConfigLoader;
+use crate::common::global_ctx::GlobalCtxEvent;
 use crate::dns::config::DnsGlobalCtxExt;
 use crate::utils::DeterministicDigest;
 use crate::{
@@ -458,8 +459,8 @@ impl SyncedRouteInfo {
         dst_peer_id: PeerId,
         peer_infos: &[RoutePeerInfo],
         raw_peer_infos: &[DynamicMessage],
-    ) -> Result<(), Error> {
-        let mut need_inc_version = false;
+    ) -> Result<Vec<PeerId>, Error> {
+        let mut updated_peer_ids = Vec::new();
         for (idx, route_info) in peer_infos.iter().enumerate() {
             let mut route_info = route_info.clone();
             let raw_route_info = &raw_peer_infos[idx];
@@ -495,14 +496,15 @@ impl SyncedRouteInfo {
             {
                 self.raw_peer_infos
                     .insert(route_info.peer_id, raw_route_info.clone());
-                guard.insert(route_info.peer_id, route_info);
-                need_inc_version = true;
+                let peer_id = route_info.peer_id;
+                guard.insert(peer_id, route_info);
+                updated_peer_ids.push(peer_id);
             }
         }
-        if need_inc_version {
+        if !updated_peer_ids.is_empty() {
             self.version.inc();
         }
-        Ok(())
+        Ok(updated_peer_ids)
     }
 
     fn update_conn_info_one_peer(
@@ -2638,7 +2640,7 @@ impl RouteSessionManager {
         let mut need_update_route_table = false;
 
         if let Some(peer_infos) = &peer_infos {
-            service_impl.synced_route_info.update_peer_infos(
+            let updated_peer_ids = service_impl.synced_route_info.update_peer_infos(
                 my_peer_id,
                 service_impl.my_peer_route_id,
                 from_peer_id,
@@ -2653,6 +2655,12 @@ impl RouteSessionManager {
                 );
             session.update_dst_saved_peer_info_version(peer_infos, from_peer_id);
             need_update_route_table = true;
+
+            if !updated_peer_ids.is_empty() {
+                service_impl
+                    .global_ctx
+                    .issue_event(GlobalCtxEvent::PeerInfoUpdated(updated_peer_ids));
+            }
         }
 
         if let Some(conn_info) = &conn_info {
