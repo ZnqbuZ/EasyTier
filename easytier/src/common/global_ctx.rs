@@ -16,8 +16,9 @@ use crate::proto::common::{PeerFeatureFlag, PortForwardConfigPb};
 use crate::proto::peer_rpc::PeerGroupInfo;
 use crossbeam::atomic::AtomicCell;
 use hmac::{Hmac, Mac};
+use parking_lot::RwLock;
 use sha2::Sha256;
-
+use crate::dns::server::DnsServer;
 use super::{
     config::{ConfigLoader, Flags},
     netns::NetNS,
@@ -82,6 +83,8 @@ pub struct GlobalCtx {
     ip_collector: Mutex<Option<Arc<IPCollector>>>,
 
     hostname: Mutex<String>,
+
+    dns: RwLock<Option<Arc<DnsServer>>>,
 
     stun_info_collection: Mutex<Arc<dyn StunInfoCollectorTrait>>,
 
@@ -170,6 +173,8 @@ impl GlobalCtx {
                 net_ns,
                 stun_info_collector.clone(),
             )))),
+            
+            dns: RwLock::new(None),
 
             hostname: Mutex::new(hostname),
 
@@ -286,6 +291,14 @@ impl GlobalCtx {
 
     pub fn get_ip_collector(&self) -> Arc<IPCollector> {
         self.ip_collector.lock().unwrap().as_ref().unwrap().clone()
+    }
+    
+    pub fn get_dns(&self) -> Option<Arc<DnsServer>> {
+        self.dns.read().clone()
+    }
+    
+    pub fn set_dns(&self, dns: Option<Arc<DnsServer>>) {
+        *self.dns.write() = dns;
     }
 
     pub fn get_hostname(&self) -> String {
