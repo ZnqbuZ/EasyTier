@@ -3,7 +3,7 @@ FROM base AS builder
 
 ARG TARGETPLATFORM
 
-COPY . /tmp/artifacts
+COPY .github/workflows /tmp/artifacts
 WORKDIR /tmp/output
 RUN ARTIFACT_ARCH=""; \
     if [ "$TARGETPLATFORM" = "linux/amd64" ]; then \
