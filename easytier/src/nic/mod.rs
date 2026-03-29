@@ -13,8 +13,6 @@ use crate::{
     common::{
         error::Error,
         global_ctx::{ArcGlobalCtx, GlobalCtxEvent},
-        ifcfg,
-        ifcfg::IfConfiger,
         log,
     },
     instance::proxy_cidrs_monitor::ProxyCidrsMonitor,
@@ -44,7 +42,10 @@ use zerocopy::{NativeEndian, NetworkEndian};
 mod platform;
 mod route;
 mod tun;
+mod configurator;
+
 use tun::{TunAsyncWrite, TunStream, TunZCPacketToBytes};
+use crate::nic::configurator::IfConfiger;
 
 pub struct VirtualNic {
     global_ctx: ArcGlobalCtx,
