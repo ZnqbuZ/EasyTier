@@ -1,8 +1,11 @@
+use crate::common::error::Error;
+use crate::common::ifcfg;
+use crate::common::ifcfg::IfConfiger;
+use crate::instance::instance::ArcNicCtx;
+use crate::instance::virtual_nic::NicCtx;
 use cidr::IpCidr;
 use std::collections::{BTreeMap, HashSet};
 use tokio::sync::mpsc::{channel, Receiver, Sender};
-use crate::common::ifcfg;
-use crate::common::ifcfg::IfConfiger;
 
 #[derive(Clone, Debug, Ord, PartialOrd, Eq, PartialEq)]
 pub enum RouteSource {
@@ -44,18 +47,20 @@ pub struct RouteReconcilePlan {
 
 #[derive(Debug)]
 pub struct RouteManager {
-    sources: BTreeMap<RouteSource, RouteSourceState>,
     nic_ctx: ArcNicCtx,
+    ifcfg: IfConfiger,
+    sources: BTreeMap<RouteSource, RouteSourceState>,
     tx: Sender<RouteCommand>,
     rx: Receiver<RouteCommand>,
 }
 
 impl RouteManager {
-    pub fn new() -> Self {
+    pub fn new(nic_ctx: ArcNicCtx) -> Self {
         let (tx, rx) = channel(ROUTE_CHANNEL_CAPACITY);
         Self {
-            sources: BTreeMap::new(),
+            nic_ctx,
             ifcfg: ifcfg::get(),
+            sources: BTreeMap::new(),
             tx,
             rx,
         }
@@ -66,11 +71,24 @@ impl RouteManager {
     }
 
     async fn add_route(&self, route: &RouteSpec) -> Result<(), Error> {
+        let Some(nic_ctx) = self
+            .nic_ctx
+            .lock()
+            .await
+            .and_then(|nic_ctx| nic_ctx.nic_ctx.as_ref())
+            .and_then(|nic_ctx| nic_ctx.downcast_ref::<NicCtx>())
+        else {
+            return Err(Error::NotFound);
+        };
+        let Some(ifname) = nic_ctx.ifname().await else {
+            return Err(Error::NotFound);
+        };
+
         match route.destination {
             IpCidr::V4(cidr) => {
                 self.ifcfg
                     .add_ipv4_route(
-                        &route.ifname,
+                        ifname.as_str(),
                         cidr.first_address(),
                         cidr.network_length(),
                         route.metric,
@@ -80,7 +98,7 @@ impl RouteManager {
             IpCidr::V6(cidr) => {
                 self.ifcfg
                     .add_ipv6_route(
-                        &route.ifname,
+                        ifname.as_str(),
                         cidr.first_address(),
                         cidr.network_length(),
                         route.metric,

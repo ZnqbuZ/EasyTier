@@ -574,7 +574,11 @@ impl VirtualNic {
         Ok(tun::create(&config)?)
     }
 
-    #[cfg(mobile)]
+    #[cfg(any(
+        target_os = "android",
+        any(target_os = "ios", all(target_os = "macos", feature = "macos-ne")),
+        target_env = "ohos"
+    ))]
     pub async fn create_dev_for_mobile(
         &mut self,
         tun_fd: std::os::fd::RawFd,
@@ -768,31 +772,16 @@ impl VirtualNic {
     }
 }
 
-pub struct NicCtx {
+pub struct Nic {
     global_ctx: ArcGlobalCtx,
-    peer_mgr: Weak<PeerManager>,
-    peer_packet_receiver: Arc<Mutex<PacketRecvChanReceiver>>,
-
-    close_notifier: Arc<Notify>,
-
     pub nic: Arc<Mutex<VirtualNic>>,
     tasks: JoinSet<()>,
 }
 
-impl NicCtx {
-    pub fn new(
-        global_ctx: ArcGlobalCtx,
-        peer_manager: &Arc<PeerManager>,
-        peer_packet_receiver: Arc<Mutex<PacketRecvChanReceiver>>,
-        close_notifier: Arc<Notify>,
-    ) -> Self {
-        NicCtx {
+impl Nic {
+    pub fn new(global_ctx: ArcGlobalCtx) -> Self {
+        Nic {
             global_ctx: global_ctx.clone(),
-            peer_mgr: Arc::downgrade(peer_manager),
-            peer_packet_receiver,
-
-            close_notifier,
-
             nic: Arc::new(Mutex::new(VirtualNic::new(global_ctx))),
             tasks: JoinSet::new(),
         }
@@ -835,150 +824,6 @@ impl NicCtx {
                 .await?;
         }
         Ok(())
-    }
-
-    async fn do_forward_nic_to_peers_ipv4(ret: ZCPacket, mgr: &PeerManager) {
-        if let Some(ipv4) = Ipv4Packet::new(ret.payload()) {
-            if ipv4.get_version() != 4 {
-                tracing::info!("[USER_PACKET] not ipv4 packet: {:?}", ipv4);
-                return;
-            }
-            let dst_ipv4 = ipv4.get_destination();
-            let src_ipv4 = ipv4.get_source();
-            let my_ipv4 = mgr.get_global_ctx().get_ipv4().map(|x| x.address());
-            tracing::trace!(
-                ?ret,
-                ?src_ipv4,
-                ?dst_ipv4,
-                "[USER_PACKET] recv new packet from tun device and forward to peers."
-            );
-
-            // Subnet A is proxied as 10.0.0.0/24, and Subnet B is also proxied as 10.0.0.0/24.
-            //
-            // Subnet A has received a route advertised by Subnet B. As a result, A can reach
-            // the physical subnet 10.0.0.0/24 directly and has also added a virtual route for
-            // the same subnet 10.0.0.0/24. However, the physical route has a higher priority
-            // (lower metric) than the virtual one.
-            //
-            // When A sends a UDP packet to a non-existent IP within this subnet, the packet
-            // cannot be delivered on the physical network and is instead routed to the virtual
-            // network interface.
-            //
-            // The virtual interface receives the packet and forwards it to itself, which triggers
-            // the subnet proxy logic. The subnet proxy then attempts to send another packet to
-            // the same destination address, causing the same process to repeat and creating an
-            // infinite loop. Therefore, we must avoid re-sending packets back to ourselves
-            // when the subnet proxy itself is the originator of the packet.
-            //
-            // However, there is a special scenario to consider: when A acts as a gateway,
-            // packets from devices behind A may be forwarded by the OS to the ET (e.g., an
-            // eBPF or tunneling component), which happens to proxy the subnet. In this case,
-            // the packet’s source IP is not A’s own IP, and we must allow such packets to be
-            // sent to the virtual interface (i.e., "sent to ourselves") to maintain correct
-            // forwarding behavior. Thus, loop prevention should only apply when the source IP
-            // belongs to the local host.
-            let send_ret = mgr
-                .send_msg_by_ip(ret, IpAddr::V4(dst_ipv4), Some(src_ipv4) == my_ipv4)
-                .await;
-            if send_ret.is_err() {
-                tracing::trace!(?send_ret, "[USER_PACKET] send_msg failed")
-            }
-        } else {
-            tracing::warn!(?ret, "[USER_PACKET] not ipv4 packet");
-        }
-    }
-
-    async fn do_forward_nic_to_peers_ipv6(ret: ZCPacket, mgr: &PeerManager) {
-        if let Some(ipv6) = Ipv6Packet::new(ret.payload()) {
-            if ipv6.get_version() != 6 {
-                tracing::info!("[USER_PACKET] not ipv6 packet: {:?}", ipv6);
-                return;
-            }
-            let src_ipv6 = ipv6.get_source();
-            let dst_ipv6 = ipv6.get_destination();
-            let my_ipv6 = mgr.get_global_ctx().get_ipv6().map(|x| x.address());
-            tracing::trace!(
-                ?ret,
-                ?src_ipv6,
-                ?dst_ipv6,
-                "[USER_PACKET] recv new packet from tun device and forward to peers."
-            );
-
-            if src_ipv6.is_unicast_link_local() && Some(src_ipv6) != my_ipv6 {
-                // do not route link local packet to other nodes unless the address is assigned by user
-                return;
-            }
-
-            // TODO: use zero-copy
-            let send_ret = mgr
-                .send_msg_by_ip(ret, IpAddr::V6(dst_ipv6), Some(src_ipv6) == my_ipv6)
-                .await;
-            if send_ret.is_err() {
-                tracing::trace!(?send_ret, "[USER_PACKET] send_msg failed")
-            }
-        } else {
-            tracing::warn!(?ret, "[USER_PACKET] not ipv6 packet");
-        }
-    }
-
-    async fn do_forward_nic_to_peers(ret: ZCPacket, mgr: &PeerManager) {
-        let payload = ret.payload();
-        if payload.is_empty() {
-            return;
-        }
-
-        match payload[0] >> 4 {
-            4 => Self::do_forward_nic_to_peers_ipv4(ret, mgr).await,
-            6 => Self::do_forward_nic_to_peers_ipv6(ret, mgr).await,
-            _ => {
-                tracing::warn!(?ret, "[USER_PACKET] unknown IP version");
-            }
-        }
-    }
-
-    fn do_forward_nic_to_peers_task(
-        &mut self,
-        mut stream: Pin<Box<dyn ZCPacketStream>>,
-    ) -> Result<(), Error> {
-        // read from nic and write to corresponding tunnel
-        let Some(mgr) = self.peer_mgr.upgrade() else {
-            return Err(anyhow::anyhow!("peer manager not available").into());
-        };
-        let close_notifier = self.close_notifier.clone();
-        self.tasks.spawn(async move {
-            while let Some(ret) = stream.next().await {
-                if ret.is_err() {
-                    tracing::error!("read from nic failed: {:?}", ret);
-                    break;
-                }
-                Self::do_forward_nic_to_peers(ret.unwrap(), mgr.as_ref()).await;
-            }
-            close_notifier.notify_one();
-            tracing::error!("nic closed when recving from it");
-        });
-
-        Ok(())
-    }
-
-    fn do_forward_peers_to_nic(&mut self, mut sink: Pin<Box<dyn ZCPacketSink>>) {
-        let channel = self.peer_packet_receiver.clone();
-        let close_notifier = self.close_notifier.clone();
-        self.tasks.spawn(async move {
-            // unlock until coroutine finished
-            let mut channel = channel.lock().await;
-            while let Ok(packet) = recv_packet_from_chan(&mut channel).await {
-                tracing::trace!(
-                    "[USER_PACKET] forward packet from peers to nic. packet: {:?}",
-                    packet
-                );
-                let ret = sink.send(packet).await;
-                if ret.is_err() {
-                    tracing::error!(?ret, "do_forward_tunnel_to_nic sink error");
-                }
-            }
-            close_notifier.notify_one();
-            tracing::error!("nic closed when sending to it");
-        });
     }
 
     async fn apply_route_changes(
@@ -1109,8 +954,11 @@ impl NicCtx {
 
     pub async fn run(
         &mut self,
-        ipv4_addr: Option<cidr::Ipv4Inet>,
-        ipv6_addr: Option<cidr::Ipv6Inet>,
+        peer_mgr: &Arc<PeerManager>,
+        peer_packet_receiver: Arc<Mutex<PacketRecvChanReceiver>>,
+        close_notifier: Arc<Notify>,
+        ipv4_addr: Option<Ipv4Inet>,
+        ipv6_addr: Option<Ipv6Inet>,
     ) -> Result<(), Error> {
         let tunnel = {
             let mut nic = self.nic.lock().await;
@@ -1148,8 +996,23 @@ impl NicCtx {
 
         let (stream, sink) = tunnel.split();
 
-        self.do_forward_nic_to_peers_task(stream)?;
-        self.do_forward_peers_to_nic(sink);
+        self.tasks.spawn(
+            NicPeersForwarder {
+                peer_mgr: peer_mgr.clone(),
+                close_notifier: close_notifier.clone(),
+                stream,
+            }
+            .run(),
+        );
+
+        self.tasks.spawn(
+            PeersNicForwarder {
+                packet_recv_chan_receiver: peer_packet_receiver,
+                close_notifier: close_notifier.clone(),
+                sink,
+            }
+            .run(),
+        );
 
         // Assign IPv4 address if provided
         if let Some(ipv4_addr) = ipv4_addr {
@@ -1166,7 +1029,11 @@ impl NicCtx {
         Ok(())
     }
 
-    #[cfg(mobile)]
+    #[cfg(any(
+        target_os = "android",
+        any(target_os = "ios", all(target_os = "macos", feature = "macos-ne")),
+        target_env = "ohos"
+    ))]
     pub async fn run_for_mobile(&mut self, tun_fd: std::os::fd::RawFd) -> Result<(), Error> {
         let tunnel = {
             let mut nic = self.nic.lock().await;
@@ -1193,39 +1060,147 @@ impl NicCtx {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use crate::common::{error::Error, global_ctx::tests::get_mock_global_ctx};
+pub struct NicPeersForwarder {
+    peer_mgr: Arc<PeerManager>,
+    close_notifier: Arc<Notify>,
 
-    use super::VirtualNic;
+    stream: Pin<Box<dyn ZCPacketStream>>,
+}
 
-    async fn run_test_helper() -> Result<VirtualNic, Error> {
-        let mut dev = VirtualNic::new(get_mock_global_ctx());
-        let _tunnel = dev.create_dev().await?;
+impl NicPeersForwarder {
+    async fn forward_ipv4(peer_mgr: &PeerManager, ret: ZCPacket) {
+        if let Some(ipv4) = Ipv4Packet::new(ret.payload()) {
+            if ipv4.get_version() != 4 {
+                tracing::info!("[USER_PACKET] not ipv4 packet: {:?}", ipv4);
+                return;
+            }
+            let dst_ipv4 = ipv4.get_destination();
+            let src_ipv4 = ipv4.get_source();
+            let my_ipv4 = peer_mgr.get_global_ctx().get_ipv4().map(|x| x.address());
+            tracing::trace!(
+                ?ret,
+                ?src_ipv4,
+                ?dst_ipv4,
+                "[USER_PACKET] recv new packet from tun device and forward to peers."
+            );
 
-        tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
-
-        dev.link_up().await?;
-        dev.remove_ip(None).await?;
-        dev.add_ip("10.144.111.1".parse().unwrap(), 24).await?;
-        Ok(dev)
+            // Subnet A is proxied as 10.0.0.0/24, and Subnet B is also proxied as 10.0.0.0/24.
+            //
+            // Subnet A has received a route advertised by Subnet B. As a result, A can reach
+            // the physical subnet 10.0.0.0/24 directly and has also added a virtual route for
+            // the same subnet 10.0.0.0/24. However, the physical route has a higher priority
+            // (lower metric) than the virtual one.
+            //
+            // When A sends a UDP packet to a non-existent IP within this subnet, the packet
+            // cannot be delivered on the physical network and is instead routed to the virtual
+            // network interface.
+            //
+            // The virtual interface receives the packet and forwards it to itself, which triggers
+            // the subnet proxy logic. The subnet proxy then attempts to send another packet to
+            // the same destination address, causing the same process to repeat and creating an
+            // infinite loop. Therefore, we must avoid re-sending packets back to ourselves
+            // when the subnet proxy itself is the originator of the packet.
+            //
+            // However, there is a special scenario to consider: when A acts as a gateway,
+            // packets from devices behind A may be forwarded by the OS to the ET (e.g., an
+            // eBPF or tunneling component), which happens to proxy the subnet. In this case,
+            // the packet’s source IP is not A’s own IP, and we must allow such packets to be
+            // sent to the virtual interface (i.e., "sent to ourselves") to maintain correct
+            // forwarding behavior. Thus, loop prevention should only apply when the source IP
+            // belongs to the local host.
+            let send_ret = peer_mgr
+                .send_msg_by_ip(ret, IpAddr::V4(dst_ipv4), Some(src_ipv4) == my_ipv4)
+                .await;
+            if send_ret.is_err() {
+                tracing::trace!(?send_ret, "[USER_PACKET] send_msg failed")
+            }
+        } else {
+            tracing::warn!(?ret, "[USER_PACKET] not ipv4 packet");
+        }
     }
 
-    #[tokio::test]
-    async fn tun_test() {
-        let _dev = run_test_helper().await.unwrap();
+    async fn forward_ipv6(peer_mgr: &PeerManager, ret: ZCPacket) {
+        if let Some(ipv6) = Ipv6Packet::new(ret.payload()) {
+            if ipv6.get_version() != 6 {
+                tracing::info!("[USER_PACKET] not ipv6 packet: {:?}", ipv6);
+                return;
+            }
+            let src_ipv6 = ipv6.get_source();
+            let dst_ipv6 = ipv6.get_destination();
+            let my_ipv6 = peer_mgr.get_global_ctx().get_ipv6().map(|x| x.address());
+            tracing::trace!(
+                ?ret,
+                ?src_ipv6,
+                ?dst_ipv6,
+                "[USER_PACKET] recv new packet from tun device and forward to peers."
+            );
 
-        // let mut stream = nic.pin_recv_stream();
-        // while let Some(item) = stream.next().await {
-        //     println!("item: {:?}", item);
-        // }
+            if src_ipv6.is_unicast_link_local() && Some(src_ipv6) != my_ipv6 {
+                // do not route link local packet to other nodes unless the address is assigned by user
+                return;
+            }
 
-        // let framed = dev.into_framed();
-        // let (mut s, mut b) = framed.split();
-        // loop {
-        //     let tmp = b.next().await.unwrap().unwrap();
-        //     let tmp = EthernetPacket::new(tmp.get_bytes());
-        //     println!("ret: {:?}", tmp.unwrap());
-        // }
+            // TODO: use zero-copy
+            let send_ret = peer_mgr
+                .send_msg_by_ip(ret, IpAddr::V6(dst_ipv6), Some(src_ipv6) == my_ipv6)
+                .await;
+            if send_ret.is_err() {
+                tracing::trace!(?send_ret, "[USER_PACKET] send_msg failed")
+            }
+        } else {
+            tracing::warn!(?ret, "[USER_PACKET] not ipv6 packet");
+        }
+    }
+
+    async fn forward(peer_mgr: &PeerManager, ret: ZCPacket) {
+        let payload = ret.payload();
+        if payload.is_empty() {
+            return;
+        }
+
+        match payload[0] >> 4 {
+            4 => Self::forward_ipv4(peer_mgr, ret).await,
+            6 => Self::forward_ipv6(peer_mgr, ret).await,
+            _ => {
+                tracing::warn!(?ret, "[USER_PACKET] unknown IP version");
+            }
+        }
+    }
+
+    async fn run(mut self) {
+        while let Some(ret) = self.stream.next().await {
+            let Ok(ret) = ret else {
+                tracing::error!("read from nic failed: {:?}", ret);
+                break;
+            };
+            Self::forward(self.peer_mgr.as_ref(), ret).await;
+        }
+        self.close_notifier.notify_one();
+        tracing::error!("nic closed when recving from it");
+    }
+}
+
+pub struct PeersNicForwarder {
+    packet_recv_chan_receiver: Arc<Mutex<PacketRecvChanReceiver>>,
+    close_notifier: Arc<Notify>,
+
+    sink: Pin<Box<dyn ZCPacketSink>>,
+}
+
+impl PeersNicForwarder {
+    async fn run(mut self) {
+        // unlock until coroutine finished
+        let mut channel = self.packet_recv_chan_receiver.lock().await;
+        while let Ok(packet) = recv_packet_from_chan(&mut channel).await {
+            tracing::trace!(
+                "[USER_PACKET] forward packet from peers to nic. packet: {:?}",
+                packet
+            );
+            if let Err(e) = self.sink.send(packet).await {
+                tracing::error!("forward packet from peers to nic sink error: {:?}", e);
+            }
+        }
+        self.close_notifier.notify_one();
+        tracing::error!("nic closed when sending to it");
     }
 }

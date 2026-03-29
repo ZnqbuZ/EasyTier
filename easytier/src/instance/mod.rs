@@ -10,3 +10,4 @@ pub mod route;
 
 #[cfg(feature = "tun")]
 pub mod virtual_nic;
+pub mod nic;

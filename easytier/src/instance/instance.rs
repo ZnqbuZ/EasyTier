@@ -142,7 +142,7 @@ struct MagicDnsContainer {
 // nic container will be cleared when dhcp ip changed
 #[cfg(feature = "tun")]
 pub struct NicCtxContainer {
-    nic_ctx: Option<Box<dyn Any + 'static + Send>>,
+    pub nic_ctx: Option<Box<dyn Any + 'static + Send>>,
     #[cfg(feature = "magic-dns")]
     magic_dns: Option<MagicDnsContainer>,
 }
@@ -189,7 +189,7 @@ impl NicCtxContainer {
 }
 
 #[cfg(feature = "tun")]
-type ArcNicCtx = Arc<Mutex<Option<NicCtxContainer>>>;
+pub type ArcNicCtx = Arc<Mutex<Option<NicCtxContainer>>>;
 
 pub struct InstanceRpcServerHook {
     rpc_portal_whitelist: Vec<IpCidr>,
