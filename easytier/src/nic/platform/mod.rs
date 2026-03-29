@@ -6,9 +6,11 @@ use crate::tunnel::common::{FramedWriter, TunnelWrapper};
 use crate::utils::BoxExt;
 use cfg_if::cfg_if;
 use cidr::IpInet;
+use derive_new::new;
 use futures_util::lock::BiLock;
 use tun::platform::Device;
 use tun::{AbstractDevice, AsyncDevice, Configuration, Layer};
+use crate::common::global_ctx::ArcGlobalCtx;
 
 // #[cfg(target_os = "freebsd")]
 mod freebsd;
@@ -20,35 +22,30 @@ mod macos;
 mod mobile;
 mod windows;
 
-pub type PlatformContext = cfg_if! {
-    if #[cfg(mobile)] {
-        std::os::fd::RawFd
-    } else {
-        ArcGlobalCtx
-    }
-};
-
-pub trait PlatformIf {
+pub trait PlatformNic {
     async fn configure(&self, config: &mut Configuration) -> Result<(), Error>;
     async fn initialize(&mut self) {}
     async fn finalize(&mut self) {}
 }
 
-struct If {
+#[derive(new)]
+struct Nic {
+    #[new(default)]
     name: Option<String>,
-    ctx: PlatformContext,
+    
+    global_ctx: ArcGlobalCtx,
+    
+    #[cfg(mobile)]
+    fd: std::os::fd::RawFd,
 }
 
-impl If {
-    fn new(ctx: PlatformContext) -> Self {
-        Self { name: None, ctx }
-    }
+impl Nic {
     fn guard(&self) -> Option<Box<NetNSGuard>> {
         cfg_if! {
             if #[cfg(mobile)] {
                 None
             } else {
-                Some(self.ctx.net_ns.guard())
+                Some(self.global_ctx.net_ns.guard())
             }
         }
     }
@@ -85,7 +82,7 @@ impl If {
 
         #[cfg(not(mobile))]
         {
-            let flags = self.ctx.config.get_flags();
+            let flags = self.global_ctx.config.get_flags();
             let mut mtu_in_config = flags.mtu;
             if flags.enable_encryption {
                 mtu_in_config -= 20;

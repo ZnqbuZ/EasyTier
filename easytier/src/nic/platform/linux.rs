@@ -1,10 +1,10 @@
 use crate::common::error::Error;
 use crate::common::global_ctx::ArcGlobalCtx;
 use crate::common::log;
-use crate::nic::platform::{If, PlatformContext, PlatformIf};
+use crate::nic::platform::{Nic, PlatformNic};
 use tun::Configuration;
 
-impl If {
+impl Nic {
     /// Check and create TUN device node if necessary on Linux systems
     async fn ensure_tun_device_node() {
         const TUN_DEV_PATH: &str = "/dev/net/tun";
@@ -87,11 +87,11 @@ impl If {
     }
 }
 
-impl PlatformIf for If {
+impl PlatformNic for Nic {
     async fn configure(&self, config: &mut Configuration) -> Result<(), Error> {
         Self::ensure_tun_device_node().await;
 
-        let name = &self.ctx.get_flags().dev_name;
+        let name = &self.global_ctx.get_flags().dev_name;
         if !name.is_empty() {
             config.tun_name(name);
         }

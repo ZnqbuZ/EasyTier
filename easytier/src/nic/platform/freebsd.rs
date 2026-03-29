@@ -1,8 +1,8 @@
 use crate::common::error::Error;
-use crate::nic::platform::{If, PlatformIf};
+use crate::nic::platform::{Nic, PlatformNic};
 use tun::Configuration;
 
-impl If {
+impl Nic {
     /// FreeBSD specific: Rename a TUN interface
     async fn rename_tun_interface(old_name: &str, new_name: &str) -> Result<(), Error> {
         let output = tokio::process::Command::new("ifconfig")
@@ -128,9 +128,9 @@ impl If {
     }
 }
 
-impl PlatformIf for If {
+impl PlatformNic for Nic {
     async fn configure(&self, _: &mut Configuration) -> Result<(), Error> {
-        let name = &self.ctx.get_flags().dev_name;
+        let name = &self.global_ctx.get_flags().dev_name;
 
         if !name.is_empty() {
             // Restore TUN interface name if needed, ignoring errors as it's not critical
@@ -141,7 +141,7 @@ impl PlatformIf for If {
     }
 
     async fn initialize(&mut self) {
-        let dev_name = self.ctx.get_flags().dev_name;
+        let dev_name = self.global_ctx.get_flags().dev_name;
         let ifname = self.name().unwrap();
 
         if !dev_name.is_empty() && ifname != dev_name {

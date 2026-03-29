@@ -1,8 +1,8 @@
 use tun::Configuration;
 use crate::common::error::Error;
-use crate::nic::platform::{If, PlatformIf};
+use crate::nic::platform::{Nic, PlatformNic};
 
-impl PlatformIf for If {
+impl PlatformNic for Nic {
     async fn configure(&self, config: &mut Configuration) -> Result<(), Error> {
         #[cfg(any(target_os = "ios", all(target_os = "macos", feature = "macos-ne")))]
         config.platform_config(|config| {

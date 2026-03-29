@@ -1,12 +1,12 @@
 use crate::common::error::Error;
 use crate::common::ifcfg::RegistryManager;
 use crate::common::log;
-use crate::nic::platform::{If, PlatformIf};
+use crate::nic::platform::{Nic, PlatformNic};
 use tun::Configuration;
 
-impl PlatformIf for If {
+impl PlatformNic for Nic {
     async fn configure(&self, config: &mut Configuration) -> Result<(), Error> {
-        let name = &self.ctx.get_flags().dev_name;
+        let name = &self.global_ctx.get_flags().dev_name;
 
         match crate::arch::windows::add_self_to_firewall_allowlist() {
             Ok(_) => tracing::info!("add_self_to_firewall_allowlist successful!"),
@@ -37,9 +37,9 @@ impl PlatformIf for If {
             let random_dev_name = format!("et_{}_{}", c, s);
             config.tun_name(random_dev_name.clone());
 
-            let mut flags = self.ctx.get_flags();
+            let mut flags = self.global_ctx.get_flags();
             flags.dev_name = random_dev_name.clone();
-            self.ctx.set_flags(flags);
+            self.global_ctx.set_flags(flags);
         }
 
         config.platform_config(|config| {
@@ -103,7 +103,7 @@ impl PlatformIf for If {
     }
 }
 
-impl Drop for If {
+impl Drop for Nic {
     fn drop(&mut self) {
         if let Some(ifname) = self.name() {
             // Try to clean up firewall rules, but don't panic in destructor
