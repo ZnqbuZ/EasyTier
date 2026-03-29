@@ -8,6 +8,7 @@ use clap_complete::{Generator, Shell};
 mod arch;
 mod gateway;
 pub mod instance;
+mod nic;
 mod peer_center;
 mod vpn_portal;
 

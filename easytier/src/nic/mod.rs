@@ -42,6 +42,7 @@ use ::tun::{AbstractDevice, AsyncDevice, Configuration, Layer};
 use zerocopy::{NativeEndian, NetworkEndian};
 
 mod platform;
+mod route;
 mod tun;
 use tun::{TunAsyncWrite, TunStream, TunZCPacketToBytes};
 

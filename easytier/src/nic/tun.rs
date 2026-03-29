@@ -121,7 +121,7 @@ fn infer_proto(buf: &[u8]) -> PacketProtocol {
     }
 }
 
-pub(super) struct TunZCPacketToBytes {
+pub struct TunZCPacketToBytes {
     has_packet_info: bool,
 }
 
