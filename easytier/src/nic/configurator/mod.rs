@@ -2,9 +2,9 @@
 //     all(target_os = "macos", not(feature = "macos-ne")),
 //     target_os = "freebsd"
 // ))]
-mod darwin;
+mod macos;
 // #[cfg(target_os = "linux")]
-mod netlink;
+mod linux;
 // #[cfg(target_os = "windows")]
 mod win;
 // #[cfg(target_os = "windows")]
@@ -141,13 +141,13 @@ async fn run_shell_cmd(cmd: &str) -> Result<(), Error> {
 pub struct DummyIfConfiger;
 
 #[cfg(target_os = "linux")]
-const IF_CONFIGER: netlink::IfConfiger = netlink::IfConfiger;
+const IF_CONFIGER: linux::IfConfiger = linux::IfConfiger;
 
 #[cfg(any(
     all(target_os = "macos", not(feature = "macos-ne")),
     target_os = "freebsd"
 ))]
-const IF_CONFIGER: darwin::IfConfiger = darwin::IfConfiger;
+const IF_CONFIGER: macos::IfConfiger = macos::IfConfiger;
 
 #[cfg(target_os = "windows")]
 const IF_CONFIGER: windows::IfConfiger = windows::IfConfiger;
