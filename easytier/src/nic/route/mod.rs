@@ -1,6 +1,6 @@
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
-mod manager;
+pub mod manager;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Route {
