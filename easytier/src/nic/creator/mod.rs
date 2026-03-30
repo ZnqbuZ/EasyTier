@@ -2,7 +2,7 @@ use crate::common::error::Error;
 use crate::common::global_ctx::ArcGlobalCtx;
 use crate::common::ifcfg;
 use crate::common::netns::NetNSGuard;
-use crate::nic::configurator::PlatformConfigurator;
+use crate::nic::controller::PlatformController;
 use crate::nic::tun::{TunAsyncWrite, TunStream, TunZCPacketToBytes};
 use crate::nic::Nic;
 use crate::tunnel::common::{FramedWriter, TunnelWrapper};
@@ -49,7 +49,7 @@ impl NicCreator {
             }
         }
     }
-    async fn create(mut self) -> Result<Nic, Error> {
+    pub async fn create(mut self) -> Result<Nic, Error> {
         let mut config = Configuration::default();
         config.layer(Layer::L3);
         self.configure(&mut config).await?;
@@ -108,6 +108,6 @@ impl NicCreator {
 
         self.finalize().await;
 
-        Ok(Nic::new(self.global_ctx, self.name.unwrap(), ft.boxed()))
+        Ok(Nic::new(self.global_ctx, ft.boxed(), self.name.unwrap()))
     }
 }

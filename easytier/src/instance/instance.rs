@@ -68,6 +68,7 @@ use super::listeners::ListenerManager;
 
 #[cfg(feature = "socks5")]
 use crate::gateway::socks5::Socks5Server;
+use crate::nic::creator::NicCreator;
 
 #[derive(Clone)]
 struct IpProxy {
@@ -131,7 +132,7 @@ impl IpProxy {
 }
 
 #[cfg(feature = "tun")]
-type NicCtx = super::virtual_nic::NicCtx;
+type NicCtx = crate::nic::Nic;
 
 #[cfg(feature = "magic-dns")]
 struct MagicDnsContainer {
@@ -810,13 +811,24 @@ impl Instance {
 
                     #[cfg(all(not(mobile), feature = "tun"))]
                     {
-                        let mut new_nic_ctx = NicCtx::new(
-                            global_ctx_c.clone(),
-                            &peer_manager_c,
-                            _peer_packet_receiver.clone(),
-                            nic_closed_notifier.clone(),
-                        );
-                        if let Err(e) = new_nic_ctx.run(Some(ip), global_ctx_c.get_ipv6()).await {
+                        let mut nic = match NicCreator::new(global_ctx_c.clone()).create().await {
+                            Ok(nic) => nic,
+                            Err(e) => {
+                                tracing::error!("create nic failed: {:?}", e);
+                                continue;
+                            }
+                        };
+
+                        if let Err(e) = nic
+                            .run(
+                                &peer_manager_c,
+                                _peer_packet_receiver.clone(),
+                                nic_closed_notifier.clone(),
+                                Some(ip),
+                                global_ctx_c.get_ipv6(),
+                            )
+                            .await
+                        {
                             tracing::error!(
                                 ?current_dhcp_ip,
                                 ?candidate_ipv4_addr,
@@ -826,13 +838,14 @@ impl Instance {
                             global_ctx_c.set_ipv4(None);
                             continue;
                         }
+
                         #[cfg(feature = "magic-dns")]
-                        let ifname = new_nic_ctx.ifname().await;
+                        let ifname = nic.name().to_string();
                         Self::use_new_nic_ctx(
                             nic_ctx.clone(),
-                            new_nic_ctx,
+                            nic,
                             #[cfg(feature = "magic-dns")]
-                            Self::create_magic_dns_runner(peer_manager_c.clone(), ifname, ip),
+                            Self::create_magic_dns_runner(peer_manager_c.clone(), Some(ifname), ip),
                         )
                         .await;
                     }
@@ -876,15 +889,29 @@ impl Instance {
                     return;
                 };
 
-                let close_notifier = Arc::new(Notify::new());
-                let mut new_nic_ctx = NicCtx::new(
-                    peer_manager.get_global_ctx(),
-                    &peer_manager,
-                    peer_packet_receiver.clone(),
-                    close_notifier.clone(),
-                );
+                let mut nic = match NicCreator::new(peer_manager.get_global_ctx())
+                    .create()
+                    .await
+                {
+                    Ok(nic) => nic,
+                    Err(e) => {
+                        tracing::error!("create nic failed: {:?}", e);
+                        continue;
+                    }
+                };
 
-                if let Err(e) = new_nic_ctx.run(ipv4_addr, ipv6_addr).await {
+                let close_notifier = Arc::new(Notify::new());
+
+                if let Err(e) = nic
+                    .run(
+                        &peer_manager,
+                        peer_packet_receiver.clone(),
+                        close_notifier.clone(),
+                        ipv4_addr,
+                        ipv6_addr,
+                    )
+                    .await
+                {
                     if let Some(output_tx) = output_tx.take() {
                         let _ = output_tx.send(Err(e));
                         return;
@@ -897,13 +924,13 @@ impl Instance {
                 // Create Magic DNS runner only if we have IPv4
                 #[cfg(feature = "magic-dns")]
                 {
-                    let ifname = new_nic_ctx.ifname().await;
+                    let ifname = nic.name().to_string();
                     let dns_runner = if let Some(ipv4) = ipv4_addr {
-                        Self::create_magic_dns_runner(peer_manager, ifname, ipv4)
+                        Self::create_magic_dns_runner(peer_manager, Some(ifname), ipv4)
                     } else {
                         None
                     };
-                    Self::use_new_nic_ctx(nic_ctx.clone(), new_nic_ctx, dns_runner).await;
+                    Self::use_new_nic_ctx(nic_ctx.clone(), nic, dns_runner).await;
                 }
                 #[cfg(not(feature = "magic-dns"))]
                 Self::use_new_nic_ctx(nic_ctx.clone(), new_nic_ctx).await;

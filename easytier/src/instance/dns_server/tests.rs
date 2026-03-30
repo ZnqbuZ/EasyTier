@@ -17,7 +17,8 @@ use crate::connector::udp_hole_punch::tests::replace_stun_info_collector;
 use crate::instance::dns_server::runner::DnsRunner;
 use crate::instance::dns_server::server_instance::MagicDnsServerInstance;
 use crate::instance::dns_server::{DEFAULT_ET_DNS_ZONE, MAGIC_DNS_FAKE_IP};
-use crate::instance::virtual_nic::NicCtx;
+use crate::nic::creator::NicCreator;
+use crate::nic::Nic;
 use crate::peers::peer_manager::{PeerManager, RouteAlgoType};
 
 use crate::peers::create_packet_recv_chan;
@@ -26,7 +27,7 @@ use crate::proto::common::NatType;
 use crate::proto::magic_dns::{MagicDnsServerRpc as _, UpdateDnsRecordRequest};
 use crate::proto::rpc_types::controller::{BaseController, Controller as _};
 
-pub async fn prepare_env(dns_name: &str, tun_ip: Ipv4Inet) -> (Arc<PeerManager>, NicCtx) {
+pub async fn prepare_env(dns_name: &str, tun_ip: Ipv4Inet) -> (Arc<PeerManager>, Nic) {
     prepare_env_with_tld_dns_zone(dns_name, tun_ip, None).await
 }
 
@@ -34,7 +35,7 @@ pub async fn prepare_env_with_tld_dns_zone(
     dns_name: &str,
     tun_ip: Ipv4Inet,
     tld_dns_zone: Option<&str>,
-) -> (Arc<PeerManager>, NicCtx) {
+) -> (Arc<PeerManager>, Nic) {
     let ctx = get_mock_global_ctx();
     ctx.set_hostname(dns_name.to_owned());
     ctx.set_ipv4(Some(tun_ip));
@@ -54,15 +55,15 @@ pub async fn prepare_env_with_tld_dns_zone(
     replace_stun_info_collector(peer_mgr.clone(), NatType::PortRestricted);
 
     let r = Arc::new(tokio::sync::Mutex::new(r));
-    let mut virtual_nic = NicCtx::new(
-        peer_mgr.get_global_ctx(),
-        &peer_mgr,
-        r,
-        Arc::new(Notify::new()),
-    );
-    virtual_nic.run(Some(tun_ip), None).await.unwrap();
+    let mut nic = NicCreator::new(peer_mgr.get_global_ctx())
+        .create()
+        .await
+        .unwrap();
+    nic.run(&peer_mgr, r, Arc::new(Notify::new()), Some(tun_ip), None)
+        .await
+        .unwrap();
 
-    (peer_mgr, virtual_nic)
+    (peer_mgr, nic)
 }
 
 pub async fn check_dns_record(fake_ip: &Ipv4Addr, domain: &str, expected_ip: &str) {
@@ -121,7 +122,7 @@ pub async fn check_dns_record_missing(fake_ip: &Ipv4Addr, domain: &str) {
 async fn test_magic_dns_server_instance() {
     let tun_ip = Ipv4Inet::from_str("10.144.144.10/24").unwrap();
     let (peer_mgr, virtual_nic) = prepare_env("test1", tun_ip).await;
-    let tun_name = virtual_nic.ifname().await.unwrap();
+    let tun_name = virtual_nic.name().to_string();
     let fake_ip = Ipv4Addr::from_str("100.100.100.101").unwrap();
     let dns_server_inst =
         MagicDnsServerInstance::new(peer_mgr.clone(), Some(tun_name), tun_ip, fake_ip)
@@ -161,7 +162,7 @@ async fn test_magic_dns_runner() {
     {
         let tun_ip = Ipv4Inet::from_str("10.144.144.10/24").unwrap();
         let (peer_mgr, virtual_nic) = prepare_env("test1", tun_ip).await;
-        let tun_name = virtual_nic.ifname().await.unwrap();
+        let tun_name = virtual_nic.name().to_string();
         let fake_ip = Ipv4Addr::from_str(MAGIC_DNS_FAKE_IP).unwrap();
         let mut dns_runner = DnsRunner::new(peer_mgr, Some(tun_name), tun_ip, fake_ip);
 
@@ -189,7 +190,7 @@ async fn test_magic_dns_runner() {
         let custom_tld_zone = "custom.local."; // Different TLD zone is safer
         let (peer_mgr, virtual_nic) =
             prepare_env_with_tld_dns_zone("test2", tun_ip, Some(custom_tld_zone)).await;
-        let tun_name = virtual_nic.ifname().await.unwrap();
+        let tun_name = virtual_nic.name().to_string();
         let fake_ip = Ipv4Addr::from_str(MAGIC_DNS_FAKE_IP).unwrap();
         let mut dns_runner = DnsRunner::new(peer_mgr, Some(tun_name), tun_ip, fake_ip);
 

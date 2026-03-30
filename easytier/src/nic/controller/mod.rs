@@ -12,61 +12,77 @@ mod windows;
 
 mod route;
 
-use std::net::{Ipv4Addr, Ipv6Addr};
-
+use crate::common::error::Error;
 use async_trait::async_trait;
 use cidr::{Ipv4Inet, Ipv6Inet};
-use derive_more::Constructor;
+use std::net::{Ipv4Addr, Ipv6Addr};
+use std::sync::Arc;
 use tokio::process::Command;
+use tokio::sync::RwLock;
 
-#[derive(Constructor)]
-pub struct Configurator {
+pub struct Controller {
     name: String,
 }
 
+pub type NicController = Arc<RwLock<Controller>>;
+
+impl Controller {
+    pub fn new(name: String) -> NicController {
+        Arc::new(RwLock::new(Controller { name }))
+    }
+}
+
 #[async_trait]
-pub trait PlatformConfigurator: Send + Sync {
+pub trait PlatformController: Send + Sync {
     async fn add_ipv4_route(
-        &self,
+        &mut self,
         _address: Ipv4Addr,
         _cidr_prefix: u8,
         _cost: Option<i32>,
     ) -> Result<(), Error> {
         Ok(())
     }
-    async fn remove_ipv4_route(&self, _address: Ipv4Addr, _cidr_prefix: u8) -> Result<(), Error> {
+    async fn remove_ipv4_route(
+        &mut self,
+        _address: Ipv4Addr,
+        _cidr_prefix: u8,
+    ) -> Result<(), Error> {
         Ok(())
     }
-    async fn add_ipv4_ip(&self, _address: Ipv4Addr, _cidr_prefix: u8) -> Result<(), Error> {
+    async fn add_ipv4_ip(&mut self, _address: Ipv4Addr, _cidr_prefix: u8) -> Result<(), Error> {
         Ok(())
     }
-    async fn remove_ipv4_ip(&self, _ip: Option<Ipv4Inet>) -> Result<(), Error> {
+    async fn remove_ipv4_ip(&mut self, _ip: Option<Ipv4Inet>) -> Result<(), Error> {
         Ok(())
     }
     async fn add_ipv6_route(
-        &self,
+        &mut self,
         _address: Ipv6Addr,
         _cidr_prefix: u8,
         _cost: Option<i32>,
     ) -> Result<(), Error> {
         Ok(())
     }
-    async fn remove_ipv6_route(&self, _address: Ipv6Addr, _cidr_prefix: u8) -> Result<(), Error> {
+    async fn remove_ipv6_route(
+        &mut self,
+        _address: Ipv6Addr,
+        _cidr_prefix: u8,
+    ) -> Result<(), Error> {
         Ok(())
     }
-    async fn add_ipv6_ip(&self, _address: Ipv6Addr, _cidr_prefix: u8) -> Result<(), Error> {
+    async fn add_ipv6_ip(&mut self, _address: Ipv6Addr, _cidr_prefix: u8) -> Result<(), Error> {
         Ok(())
     }
-    async fn remove_ipv6_ip(&self, _ip: Option<Ipv6Inet>) -> Result<(), Error> {
+    async fn remove_ipv6_ip(&mut self, _ip: Option<Ipv6Inet>) -> Result<(), Error> {
         Ok(())
     }
-    async fn set_link_status(&self, _up: bool) -> Result<(), Error> {
+    async fn set_link_status(&mut self, _up: bool) -> Result<(), Error> {
         Ok(())
     }
     async fn wait_interface_show(&self) -> Result<(), Error> {
         Ok(())
     }
-    async fn set_mtu(&self, _mtu: u32) -> Result<(), Error> {
+    async fn set_mtu(&mut self, _mtu: u32) -> Result<(), Error> {
         Ok(())
     }
 }
@@ -121,7 +137,3 @@ async fn run_shell_cmd(cmd: &str) -> Result<(), Error> {
     }
     Ok(())
 }
-
-use crate::common::error::Error;
-#[cfg(target_os = "windows")]
-pub use windows::RegistryManager;

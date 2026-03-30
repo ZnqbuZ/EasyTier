@@ -1,11 +1,11 @@
 use std::net::Ipv4Addr;
 
-use super::{cidr_to_subnet_mask, run_shell_cmd, Configurator, Error, PlatformConfigurator};
+use super::{cidr_to_subnet_mask, run_shell_cmd, Controller, Error, PlatformController};
 use async_trait::async_trait;
 use cidr::{Ipv4Inet, Ipv6Inet};
 
 #[async_trait]
-impl PlatformConfigurator for Configurator {
+impl PlatformController for Controller {
     async fn add_ipv4_route(
         &self,
         address: Ipv4Addr,

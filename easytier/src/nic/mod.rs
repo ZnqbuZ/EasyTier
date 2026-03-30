@@ -5,7 +5,9 @@ use std::{
     task::{Context, Poll},
 };
 
-use crate::nic::configurator::{Configurator, PlatformConfigurator};
+use crate::nic::controller::{Controller, PlatformController};
+use crate::nic::controller::{Controller, NicController, PlatformController};
+use crate::nic::creator::NicCreator;
 use crate::{
     common::{error::Error, global_ctx::ArcGlobalCtx, log},
     instance::proxy_cidrs_monitor::ProxyCidrsMonitor,
@@ -17,16 +19,17 @@ use crate::{
     },
 };
 use cidr::{Ipv4Inet, Ipv6Inet};
-use futures::{SinkExt, Stream, StreamExt};
+use futures::{SinkExt, StreamExt};
 use pnet::packet::{ipv4::Ipv4Packet, ipv6::Ipv6Packet};
+use tokio::sync::RwLock;
 use tokio::{
     sync::{Mutex, Notify},
     task::JoinSet,
 };
 use ::tun::AbstractDevice;
 
-mod configurator;
-mod creator;
+mod controller;
+pub mod creator;
 mod route;
 mod tun;
 
@@ -175,21 +178,34 @@ impl PeersNicForwarder {
     }
 }
 
-pub(crate) struct Nic {
+pub struct Nic {
+    ctrl: NicController,
     global_ctx: ArcGlobalCtx,
     tunnel: Box<dyn Tunnel>,
-    configurator: Configurator,
+    name: String,
     tasks: JoinSet<()>,
 }
 
 impl Nic {
-    pub(super) fn new(global_ctx: ArcGlobalCtx, name: String, tunnel: Box<dyn Tunnel>) -> Self {
+    // TODO: used by magic DNS, REMOVE THIS!
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+}
+
+impl Nic {
+    pub(super) fn new(global_ctx: ArcGlobalCtx, tunnel: Box<dyn Tunnel>, name: String) -> Self {
         Self {
+            ctrl: Controller::new(name.clone()),
             global_ctx,
             tunnel,
-            configurator: Configurator::new(name),
+            name,
             tasks: JoinSet::new(),
         }
+    }
+
+    pub fn ctrl(&self) -> NicController {
+        self.ctrl.clone()
     }
 
     pub async fn run(
@@ -220,9 +236,9 @@ impl Nic {
             .run(),
         );
 
-        let cfg = &self.configurator;
+        let mut ctrl = self.ctrl.write().await;
 
-        cfg.wait_interface_show().await?;
+        ctrl.wait_interface_show().await?;
 
         // TODO: run route manager
 
@@ -231,23 +247,36 @@ impl Nic {
 
             // Assign IPv4 address if provided
             if let Some(ipv4_addr) = ipv4_addr {
-                cfg.remove_ipv4_ip(None).await?;
-                cfg.add_ipv4_ip(ipv4_addr.address(), ipv4_addr.network_length())
+                ctrl.remove_ipv4_ip(None).await?;
+                ctrl.add_ipv4_ip(ipv4_addr.address(), ipv4_addr.network_length())
                     .await?;
             }
 
             // Assign IPv6 address if provided
             if let Some(ipv6_addr) = ipv6_addr {
-                cfg.remove_ipv6_ip(None).await?;
-                cfg.add_ipv6_ip(ipv6_addr.address(), ipv6_addr.network_length())
+                ctrl.remove_ipv6_ip(None).await?;
+                ctrl.add_ipv6_ip(ipv6_addr.address(), ipv6_addr.network_length())
                     .await?;
             }
 
             // TODO: publish route here
         }
 
-        self.run_proxy_cidrs_route_updater().await?;
-
         Ok(())
+    }
+}
+
+#[cfg(target_os = "windows")]
+impl Drop for Nic {
+    fn drop(&mut self) {
+        let ifname = &self.name;
+        // Try to clean up firewall rules, but don't panic in destructor
+        if let Err(error) = crate::arch::windows::remove_interface_firewall_rules(ifname) {
+            log::warn!(
+                %error,
+                "failed to remove firewall rules for interface {}",
+                ifname
+            );
+        }
     }
 }

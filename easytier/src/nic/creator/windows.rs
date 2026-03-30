@@ -54,7 +54,7 @@ impl PlatformNicCreator for NicCreator {
     }
 
     async fn initialize(&mut self) {
-        let ifname = self.name().unwrap();
+        let ifname = self.name.as_ref().unwrap();
 
         if let Ok(guid) = RegistryManager::find_interface_guid(ifname) {
             if let Err(e) = RegistryManager::disable_dynamic_updates(&guid) {
@@ -102,20 +102,5 @@ impl PlatformNicCreator for NicCreator {
         }
 
         let _ = RegistryManager::reg_change_catrgory_in_profile(ifname);
-    }
-}
-
-impl Drop for NicCreator {
-    fn drop(&mut self) {
-        if let Some(ifname) = self.name() {
-            // Try to clean up firewall rules, but don't panic in destructor
-            if let Err(error) = crate::arch::windows::remove_interface_firewall_rules(ifname) {
-                log::warn!(
-                    %error,
-                    "failed to remove firewall rules for interface {}",
-                    ifname
-                );
-            }
-        }
     }
 }

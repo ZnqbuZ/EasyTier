@@ -2,10 +2,12 @@ use crate::common::error::Error;
 use crate::common::ifcfg;
 use crate::common::ifcfg::IfConfiger;
 use crate::instance::instance::ArcNicCtx;
-use crate::instance::virtual_nic::NicCtx;
 use cidr::IpCidr;
 use std::collections::{BTreeMap, HashSet};
+use derivative::Derivative;
 use tokio::sync::mpsc::{channel, Receiver, Sender};
+use crate::nic::controller::Controller;
+use crate::nic::Nic;
 
 #[derive(Clone, Debug, Ord, PartialOrd, Eq, PartialEq)]
 pub enum RouteSource {
@@ -45,21 +47,21 @@ pub struct RouteReconcilePlan {
     pub to_remove: Vec<RouteSpec>,
 }
 
-#[derive(Debug)]
+#[derive(Derivative)]
+#[derivative(Debug)]
 pub struct RouteManager {
-    nic_ctx: ArcNicCtx,
-    ifcfg: IfConfiger,
+    #[derivative(Debug = "ignore")]
+    nic: ArcNicCtx,
     sources: BTreeMap<RouteSource, RouteSourceState>,
     tx: Sender<RouteCommand>,
     rx: Receiver<RouteCommand>,
 }
 
 impl RouteManager {
-    pub fn new(nic_ctx: ArcNicCtx) -> Self {
+    pub fn new(nic: ArcNicCtx) -> Self {
         let (tx, rx) = channel(ROUTE_CHANNEL_CAPACITY);
         Self {
-            nic_ctx,
-            ifcfg: ifcfg::get(),
+            nic,
             sources: BTreeMap::new(),
             tx,
             rx,
@@ -70,13 +72,26 @@ impl RouteManager {
         self.tx.clone()
     }
 
-    async fn add_route(&self, route: &RouteSpec) -> Result<(), Error> {
-        let Some(nic_ctx) = self
-            .nic_ctx
+    async fn nic(&self) -> Option<&Nic> {
+        self
+            .nic
             .lock()
             .await
-            .and_then(|nic_ctx| nic_ctx.nic_ctx.as_ref())
-            .and_then(|nic_ctx| nic_ctx.downcast_ref::<NicCtx>())
+            .and_then(|nic| nic.nic_ctx.as_ref())
+            .and_then(|nic| nic.downcast_ref::<Nic>())
+    }
+
+    async fn configurator(&self) -> Option<Controller> {
+        self.nic().await.map(|nic| nic.configurator)
+    }
+
+    async fn add_route(&self, route: &RouteSpec) -> Result<(), Error> {
+        let Some(nic) = self
+            .nic
+            .lock()
+            .await
+            .and_then(|nic| nic.nic_ctx.as_ref())
+            .and_then(|nic| nic.downcast_ref::<Nic>())
         else {
             return Err(Error::NotFound);
         };

@@ -30,7 +30,7 @@ use nix::{
 };
 use pnet::ipnetwork::ip_mask_to_prefix;
 
-use super::{route::Route, Configurator, Error, PlatformConfigurator};
+use super::{route::Route, Controller, Error, PlatformController};
 
 pub(crate) fn dummy_socket() -> Result<std::net::UdpSocket, Error> {
     Ok(std::net::UdpSocket::bind("0:0")?)
@@ -157,7 +157,7 @@ impl From<RouteMessage> for Route {
     }
 }
 
-impl Configurator {
+impl Controller {
     fn get_interface_index(name: &str) -> Result<u32, Error> {
         let name = CString::new(name).with_context(|| "failed to convert interface name")?;
         match unsafe { libc::if_nametoindex(name.as_ptr()) } {
@@ -368,7 +368,7 @@ impl Configurator {
 }
 
 #[async_trait]
-impl PlatformConfigurator for Configurator {
+impl PlatformController for Controller {
     async fn add_ipv4_route(
         &self,
         address: Ipv4Addr,

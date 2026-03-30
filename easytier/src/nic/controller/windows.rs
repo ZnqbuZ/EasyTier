@@ -20,7 +20,7 @@ use winreg::{
     RegKey,
 };
 
-use super::{Configurator, Error, PlatformConfigurator};
+use super::{Controller, Error, PlatformController};
 
 fn format_win_error(error: u32) -> String {
     // use FormatMessageW to get the error message
@@ -47,7 +47,7 @@ fn format_win_error(error: u32) -> String {
     )
 }
 
-impl Configurator {
+impl Controller {
     pub fn get_interface_index(name: &str) -> Option<u32> {
         crate::arch::windows::find_interface_index(name).ok()
     }
@@ -178,7 +178,7 @@ impl Configurator {
 }
 
 #[async_trait]
-impl PlatformConfigurator for Configurator {
+impl PlatformController for Controller {
     async fn add_ipv4_route(
         &self,
         address: Ipv4Addr,
