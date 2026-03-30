@@ -28,8 +28,8 @@ use ::tun::AbstractDevice;
 
 mod controller;
 pub mod creator;
-mod route;
 mod tun;
+pub mod route;
 
 pub struct NicPeersForwarder {
     peer_mgr: Arc<PeerManager>,

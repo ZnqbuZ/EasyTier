@@ -29,7 +29,6 @@ use nix::{
     sys::socket::SockaddrLike as _,
 };
 use pnet::ipnetwork::ip_mask_to_prefix;
-
 use super::{route::Route, Controller, Error, PlatformController};
 
 pub(crate) fn dummy_socket() -> Result<std::net::UdpSocket, Error> {

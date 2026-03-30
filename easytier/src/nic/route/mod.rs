@@ -1,5 +1,7 @@
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
+mod manager;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Route {
     /// Network address of the destination. `0.0.0.0` with a prefix of `0` is considered a default route.
