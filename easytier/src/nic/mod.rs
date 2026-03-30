@@ -5,7 +5,6 @@ use std::{
     task::{Context, Poll},
 };
 
-use crate::nic::controller::{Controller, PlatformController};
 use crate::nic::controller::{Controller, NicController, PlatformController};
 use crate::nic::creator::NicCreator;
 use crate::{
