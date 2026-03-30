@@ -1,16 +1,15 @@
 use crate::common::error::Error;
-use crate::common::ifcfg;
-use crate::common::ifcfg::IfConfiger;
 use crate::instance::instance::ArcNicCtx;
-use cidr::IpCidr;
-use std::collections::{BTreeMap, HashSet};
-use derivative::Derivative;
-use tokio::sync::mpsc::{channel, Receiver, Sender};
-use crate::nic::controller::Controller;
+use crate::nic::controller::{NicController, PlatformController};
 use crate::nic::Nic;
+use cidr::IpCidr;
+use derivative::Derivative;
+use std::collections::{BTreeMap, HashSet};
+use tokio::sync::mpsc::{channel, Receiver, Sender};
 
 #[derive(Clone, Debug, Ord, PartialOrd, Eq, PartialEq)]
 pub enum RouteSource {
+    Nic,
     Proxy,
 }
 
@@ -41,12 +40,6 @@ pub enum RouteCommand {
     },
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Default)]
-pub struct RouteReconcilePlan {
-    pub to_add: Vec<RouteSpec>,
-    pub to_remove: Vec<RouteSpec>,
-}
-
 #[derive(Derivative)]
 #[derivative(Debug)]
 pub struct RouteManager {
@@ -72,67 +65,40 @@ impl RouteManager {
         self.tx.clone()
     }
 
-    async fn nic(&self) -> Option<&Nic> {
-        self
-            .nic
-            .lock()
-            .await
+    async fn ctrl(&self)-> Result<NicController, Error>  {
+        let nic = self.nic.lock().await;
+        nic.as_ref()
             .and_then(|nic| nic.nic_ctx.as_ref())
             .and_then(|nic| nic.downcast_ref::<Nic>())
-    }
-
-    async fn configurator(&self) -> Option<Controller> {
-        self.nic().await.map(|nic| nic.configurator)
+            .map(Nic::ctrl)
+            .ok_or(Error::NotFound)
     }
 
     async fn add_route(&self, route: &RouteSpec) -> Result<(), Error> {
-        let Some(nic) = self
-            .nic
-            .lock()
-            .await
-            .and_then(|nic| nic.nic_ctx.as_ref())
-            .and_then(|nic| nic.downcast_ref::<Nic>())
-        else {
-            return Err(Error::NotFound);
-        };
-        let Some(ifname) = nic_ctx.ifname().await else {
-            return Err(Error::NotFound);
-        };
+        let mut ctrl = self.ctrl().await?.write().await;
 
         match route.destination {
             IpCidr::V4(cidr) => {
-                self.ifcfg
-                    .add_ipv4_route(
-                        ifname.as_str(),
-                        cidr.first_address(),
-                        cidr.network_length(),
-                        route.metric,
-                    )
+                ctrl.add_ipv4_route(cidr.first_address(), cidr.network_length(), route.metric)
                     .await
             }
             IpCidr::V6(cidr) => {
-                self.ifcfg
-                    .add_ipv6_route(
-                        ifname.as_str(),
-                        cidr.first_address(),
-                        cidr.network_length(),
-                        route.metric,
-                    )
+                ctrl.add_ipv6_route(cidr.first_address(), cidr.network_length(), route.metric)
                     .await
             }
         }
     }
 
     async fn remove_route(&self, route: &RouteSpec) -> Result<(), Error> {
+        let mut ctrl = self.ctrl().await?.write().await;
+
         match route.destination {
             IpCidr::V4(cidr) => {
-                self.ifcfg
-                    .remove_ipv4_route(&route.ifname, cidr.first_address(), cidr.network_length())
+                ctrl.remove_ipv4_route(cidr.first_address(), cidr.network_length())
                     .await
             }
             IpCidr::V6(cidr) => {
-                self.ifcfg
-                    .remove_ipv6_route(&route.ifname, cidr.first_address(), cidr.network_length())
+                ctrl.remove_ipv6_route(cidr.first_address(), cidr.network_length())
                     .await
             }
         }
