@@ -1,7 +1,7 @@
 use crate::common::error::Error;
 use crate::common::ifcfg::RegistryManager;
 use crate::common::log;
-use crate::nic::platform::{NicCreator, PlatformNicCreator};
+use crate::nic::creator::{NicCreator, PlatformNicCreator};
 use tun::Configuration;
 
 impl PlatformNicCreator for NicCreator {

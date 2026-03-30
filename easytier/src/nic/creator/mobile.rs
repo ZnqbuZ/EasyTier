@@ -1,6 +1,6 @@
 use tun::Configuration;
 use crate::common::error::Error;
-use crate::nic::platform::{NicCreator, PlatformNicCreator};
+use crate::nic::creator::{NicCreator, PlatformNicCreator};
 
 impl PlatformNicCreator for NicCreator {
     async fn configure(&self, config: &mut Configuration) -> Result<(), Error> {

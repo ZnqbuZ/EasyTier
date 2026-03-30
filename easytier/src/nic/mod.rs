@@ -5,12 +5,9 @@ use std::{
     task::{Context, Poll},
 };
 
+use crate::nic::configurator::{Configurator, PlatformConfigurator};
 use crate::{
-    common::{
-        error::Error,
-        global_ctx::{ArcGlobalCtx},
-        log,
-    },
+    common::{error::Error, global_ctx::ArcGlobalCtx, log},
     instance::proxy_cidrs_monitor::ProxyCidrsMonitor,
     peers::{peer_manager::PeerManager, recv_packet_from_chan, PacketRecvChanReceiver},
     tunnel::{
@@ -26,13 +23,12 @@ use tokio::{
     sync::{Mutex, Notify},
     task::JoinSet,
 };
-use ::tun::{AbstractDevice};
-use crate::nic::configurator::{Configurator, PlatformConfigurator};
+use ::tun::AbstractDevice;
 
-mod platform;
+mod configurator;
+mod creator;
 mod route;
 mod tun;
-mod configurator;
 
 pub struct NicPeersForwarder {
     peer_mgr: Arc<PeerManager>,
@@ -179,7 +175,7 @@ impl PeersNicForwarder {
     }
 }
 
-struct Nic {
+pub(crate) struct Nic {
     global_ctx: ArcGlobalCtx,
     tunnel: Box<dyn Tunnel>,
     configurator: Configurator,
@@ -212,7 +208,7 @@ impl Nic {
                 close_notifier: close_notifier.clone(),
                 stream,
             }
-                .run(),
+            .run(),
         );
 
         self.tasks.spawn(
@@ -221,7 +217,7 @@ impl Nic {
                 close_notifier: close_notifier.clone(),
                 sink,
             }
-                .run(),
+            .run(),
         );
 
         let cfg = &self.configurator;
@@ -236,13 +232,15 @@ impl Nic {
             // Assign IPv4 address if provided
             if let Some(ipv4_addr) = ipv4_addr {
                 cfg.remove_ipv4_ip(None).await?;
-                cfg.add_ipv4_ip(ipv4_addr.address(), ipv4_addr.network_length()).await?;
+                cfg.add_ipv4_ip(ipv4_addr.address(), ipv4_addr.network_length())
+                    .await?;
             }
 
             // Assign IPv6 address if provided
             if let Some(ipv6_addr) = ipv6_addr {
                 cfg.remove_ipv6_ip(None).await?;
-                cfg.add_ipv6_ip(ipv6_addr.address(), ipv6_addr.network_length()).await?;
+                cfg.add_ipv6_ip(ipv6_addr.address(), ipv6_addr.network_length())
+                    .await?;
             }
 
             // TODO: publish route here

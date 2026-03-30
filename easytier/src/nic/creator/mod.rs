@@ -12,14 +12,15 @@ use derive_new::new;
 use futures::lock::BiLock;
 use tun::{AbstractDevice, AsyncDevice, Configuration, Layer};
 
-// #[cfg(target_os = "freebsd")]
+#[cfg(target_os = "freebsd")]
 mod freebsd;
-// #[cfg(target_os = "linux")]
+#[cfg(target_os = "linux")]
 mod linux;
-// #[cfg(all(target_os = "macos", not(feature = "macos-ne")))]
+#[cfg(all(target_os = "macos", not(feature = "macos-ne")))]
 mod macos;
-// #[cfg(target_os = "windows")]
+#[cfg(mobile)]
 mod mobile;
+#[cfg(target_os = "windows")]
 mod windows;
 
 pub trait PlatformNicCreator {
@@ -29,7 +30,7 @@ pub trait PlatformNicCreator {
 }
 
 #[derive(new)]
-struct NicCreator {
+pub struct NicCreator {
     global_ctx: ArcGlobalCtx,
     #[cfg(mobile)]
     fd: std::os::fd::RawFd,
