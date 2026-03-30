@@ -1,10 +1,3 @@
-use std::{
-    net::{IpAddr, Ipv4Addr, Ipv6Addr},
-    pin::Pin,
-    sync::{Arc, Weak},
-    task::{Context, Poll},
-};
-
 use crate::nic::controller::{Controller, NicController, PlatformController};
 use crate::nic::creator::NicCreator;
 use crate::{
@@ -20,6 +13,12 @@ use crate::{
 use cidr::{Ipv4Inet, Ipv6Inet};
 use futures::{SinkExt, StreamExt};
 use pnet::packet::{ipv4::Ipv4Packet, ipv6::Ipv6Packet};
+use std::{
+    net::{IpAddr, Ipv4Addr, Ipv6Addr},
+    pin::Pin,
+    sync::{Arc, Weak},
+    task::{Context, Poll},
+};
 use tokio::sync::RwLock;
 use tokio::{
     sync::{Mutex, Notify},
