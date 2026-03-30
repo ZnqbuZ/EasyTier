@@ -1,8 +1,8 @@
 use crate::common::error::Error;
-use crate::nic::platform::{Nic, PlatformNic};
+use crate::nic::platform::{NicCreator, PlatformNicCreator};
 use tun::Configuration;
 
-impl Nic {
+impl NicCreator {
     /// FreeBSD specific: Rename a TUN interface
     async fn rename_tun_interface(old_name: &str, new_name: &str) -> Result<(), Error> {
         let output = tokio::process::Command::new("ifconfig")
@@ -128,7 +128,7 @@ impl Nic {
     }
 }
 
-impl PlatformNic for Nic {
+impl PlatformNicCreator for NicCreator {
     async fn configure(&self, _: &mut Configuration) -> Result<(), Error> {
         let name = &self.global_ctx.get_flags().dev_name;
 

@@ -1,10 +1,10 @@
 use crate::common::error::Error;
 use crate::common::global_ctx::ArcGlobalCtx;
 use crate::common::log;
-use crate::nic::platform::{Nic, PlatformNic};
+use crate::nic::platform::{NicCreator, PlatformNicCreator};
 use tun::Configuration;
 
-impl Nic {
+impl NicCreator {
     /// Check and create TUN device node if necessary on Linux systems
     async fn ensure_tun_device_node() {
         const TUN_DEV_PATH: &str = "/dev/net/tun";
@@ -87,7 +87,7 @@ impl Nic {
     }
 }
 
-impl PlatformNic for Nic {
+impl PlatformNicCreator for NicCreator {
     async fn configure(&self, config: &mut Configuration) -> Result<(), Error> {
         Self::ensure_tun_device_node().await;
 

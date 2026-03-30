@@ -1,10 +1,10 @@
 use crate::common::error::Error;
 use crate::common::ifcfg::RegistryManager;
 use crate::common::log;
-use crate::nic::platform::{Nic, PlatformNic};
+use crate::nic::platform::{NicCreator, PlatformNicCreator};
 use tun::Configuration;
 
-impl PlatformNic for Nic {
+impl PlatformNicCreator for NicCreator {
     async fn configure(&self, config: &mut Configuration) -> Result<(), Error> {
         let name = &self.global_ctx.get_flags().dev_name;
 
@@ -79,7 +79,7 @@ impl PlatformNic for Nic {
     }
 
     async fn finalize(&mut self) {
-        let ifname = self.name().unwrap();
+        let ifname = self.name.as_ref().unwrap();
 
         // Add firewall rules for virtual NIC interface to allow all traffic
         match crate::arch::windows::add_interface_to_firewall_allowlist(ifname) {
@@ -100,10 +100,12 @@ impl PlatformNic for Nic {
                     \n\tAlternatively, you can disable Windows Firewall for testing purposes.", ifname);
             }
         }
+
+        let _ = RegistryManager::reg_change_catrgory_in_profile(ifname);
     }
 }
 
-impl Drop for Nic {
+impl Drop for NicCreator {
     fn drop(&mut self) {
         if let Some(ifname) = self.name() {
             // Try to clean up firewall rules, but don't panic in destructor

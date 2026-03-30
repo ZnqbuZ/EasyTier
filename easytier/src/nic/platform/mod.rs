@@ -1,16 +1,25 @@
+use std::sync::Arc;
 use crate::common::error::Error;
+use crate::common::global_ctx::{ArcGlobalCtx, GlobalCtxEvent};
 use crate::common::ifcfg;
 use crate::common::netns::NetNSGuard;
 use crate::nic::tun::{TunAsyncWrite, TunStream, TunZCPacketToBytes};
 use crate::tunnel::common::{FramedWriter, TunnelWrapper};
 use crate::utils::BoxExt;
 use cfg_if::cfg_if;
-use cidr::IpInet;
+use cidr::{Ipv4Inet, Ipv6Inet};
 use derive_new::new;
 use futures_util::lock::BiLock;
+use tokio::sync::{Mutex, Notify};
+use tokio::task::JoinSet;
 use tun::platform::Device;
 use tun::{AbstractDevice, AsyncDevice, Configuration, Layer};
-use crate::common::global_ctx::ArcGlobalCtx;
+use crate::common::ifcfg::RegistryManager;
+use crate::nic::configurator::{Configurator, PlatformConfigurator};
+use crate::nic::{NicPeersForwarder, PeersNicForwarder};
+use crate::peers::PacketRecvChanReceiver;
+use crate::peers::peer_manager::PeerManager;
+use crate::tunnel::Tunnel;
 
 // #[cfg(target_os = "freebsd")]
 mod freebsd;
@@ -22,24 +31,23 @@ mod macos;
 mod mobile;
 mod windows;
 
-pub trait PlatformNic {
+pub trait PlatformNicCreator {
     async fn configure(&self, config: &mut Configuration) -> Result<(), Error>;
     async fn initialize(&mut self) {}
     async fn finalize(&mut self) {}
 }
 
 #[derive(new)]
-struct Nic {
-    #[new(default)]
-    name: Option<String>,
-    
+struct NicCreator {
     global_ctx: ArcGlobalCtx,
-    
     #[cfg(mobile)]
     fd: std::os::fd::RawFd,
+
+    #[new(default)]
+    name: Option<String>,
 }
 
-impl Nic {
+impl NicCreator {
     fn guard(&self) -> Option<Box<NetNSGuard>> {
         cfg_if! {
             if #[cfg(mobile)] {
@@ -49,10 +57,7 @@ impl Nic {
             }
         }
     }
-    fn name(&self) -> Option<&String> {
-        self.name.as_ref()
-    }
-    async fn create(&mut self) -> Result<Device, Error> {
+    async fn create(mut self) -> Result<Nic, Error> {
         let mut config = Configuration::default();
         config.layer(Layer::L3);
         self.configure(&mut config).await?;
@@ -70,7 +75,7 @@ impl Nic {
         };
 
         let name = device.tun_name()?;
-        self.set_name(name.clone());
+        self.name.replace(name.clone());
 
         let ifcfg = ifcfg::get();
 
@@ -89,7 +94,7 @@ impl Nic {
             }
             // set mtu by ourselves, rust-tun does not handle it correctly on windows
             let _g = self.guard();
-            ifcfg.set_mtu(self.name().unwrap(), mtu_in_config).await?;
+            ifcfg.set_mtu(self.name.as_ref().unwrap(), mtu_in_config).await?;
         }
 
         let has_packet_info = cfg!(any(
@@ -108,7 +113,83 @@ impl Nic {
         );
 
         self.finalize().await;
+        
+        let name = self.name.unwrap();
 
-        Ok(ft.boxed())
+        Ok(Nic {
+            global_ctx: self.global_ctx,
+            tunnel: ft.boxed(),
+            name: name.clone(),
+            configurator: Configurator::new(name),
+            tasks: JoinSet::new(),
+        })
     }
 }
+
+struct Nic {
+    global_ctx: ArcGlobalCtx,
+    tunnel: Box<dyn Tunnel>,
+    name: String,
+    configurator: Configurator,
+    tasks: JoinSet<()>,
+}
+
+impl Nic {
+    pub async fn run(
+        &mut self,
+        peer_mgr: &Arc<PeerManager>,
+        peer_packet_receiver: Arc<Mutex<PacketRecvChanReceiver>>,
+        close_notifier: Arc<Notify>,
+        ipv4_addr: Option<Ipv4Inet>,
+        ipv6_addr: Option<Ipv6Inet>,
+    ) -> Result<(), Error> {
+        let (stream, sink) = self.tunnel.split();
+
+        self.tasks.spawn(
+            NicPeersForwarder {
+                peer_mgr: peer_mgr.clone(),
+                close_notifier: close_notifier.clone(),
+                stream,
+            }
+                .run(),
+        );
+
+        self.tasks.spawn(
+            PeersNicForwarder {
+                packet_recv_chan_receiver: peer_packet_receiver,
+                close_notifier: close_notifier.clone(),
+                sink,
+            }
+                .run(),
+        );
+        
+        let cfg = &self.configurator;
+
+        cfg.wait_interface_show().await?;
+        
+        // TODO: run route manager
+
+        {
+            let _g = self.global_ctx.net_ns.guard();
+
+            // Assign IPv4 address if provided
+            if let Some(ipv4_addr) = ipv4_addr {
+                cfg.remove_ipv4_ip(None).await?;
+                cfg.add_ipv4_ip(ipv4_addr.address(), ipv4_addr.network_length()).await?;
+            }
+
+            // Assign IPv6 address if provided
+            if let Some(ipv6_addr) = ipv6_addr {
+                cfg.remove_ipv6_ip(None).await?;
+                cfg.add_ipv6_ip(ipv6_addr.address(), ipv6_addr.network_length()).await?;
+            }
+            
+            // TODO: publish route here
+        }
+
+        self.run_proxy_cidrs_route_updater().await?;
+
+        Ok(())
+    }
+}
+

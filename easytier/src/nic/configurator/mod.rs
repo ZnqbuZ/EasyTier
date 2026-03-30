@@ -34,18 +34,10 @@ pub trait PlatformConfigurator: Send + Sync {
     ) -> Result<(), Error> {
         Ok(())
     }
-    async fn remove_ipv4_route(
-        &self,
-        _address: Ipv4Addr,
-        _cidr_prefix: u8,
-    ) -> Result<(), Error> {
+    async fn remove_ipv4_route(&self, _address: Ipv4Addr, _cidr_prefix: u8) -> Result<(), Error> {
         Ok(())
     }
-    async fn add_ipv4_ip(
-        &self,
-        _address: Ipv4Addr,
-        _cidr_prefix: u8,
-    ) -> Result<(), Error> {
+    async fn add_ipv4_ip(&self, _address: Ipv4Addr, _cidr_prefix: u8) -> Result<(), Error> {
         Ok(())
     }
     async fn remove_ipv4_ip(&self, _ip: Option<Ipv4Inet>) -> Result<(), Error> {
@@ -59,18 +51,10 @@ pub trait PlatformConfigurator: Send + Sync {
     ) -> Result<(), Error> {
         Ok(())
     }
-    async fn remove_ipv6_route(
-        &self,
-        _address: Ipv6Addr,
-        _cidr_prefix: u8,
-    ) -> Result<(), Error> {
+    async fn remove_ipv6_route(&self, _address: Ipv6Addr, _cidr_prefix: u8) -> Result<(), Error> {
         Ok(())
     }
-    async fn add_ipv6_ip(
-        &self,
-        _address: Ipv6Addr,
-        _cidr_prefix: u8,
-    ) -> Result<(), Error> {
+    async fn add_ipv6_ip(&self, _address: Ipv6Addr, _cidr_prefix: u8) -> Result<(), Error> {
         Ok(())
     }
     async fn remove_ipv6_ip(&self, _ip: Option<Ipv6Inet>) -> Result<(), Error> {
@@ -138,34 +122,6 @@ async fn run_shell_cmd(cmd: &str) -> Result<(), Error> {
     Ok(())
 }
 
-pub struct DummyIfConfiger;
-
-#[cfg(target_os = "linux")]
-const IF_CONFIGER: linux::IfConfiger = linux::IfConfiger;
-
-#[cfg(any(
-    all(target_os = "macos", not(feature = "macos-ne")),
-    target_os = "freebsd"
-))]
-const IF_CONFIGER: macos::IfConfiger = macos::IfConfiger;
-
-#[cfg(target_os = "windows")]
-const IF_CONFIGER: windows::IfConfiger = windows::IfConfiger;
-
-#[cfg(not(any(
-    all(target_os = "macos", not(feature = "macos-ne")),
-    target_os = "linux",
-    target_os = "windows",
-    target_os = "freebsd",
-)))]
-const IF_CONFIGER: DummyIfConfiger = DummyIfConfiger;
-
+use crate::common::error::Error;
 #[cfg(target_os = "windows")]
 pub use windows::RegistryManager;
-use crate::common::error::Error;
-
-pub type IfConfiger = &'static dyn PlatformConfigurator;
-
-pub fn get() -> IfConfiger {
-    &IF_CONFIGER
-}
