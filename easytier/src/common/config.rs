@@ -528,17 +528,20 @@ impl TomlConfigLoader {
 }
 
 impl ConfigLoader for TomlConfigLoader {
-    fn get_inst_name(&self) -> String {
-        self.config
-            .lock()
-            .unwrap()
-            .instance_name
-            .clone()
-            .unwrap_or("default".to_string())
+    fn get_id(&self) -> uuid::Uuid {
+        let mut locked_config = self.config.lock().unwrap();
+        match locked_config.instance_id {
+            Some(id) => id,
+            None => {
+                let id = uuid::Uuid::new_v4();
+                locked_config.instance_id = Some(id);
+                id
+            }
+        }
     }
 
-    fn set_inst_name(&self, name: String) {
-        self.config.lock().unwrap().instance_name = Some(name);
+    fn set_id(&self, id: uuid::Uuid) {
+        self.config.lock().unwrap().instance_id = Some(id);
     }
 
     fn get_hostname(&self) -> String {
@@ -566,6 +569,19 @@ impl ConfigLoader for TomlConfigLoader {
 
     fn set_hostname(&self, name: Option<String>) {
         self.config.lock().unwrap().hostname = name;
+    }
+
+    fn get_inst_name(&self) -> String {
+        self.config
+            .lock()
+            .unwrap()
+            .instance_name
+            .clone()
+            .unwrap_or("default".to_string())
+    }
+
+    fn set_inst_name(&self, name: String) {
+        self.config.lock().unwrap().instance_name = Some(name);
     }
 
     fn get_netns(&self) -> Option<String> {
@@ -671,22 +687,6 @@ impl ConfigLoader for TomlConfigLoader {
             .as_ref()
             .cloned()
             .unwrap_or_default()
-    }
-
-    fn get_id(&self) -> uuid::Uuid {
-        let mut locked_config = self.config.lock().unwrap();
-        match locked_config.instance_id {
-            Some(id) => id,
-            None => {
-                let id = uuid::Uuid::new_v4();
-                locked_config.instance_id = Some(id);
-                id
-            }
-        }
-    }
-
-    fn set_id(&self, id: uuid::Uuid) {
-        self.config.lock().unwrap().instance_id = Some(id);
     }
 
     fn get_network_identity(&self) -> NetworkIdentity {
