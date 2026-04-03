@@ -1819,7 +1819,7 @@ impl PeerManager {
             proxy_cidrs: self
                 .global_ctx
                 .config
-                .get_proxy_cidrs()
+                .get_proxy_networks()
                 .into_iter()
                 .map(|x| match x.mapped_cidr {
                     None => x.cidr.to_string(),

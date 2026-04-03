@@ -224,7 +224,7 @@ impl RoutePeerInfo {
             ipv4_addr: global_ctx.get_ipv4().map(|x| x.address().into()),
             proxy_cidrs: global_ctx
                 .config
-                .get_proxy_cidrs()
+                .get_proxy_networks()
                 .iter()
                 .map(|x| x.mapped_cidr.unwrap_or(x.cidr))
                 .chain(global_ctx.get_vpn_portal_cidr())

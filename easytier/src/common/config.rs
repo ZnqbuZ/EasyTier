@@ -129,8 +129,8 @@ pub trait ConfigLoader: Send + Sync {
     fn get_hostname(&self) -> String;
     fn set_hostname(&self, name: Option<String>);
 
-    fn get_inst_name(&self) -> String;
-    fn set_inst_name(&self, name: String);
+    fn get_name(&self) -> String;
+    fn set_name(&self, name: String);
 
     fn get_netns(&self) -> Option<String>;
     fn set_netns(&self, ns: Option<String>);
@@ -151,7 +151,9 @@ pub trait ConfigLoader: Send + Sync {
     ) -> Result<(), anyhow::Error>;
     fn remove_proxy_cidr(&self, cidr: cidr::Ipv4Cidr);
     fn clear_proxy_cidrs(&self);
-    fn get_proxy_cidrs(&self) -> Vec<ProxyNetworkConfig>;
+
+    fn get_proxy_networks(&self) -> Vec<ProxyNetworkConfig>;
+    fn set_proxy_networks(&self, networks: Vec<ProxyNetworkConfig>);
 
     fn get_network_identity(&self) -> NetworkIdentity;
     fn set_network_identity(&self, identity: NetworkIdentity);
@@ -177,8 +179,8 @@ pub trait ConfigLoader: Send + Sync {
     fn get_routes(&self) -> Vec<cidr::Ipv4Cidr>;
     fn set_routes(&self, routes: Vec<cidr::Ipv4Cidr>);
 
-    fn get_socks5_portal(&self) -> Option<url::Url>;
-    fn set_socks5_portal(&self, addr: Option<url::Url>);
+    fn get_socks5_proxy(&self) -> Option<url::Url>;
+    fn set_socks5_proxy(&self, addr: Option<url::Url>);
 
     fn get_port_forwards(&self) -> Vec<PortForwardConfig>;
     fn set_port_forwards(&self, forwards: Vec<PortForwardConfig>);
@@ -447,11 +449,11 @@ struct Config {
     #[get_clone]
     hostname: Option<String>,
     #[get_clone]
-    #[serde(default = "crate::utils::gethostname")]
-    instance_name: String,
+    #[serde(rename = "instance_name", default = "crate::utils::gethostname")]
+    name: String,
     #[get_copy]
-    #[serde(default = "uuid::Uuid::new_v4")]
-    instance_id: uuid::Uuid,
+    #[serde(rename = "instance_id", default = "uuid::Uuid::new_v4")]
+    id: uuid::Uuid,
     #[get]
     ipv4: Option<String>,
     #[get]
@@ -468,10 +470,12 @@ struct Config {
     exit_nodes: Vec<IpAddr>,
 
     #[get_clone]
-    peer: Vec<PeerConfig>,
+    #[serde(rename = "peer")]
+    peers: Vec<PeerConfig>,
     #[get]
     #[get_mut]
-    proxy_network: Vec<ProxyNetworkConfig>,
+    #[serde(rename = "proxy_network")]
+    proxy_networks: Vec<ProxyNetworkConfig>,
 
     #[get_clone]
     vpn_portal_config: Option<VpnPortalConfig>,
@@ -483,17 +487,19 @@ struct Config {
     socks5_proxy: Option<url::Url>,
 
     #[get_clone]
-    port_forward: Vec<PortForwardConfig>,
+    #[serde(rename = "port_forward")]
+    port_forwards: Vec<PortForwardConfig>,
 
     #[get_clone]
     secure_mode: Option<SecureModeConfig>,
 
     #[get_clone]
-    flags: serde_json::Map<String, serde_json::Value>,
+    #[serde(rename = "flags")]
+    raw_flags: serde_json::Map<String, serde_json::Value>,
 
     #[get_clone]
     #[serde(skip)]
-    flags_struct: Flags,
+    flags: Flags,
 
     #[get_clone]
     acl: Option<Acl>,
@@ -527,7 +533,7 @@ impl TomlConfigLoader {
         let mut config = toml::de::from_str::<Config>(config_str)
             .with_context(|| format!("failed to parse config file: {}", config_str))?;
 
-        config.flags_struct = Self::gen_flags(config.flags());
+        config.flags = Self::gen_flags(config.raw_flags());
 
         let config = TomlConfigLoader {
             config: Arc::new(Mutex::new(config)),
@@ -575,11 +581,11 @@ impl TomlConfigLoader {
 
 impl ConfigLoader for TomlConfigLoader {
     fn get_id(&self) -> uuid::Uuid {
-        self.config().instance_id()
+        self.config().id()
     }
 
     fn set_id(&self, id: uuid::Uuid) {
-        self.config().set_instance_id(id);
+        self.config().set_id(id);
     }
 
     fn get_hostname(&self) -> String {
@@ -609,12 +615,12 @@ impl ConfigLoader for TomlConfigLoader {
         self.config().set_hostname(name);
     }
 
-    fn get_inst_name(&self) -> String {
-        self.config().instance_name()
+    fn get_name(&self) -> String {
+        self.config().name()
     }
 
-    fn set_inst_name(&self, name: String) {
-        self.config().set_instance_name(name);
+    fn set_name(&self, name: String) {
+        self.config().set_name(name);
     }
 
     fn get_netns(&self) -> Option<String> {
@@ -677,11 +683,11 @@ impl ConfigLoader for TomlConfigLoader {
         // insert if no duplicate
         let mut config = self.config();
         if !config
-            .proxy_network()
+            .proxy_networks()
             .iter()
             .any(|c| c.cidr == cidr && c.mapped_cidr == mapped_cidr)
         {
-            config.proxy_network_mut().push(ProxyNetworkConfig {
+            config.proxy_networks_mut().push(ProxyNetworkConfig {
                 cidr,
                 mapped_cidr,
                 allow: None,
@@ -691,15 +697,21 @@ impl ConfigLoader for TomlConfigLoader {
     }
 
     fn remove_proxy_cidr(&self, cidr: cidr::Ipv4Cidr) {
-        self.config().proxy_network_mut().retain(|c| c.cidr != cidr)
+        self.config()
+            .proxy_networks_mut()
+            .retain(|c| c.cidr != cidr)
     }
 
     fn clear_proxy_cidrs(&self) {
-        self.config().proxy_network_mut().clear()
+        self.config().proxy_networks_mut().clear()
     }
 
-    fn get_proxy_cidrs(&self) -> Vec<ProxyNetworkConfig> {
-        self.config().proxy_network().clone()
+    fn get_proxy_networks(&self) -> Vec<ProxyNetworkConfig> {
+        self.config().proxy_networks().clone()
+    }
+
+    fn set_proxy_networks(&self, networks: Vec<ProxyNetworkConfig>) {
+        self.config().set_proxy_networks(networks);
     }
 
     fn get_network_identity(&self) -> NetworkIdentity {
@@ -711,11 +723,11 @@ impl ConfigLoader for TomlConfigLoader {
     }
 
     fn get_peers(&self) -> Vec<PeerConfig> {
-        self.config().peer()
+        self.config().peers()
     }
 
     fn set_peers(&self, peers: Vec<PeerConfig>) {
-        self.config().set_peer(peers);
+        self.config().set_peers(peers);
     }
 
     fn get_listeners(&self) -> Vec<url::Url> {
@@ -742,11 +754,11 @@ impl ConfigLoader for TomlConfigLoader {
     }
 
     fn get_flags(&self) -> Flags {
-        self.config().flags_struct()
+        self.config().flags()
     }
 
     fn set_flags(&self, flags: Flags) {
-        self.config().set_flags_struct(flags);
+        self.config().set_flags(flags);
     }
 
     fn get_exit_nodes(&self) -> Vec<IpAddr> {
@@ -765,20 +777,20 @@ impl ConfigLoader for TomlConfigLoader {
         self.config().set_routes(routes);
     }
 
-    fn get_socks5_portal(&self) -> Option<url::Url> {
+    fn get_socks5_proxy(&self) -> Option<url::Url> {
         self.config().socks5_proxy()
     }
 
-    fn set_socks5_portal(&self, addr: Option<url::Url>) {
+    fn set_socks5_proxy(&self, addr: Option<url::Url>) {
         self.config().set_socks5_proxy(addr);
     }
 
     fn get_port_forwards(&self) -> Vec<PortForwardConfig> {
-        self.config().port_forward()
+        self.config().port_forwards()
     }
 
     fn set_port_forwards(&self, forwards: Vec<PortForwardConfig>) {
-        self.config().set_port_forward(forwards);
+        self.config().set_port_forwards(forwards);
     }
 
     fn get_acl(&self) -> Option<Acl> {
@@ -858,7 +870,7 @@ impl ConfigLoader for TomlConfigLoader {
         }
 
         let mut config = self.config.lock().unwrap().clone();
-        config.flags = flag_map;
+        config.raw_flags = flag_map;
         if config.stun_servers == StunInfoCollector::get_default_servers() {
             config.stun_servers = vec![];
         }
@@ -1346,7 +1358,7 @@ network_secret = "${INSTANCE_SECRET}"
             .unwrap();
 
         // 验证实例1的配置
-        assert_eq!(config1.get_inst_name(), "instance-one");
+        assert_eq!(config1.get_name(), "instance-one");
         assert_eq!(
             config1
                 .get_network_identity()
@@ -1370,7 +1382,7 @@ network_secret = "${INSTANCE_SECRET}"
             .unwrap();
 
         // 验证实例2使用了不同的环境变量值
-        assert_eq!(config2.get_inst_name(), "instance-two");
+        assert_eq!(config2.get_name(), "instance-two");
         assert_eq!(
             config2
                 .get_network_identity()
@@ -1381,7 +1393,7 @@ network_secret = "${INSTANCE_SECRET}"
         );
 
         // 验证两个实例的配置确实不同
-        assert_ne!(config1.get_inst_name(), config2.get_inst_name());
+        assert_ne!(config1.get_name(), config2.get_name());
         assert_ne!(
             config1.get_network_identity().network_secret,
             config2.get_network_identity().network_secret

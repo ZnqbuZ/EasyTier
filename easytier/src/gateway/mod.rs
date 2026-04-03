@@ -52,7 +52,7 @@ impl CidrSet {
         self.tasks.spawn(async move {
             let mut last_cidrs = vec![];
             loop {
-                let cidrs = global_ctx.config.get_proxy_cidrs();
+                let cidrs = global_ctx.config.get_proxy_networks();
                 if cidrs != last_cidrs {
                     last_cidrs = cidrs.clone();
                     mapped_to_real.clear();

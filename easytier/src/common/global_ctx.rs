@@ -275,7 +275,7 @@ impl GlobalCtx {
         let credential_manager = Arc::new(CredentialManager::new(credential_storage_path));
 
         GlobalCtx {
-            inst_name: config_fs.get_inst_name(),
+            inst_name: config_fs.get_name(),
             id,
             config: Box::new(config_fs),
             net_ns: net_ns.clone(),

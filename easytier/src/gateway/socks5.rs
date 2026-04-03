@@ -699,7 +699,7 @@ impl Socks5Server {
         {
             *self.kcp_endpoint.lock().await = kcp_endpoint.clone();
         }
-        if let Some(proxy_url) = self.global_ctx.config.get_socks5_portal() {
+        if let Some(proxy_url) = self.global_ctx.config.get_socks5_proxy() {
             let bind_addr = format!(
                 "{}:{}",
                 proxy_url.host_str().unwrap(),

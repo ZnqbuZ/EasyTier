@@ -121,7 +121,7 @@ pub unsafe extern "C" fn run_network_instance(cfg_str: *const std::ffi::c_char) 
         }
     };
 
-    let inst_name = cfg.get_inst_name();
+    let inst_name = cfg.get_name();
 
     if INSTANCE_NAME_ID_MAP.contains_key(&inst_name) {
         set_error_msg("instance already exists");

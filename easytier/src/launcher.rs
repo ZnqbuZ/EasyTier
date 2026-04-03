@@ -388,7 +388,7 @@ impl NetworkInstance {
     }
 
     pub fn get_inst_name(&self) -> String {
-        self.config.get_inst_name()
+        self.config.get_name()
     }
 
     pub fn get_network_name(&self) -> String {
@@ -658,7 +658,7 @@ impl NetworkConfig {
 
         if self.enable_socks5.unwrap_or_default() {
             if let Some(socks5_port) = self.socks5_port {
-                cfg.set_socks5_portal(Some(
+                cfg.set_socks5_proxy(Some(
                     format!("socks5://0.0.0.0:{}", socks5_port).parse().unwrap(),
                 ));
             }
@@ -873,7 +873,7 @@ impl NetworkConfig {
             .collect();
 
         result.proxy_cidrs = config
-            .get_proxy_cidrs()
+            .get_proxy_networks()
             .iter()
             .map(|c| {
                 if let Some(mapped) = c.mapped_cidr {
@@ -919,7 +919,7 @@ impl NetworkConfig {
             result.exit_nodes = exit_nodes.iter().map(|n| n.to_string()).collect();
         }
 
-        if let Some(socks5_portal) = config.get_socks5_portal() {
+        if let Some(socks5_portal) = config.get_socks5_proxy() {
             result.enable_socks5 = Some(true);
             result.socks5_port = socks5_portal.port().map(|p| p as i32);
         }
@@ -1171,7 +1171,7 @@ mod tests {
 
             if rng.gen_bool(0.5) {
                 let socks5_port = rng.gen_range(10000..60000);
-                config.set_socks5_portal(Some(
+                config.set_socks5_proxy(Some(
                     format!("socks5://0.0.0.0:{}", socks5_port).parse().unwrap(),
                 ));
             }

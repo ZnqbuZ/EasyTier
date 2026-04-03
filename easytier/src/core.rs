@@ -942,7 +942,7 @@ impl NetworkOptions {
 
         #[cfg(feature = "socks5")]
         if let Some(socks5_proxy) = self.socks5 {
-            cfg.set_socks5_portal(Some(
+            cfg.set_socks5_proxy(Some(
                 format!("socks5://0.0.0.0:{}", socks5_proxy)
                     .parse()
                     .unwrap(),
