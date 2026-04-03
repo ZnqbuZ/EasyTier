@@ -642,7 +642,7 @@ impl NetworkConfig {
                         .with_context(|| format!("failed to parse route: {}", route))?,
                 );
             }
-            cfg.set_routes(Some(routes));
+            cfg.set_routes(routes);
         }
 
         if !self.exit_nodes.is_empty() {
@@ -665,7 +665,7 @@ impl NetworkConfig {
         }
 
         if !self.mapped_listeners.is_empty() {
-            cfg.set_mapped_listeners(Some(
+            cfg.set_mapped_listeners(
                 self.mapped_listeners
                     .iter()
                     .map(|s| {
@@ -680,7 +680,7 @@ impl NetworkConfig {
                         s
                     })
                     .collect(),
-            ));
+            );
         }
 
         if let Some(credential_file) = self
@@ -868,7 +868,6 @@ impl NetworkConfig {
 
         result.listener_urls = config
             .get_listeners()
-            .unwrap_or_default()
             .iter()
             .map(|l| l.to_string())
             .collect();
@@ -909,11 +908,10 @@ impl NetworkConfig {
             result.vpn_portal_listen_port = Some(vpn_config.wireguard_listen.port() as i32);
         }
 
-        if let Some(routes) = config.get_routes() {
-            if !routes.is_empty() {
-                result.enable_manual_routes = Some(true);
-                result.routes = routes.iter().map(|r| r.to_string()).collect();
-            }
+        let routes = config.get_routes();
+        if !routes.is_empty() {
+            result.enable_manual_routes = Some(true);
+            result.routes = routes.iter().map(|r| r.to_string()).collect();
         }
 
         let exit_nodes = config.get_exit_nodes();
@@ -1141,7 +1139,7 @@ mod tests {
                     );
                     routes.push(route.parse().unwrap());
                 }
-                config.set_routes(Some(routes));
+                config.set_routes(routes);
             }
 
             if rng.gen_bool(0.4) {
@@ -1185,7 +1183,7 @@ mod tests {
                     let port = rng.gen_range(10000..60000);
                     mapped_listeners.push(format!("tcp://0.0.0.0:{}", port).parse().unwrap());
                 }
-                config.set_mapped_listeners(Some(mapped_listeners));
+                config.set_mapped_listeners(mapped_listeners);
             }
 
             if rng.gen_bool(0.3) {

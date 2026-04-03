@@ -715,7 +715,7 @@ mod tests {
 
         p_c.get_global_ctx()
             .config
-            .set_mapped_listeners(Some(vec!["tcp://127.0.0.1:11334".parse().unwrap()]));
+            .set_mapped_listeners(vec!["tcp://127.0.0.1:11334".parse().unwrap()]);
 
         p_x.get_global_ctx()
             .config

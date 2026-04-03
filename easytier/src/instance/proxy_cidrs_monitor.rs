@@ -50,7 +50,8 @@ impl ProxyCidrsMonitor {
         }
 
         // If has manual routes, override entire proxy_cidrs
-        if let Some(routes) = global_ctx.config.get_routes() {
+        let routes = global_ctx.config.get_routes();
+        if !routes.is_empty() {
             proxy_cidrs = routes.into_iter().collect();
         }
 

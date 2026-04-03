@@ -852,7 +852,7 @@ impl NetworkOptions {
                     .map(|s| s.parse().unwrap())
                     .collect(),
             );
-        } else if cfg.get_listeners().is_none() {
+        } else if cfg.get_listeners().is_empty() {
             cfg.set_listeners(
                 Cli::parse_listeners(false, vec!["11010".to_string()])?
                     .into_iter()
@@ -863,7 +863,7 @@ impl NetworkOptions {
 
         if !self.mapped_listeners.is_empty() {
             let mut errs = Vec::new();
-            cfg.set_mapped_listeners(Some(
+            cfg.set_mapped_listeners(
                 self.mapped_listeners
                     .iter()
                     .map(|s| {
@@ -878,7 +878,7 @@ impl NetworkOptions {
                         s
                     })
                     .collect::<Vec<_>>(),
-            ));
+            );
             if !errs.is_empty() {
                 return Err(anyhow::anyhow!(
                     "{}",
@@ -937,7 +937,7 @@ impl NetworkOptions {
                         .with_context(|| format!("failed to parse route: {}", r))?,
                 );
             }
-            cfg.set_routes(Some(routes));
+            cfg.set_routes(routes);
         }
 
         #[cfg(feature = "socks5")]
@@ -1099,15 +1099,15 @@ impl NetworkOptions {
         cfg.set_udp_whitelist(old_udp_whitelist);
 
         if let Some(stun_servers) = &self.stun_servers {
-            let mut old_stun_servers = cfg.get_stun_servers().unwrap_or_default();
+            let mut old_stun_servers = cfg.get_stun_servers();
             old_stun_servers.extend(stun_servers.iter().cloned());
-            cfg.set_stun_servers(Some(old_stun_servers));
+            cfg.set_stun_servers(old_stun_servers);
         }
 
         if let Some(stun_servers_v6) = &self.stun_servers_v6 {
-            let mut old_stun_servers_v6 = cfg.get_stun_servers_v6().unwrap_or_default();
+            let mut old_stun_servers_v6 = cfg.get_stun_servers_v6();
             old_stun_servers_v6.extend(stun_servers_v6.iter().cloned());
-            cfg.set_stun_servers_v6(Some(old_stun_servers_v6));
+            cfg.set_stun_servers_v6(old_stun_servers_v6);
         }
         Ok(())
     }

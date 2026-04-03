@@ -433,15 +433,11 @@ impl InstanceConfigPatcher {
             return Ok(());
         }
         let global_ctx = weak_upgrade(&self.global_ctx)?;
-        let mut current_routes = global_ctx.config.get_routes().unwrap_or_default();
+        let mut current_routes = global_ctx.config.get_routes();
         let patches = routes.into_iter().map(Into::into).collect();
         InstanceConfigPatcher::trace_patchables(&patches);
         crate::proto::api::config::patch_vec(&mut current_routes, patches);
-        if current_routes.is_empty() {
-            global_ctx.config.set_routes(None);
-        } else {
-            global_ctx.config.set_routes(Some(current_routes));
-        }
+        global_ctx.config.set_routes(current_routes);
         Ok(())
     }
 
@@ -476,13 +472,9 @@ impl InstanceConfigPatcher {
         let patches = mapped_listeners.into_iter().map(Into::into).collect();
         InstanceConfigPatcher::trace_patchables(&patches);
         crate::proto::api::config::patch_vec(&mut current_mapped_listeners, patches);
-        if current_mapped_listeners.is_empty() {
-            global_ctx.config.set_mapped_listeners(None);
-        } else {
-            global_ctx
-                .config
-                .set_mapped_listeners(Some(current_mapped_listeners));
-        }
+        global_ctx
+            .config
+            .set_mapped_listeners(current_mapped_listeners);
         Ok(())
     }
 

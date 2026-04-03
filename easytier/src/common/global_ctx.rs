@@ -255,17 +255,15 @@ impl GlobalCtx {
 
         let stun_info_collector = StunInfoCollector::new_with_default_servers();
 
-        if let Some(stun_servers) = config_fs.get_stun_servers() {
-            stun_info_collector.set_stun_servers(stun_servers);
-        } else {
-            stun_info_collector.set_stun_servers(StunInfoCollector::get_default_servers());
-        }
+        stun_info_collector.set_stun_servers(match config_fs.get_stun_servers() {
+            s if s.is_empty() => StunInfoCollector::get_default_servers(),
+            s => s,
+        });
 
-        if let Some(stun_servers) = config_fs.get_stun_servers_v6() {
-            stun_info_collector.set_stun_servers_v6(stun_servers);
-        } else {
-            stun_info_collector.set_stun_servers_v6(StunInfoCollector::get_default_servers_v6());
-        }
+        stun_info_collector.set_stun_servers_v6(match config_fs.get_stun_servers_v6() {
+            s if s.is_empty() => StunInfoCollector::get_default_servers_v6(),
+            s => s,
+        });
 
         let stun_info_collector = Arc::new(stun_info_collector);
 
