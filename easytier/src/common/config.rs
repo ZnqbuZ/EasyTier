@@ -439,11 +439,14 @@ pub fn process_secure_mode_cfg(mut user_cfg: SecureModeConfig) -> anyhow::Result
     MutGetters,
     Setters,
 )]
-#[getset(get_clone, set)]
+#[getset(set)]
 #[serde(default)]
 struct Config {
+    #[get_clone]
     netns: Option<String>,
+    #[get_clone]
     hostname: Option<String>,
+    #[get_clone]
     #[serde(default = "crate::utils::gethostname")]
     instance_name: String,
     #[get_copy]
@@ -455,38 +458,56 @@ struct Config {
     ipv6: Option<String>,
     #[get_copy]
     dhcp: bool,
+    #[get_clone]
     network_identity: NetworkIdentity,
+    #[get_clone]
     listeners: Vec<url::Url>,
+    #[get_clone]
     mapped_listeners: Vec<url::Url>,
+    #[get_clone]
     exit_nodes: Vec<IpAddr>,
 
+    #[get_clone]
     peer: Vec<PeerConfig>,
     #[get]
     #[get_mut]
     proxy_network: Vec<ProxyNetworkConfig>,
 
+    #[get_clone]
     vpn_portal_config: Option<VpnPortalConfig>,
 
+    #[get_clone]
     routes: Vec<cidr::Ipv4Cidr>,
 
+    #[get_clone]
     socks5_proxy: Option<url::Url>,
 
+    #[get_clone]
     port_forward: Vec<PortForwardConfig>,
 
+    #[get_clone]
     secure_mode: Option<SecureModeConfig>,
 
+    #[get_clone]
     flags: serde_json::Map<String, serde_json::Value>,
 
+    #[get_clone]
     #[serde(skip)]
     flags_struct: Flags,
 
+    #[get_clone]
     acl: Option<Acl>,
 
+    #[get_clone]
     tcp_whitelist: Vec<String>,
+    #[get_clone]
     udp_whitelist: Vec<String>,
+    #[get_clone]
     stun_servers: Vec<String>,
+    #[get_clone]
     stun_servers_v6: Vec<String>,
 
+    #[get_clone]
     credential_file: Option<PathBuf>,
 }
 
@@ -607,6 +628,7 @@ impl ConfigLoader for TomlConfigLoader {
     fn get_ipv4(&self) -> Option<cidr::Ipv4Inet> {
         self.config()
             .ipv4()
+            .as_ref()
             .and_then(|s| s.parse().ok())
             .map(|c: cidr::Ipv4Inet| {
                 if c.network_length() == 32 {
@@ -622,7 +644,7 @@ impl ConfigLoader for TomlConfigLoader {
     }
 
     fn get_ipv6(&self) -> Option<cidr::Ipv6Inet> {
-        self.config().ipv6().and_then(|s| s.parse().ok())
+        self.config().ipv6().as_ref().and_then(|s| s.parse().ok())
     }
 
     fn set_ipv6(&self, addr: Option<cidr::Ipv6Inet>) {
@@ -1478,10 +1500,7 @@ network_secret = "${UNDEFINED_SECRET:-default-secret}"
                 .unwrap(),
             "default-secret"
         );
-        assert_eq!(
-            config.get_listeners()[0].to_string(),
-            "tcp://0.0.0.0:11010"
-        );
+        assert_eq!(config.get_listeners()[0].to_string(), "tcp://0.0.0.0:11010");
     }
 
     /// 环境变量未定义且无默认值的情况
