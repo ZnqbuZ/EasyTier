@@ -159,11 +159,11 @@ pub trait ConfigLoader: Send + Sync {
     fn get_peers(&self) -> Vec<PeerConfig>;
     fn set_peers(&self, peers: Vec<PeerConfig>);
 
-    fn get_listeners(&self) -> Option<Vec<url::Url>>;
+    fn get_listeners(&self) -> Vec<url::Url>;
     fn set_listeners(&self, listeners: Vec<url::Url>);
 
     fn get_mapped_listeners(&self) -> Vec<url::Url>;
-    fn set_mapped_listeners(&self, listeners: Option<Vec<url::Url>>);
+    fn set_mapped_listeners(&self, listeners: Vec<url::Url>);
 
     fn get_vpn_portal_config(&self) -> Option<VpnPortalConfig>;
     fn set_vpn_portal_config(&self, config: VpnPortalConfig);
@@ -174,8 +174,8 @@ pub trait ConfigLoader: Send + Sync {
     fn get_exit_nodes(&self) -> Vec<IpAddr>;
     fn set_exit_nodes(&self, nodes: Vec<IpAddr>);
 
-    fn get_routes(&self) -> Option<Vec<cidr::Ipv4Cidr>>;
-    fn set_routes(&self, routes: Option<Vec<cidr::Ipv4Cidr>>);
+    fn get_routes(&self) -> Vec<cidr::Ipv4Cidr>;
+    fn set_routes(&self, routes: Vec<cidr::Ipv4Cidr>);
 
     fn get_socks5_portal(&self) -> Option<url::Url>;
     fn set_socks5_portal(&self, addr: Option<url::Url>);
@@ -192,19 +192,19 @@ pub trait ConfigLoader: Send + Sync {
     fn get_udp_whitelist(&self) -> Vec<String>;
     fn set_udp_whitelist(&self, whitelist: Vec<String>);
 
-    fn get_stun_servers(&self) -> Option<Vec<String>>;
-    fn set_stun_servers(&self, servers: Option<Vec<String>>);
+    fn get_stun_servers(&self) -> Vec<String>;
+    fn set_stun_servers(&self, servers: Vec<String>);
 
-    fn get_stun_servers_v6(&self) -> Option<Vec<String>>;
-    fn set_stun_servers_v6(&self, servers: Option<Vec<String>>);
+    fn get_stun_servers_v6(&self) -> Vec<String>;
+    fn set_stun_servers_v6(&self, servers: Vec<String>);
 
     fn get_secure_mode(&self) -> Option<SecureModeConfig>;
     fn set_secure_mode(&self, secure_mode: Option<SecureModeConfig>);
 
-    fn get_credential_file(&self) -> Option<std::path::PathBuf> {
+    fn get_credential_file(&self) -> Option<PathBuf> {
         None
     }
-    fn set_credential_file(&self, _path: Option<std::path::PathBuf>) {}
+    fn set_credential_file(&self, _path: Option<PathBuf>) {}
 
     fn dump(&self) -> String;
 }
