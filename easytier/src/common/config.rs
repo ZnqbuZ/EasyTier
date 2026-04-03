@@ -156,8 +156,6 @@ pub trait ConfigLoader: Send + Sync {
     fn get_network_identity(&self) -> NetworkIdentity;
     fn set_network_identity(&self, identity: NetworkIdentity);
 
-    fn get_listener_uris(&self) -> Vec<url::Url>;
-
     fn get_peers(&self) -> Vec<PeerConfig>;
     fn set_peers(&self, peers: Vec<PeerConfig>);
 
@@ -692,15 +690,6 @@ impl ConfigLoader for TomlConfigLoader {
         self.config().set_network_identity(identity);
     }
 
-    fn get_listener_uris(&self) -> Vec<url::Url> {
-        self.config
-            .lock()
-            .unwrap()
-            .listeners
-            .clone()
-            .unwrap_or_default()
-    }
-
     fn get_peers(&self) -> Vec<PeerConfig> {
         self.config().peer()
     }
@@ -1139,7 +1128,7 @@ proto = "tcp"
 
         assert_eq!(
             vec!["tcp://0.0.0.0:11010", "udp://0.0.0.0:11010"],
-            ret.get_listener_uris()
+            ret.get_listeners()
                 .iter()
                 .map(|u| u.to_string())
                 .collect::<Vec<String>>()
@@ -1431,7 +1420,7 @@ uri = "tcp://${PEER_HOST}:${PEER_PORT}"
         );
 
         // 验证 listeners 字段
-        let listeners = config.get_listener_uris();
+        let listeners = config.get_listeners();
         assert_eq!(listeners.len(), 1);
         assert_eq!(listeners[0].to_string(), "tcp://0.0.0.0:11010");
 
@@ -1490,7 +1479,7 @@ network_secret = "${UNDEFINED_SECRET:-default-secret}"
             "default-secret"
         );
         assert_eq!(
-            config.get_listener_uris()[0].to_string(),
+            config.get_listeners()[0].to_string(),
             "tcp://0.0.0.0:11010"
         );
     }
@@ -1692,7 +1681,7 @@ enable_encryption = ${MIXED_ENCRYPTION}
         assert_eq!(flags.mtu, 1500);
 
         // 验证 URL 中的端口号（数字）
-        let listeners = config.get_listener_uris();
+        let listeners = config.get_listeners();
         assert_eq!(listeners.len(), 1);
         assert_eq!(listeners[0].to_string(), "tcp://0.0.0.0:12345");
 

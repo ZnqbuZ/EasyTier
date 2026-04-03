@@ -131,7 +131,7 @@ impl<H: TunnelHandlerForListener + Send + Sync + 'static + Debug> ListenerManage
         )
         .await?;
 
-        for l in self.global_ctx.config.get_listener_uris().iter() {
+        for l in self.global_ctx.config.get_listeners().iter() {
             let l = l.clone();
             let Ok(_) = get_listener_by_url(&l, self.global_ctx.clone()) else {
                 let msg = format!("failed to get listener by url: {}, maybe not supported", l);
