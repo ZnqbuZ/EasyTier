@@ -1,16 +1,17 @@
+use anyhow::Context;
+use base64::{prelude::BASE64_STANDARD, Engine as _};
+use cfg_if::cfg_if;
+use clap::builder::PossibleValue;
+use clap::ValueEnum;
+use getset::{CloneGetters, CopyGetters, Getters, MutGetters, Setters};
+use serde::{Deserialize, Serialize};
+use std::sync::MutexGuard;
 use std::{
     hash::Hasher,
     net::{IpAddr, SocketAddr},
     path::PathBuf,
     sync::{Arc, Mutex},
 };
-
-use anyhow::Context;
-use base64::{prelude::BASE64_STANDARD, Engine as _};
-use cfg_if::cfg_if;
-use clap::builder::PossibleValue;
-use clap::ValueEnum;
-use serde::{Deserialize, Serialize};
 use strum::{Display, EnumString, VariantArray};
 use tokio::io::AsyncReadExt as _;
 
@@ -427,44 +428,66 @@ pub fn process_secure_mode_cfg(mut user_cfg: SecureModeConfig) -> anyhow::Result
     Ok(user_cfg)
 }
 
-#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Default,
+    Deserialize,
+    Serialize,
+    Getters,
+    CopyGetters,
+    CloneGetters,
+    MutGetters,
+    Setters,
+)]
+#[getset(get_clone, set)]
+#[serde(default)]
 struct Config {
     netns: Option<String>,
     hostname: Option<String>,
-    instance_name: Option<String>,
-    instance_id: Option<uuid::Uuid>,
+    #[serde(default = "crate::utils::gethostname")]
+    instance_name: String,
+    #[get_copy]
+    #[serde(default = "uuid::Uuid::new_v4")]
+    instance_id: uuid::Uuid,
+    #[get]
     ipv4: Option<String>,
+    #[get]
     ipv6: Option<String>,
-    dhcp: Option<bool>,
-    network_identity: Option<NetworkIdentity>,
-    listeners: Option<Vec<url::Url>>,
-    mapped_listeners: Option<Vec<url::Url>>,
-    exit_nodes: Option<Vec<IpAddr>>,
+    #[get_copy]
+    dhcp: bool,
+    network_identity: NetworkIdentity,
+    listeners: Vec<url::Url>,
+    mapped_listeners: Vec<url::Url>,
+    exit_nodes: Vec<IpAddr>,
 
-    peer: Option<Vec<PeerConfig>>,
-    proxy_network: Option<Vec<ProxyNetworkConfig>>,
+    peer: Vec<PeerConfig>,
+    #[get]
+    #[get_mut]
+    proxy_network: Vec<ProxyNetworkConfig>,
 
     vpn_portal_config: Option<VpnPortalConfig>,
 
-    routes: Option<Vec<cidr::Ipv4Cidr>>,
+    routes: Vec<cidr::Ipv4Cidr>,
 
     socks5_proxy: Option<url::Url>,
 
-    port_forward: Option<Vec<PortForwardConfig>>,
+    port_forward: Vec<PortForwardConfig>,
 
     secure_mode: Option<SecureModeConfig>,
 
-    flags: Option<serde_json::Map<String, serde_json::Value>>,
+    flags: serde_json::Map<String, serde_json::Value>,
 
     #[serde(skip)]
-    flags_struct: Option<Flags>,
+    flags_struct: Flags,
 
     acl: Option<Acl>,
 
-    tcp_whitelist: Option<Vec<String>>,
-    udp_whitelist: Option<Vec<String>>,
-    stun_servers: Option<Vec<String>>,
-    stun_servers_v6: Option<Vec<String>>,
+    tcp_whitelist: Vec<String>,
+    udp_whitelist: Vec<String>,
+    stun_servers: Vec<String>,
+    stun_servers_v6: Vec<String>,
 
     credential_file: Option<PathBuf>,
 }
@@ -485,7 +508,7 @@ impl TomlConfigLoader {
         let mut config = toml::de::from_str::<Config>(config_str)
             .with_context(|| format!("failed to parse config file: {}", config_str))?;
 
-        config.flags_struct = Some(Self::gen_flags(config.flags.clone().unwrap_or_default()));
+        config.flags_struct = Self::gen_flags(config.flags());
 
         let config = TomlConfigLoader {
             config: Arc::new(Mutex::new(config)),
@@ -525,27 +548,23 @@ impl TomlConfigLoader {
 
         serde_json::from_value(serde_json::Value::Object(merged_hashmap)).unwrap()
     }
+
+    fn config(&self) -> MutexGuard<'_, Config> {
+        self.config.lock().unwrap()
+    }
 }
 
 impl ConfigLoader for TomlConfigLoader {
     fn get_id(&self) -> uuid::Uuid {
-        let mut locked_config = self.config.lock().unwrap();
-        match locked_config.instance_id {
-            Some(id) => id,
-            None => {
-                let id = uuid::Uuid::new_v4();
-                locked_config.instance_id = Some(id);
-                id
-            }
-        }
+        self.config().instance_id()
     }
 
     fn set_id(&self, id: uuid::Uuid) {
-        self.config.lock().unwrap().instance_id = Some(id);
+        self.config().set_instance_id(id);
     }
 
     fn get_hostname(&self) -> String {
-        let hostname = self.config.lock().unwrap().hostname.clone();
+        let hostname = self.config().hostname();
 
         match hostname {
             Some(hostname) => {
@@ -568,35 +587,28 @@ impl ConfigLoader for TomlConfigLoader {
     }
 
     fn set_hostname(&self, name: Option<String>) {
-        self.config.lock().unwrap().hostname = name;
+        self.config().set_hostname(name);
     }
 
     fn get_inst_name(&self) -> String {
-        self.config
-            .lock()
-            .unwrap()
-            .instance_name
-            .clone()
-            .unwrap_or("default".to_string())
+        self.config().instance_name()
     }
 
     fn set_inst_name(&self, name: String) {
-        self.config.lock().unwrap().instance_name = Some(name);
+        self.config().set_instance_name(name);
     }
 
     fn get_netns(&self) -> Option<String> {
-        self.config.lock().unwrap().netns.clone()
+        self.config().netns()
     }
 
-    fn set_netns(&self, ns: Option<String>) {
-        self.config.lock().unwrap().netns = ns;
+    fn set_netns(&self, netns: Option<String>) {
+        self.config().set_netns(netns);
     }
 
     fn get_ipv4(&self) -> Option<cidr::Ipv4Inet> {
-        let locked_config = self.config.lock().unwrap();
-        locked_config
-            .ipv4
-            .as_ref()
+        self.config()
+            .ipv4()
             .and_then(|s| s.parse().ok())
             .map(|c: cidr::Ipv4Inet| {
                 if c.network_length() == 32 {
@@ -608,24 +620,23 @@ impl ConfigLoader for TomlConfigLoader {
     }
 
     fn set_ipv4(&self, addr: Option<cidr::Ipv4Inet>) {
-        self.config.lock().unwrap().ipv4 = addr.map(|addr| addr.to_string());
+        self.config().ipv4 = addr.map(|addr| addr.to_string());
     }
 
     fn get_ipv6(&self) -> Option<cidr::Ipv6Inet> {
-        let locked_config = self.config.lock().unwrap();
-        locked_config.ipv6.as_ref().and_then(|s| s.parse().ok())
+        self.config().ipv6().and_then(|s| s.parse().ok())
     }
 
     fn set_ipv6(&self, addr: Option<cidr::Ipv6Inet>) {
-        self.config.lock().unwrap().ipv6 = addr.map(|addr| addr.to_string());
+        self.config().ipv6 = addr.map(|addr| addr.to_string());
     }
 
     fn get_dhcp(&self) -> bool {
-        self.config.lock().unwrap().dhcp.unwrap_or_default()
+        self.config().dhcp()
     }
 
     fn set_dhcp(&self, dhcp: bool) {
-        self.config.lock().unwrap().dhcp = Some(dhcp);
+        self.config().set_dhcp(dhcp);
     }
 
     fn add_proxy_cidr(
@@ -633,10 +644,6 @@ impl ConfigLoader for TomlConfigLoader {
         cidr: cidr::Ipv4Cidr,
         mapped_cidr: Option<cidr::Ipv4Cidr>,
     ) -> Result<(), anyhow::Error> {
-        let mut locked_config = self.config.lock().unwrap();
-        if locked_config.proxy_network.is_none() {
-            locked_config.proxy_network = Some(vec![]);
-        }
         if let Some(mapped_cidr) = mapped_cidr.as_ref() {
             if cidr.network_length() != mapped_cidr.network_length() {
                 return Err(anyhow::anyhow!(
@@ -646,60 +653,43 @@ impl ConfigLoader for TomlConfigLoader {
                 ));
             }
         }
+
         // insert if no duplicate
-        if !locked_config
-            .proxy_network
-            .as_ref()
-            .unwrap()
+        let mut config = self.config();
+        if !config
+            .proxy_network()
             .iter()
             .any(|c| c.cidr == cidr && c.mapped_cidr == mapped_cidr)
         {
-            locked_config
-                .proxy_network
-                .as_mut()
-                .unwrap()
-                .push(ProxyNetworkConfig {
-                    cidr,
-                    mapped_cidr,
-                    allow: None,
-                });
+            config.proxy_network_mut().push(ProxyNetworkConfig {
+                cidr,
+                mapped_cidr,
+                allow: None,
+            });
         }
         Ok(())
     }
 
     fn remove_proxy_cidr(&self, cidr: cidr::Ipv4Cidr) {
-        let mut locked_config = self.config.lock().unwrap();
-        if let Some(proxy_cidrs) = &mut locked_config.proxy_network {
+        if let Some(proxy_cidrs) = self.config().proxy_network_mut() {
             proxy_cidrs.retain(|c| c.cidr != cidr);
         }
     }
 
     fn clear_proxy_cidrs(&self) {
-        let mut locked_config = self.config.lock().unwrap();
-        locked_config.proxy_network = None;
+        self.config().proxy_network_mut().clear()
     }
 
     fn get_proxy_cidrs(&self) -> Vec<ProxyNetworkConfig> {
-        self.config
-            .lock()
-            .unwrap()
-            .proxy_network
-            .as_ref()
-            .cloned()
-            .unwrap_or_default()
+        self.config().proxy_network().clone()
     }
 
     fn get_network_identity(&self) -> NetworkIdentity {
-        self.config
-            .lock()
-            .unwrap()
-            .network_identity
-            .clone()
-            .unwrap_or_default()
+        self.config().network_identity()
     }
 
     fn set_network_identity(&self, identity: NetworkIdentity) {
-        self.config.lock().unwrap().network_identity = Some(identity);
+        self.config().set_network_identity(identity);
     }
 
     fn get_listener_uris(&self) -> Vec<url::Url> {
@@ -712,160 +702,130 @@ impl ConfigLoader for TomlConfigLoader {
     }
 
     fn get_peers(&self) -> Vec<PeerConfig> {
-        self.config.lock().unwrap().peer.clone().unwrap_or_default()
+        self.config().peer()
     }
 
     fn set_peers(&self, peers: Vec<PeerConfig>) {
-        self.config.lock().unwrap().peer = Some(peers);
+        self.config().set_peer(peers);
     }
 
-    fn get_listeners(&self) -> Option<Vec<url::Url>> {
-        self.config.lock().unwrap().listeners.clone()
+    fn get_listeners(&self) -> Vec<url::Url> {
+        self.config().listeners()
     }
 
     fn set_listeners(&self, listeners: Vec<url::Url>) {
-        self.config.lock().unwrap().listeners = Some(listeners);
+        self.config().set_listeners(listeners);
     }
 
     fn get_mapped_listeners(&self) -> Vec<url::Url> {
-        self.config
-            .lock()
-            .unwrap()
-            .mapped_listeners
-            .clone()
-            .unwrap_or_default()
+        self.config().mapped_listeners()
     }
 
-    fn set_mapped_listeners(&self, listeners: Option<Vec<url::Url>>) {
-        self.config.lock().unwrap().mapped_listeners = listeners;
+    fn set_mapped_listeners(&self, listeners: Vec<url::Url>) {
+        self.config().set_mapped_listeners(listeners);
     }
 
     fn get_vpn_portal_config(&self) -> Option<VpnPortalConfig> {
-        self.config.lock().unwrap().vpn_portal_config.clone()
+        self.config().vpn_portal_config()
     }
     fn set_vpn_portal_config(&self, config: VpnPortalConfig) {
-        self.config.lock().unwrap().vpn_portal_config = Some(config);
+        self.config().set_vpn_portal_config(Some(config));
     }
 
     fn get_flags(&self) -> Flags {
-        self.config
-            .lock()
-            .unwrap()
-            .flags_struct
-            .clone()
-            .unwrap_or_default()
+        self.config().flags_struct()
     }
 
     fn set_flags(&self, flags: Flags) {
-        self.config.lock().unwrap().flags_struct = Some(flags);
+        self.config().set_flags_struct(flags);
     }
 
     fn get_exit_nodes(&self) -> Vec<IpAddr> {
-        self.config
-            .lock()
-            .unwrap()
-            .exit_nodes
-            .clone()
-            .unwrap_or_default()
+        self.config().exit_nodes()
     }
 
     fn set_exit_nodes(&self, nodes: Vec<IpAddr>) {
-        self.config.lock().unwrap().exit_nodes = Some(nodes);
+        self.config().set_exit_nodes(nodes);
     }
 
-    fn get_routes(&self) -> Option<Vec<cidr::Ipv4Cidr>> {
-        self.config.lock().unwrap().routes.clone()
+    fn get_routes(&self) -> Vec<cidr::Ipv4Cidr> {
+        self.config().routes()
     }
 
-    fn set_routes(&self, routes: Option<Vec<cidr::Ipv4Cidr>>) {
-        self.config.lock().unwrap().routes = routes;
+    fn set_routes(&self, routes: Vec<cidr::Ipv4Cidr>) {
+        self.config().set_routes(routes);
     }
 
     fn get_socks5_portal(&self) -> Option<url::Url> {
-        self.config.lock().unwrap().socks5_proxy.clone()
+        self.config().socks5_proxy()
     }
 
     fn set_socks5_portal(&self, addr: Option<url::Url>) {
-        self.config.lock().unwrap().socks5_proxy = addr;
+        self.config().set_socks5_proxy(addr);
     }
 
     fn get_port_forwards(&self) -> Vec<PortForwardConfig> {
-        self.config
-            .lock()
-            .unwrap()
-            .port_forward
-            .clone()
-            .unwrap_or_default()
+        self.config().port_forward()
     }
 
     fn set_port_forwards(&self, forwards: Vec<PortForwardConfig>) {
-        self.config.lock().unwrap().port_forward = Some(forwards);
+        self.config().set_port_forward(forwards);
     }
 
     fn get_acl(&self) -> Option<Acl> {
-        self.config.lock().unwrap().acl.clone()
+        self.config().acl()
     }
 
     fn set_acl(&self, acl: Option<Acl>) {
-        self.config.lock().unwrap().acl = acl;
+        self.config().set_acl(acl);
     }
 
     fn get_tcp_whitelist(&self) -> Vec<String> {
-        self.config
-            .lock()
-            .unwrap()
-            .tcp_whitelist
-            .clone()
-            .unwrap_or_default()
+        self.config().tcp_whitelist()
     }
 
     fn set_tcp_whitelist(&self, whitelist: Vec<String>) {
-        self.config.lock().unwrap().tcp_whitelist = Some(whitelist);
+        self.config().set_tcp_whitelist(whitelist);
     }
 
     fn get_udp_whitelist(&self) -> Vec<String> {
-        self.config
-            .lock()
-            .unwrap()
-            .udp_whitelist
-            .clone()
-            .unwrap_or_default()
+        self.config().udp_whitelist()
     }
 
     fn set_udp_whitelist(&self, whitelist: Vec<String>) {
-        self.config.lock().unwrap().udp_whitelist = Some(whitelist);
+        self.config().set_udp_whitelist(whitelist);
     }
 
-    fn get_stun_servers(&self) -> Option<Vec<String>> {
-        self.config.lock().unwrap().stun_servers.clone()
+    fn get_stun_servers(&self) -> Vec<String> {
+        self.config().stun_servers()
     }
 
-    fn set_stun_servers(&self, servers: Option<Vec<String>>) {
-        self.config.lock().unwrap().stun_servers = servers;
+    fn set_stun_servers(&self, servers: Vec<String>) {
+        self.config().set_stun_servers(servers);
     }
 
-    fn get_stun_servers_v6(&self) -> Option<Vec<String>> {
-        self.config.lock().unwrap().stun_servers_v6.clone()
+    fn get_stun_servers_v6(&self) -> Vec<String> {
+        self.config().stun_servers_v6()
     }
 
-    fn set_stun_servers_v6(&self, servers: Option<Vec<String>>) {
-        self.config.lock().unwrap().stun_servers_v6 = servers;
+    fn set_stun_servers_v6(&self, servers: Vec<String>) {
+        self.config().set_stun_servers_v6(servers);
     }
 
     fn get_secure_mode(&self) -> Option<SecureModeConfig> {
-        self.config.lock().unwrap().secure_mode.clone()
+        self.config().secure_mode()
     }
 
     fn set_secure_mode(&self, secure_mode: Option<SecureModeConfig>) {
-        self.config.lock().unwrap().secure_mode = secure_mode;
+        self.config().set_secure_mode(secure_mode);
     }
 
     fn get_credential_file(&self) -> Option<PathBuf> {
-        self.config.lock().unwrap().credential_file.clone()
+        self.config().credential_file()
     }
 
     fn set_credential_file(&self, path: Option<PathBuf>) {
-        self.config.lock().unwrap().credential_file = path;
+        self.config().set_credential_file(path);
     }
 
     fn dump(&self) -> String {
@@ -889,12 +849,12 @@ impl ConfigLoader for TomlConfigLoader {
         }
 
         let mut config = self.config.lock().unwrap().clone();
-        config.flags = Some(flag_map);
-        if config.stun_servers == Some(StunInfoCollector::get_default_servers()) {
-            config.stun_servers = None;
+        config.flags = flag_map;
+        if config.stun_servers == StunInfoCollector::get_default_servers() {
+            config.stun_servers = vec![];
         }
-        if config.stun_servers_v6 == Some(StunInfoCollector::get_default_servers_v6()) {
-            config.stun_servers_v6 = None;
+        if config.stun_servers_v6 == StunInfoCollector::get_default_servers_v6() {
+            config.stun_servers_v6 = vec![];
         }
         toml::to_string_pretty(&config).unwrap()
     }
