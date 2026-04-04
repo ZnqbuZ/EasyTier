@@ -1,3 +1,5 @@
+use crate::common::config::ConfigLoaderBase;
+
 mod acl_manage;
 mod config;
 mod connector_manage;

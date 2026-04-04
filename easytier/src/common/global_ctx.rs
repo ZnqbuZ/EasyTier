@@ -665,12 +665,12 @@ impl GlobalCtx {
 
 #[cfg(test)]
 pub mod tests {
+    use super::*;
+    use crate::common::config::ConfigLoaderBase;
     use crate::{
         common::{config::TomlConfigLoader, new_peer_id, stun::MockStunInfoCollector},
         proto::common::NatType,
     };
-
-    use super::*;
 
     #[tokio::test]
     async fn test_global_ctx() {

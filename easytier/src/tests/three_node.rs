@@ -567,7 +567,10 @@ pub async fn quic_proxy() {
     )
     .await;
 
-    assert_eq!(insts[2].get_global_ctx().config.get_proxy_networks().len(), 1);
+    assert_eq!(
+        insts[2].get_global_ctx().config.get_proxy_networks().len(),
+        1
+    );
 
     wait_proxy_route_appear(
         &insts[0].get_peer_manager(),
@@ -652,7 +655,10 @@ pub async fn subnet_proxy_three_node_test(
     )
     .await;
 
-    assert_eq!(insts[2].get_global_ctx().config.get_proxy_networks().len(), 2);
+    assert_eq!(
+        insts[2].get_global_ctx().config.get_proxy_networks().len(),
+        2
+    );
 
     wait_proxy_route_appear(
         &insts[0].get_peer_manager(),

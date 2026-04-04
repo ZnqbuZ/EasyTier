@@ -3,7 +3,9 @@ use base64::{prelude::BASE64_STANDARD, Engine as _};
 use cfg_if::cfg_if;
 use clap::builder::PossibleValue;
 use clap::ValueEnum;
+use delegate::delegate;
 use getset::{CloneGetters, CopyGetters, Getters, MutGetters, Setters};
+use paste::paste;
 use serde::{Deserialize, Serialize};
 use std::sync::MutexGuard;
 use std::{
@@ -119,96 +121,6 @@ impl Default for EncryptionAlgorithm {
             }
         }
     }
-}
-
-#[auto_impl::auto_impl(Box, &)]
-pub trait ConfigLoader: Send + Sync {
-    fn get_id(&self) -> uuid::Uuid;
-    fn set_id(&self, id: uuid::Uuid);
-
-    fn get_hostname(&self) -> String;
-    fn set_hostname(&self, name: Option<String>);
-
-    fn get_name(&self) -> String;
-    fn set_name(&self, name: String);
-
-    fn get_netns(&self) -> Option<String>;
-    fn set_netns(&self, ns: Option<String>);
-
-    fn get_ipv4(&self) -> Option<cidr::Ipv4Inet>;
-    fn set_ipv4(&self, addr: Option<cidr::Ipv4Inet>);
-
-    fn get_ipv6(&self) -> Option<cidr::Ipv6Inet>;
-    fn set_ipv6(&self, addr: Option<cidr::Ipv6Inet>);
-
-    fn get_dhcp(&self) -> bool;
-    fn set_dhcp(&self, dhcp: bool);
-
-    fn add_proxy_cidr(
-        &self,
-        cidr: cidr::Ipv4Cidr,
-        mapped_cidr: Option<cidr::Ipv4Cidr>,
-    ) -> Result<(), anyhow::Error>;
-    fn remove_proxy_cidr(&self, cidr: cidr::Ipv4Cidr);
-    fn clear_proxy_cidrs(&self);
-
-    fn get_proxy_networks(&self) -> Vec<ProxyNetworkConfig>;
-    fn set_proxy_networks(&self, networks: Vec<ProxyNetworkConfig>);
-
-    fn get_network_identity(&self) -> NetworkIdentity;
-    fn set_network_identity(&self, identity: NetworkIdentity);
-
-    fn get_peers(&self) -> Vec<PeerConfig>;
-    fn set_peers(&self, peers: Vec<PeerConfig>);
-
-    fn get_listeners(&self) -> Vec<url::Url>;
-    fn set_listeners(&self, listeners: Vec<url::Url>);
-
-    fn get_mapped_listeners(&self) -> Vec<url::Url>;
-    fn set_mapped_listeners(&self, listeners: Vec<url::Url>);
-
-    fn get_vpn_portal_config(&self) -> Option<VpnPortalConfig>;
-    fn set_vpn_portal_config(&self, config: VpnPortalConfig);
-
-    fn get_flags(&self) -> Flags;
-    fn set_flags(&self, flags: Flags);
-
-    fn get_exit_nodes(&self) -> Vec<IpAddr>;
-    fn set_exit_nodes(&self, nodes: Vec<IpAddr>);
-
-    fn get_routes(&self) -> Vec<cidr::Ipv4Cidr>;
-    fn set_routes(&self, routes: Vec<cidr::Ipv4Cidr>);
-
-    fn get_socks5_proxy(&self) -> Option<url::Url>;
-    fn set_socks5_proxy(&self, addr: Option<url::Url>);
-
-    fn get_port_forwards(&self) -> Vec<PortForwardConfig>;
-    fn set_port_forwards(&self, forwards: Vec<PortForwardConfig>);
-
-    fn get_acl(&self) -> Option<Acl>;
-    fn set_acl(&self, acl: Option<Acl>);
-
-    fn get_tcp_whitelist(&self) -> Vec<String>;
-    fn set_tcp_whitelist(&self, whitelist: Vec<String>);
-
-    fn get_udp_whitelist(&self) -> Vec<String>;
-    fn set_udp_whitelist(&self, whitelist: Vec<String>);
-
-    fn get_stun_servers(&self) -> Vec<String>;
-    fn set_stun_servers(&self, servers: Vec<String>);
-
-    fn get_stun_servers_v6(&self) -> Vec<String>;
-    fn set_stun_servers_v6(&self, servers: Vec<String>);
-
-    fn get_secure_mode(&self) -> Option<SecureModeConfig>;
-    fn set_secure_mode(&self, secure_mode: Option<SecureModeConfig>);
-
-    fn get_credential_file(&self) -> Option<PathBuf> {
-        None
-    }
-    fn set_credential_file(&self, _path: Option<PathBuf>) {}
-
-    fn dump(&self) -> String;
 }
 
 pub trait LoggingConfigLoader {
@@ -428,93 +340,126 @@ pub fn process_secure_mode_cfg(mut user_cfg: SecureModeConfig) -> anyhow::Result
     Ok(user_cfg)
 }
 
-#[derive(
-    Debug,
-    Clone,
-    PartialEq,
-    Default,
-    Deserialize,
-    Serialize,
-    Getters,
-    CopyGetters,
-    CloneGetters,
-    MutGetters,
-    Setters,
-)]
-#[getset(set)]
-#[serde(default)]
-struct Config {
-    #[get_clone]
-    netns: Option<String>,
-    #[get_clone]
-    hostname: Option<String>,
-    #[get_clone]
-    #[serde(rename = "instance_name", default = "crate::utils::gethostname")]
-    name: String,
-    #[get_copy]
-    #[serde(rename = "instance_id", default = "uuid::Uuid::new_v4")]
-    id: uuid::Uuid,
-    #[get]
-    ipv4: Option<String>,
-    #[get]
-    ipv6: Option<String>,
-    #[get_copy]
-    dhcp: bool,
-    #[get_clone]
-    network_identity: NetworkIdentity,
-    #[get_clone]
-    listeners: Vec<url::Url>,
-    #[get_clone]
-    mapped_listeners: Vec<url::Url>,
-    #[get_clone]
-    exit_nodes: Vec<IpAddr>,
+macro_rules! config {
+    (
+        auto {
+            $(
+                $(#[$auto_attr:meta])*
+                $auto_v:ident : $auto_t:ty
+            ),* $(,)?
+        }
+        manual {
+            $(
+                $(#[$manual_attr:meta])*
+                $manual_v:ident : $manual_t:ty => get -> $get_t:ty, set <- $set_t:ty
+            ),* $(,)?
+        }
+        skip {
+            $(
+                $(#[$skip_attr:meta])*
+                $skip_v:ident : $skip_t:ty
+            ),* $(,)?
+        }
+    ) => {
+        paste! {
+            #[derive(
+                Debug,
+                Clone,
+                PartialEq,
+                Default,
+                serde::Deserialize,
+                serde::Serialize,
+                getset::Getters,
+                getset::CopyGetters,
+                getset::CloneGetters,
+                getset::MutGetters,
+                getset::Setters
+            )]
+            #[getset(get_clone = "with_prefix", set)]
+            #[serde(default)]
+            struct Config {
+                $( $(#[$auto_attr])* $auto_v: $auto_t, )*
+                $( $(#[$manual_attr])* $manual_v: $manual_t, )*
+                $( $(#[$skip_attr])* $skip_v: $skip_t, )*
+            }
 
-    #[get_clone]
-    #[serde(rename = "peer")]
-    peers: Vec<PeerConfig>,
-    #[get]
-    #[get_mut]
-    #[serde(rename = "proxy_network")]
-    proxy_networks: Vec<ProxyNetworkConfig>,
+            #[auto_impl::auto_impl(Box, &)]
+            pub trait ConfigLoaderBase: Send + Sync {
+                $(
+                    fn [<get_ $auto_v>](&self) -> $auto_t;
+                    fn [<set_ $auto_v>](&self, $auto_v: $auto_t);
+                )*
 
-    #[get_clone]
-    vpn_portal_config: Option<VpnPortalConfig>,
+                $(
+                    fn [<get_ $manual_v>](&self) -> $get_t;
+                    fn [<set_ $manual_v>](&self, $manual_v: $set_t);
+                )*
+            }
+        }
+    };
+}
 
-    #[get_clone]
-    routes: Vec<cidr::Ipv4Cidr>,
+config! {
+    auto {
+        netns: Option<String>,
+        #[serde(rename = "instance_name", default = "crate::utils::gethostname")]
+        name: String,
+        #[get_copy]
+        #[serde(rename = "instance_id", default = "uuid::Uuid::new_v4")]
+        id: uuid::Uuid,
+        #[get_copy]
+        dhcp: bool,
+        network_identity: NetworkIdentity,
+        listeners: Vec<url::Url>,
+        mapped_listeners: Vec<url::Url>,
+        exit_nodes: Vec<IpAddr>,
+        #[serde(rename = "peer")]
+        peers: Vec<PeerConfig>,
+        vpn_portal_config: Option<VpnPortalConfig>,
+        routes: Vec<cidr::Ipv4Cidr>,
+        #[serde(skip)]
+        flags: Flags,
+        socks5_proxy: Option<url::Url>,
+        #[get]
+        #[get_mut]
+        #[serde(rename = "proxy_network")]
+        proxy_networks: Vec<ProxyNetworkConfig>,
+        #[serde(rename = "port_forward")]
+        port_forwards: Vec<PortForwardConfig>,
+        secure_mode: Option<SecureModeConfig>,
+        acl: Option<Acl>,
+        tcp_whitelist: Vec<String>,
+        udp_whitelist: Vec<String>,
+        stun_servers: Vec<String>,
+        stun_servers_v6: Vec<String>,
+        credential_file: Option<PathBuf>,
+    }
 
-    #[get_clone]
-    socks5_proxy: Option<url::Url>,
+    manual {
+        hostname: Option<String> => get -> String, set <- Option<String>,
+        #[get]
+        ipv4: Option<String> => get -> Option<cidr::Ipv4Inet>, set <- Option<cidr::Ipv4Inet>,
+        #[get]
+        ipv6: Option<String> => get -> Option<cidr::Ipv6Inet>, set <- Option<cidr::Ipv6Inet>,
+    }
 
-    #[get_clone]
-    #[serde(rename = "port_forward")]
-    port_forwards: Vec<PortForwardConfig>,
+    skip {
+        #[serde(rename = "flags")]
+        raw_flags: serde_json::Map<String, serde_json::Value>,
+    }
+}
 
-    #[get_clone]
-    secure_mode: Option<SecureModeConfig>,
+#[auto_impl::auto_impl(Box, &)]
+pub trait ConfigLoader: ConfigLoaderBase {
+    fn add_proxy_cidr(
+        &self,
+        cidr: cidr::Ipv4Cidr,
+        mapped_cidr: Option<cidr::Ipv4Cidr>,
+    ) -> Result<(), anyhow::Error>;
+    fn remove_proxy_cidr(&self, cidr: cidr::Ipv4Cidr);
+    fn clear_proxy_cidrs(&self);
 
-    #[get_clone]
-    #[serde(rename = "flags")]
-    raw_flags: serde_json::Map<String, serde_json::Value>,
-
-    #[get_clone]
-    #[serde(skip)]
-    flags: Flags,
-
-    #[get_clone]
-    acl: Option<Acl>,
-
-    #[get_clone]
-    tcp_whitelist: Vec<String>,
-    #[get_clone]
-    udp_whitelist: Vec<String>,
-    #[get_clone]
-    stun_servers: Vec<String>,
-    #[get_clone]
-    stun_servers_v6: Vec<String>,
-
-    #[get_clone]
-    credential_file: Option<PathBuf>,
+    fn dump(&self) -> String;
 }
 
 #[derive(Debug, Clone)]
@@ -533,7 +478,7 @@ impl TomlConfigLoader {
         let mut config = toml::de::from_str::<Config>(config_str)
             .with_context(|| format!("failed to parse config file: {}", config_str))?;
 
-        config.flags = Self::gen_flags(config.raw_flags());
+        config.flags = Self::gen_flags(config.get_raw_flags());
 
         let config = TomlConfigLoader {
             config: Arc::new(Mutex::new(config)),
@@ -579,18 +524,58 @@ impl TomlConfigLoader {
     }
 }
 
-impl ConfigLoader for TomlConfigLoader {
-    fn get_id(&self) -> uuid::Uuid {
-        self.config().id()
-    }
-
-    fn set_id(&self, id: uuid::Uuid) {
-        self.config().set_id(id);
+impl ConfigLoaderBase for TomlConfigLoader {
+    delegate! {
+        to self.config() {
+            fn get_id(&self) -> uuid::Uuid;
+            fn set_id(&self, id: uuid::Uuid);
+            fn get_name(&self) -> String;
+            fn set_name(&self, name: String);
+            fn get_netns(&self) -> Option<String>;
+            fn set_netns(&self, netns: Option<String>);
+            fn get_dhcp(&self) -> bool;
+            fn set_dhcp(&self, dhcp: bool);
+            fn get_proxy_networks(&self) -> Vec<ProxyNetworkConfig>;
+            fn set_proxy_networks(&self, networks: Vec<ProxyNetworkConfig>);
+            fn get_network_identity(&self) -> NetworkIdentity;
+            fn set_network_identity(&self, identity: NetworkIdentity);
+            fn get_peers(&self) -> Vec<PeerConfig>;
+            fn set_peers(&self, peers: Vec<PeerConfig>);
+            fn get_listeners(&self) -> Vec<url::Url>;
+            fn set_listeners(&self, listeners: Vec<url::Url>);
+            fn get_mapped_listeners(&self) -> Vec<url::Url>;
+            fn set_mapped_listeners(&self, listeners: Vec<url::Url>);
+            fn get_vpn_portal_config(&self) -> Option<VpnPortalConfig>;
+            fn set_vpn_portal_config(&self, config: Option<VpnPortalConfig>);
+            fn get_flags(&self) -> Flags;
+            fn set_flags(&self, flags: Flags);
+            fn get_exit_nodes(&self) -> Vec<IpAddr>;
+            fn set_exit_nodes(&self, nodes: Vec<IpAddr>);
+            fn get_routes(&self) -> Vec<cidr::Ipv4Cidr>;
+            fn set_routes(&self, routes: Vec<cidr::Ipv4Cidr>);
+            fn get_socks5_proxy(&self) -> Option<url::Url>;
+            fn set_socks5_proxy(&self, addr: Option<url::Url>);
+            fn get_port_forwards(&self) -> Vec<PortForwardConfig>;
+            fn set_port_forwards(&self, forwards: Vec<PortForwardConfig>);
+            fn get_acl(&self) -> Option<Acl>;
+            fn set_acl(&self, acl: Option<Acl>);
+            fn get_tcp_whitelist(&self) -> Vec<String>;
+            fn set_tcp_whitelist(&self, whitelist: Vec<String>);
+            fn get_udp_whitelist(&self) -> Vec<String>;
+            fn set_udp_whitelist(&self, whitelist: Vec<String>);
+            fn get_stun_servers(&self) -> Vec<String>;
+            fn set_stun_servers(&self, servers: Vec<String>);
+            fn get_stun_servers_v6(&self) -> Vec<String>;
+            fn set_stun_servers_v6(&self, servers: Vec<String>);
+            fn get_secure_mode(&self) -> Option<SecureModeConfig>;
+            fn set_secure_mode(&self, secure_mode: Option<SecureModeConfig>);
+            fn get_credential_file(&self) -> Option<PathBuf>;
+            fn set_credential_file(&self, path: Option<PathBuf>);
+        }
     }
 
     fn get_hostname(&self) -> String {
-        let hostname = self.config().hostname();
-
+        let hostname = self.config().get_hostname();
         match hostname {
             Some(hostname) => {
                 let hostname = hostname
@@ -598,7 +583,6 @@ impl ConfigLoader for TomlConfigLoader {
                     .filter(|c| !c.is_control())
                     .take(32)
                     .collect::<String>();
-
                 if !hostname.is_empty() {
                     self.set_hostname(Some(hostname.clone()));
                     hostname
@@ -613,22 +597,6 @@ impl ConfigLoader for TomlConfigLoader {
 
     fn set_hostname(&self, name: Option<String>) {
         self.config().set_hostname(name);
-    }
-
-    fn get_name(&self) -> String {
-        self.config().name()
-    }
-
-    fn set_name(&self, name: String) {
-        self.config().set_name(name);
-    }
-
-    fn get_netns(&self) -> Option<String> {
-        self.config().netns()
-    }
-
-    fn set_netns(&self, netns: Option<String>) {
-        self.config().set_netns(netns);
     }
 
     fn get_ipv4(&self) -> Option<cidr::Ipv4Inet> {
@@ -646,7 +614,7 @@ impl ConfigLoader for TomlConfigLoader {
     }
 
     fn set_ipv4(&self, addr: Option<cidr::Ipv4Inet>) {
-        self.config().ipv4 = addr.map(|addr| addr.to_string());
+        self.config().set_ipv4(addr.map(|addr| addr.to_string()));
     }
 
     fn get_ipv6(&self) -> Option<cidr::Ipv6Inet> {
@@ -654,17 +622,11 @@ impl ConfigLoader for TomlConfigLoader {
     }
 
     fn set_ipv6(&self, addr: Option<cidr::Ipv6Inet>) {
-        self.config().ipv6 = addr.map(|addr| addr.to_string());
+        self.config().set_ipv6(addr.map(|addr| addr.to_string()));
     }
+}
 
-    fn get_dhcp(&self) -> bool {
-        self.config().dhcp()
-    }
-
-    fn set_dhcp(&self, dhcp: bool) {
-        self.config().set_dhcp(dhcp);
-    }
-
+impl ConfigLoader for TomlConfigLoader {
     fn add_proxy_cidr(
         &self,
         cidr: cidr::Ipv4Cidr,
@@ -704,149 +666,6 @@ impl ConfigLoader for TomlConfigLoader {
 
     fn clear_proxy_cidrs(&self) {
         self.config().proxy_networks_mut().clear()
-    }
-
-    fn get_proxy_networks(&self) -> Vec<ProxyNetworkConfig> {
-        self.config().proxy_networks().clone()
-    }
-
-    fn set_proxy_networks(&self, networks: Vec<ProxyNetworkConfig>) {
-        self.config().set_proxy_networks(networks);
-    }
-
-    fn get_network_identity(&self) -> NetworkIdentity {
-        self.config().network_identity()
-    }
-
-    fn set_network_identity(&self, identity: NetworkIdentity) {
-        self.config().set_network_identity(identity);
-    }
-
-    fn get_peers(&self) -> Vec<PeerConfig> {
-        self.config().peers()
-    }
-
-    fn set_peers(&self, peers: Vec<PeerConfig>) {
-        self.config().set_peers(peers);
-    }
-
-    fn get_listeners(&self) -> Vec<url::Url> {
-        self.config().listeners()
-    }
-
-    fn set_listeners(&self, listeners: Vec<url::Url>) {
-        self.config().set_listeners(listeners);
-    }
-
-    fn get_mapped_listeners(&self) -> Vec<url::Url> {
-        self.config().mapped_listeners()
-    }
-
-    fn set_mapped_listeners(&self, listeners: Vec<url::Url>) {
-        self.config().set_mapped_listeners(listeners);
-    }
-
-    fn get_vpn_portal_config(&self) -> Option<VpnPortalConfig> {
-        self.config().vpn_portal_config()
-    }
-    fn set_vpn_portal_config(&self, config: VpnPortalConfig) {
-        self.config().set_vpn_portal_config(Some(config));
-    }
-
-    fn get_flags(&self) -> Flags {
-        self.config().flags()
-    }
-
-    fn set_flags(&self, flags: Flags) {
-        self.config().set_flags(flags);
-    }
-
-    fn get_exit_nodes(&self) -> Vec<IpAddr> {
-        self.config().exit_nodes()
-    }
-
-    fn set_exit_nodes(&self, nodes: Vec<IpAddr>) {
-        self.config().set_exit_nodes(nodes);
-    }
-
-    fn get_routes(&self) -> Vec<cidr::Ipv4Cidr> {
-        self.config().routes()
-    }
-
-    fn set_routes(&self, routes: Vec<cidr::Ipv4Cidr>) {
-        self.config().set_routes(routes);
-    }
-
-    fn get_socks5_proxy(&self) -> Option<url::Url> {
-        self.config().socks5_proxy()
-    }
-
-    fn set_socks5_proxy(&self, addr: Option<url::Url>) {
-        self.config().set_socks5_proxy(addr);
-    }
-
-    fn get_port_forwards(&self) -> Vec<PortForwardConfig> {
-        self.config().port_forwards()
-    }
-
-    fn set_port_forwards(&self, forwards: Vec<PortForwardConfig>) {
-        self.config().set_port_forwards(forwards);
-    }
-
-    fn get_acl(&self) -> Option<Acl> {
-        self.config().acl()
-    }
-
-    fn set_acl(&self, acl: Option<Acl>) {
-        self.config().set_acl(acl);
-    }
-
-    fn get_tcp_whitelist(&self) -> Vec<String> {
-        self.config().tcp_whitelist()
-    }
-
-    fn set_tcp_whitelist(&self, whitelist: Vec<String>) {
-        self.config().set_tcp_whitelist(whitelist);
-    }
-
-    fn get_udp_whitelist(&self) -> Vec<String> {
-        self.config().udp_whitelist()
-    }
-
-    fn set_udp_whitelist(&self, whitelist: Vec<String>) {
-        self.config().set_udp_whitelist(whitelist);
-    }
-
-    fn get_stun_servers(&self) -> Vec<String> {
-        self.config().stun_servers()
-    }
-
-    fn set_stun_servers(&self, servers: Vec<String>) {
-        self.config().set_stun_servers(servers);
-    }
-
-    fn get_stun_servers_v6(&self) -> Vec<String> {
-        self.config().stun_servers_v6()
-    }
-
-    fn set_stun_servers_v6(&self, servers: Vec<String>) {
-        self.config().set_stun_servers_v6(servers);
-    }
-
-    fn get_secure_mode(&self) -> Option<SecureModeConfig> {
-        self.config().secure_mode()
-    }
-
-    fn set_secure_mode(&self, secure_mode: Option<SecureModeConfig>) {
-        self.config().set_secure_mode(secure_mode);
-    }
-
-    fn get_credential_file(&self) -> Option<PathBuf> {
-        self.config().credential_file()
-    }
-
-    fn set_credential_file(&self, path: Option<PathBuf>) {
-        self.config().set_credential_file(path);
     }
 
     fn dump(&self) -> String {

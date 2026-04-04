@@ -1,5 +1,6 @@
 use std::net::Ipv6Addr;
 
+use crate::common::config::ConfigLoaderBase;
 use crate::{
     common::config::{ConfigLoader, TomlConfigLoader},
     common::global_ctx::tests::get_mock_global_ctx,

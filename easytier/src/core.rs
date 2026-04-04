@@ -32,6 +32,7 @@ use clap::{CommandFactory, Parser};
 use rust_i18n::t;
 use tokio::io::AsyncReadExt;
 
+use crate::common::config::ConfigLoaderBase;
 #[cfg(feature = "jemalloc-prof")]
 use jemalloc_ctl::{epoch, stats, Access as _, AsName as _};
 

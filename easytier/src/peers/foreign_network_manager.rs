@@ -19,6 +19,24 @@ use tokio::{
     task::JoinSet,
 };
 
+use super::{
+    create_packet_recv_chan,
+    peer_conn::PeerConn,
+    peer_map::PeerMap,
+    peer_ospf_route::PeerRoute,
+    peer_rpc::{PeerRpcManager, PeerRpcManagerTransport},
+    peer_rpc_service::DirectConnectorManagerRpcServer,
+    peer_session::PeerSessionStore,
+    recv_packet_from_chan,
+    relay_peer_map::RelayPeerMap,
+    route_trait::NextHopPolicy,
+    traffic_metrics::{
+        route_peer_info_instance_id, InstanceLabelKind, LogicalTrafficMetrics,
+        TrafficMetricRecorder,
+    },
+    PacketRecvChan, PacketRecvChanReceiver, PUBLIC_SERVER_HOSTNAME_PREFIX,
+};
+use crate::common::config::ConfigLoaderBase;
 use crate::{
     common::{
         config::{ConfigLoader, TomlConfigLoader},
@@ -41,24 +59,6 @@ use crate::{
     },
     tunnel::packet_def::{PacketType, ZCPacket},
     use_global_var,
-};
-
-use super::{
-    create_packet_recv_chan,
-    peer_conn::PeerConn,
-    peer_map::PeerMap,
-    peer_ospf_route::PeerRoute,
-    peer_rpc::{PeerRpcManager, PeerRpcManagerTransport},
-    peer_rpc_service::DirectConnectorManagerRpcServer,
-    peer_session::PeerSessionStore,
-    recv_packet_from_chan,
-    relay_peer_map::RelayPeerMap,
-    route_trait::NextHopPolicy,
-    traffic_metrics::{
-        route_peer_info_instance_id, InstanceLabelKind, LogicalTrafficMetrics,
-        TrafficMetricRecorder,
-    },
-    PacketRecvChan, PacketRecvChanReceiver, PUBLIC_SERVER_HOSTNAME_PREFIX,
 };
 
 #[async_trait::async_trait]

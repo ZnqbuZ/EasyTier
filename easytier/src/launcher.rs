@@ -1,4 +1,6 @@
-use crate::common::config::{process_secure_mode_cfg, ConfigFileControl, PortForwardConfig};
+use crate::common::config::{
+    process_secure_mode_cfg, ConfigFileControl, ConfigLoaderBase, PortForwardConfig,
+};
 use crate::proto::api::{self, manage};
 use crate::proto::rpc_types::controller::BaseController;
 use crate::rpc_service::InstanceRpcService;

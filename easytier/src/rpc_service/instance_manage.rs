@@ -1,5 +1,6 @@
 use std::{collections::HashSet, sync::Arc};
 
+use crate::common::config::ConfigLoaderBase;
 use crate::{
     common::config::{ConfigFileControl, ConfigFilePermission, ConfigLoader},
     instance_manager::NetworkInstanceManager,
