@@ -496,7 +496,7 @@ impl NetworkConfig {
         );
         cfg.set_hostname(self.hostname.clone());
         cfg.set_dhcp(self.dhcp.unwrap_or_default());
-        cfg.set_inst_name(self.network_name.clone().unwrap_or_default());
+        cfg.set_name(self.network_name.clone().unwrap_or_default());
 
         // The web UI does not expose credential inputs directly, but imported/saved
         // NetworkConfig objects still need to preserve credential-mode instances via
@@ -998,7 +998,7 @@ mod tests {
         let config = crate::common::config::TomlConfigLoader::default();
         config.set_id(uuid::Uuid::new_v4());
         config.set_dhcp(false);
-        config.set_inst_name("default".to_string());
+        config.set_name("default".to_string());
         config.set_listeners(vec![]);
         config
     }
@@ -1042,7 +1042,7 @@ mod tests {
                 format!("network-{}", rng.gen::<u16>()),
                 format!("secret-{}", rng.gen::<u64>()),
             ));
-            config.set_inst_name(config.get_network_identity().network_name.clone());
+            config.set_name(config.get_network_identity().network_name.clone());
 
             if !config.get_dhcp() {
                 let addr = Ipv4Addr::new(
@@ -1272,7 +1272,7 @@ mod tests {
         config.set_network_identity(crate::common::config::NetworkIdentity::new_credential(
             "credential-net".to_string(),
         ));
-        config.set_inst_name("credential-net".to_string());
+        config.set_name("credential-net".to_string());
         config.set_credential_file(Some(credential_file.clone().into()));
         config.set_secure_mode(Some(SecureModeConfig {
             enabled: true,

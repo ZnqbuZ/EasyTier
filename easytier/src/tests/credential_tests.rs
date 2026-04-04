@@ -106,7 +106,7 @@ async fn create_credential_config(
 
     // Create config
     let config = TomlConfigLoader::default();
-    config.set_inst_name(inst_name.to_owned());
+    config.set_name(inst_name.to_owned());
     config.set_netns(ns.map(|s| s.to_owned()));
     config.set_ipv4(Some(ipv4.parse().unwrap()));
     config.set_ipv6(Some(ipv6.parse().unwrap()));
@@ -134,7 +134,7 @@ fn create_unknown_credential_config(
     let random_private = x25519_dalek::StaticSecret::random_from_rng(rand::rngs::OsRng);
 
     let config = TomlConfigLoader::default();
-    config.set_inst_name(inst_name.to_owned());
+    config.set_name(inst_name.to_owned());
     config.set_netns(ns.map(|s| s.to_owned()));
     config.set_ipv4(Some(ipv4.parse().unwrap()));
     config.set_ipv6(Some(ipv6.parse().unwrap()));
@@ -153,7 +153,7 @@ fn create_admin_config(
     ipv6: &str,
 ) -> TomlConfigLoader {
     let config = TomlConfigLoader::default();
-    config.set_inst_name(inst_name.to_owned());
+    config.set_name(inst_name.to_owned());
     config.set_netns(ns.map(|s| s.to_owned()));
     config.set_ipv4(Some(ipv4.parse().unwrap()));
     config.set_ipv6(Some(ipv6.parse().unwrap()));
@@ -177,7 +177,7 @@ fn create_shared_config(
     ipv6: &str,
 ) -> TomlConfigLoader {
     let config = TomlConfigLoader::default();
-    config.set_inst_name(inst_name.to_owned());
+    config.set_name(inst_name.to_owned());
     config.set_netns(ns.map(|s| s.to_owned()));
     config.set_ipv4(Some(ipv4.parse().unwrap()));
     config.set_ipv6(Some(ipv6.parse().unwrap()));
@@ -214,7 +214,7 @@ fn create_generated_credential_config(
     let private = x25519_dalek::StaticSecret::from(privkey_bytes);
 
     let config = TomlConfigLoader::default();
-    config.set_inst_name(inst_name.to_owned());
+    config.set_name(inst_name.to_owned());
     config.set_netns(ns.map(|s| s.to_owned()));
     config.set_ipv4(Some(ipv4.parse().unwrap()));
     config.set_ipv6(Some(ipv6.parse().unwrap()));
@@ -461,7 +461,7 @@ async fn credential_relay_capability(#[case] allow_relay: bool) {
             .unwrap();
         let private = x25519_dalek::StaticSecret::from(privkey_bytes);
         let config = TomlConfigLoader::default();
-        config.set_inst_name("cred_a".to_string());
+        config.set_name("cred_a".to_string());
         config.set_netns(Some("ns_c1".to_string()));
         config.set_ipv4(Some("10.144.144.2".parse().unwrap()));
         config.set_ipv6(Some("fd00::2/64".parse().unwrap()));
@@ -488,7 +488,7 @@ async fn credential_relay_capability(#[case] allow_relay: bool) {
             .unwrap();
         let private = x25519_dalek::StaticSecret::from(privkey_bytes);
         let config = TomlConfigLoader::default();
-        config.set_inst_name("cred_b".to_string());
+        config.set_name("cred_b".to_string());
         config.set_netns(Some("ns_c2".to_string()));
         config.set_ipv4(Some("10.144.144.3".parse().unwrap()));
         config.set_ipv6(Some("fd00::3/64".parse().unwrap()));
@@ -515,7 +515,7 @@ async fn credential_relay_capability(#[case] allow_relay: bool) {
             .unwrap();
         let private = x25519_dalek::StaticSecret::from(privkey_bytes);
         let config = TomlConfigLoader::default();
-        config.set_inst_name("cred_c".to_string());
+        config.set_name("cred_c".to_string());
         config.set_netns(Some("ns_c3".to_string()));
         config.set_ipv4(Some("10.144.144.4".parse().unwrap()));
         config.set_ipv6(Some("fd00::4/64".parse().unwrap()));
@@ -796,7 +796,7 @@ async fn credential_revocation_propagates() {
         let private = x25519_dalek::StaticSecret::from(privkey_bytes);
 
         let config = TomlConfigLoader::default();
-        config.set_inst_name("cred".to_string());
+        config.set_name("cred".to_string());
         config.set_netns(Some("ns_c1".to_string()));
         config.set_ipv4(Some("10.144.144.2".parse().unwrap()));
         config.set_ipv6(Some("fd00::2/64".parse().unwrap()));
@@ -905,7 +905,7 @@ async fn credential_unknown_rejected() {
     let random_private = x25519_dalek::StaticSecret::random_from_rng(rand::rngs::OsRng);
     let cred_config = {
         let config = TomlConfigLoader::default();
-        config.set_inst_name("cred".to_string());
+        config.set_name("cred".to_string());
         config.set_netns(Some("ns_c1".to_string()));
         config.set_ipv4(Some("10.144.144.2".parse().unwrap()));
         config.set_ipv6(Some("fd00::2/64".parse().unwrap()));

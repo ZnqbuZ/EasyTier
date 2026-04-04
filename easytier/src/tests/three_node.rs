@@ -73,7 +73,7 @@ pub fn get_inst_config(
     ipv6: &str,
 ) -> TomlConfigLoader {
     let config = TomlConfigLoader::default();
-    config.set_inst_name(inst_name.to_owned());
+    config.set_name(inst_name.to_owned());
     config.set_netns(ns.map(|s| s.to_owned()));
     config.set_ipv4(Some(ipv4.parse().unwrap()));
     config.set_ipv6(Some(ipv6.parse().unwrap()));

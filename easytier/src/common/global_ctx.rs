@@ -766,7 +766,7 @@ pub mod tests {
         network_identy: Option<NetworkIdentity>,
     ) -> ArcGlobalCtx {
         let config_fs = TomlConfigLoader::default();
-        config_fs.set_inst_name(format!("test_{}", config_fs.get_id()));
+        config_fs.set_name(format!("test_{}", config_fs.get_id()));
         config_fs.set_network_identity(network_identy.unwrap_or_default());
 
         let ctx = Arc::new(GlobalCtx::new(config_fs));

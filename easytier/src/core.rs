@@ -907,7 +907,7 @@ impl NetworkOptions {
         }
 
         if let Some(inst_name) = &self.instance_name {
-            cfg.set_inst_name(inst_name.clone());
+            cfg.set_name(inst_name.clone());
         }
 
         if let Some(vpn_portal) = self.vpn_portal.as_ref() {
