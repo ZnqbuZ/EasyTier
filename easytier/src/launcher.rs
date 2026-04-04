@@ -617,7 +617,7 @@ impl NetworkConfig {
                     .unwrap_or_default(),
                 self.vpn_portal_client_network_len.unwrap_or(24)
             );
-            cfg.set_vpn_portal_config(VpnPortalConfig {
+            cfg.set_vpn_portal_config(Some(VpnPortalConfig {
                 client_cidr: cidr
                     .parse()
                     .with_context(|| format!("failed to parse vpn portal client cidr: {}", cidr))?,
@@ -632,7 +632,7 @@ impl NetworkConfig {
                         self.vpn_portal_listen_port
                     )
                 })?,
-            });
+            }));
         }
 
         if self.enable_manual_routes.unwrap_or_default() {
@@ -1123,10 +1123,10 @@ mod tests {
                     rng.gen_range(24..30)
                 );
                 let vpn_port = rng.gen_range(10000..60000);
-                config.set_vpn_portal_config(crate::common::config::VpnPortalConfig {
+                config.set_vpn_portal_config(Some(crate::common::config::VpnPortalConfig {
                     client_cidr: vpn_network.parse().unwrap(),
                     wireguard_listen: format!("0.0.0.0:{}", vpn_port).parse().unwrap(),
-                });
+                }));
             }
 
             if rng.gen_bool(0.6) {

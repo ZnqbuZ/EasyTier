@@ -924,10 +924,10 @@ impl NetworkOptions {
                 format!("failed to parse vpn portal client cidr: {}", url.path())
             })?;
             let wireguard_listen: SocketAddr = format!("{}:{}", host, port).parse().unwrap();
-            cfg.set_vpn_portal_config(VpnPortalConfig {
+            cfg.set_vpn_portal_config(Some(VpnPortalConfig {
                 wireguard_listen,
                 client_cidr,
-            });
+            }));
         }
 
         if let Some(manual_routes) = self.manual_routes.as_ref() {
