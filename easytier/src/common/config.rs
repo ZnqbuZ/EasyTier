@@ -344,66 +344,66 @@ mod inner {
     use paste::paste;
 
     macro_rules! config {
-    (
-        auto {
-            $(
-                $(#[$auto_attr:meta])*
-                $auto_v:ident : $auto_t:ty
-            ),* $(,)?
-        }
-        manual {
-            $(
-                $(#[$manual_attr:meta])*
-                $manual_v:ident : $manual_t:ty => get -> $get_t:ty, set <- $set_t:ty
-            ),* $(,)?
-        }
-        skip {
-            $(
-                $(#[$skip_attr:meta])*
-                $skip_v:ident : $skip_t:ty
-            ),* $(,)?
-        }
-    ) => {
-        paste! {
-            #[derive(
-                Debug,
-                Clone,
-                PartialEq,
-                Default,
-                Deserialize,
-                Serialize,
-                Getters,
-                CopyGetters,
-                CloneGetters,
-                MutGetters,
-                Setters
-            )]
-            #[getset(get_clone = "pub with_prefix", set = "pub")]
-            #[serde(default)]
-            pub struct Config {
-                $( $(#[$auto_attr])* $auto_v: $auto_t, )*
-                $( $(#[$manual_attr])* $manual_v: $manual_t, )*
-                $( $(#[$skip_attr])* $skip_v: $skip_t, )*
-            }
-
-            #[auto_impl::auto_impl(Box, &)]
-            pub trait ConfigLoaderBase: Send + Sync {
+        (
+            derived {
                 $(
-                    fn [<get_ $auto_v>](&self) -> $auto_t;
-                    fn [<set_ $auto_v>](&self, $auto_v: $auto_t);
-                )*
-
-                $(
-                    fn [<get_ $manual_v>](&self) -> $get_t;
-                    fn [<set_ $manual_v>](&self, $manual_v: $set_t);
-                )*
+                    $(#[$derived_attr:meta])*
+                    $derived_v:ident : $derived_t:ty
+                ),* $(,)?
             }
-        }
-    };
-}
+            bridged {
+                $(
+                    $(#[$bridged_attr:meta])*
+                    $bridged_v:ident : $bridged_t:ty => get -> $get_t:ty, set <- $set_t:ty
+                ),* $(,)?
+            }
+            hidden {
+                $(
+                    $(#[$hidden_attr:meta])*
+                    $hidden_v:ident : $hidden_t:ty
+                ),* $(,)?
+            }
+        ) => {
+            paste! {
+                #[derive(
+                    Debug,
+                    Clone,
+                    PartialEq,
+                    Default,
+                    Deserialize,
+                    Serialize,
+                    Getters,
+                    CopyGetters,
+                    CloneGetters,
+                    MutGetters,
+                    Setters
+                )]
+                #[getset(get_clone = "pub with_prefix", set = "pub")]
+                #[serde(default)]
+                pub struct Config {
+                    $( $(#[$derived_attr])* $derived_v: $derived_t, )*
+                    $( $(#[$bridged_attr])* $bridged_v: $bridged_t, )*
+                    $( $(#[$hidden_attr])* $hidden_v: $hidden_t, )*
+                }
+
+                #[auto_impl::auto_impl(Box, &)]
+                pub trait ConfigLoaderBase: Send + Sync {
+                    $(
+                        fn [<get_ $derived_v>](&self) -> $derived_t;
+                        fn [<set_ $derived_v>](&self, $derived_v: $derived_t);
+                    )*
+
+                    $(
+                        fn [<get_ $bridged_v>](&self) -> $get_t;
+                        fn [<set_ $bridged_v>](&self, $bridged_v: $set_t);
+                    )*
+                }
+            }
+        };
+    }
 
     config! {
-        auto {
+        derived {
             netns: Option<String>,
             #[serde(rename = "instance_name", default = "crate::utils::gethostname")]
             name: String,
@@ -440,7 +440,7 @@ mod inner {
             credential_file: Option<PathBuf>,
         }
 
-        manual {
+        bridged {
             hostname: Option<String> => get -> String, set <- Option<String>,
             #[get = "pub"]
             ipv4: Option<String> => get -> Option<cidr::Ipv4Inet>, set <- Option<cidr::Ipv4Inet>,
@@ -448,7 +448,7 @@ mod inner {
             ipv6: Option<String> => get -> Option<cidr::Ipv6Inet>, set <- Option<cidr::Ipv6Inet>,
         }
 
-        skip {
+        hidden {
             #[serde(rename = "flags")]
             raw_flags: serde_json::Map<String, serde_json::Value>,
         }
