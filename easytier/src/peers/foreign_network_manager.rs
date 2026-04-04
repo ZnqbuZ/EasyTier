@@ -39,7 +39,7 @@ use super::{
 use crate::common::config::ConfigLoaderBase;
 use crate::{
     common::{
-        config::{ConfigLoader, TomlConfigLoader},
+        config::TomlConfigLoader,
         error::Error,
         global_ctx::{ArcGlobalCtx, GlobalCtx, GlobalCtxEvent, NetworkIdentity, TrustedKeySource},
         join_joinset_background, shrink_dashmap,

@@ -4,7 +4,7 @@ use std::{collections::BTreeMap, path::PathBuf, sync::Arc};
 
 use crate::{
     common::{
-        config::{ConfigFileControl, ConfigLoader, TomlConfigLoader},
+        config::{ConfigFileControl, TomlConfigLoader},
         global_ctx::{EventBusSubscriber, GlobalCtxEvent},
         log,
         scoped_task::ScopedTask,

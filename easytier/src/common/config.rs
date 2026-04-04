@@ -367,13 +367,13 @@ macro_rules! config {
                 Clone,
                 PartialEq,
                 Default,
-                serde::Deserialize,
-                serde::Serialize,
-                getset::Getters,
-                getset::CopyGetters,
-                getset::CloneGetters,
-                getset::MutGetters,
-                getset::Setters
+                Deserialize,
+                Serialize,
+                Getters,
+                CopyGetters,
+                CloneGetters,
+                MutGetters,
+                Setters
             )]
             #[getset(get_clone = "with_prefix", set)]
             #[serde(default)]
