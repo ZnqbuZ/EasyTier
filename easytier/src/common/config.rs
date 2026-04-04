@@ -4,8 +4,6 @@ use cfg_if::cfg_if;
 use clap::builder::PossibleValue;
 use clap::ValueEnum;
 use delegate::delegate;
-use getset::{CloneGetters, CopyGetters, Getters, MutGetters, Setters};
-use paste::paste;
 use serde::{Deserialize, Serialize};
 use std::sync::MutexGuard;
 use std::{
@@ -340,7 +338,12 @@ pub fn process_secure_mode_cfg(mut user_cfg: SecureModeConfig) -> anyhow::Result
     Ok(user_cfg)
 }
 
-macro_rules! config {
+mod inner {
+    use super::*;
+    use getset::{CloneGetters, CopyGetters, Getters, MutGetters, Setters};
+    use paste::paste;
+
+    macro_rules! config {
     (
         auto {
             $(
@@ -375,9 +378,9 @@ macro_rules! config {
                 MutGetters,
                 Setters
             )]
-            #[getset(get_clone = "with_prefix", set)]
+            #[getset(get_clone = "pub with_prefix", set = "pub")]
             #[serde(default)]
-            struct Config {
+            pub struct Config {
                 $( $(#[$auto_attr])* $auto_v: $auto_t, )*
                 $( $(#[$manual_attr])* $manual_v: $manual_t, )*
                 $( $(#[$skip_attr])* $skip_v: $skip_t, )*
@@ -399,68 +402,74 @@ macro_rules! config {
     };
 }
 
-config! {
-    auto {
-        netns: Option<String>,
-        #[serde(rename = "instance_name", default = "crate::utils::gethostname")]
-        name: String,
-        #[get_copy]
-        #[serde(rename = "instance_id", default = "uuid::Uuid::new_v4")]
-        id: uuid::Uuid,
-        #[get_copy]
-        dhcp: bool,
-        network_identity: NetworkIdentity,
-        listeners: Vec<url::Url>,
-        mapped_listeners: Vec<url::Url>,
-        exit_nodes: Vec<IpAddr>,
-        #[serde(rename = "peer")]
-        peers: Vec<PeerConfig>,
-        vpn_portal_config: Option<VpnPortalConfig>,
-        routes: Vec<cidr::Ipv4Cidr>,
-        #[serde(skip)]
-        flags: Flags,
-        socks5_proxy: Option<url::Url>,
-        #[get]
-        #[get_mut]
-        #[serde(rename = "proxy_network")]
-        proxy_networks: Vec<ProxyNetworkConfig>,
-        #[serde(rename = "port_forward")]
-        port_forwards: Vec<PortForwardConfig>,
-        secure_mode: Option<SecureModeConfig>,
-        acl: Option<Acl>,
-        tcp_whitelist: Vec<String>,
-        udp_whitelist: Vec<String>,
-        stun_servers: Vec<String>,
-        stun_servers_v6: Vec<String>,
-        credential_file: Option<PathBuf>,
+    config! {
+        auto {
+            netns: Option<String>,
+            #[serde(rename = "instance_name", default = "crate::utils::gethostname")]
+            name: String,
+            #[get_copy]
+            #[serde(rename = "instance_id", default = "uuid::Uuid::new_v4")]
+            id: uuid::Uuid,
+            #[get_copy = "pub"]
+            dhcp: bool,
+            network_identity: NetworkIdentity,
+            listeners: Vec<url::Url>,
+            mapped_listeners: Vec<url::Url>,
+            exit_nodes: Vec<IpAddr>,
+            #[serde(rename = "peer")]
+            peers: Vec<PeerConfig>,
+            vpn_portal_config: Option<VpnPortalConfig>,
+            routes: Vec<cidr::Ipv4Cidr>,
+            #[serde(skip)]
+            flags: Flags,
+            socks5_proxy: Option<url::Url>,
+            #[get = "pub"]
+            #[get_mut = "pub"]
+            #[serde(rename = "proxy_network")]
+            proxy_networks: Vec<ProxyNetworkConfig>,
+            #[serde(rename = "port_forward")]
+            port_forwards: Vec<PortForwardConfig>,
+            secure_mode: Option<SecureModeConfig>,
+            acl: Option<Acl>,
+            tcp_whitelist: Vec<String>,
+            udp_whitelist: Vec<String>,
+            #[get = "pub"]
+            stun_servers: Vec<String>,
+            #[get = "pub"]
+            stun_servers_v6: Vec<String>,
+            credential_file: Option<PathBuf>,
+        }
+
+        manual {
+            hostname: Option<String> => get -> String, set <- Option<String>,
+            #[get = "pub"]
+            ipv4: Option<String> => get -> Option<cidr::Ipv4Inet>, set <- Option<cidr::Ipv4Inet>,
+            #[get = "pub"]
+            ipv6: Option<String> => get -> Option<cidr::Ipv6Inet>, set <- Option<cidr::Ipv6Inet>,
+        }
+
+        skip {
+            #[serde(rename = "flags")]
+            raw_flags: serde_json::Map<String, serde_json::Value>,
+        }
     }
 
-    manual {
-        hostname: Option<String> => get -> String, set <- Option<String>,
-        #[get]
-        ipv4: Option<String> => get -> Option<cidr::Ipv4Inet>, set <- Option<cidr::Ipv4Inet>,
-        #[get]
-        ipv6: Option<String> => get -> Option<cidr::Ipv6Inet>, set <- Option<cidr::Ipv6Inet>,
-    }
+    #[auto_impl::auto_impl(Box, &)]
+    pub trait ConfigLoader: ConfigLoaderBase {
+        fn add_proxy_cidr(
+            &self,
+            cidr: cidr::Ipv4Cidr,
+            mapped_cidr: Option<cidr::Ipv4Cidr>,
+        ) -> Result<(), anyhow::Error>;
+        fn remove_proxy_cidr(&self, cidr: cidr::Ipv4Cidr);
+        fn clear_proxy_cidrs(&self);
 
-    skip {
-        #[serde(rename = "flags")]
-        raw_flags: serde_json::Map<String, serde_json::Value>,
+        fn dump(&self) -> String;
     }
 }
 
-#[auto_impl::auto_impl(Box, &)]
-pub trait ConfigLoader: ConfigLoaderBase {
-    fn add_proxy_cidr(
-        &self,
-        cidr: cidr::Ipv4Cidr,
-        mapped_cidr: Option<cidr::Ipv4Cidr>,
-    ) -> Result<(), anyhow::Error>;
-    fn remove_proxy_cidr(&self, cidr: cidr::Ipv4Cidr);
-    fn clear_proxy_cidrs(&self);
-
-    fn dump(&self) -> String;
-}
+pub use inner::{ConfigLoader, ConfigLoaderBase};
+use inner::Config;
 
 #[derive(Debug, Clone)]
 pub struct TomlConfigLoader {
@@ -478,7 +487,7 @@ impl TomlConfigLoader {
         let mut config = toml::de::from_str::<Config>(config_str)
             .with_context(|| format!("failed to parse config file: {}", config_str))?;
 
-        config.flags = Self::gen_flags(config.get_raw_flags());
+        config.set_flags(Self::gen_flags(config.get_raw_flags()));
 
         let config = TomlConfigLoader {
             config: Arc::new(Mutex::new(config)),
@@ -689,12 +698,12 @@ impl ConfigLoader for TomlConfigLoader {
         }
 
         let mut config = self.config.lock().unwrap().clone();
-        config.raw_flags = flag_map;
-        if config.stun_servers == StunInfoCollector::get_default_servers() {
-            config.stun_servers = vec![];
+        config.set_raw_flags(flag_map);
+        if config.stun_servers() == &StunInfoCollector::get_default_servers() {
+            config.set_stun_servers(vec![]);
         }
-        if config.stun_servers_v6 == StunInfoCollector::get_default_servers_v6() {
-            config.stun_servers_v6 = vec![];
+        if config.stun_servers_v6() == &StunInfoCollector::get_default_servers_v6() {
+            config.set_stun_servers_v6(vec![]);
         }
         toml::to_string_pretty(&config).unwrap()
     }
