@@ -196,7 +196,7 @@ impl NetworkInstanceManager {
     pub fn get_instance_name(&self, instance_id: &uuid::Uuid) -> Option<String> {
         self.instance_map
             .get(instance_id)
-            .map(|instance| instance.value().get_name())
+            .map(|instance| instance.value().get_inst_name())
     }
 
     pub fn get_network_name(&self, instance_id: &uuid::Uuid) -> Option<String> {

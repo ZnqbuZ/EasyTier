@@ -104,7 +104,7 @@ fn get_instance_service(
                 )) = selector
                 {
                     if let Some(name) = selector.name.as_ref() {
-                        if v.get_name() != *name {
+                        if v.get_inst_name() != *name {
                             return false;
                         }
                     }
