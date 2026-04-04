@@ -13,6 +13,7 @@ use crate::{
     proto::{self},
     rpc_service::InstanceRpcService,
 };
+use crate::common::config::ConfigLoaderBase;
 
 pub(crate) struct DaemonGuard {
     guard: Option<Arc<()>>,

@@ -992,6 +992,7 @@ mod tests {
     use base64::prelude::{Engine as _, BASE64_STANDARD};
     use rand::Rng;
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+    use crate::common::config::ConfigLoaderBase;
 
     fn gen_default_config() -> crate::common::config::TomlConfigLoader {
         let config = crate::common::config::TomlConfigLoader::default();
