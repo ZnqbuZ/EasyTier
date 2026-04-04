@@ -342,6 +342,7 @@ mod inner {
     use super::*;
     use getset::{CloneGetters, CopyGetters, Getters, MutGetters, Setters};
     use paste::paste;
+    use serde::Deserializer;
 
     macro_rules! config {
         (
@@ -402,9 +403,23 @@ mod inner {
         };
     }
 
+    impl Config {
+        fn deserialize_hostname<'de, D>(deserializer: D) -> Result<String, D::Error>
+        where
+            D: Deserializer<'de>,
+        {
+            Ok(String::deserialize(deserializer)?
+                .chars()
+                .filter(|c| !c.is_control())
+                .collect())
+        }
+    }
+
     config! {
         derived {
             netns: Option<String>,
+            #[serde(deserialize_with = "Config::deserialize_hostname")]
+            hostname: String,
             #[serde(rename = "instance_name", default = "crate::utils::gethostname")]
             name: String,
             #[get_copy]
@@ -441,7 +456,6 @@ mod inner {
         }
 
         bridged {
-            hostname: Option<String> => get -> String, set <- Option<String>,
             #[get = "pub"]
             ipv4: Option<String> => get -> Option<cidr::Ipv4Inet>, set <- Option<cidr::Ipv4Inet>,
             #[get = "pub"]
@@ -468,8 +482,9 @@ mod inner {
     }
 }
 
-pub use inner::{ConfigLoader, ConfigLoaderBase};
+use crate::utils::gethostname;
 use inner::Config;
+pub use inner::{ConfigLoader, ConfigLoaderBase};
 
 #[derive(Debug, Clone)]
 pub struct TomlConfigLoader {
@@ -585,27 +600,15 @@ impl ConfigLoaderBase for TomlConfigLoader {
 
     fn get_hostname(&self) -> String {
         let hostname = self.config().get_hostname();
-        match hostname {
-            Some(hostname) => {
-                let hostname = hostname
-                    .chars()
-                    .filter(|c| !c.is_control())
-                    .take(32)
-                    .collect::<String>();
-                if !hostname.is_empty() {
-                    self.set_hostname(Some(hostname.clone()));
-                    hostname
-                } else {
-                    self.set_hostname(None);
-                    gethostname::gethostname().to_string_lossy().to_string()
-                }
-            }
-            None => gethostname::gethostname().to_string_lossy().to_string(),
+        if hostname.is_empty() {
+            gethostname()
+        } else {
+            hostname
         }
     }
 
-    fn set_hostname(&self, name: Option<String>) {
-        self.config().set_hostname(name);
+    fn set_hostname(&self, hostname: String) {
+        self.config().set_hostname(hostname);
     }
 
     fn get_ipv4(&self) -> Option<cidr::Ipv4Inet> {
