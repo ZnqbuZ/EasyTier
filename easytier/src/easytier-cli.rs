@@ -75,9 +75,10 @@ use easytier::{
         rpc_impl::standalone::StandAloneClient,
         rpc_types::controller::BaseController,
     },
-    tunnel::{TunnelScheme, tcp::TcpTunnelConnector},
+    tunnel::tcp::TcpTunnelConnector,
     utils::{PeerRoutePair, cost_to_str},
 };
+use easytier::tunnel::scheme::TunnelScheme;
 
 rust_i18n::i18n!("locales", fallback = "en");
 

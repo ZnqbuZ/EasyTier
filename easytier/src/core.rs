@@ -33,7 +33,7 @@ use rust_i18n::t;
 use strum::VariantArray;
 use tokio::io::AsyncReadExt;
 
-use crate::tunnel::IpScheme;
+use crate::tunnel::scheme::IpProto;
 #[cfg(feature = "jemalloc-prof")]
 use jemalloc_ctl::{Access as _, AsName as _, epoch, stats};
 
@@ -745,7 +745,7 @@ impl Cli {
         if origin_listeners.len() == 1
             && let Ok(port) = origin_listeners[0].parse::<u16>()
         {
-            for proto in IpScheme::VARIANTS {
+            for proto in IpProto::VARIANTS {
                 listeners.push(format!(
                     "{}://0.0.0.0:{}",
                     proto,
@@ -764,7 +764,7 @@ impl Cli {
                     panic!("failed to parse listener: {}", l);
                 }
             } else {
-                let scheme: IpScheme = proto_port[0].parse()?;
+                let scheme: IpProto = proto_port[0].parse()?;
 
                 let port = if proto_port.len() == 2 {
                     proto_port[1].parse::<u16>().unwrap()

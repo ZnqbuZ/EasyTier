@@ -142,6 +142,10 @@ pub fn weak_upgrade<T>(weak: &std::sync::Weak<T>) -> anyhow::Result<Arc<T>> {
         .ok_or_else(|| anyhow::anyhow!("{} not available", std::any::type_name::<T>()))
 }
 
+pub fn eq_as<T: PartialEq>(left: impl TryInto<T>, right: impl TryInto<T>) -> bool {
+    matches!((left.try_into(), right.try_into()), (Ok(s), Ok(t)) if s == t)
+}
+
 pub trait BoxExt: Sized {
     fn boxed(self) -> Box<Self> {
         Box::new(self)

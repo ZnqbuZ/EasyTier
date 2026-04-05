@@ -28,7 +28,7 @@ use crate::{
         common::{PeerFeatureFlag, PortForwardConfigPb},
         peer_rpc::PeerGroupInfo,
     },
-    tunnel::matches_protocol,
+    tunnel::scheme::matches_protocol,
 };
 use crossbeam::atomic::AtomicCell;
 use hmac::{Hmac, Mac};
