@@ -28,6 +28,7 @@ use unicode_width::UnicodeWidthStr;
 use easytier::service_manager::{Service, ServiceInstallOptions};
 use tokio::time::timeout;
 
+use easytier::tunnel::scheme::TunnelScheme;
 use easytier::{
     common::{
         constants::EASYTIER_VERSION,
@@ -78,7 +79,6 @@ use easytier::{
     tunnel::tcp::TcpTunnelConnector,
     utils::{PeerRoutePair, cost_to_str},
 };
-use easytier::tunnel::scheme::TunnelScheme;
 
 rust_i18n::i18n!("locales", fallback = "en");
 

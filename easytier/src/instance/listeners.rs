@@ -9,7 +9,7 @@ use anyhow::Context;
 use async_trait::async_trait;
 use tokio::task::JoinSet;
 
-use crate::tunnel::scheme::{IpProto, IpScheme, TunnelScheme};
+use crate::tunnel::scheme::{IpProto, TunnelScheme};
 use crate::{
     common::{
         error::Error,
@@ -18,8 +18,8 @@ use crate::{
     },
     peers::peer_manager::PeerManager,
     tunnel::{
-        self, Tunnel, TunnelListener, ring::RingTunnelListener,
-        tcp::TcpTunnelListener, udp::UdpTunnelListener,
+        self, Tunnel, TunnelListener, ring::RingTunnelListener, tcp::TcpTunnelListener,
+        udp::UdpTunnelListener,
     },
     utils::BoxExt,
 };

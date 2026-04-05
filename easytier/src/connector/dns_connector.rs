@@ -1,6 +1,7 @@
 use std::{net::SocketAddr, sync::Arc};
 
 use super::{create_connector_by_url, http_connector::TunnelWithInfo};
+use crate::tunnel::scheme::{DiscoveryProto, DiscoveryScheme, IpProto};
 use crate::{
     common::{
         dns::{RESOLVER, resolve_txt_record},
@@ -11,7 +12,6 @@ use crate::{
     proto::common::TunnelInfo,
     tunnel::{IpVersion, Tunnel, TunnelConnector, TunnelError},
 };
-use crate::tunnel::scheme::{DiscoveryProto, DiscoveryScheme, IpProto};
 use anyhow::Context;
 use dashmap::DashSet;
 use hickory_resolver::proto::rr::rdata::SRV;

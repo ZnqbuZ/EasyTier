@@ -3,18 +3,18 @@ use std::{
     sync::Arc,
 };
 
+use crate::tunnel::scheme::{DiscoveryProto, IpProto, TunnelScheme};
 use crate::{
     common::{error::Error, global_ctx::ArcGlobalCtx, idn, network::IPCollector},
     connector::dns_connector::DnsTunnelConnector,
     proto::common::PeerFeatureFlag,
     tunnel::{
-        self, ring::RingTunnelConnector, tcp::TcpTunnelConnector, udp::UdpTunnelConnector, FromUrl,
-        IpVersion, TunnelConnector, TunnelError,
+        self, FromUrl, IpVersion, TunnelConnector, TunnelError, ring::RingTunnelConnector,
+        tcp::TcpTunnelConnector, udp::UdpTunnelConnector,
     },
     utils::BoxExt,
 };
 use http_connector::HttpTunnelConnector;
-use crate::tunnel::scheme::{DiscoveryProto, IpProto, TunnelScheme};
 
 pub mod direct;
 pub mod manual;
@@ -150,7 +150,7 @@ pub async fn create_connector_by_url(
                 }
                 DnsTunnelConnector::new(url, global_ctx.clone()).boxed()
             }
-        }
+        },
     };
     connector.set_ip_version(ip_version);
 
