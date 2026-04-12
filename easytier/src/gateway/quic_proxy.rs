@@ -252,6 +252,7 @@ impl TryFrom<SocketAddr> for QuicAddr {
 
 //region stream
 type QuicStreamInner = Join<RecvStream, SendStream>;
+
 #[derive(Debug, Deref, DerefMut, From, Into)]
 struct QuicStream {
     #[deref]
@@ -276,8 +277,8 @@ impl From<(SendStream, RecvStream)> for QuicStream {
 
 #[derive(Debug, Clone)]
 pub struct NatDstQuicConnector {
-    pub(crate) endpoint: Endpoint,
-    pub(crate) peer_mgr: Weak<PeerManager>,
+    pub endpoint: Endpoint,
+    pub peer_mgr: Weak<PeerManager>,
 }
 
 #[async_trait::async_trait]
@@ -545,7 +546,7 @@ impl QuicStreamContext {
 struct QuicStreamReceiver {
     endpoint: Endpoint,
     tasks: JoinSet<()>,
-    ctx: Arc<QuicStreamContext>,
+    ctx: QuicStreamContext,
 }
 
 impl QuicStreamReceiver {
@@ -639,7 +640,7 @@ impl QuicStreamReceiver {
 
     async fn establish_stream(
         mut stream: QuicStream,
-        ctx: Arc<QuicStreamContext>,
+        ctx: QuicStreamContext,
     ) -> Result<impl Future<Output = crate::common::error::Result<()>>, Error> {
         let conn_data = Self::read_stream_header(&mut stream).await?;
         let conn_data_parsed = QuicConnData::decode(conn_data.as_ref())
@@ -858,7 +859,7 @@ impl QuicProxy {
                 return;
             }
 
-            let stream_ctx = Arc::new(QuicStreamContext::new(peer_mgr.clone()));
+            let stream_ctx = QuicStreamContext::new(peer_mgr.clone());
 
             let dst = QuicProxyDst {
                 peer_mgr: peer_mgr.clone(),
@@ -918,7 +919,7 @@ pub struct QuicProxyDst {
     peer_mgr: Arc<PeerManager>,
 
     tx: Sender<QuicPacket>,
-    stream_ctx: Arc<QuicStreamContext>,
+    stream_ctx: QuicStreamContext,
 }
 
 impl QuicProxyDst {
