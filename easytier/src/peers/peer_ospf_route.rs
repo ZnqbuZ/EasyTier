@@ -1,18 +1,10 @@
-use std::{
-    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
-    fmt::Debug,
-    net::{IpAddr, Ipv4Addr, Ipv6Addr},
-    sync::{
-        Arc, Weak,
-        atomic::{AtomicBool, AtomicU32, Ordering},
-    },
-    time::{Duration, Instant, SystemTime},
-};
-
 use arc_swap::ArcSwap;
-use cidr::{IpCidr, Ipv4Cidr, Ipv6Cidr, Ipv6Inet};
+use atomic_shim::AtomicU64;
+use cidr::{Ipv4Cidr, Ipv6Cidr, Ipv6Inet};
 use crossbeam::atomic::AtomicCell;
 use dashmap::DashMap;
+use ipnet::{IpNet, Ipv4Net, Ipv4Subnets, Ipv6Net, Ipv6Subnets};
+use itertools::{Either, Itertools};
 use ordered_hash_map::OrderedHashMap;
 use parking_lot::{RwLock, lock_api::RwLockUpgradableReadGuard};
 use petgraph::{
@@ -24,6 +16,17 @@ use petgraph::{
 use prefix_trie::PrefixMap;
 use prost::Message;
 use prost_reflect::{DynamicMessage, ReflectMessage};
+use std::ops::RangeInclusive;
+use std::{
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
+    fmt::Debug,
+    net::{IpAddr, Ipv4Addr, Ipv6Addr},
+    sync::{
+        Arc, Weak,
+        atomic::{AtomicBool, AtomicU32, Ordering},
+    },
+    time::{Duration, Instant, SystemTime},
+};
 use tokio::{
     select,
     sync::Mutex,
@@ -73,8 +76,6 @@ use super::{
     },
 };
 
-use atomic_shim::AtomicU64;
-
 static SERVICE_ID: u32 = 7;
 static UPDATE_PEER_INFO_PERIOD: Duration = Duration::from_secs(3600);
 static REMOVE_DEAD_PEER_INFO_AFTER: Duration = Duration::from_secs(3660);
@@ -90,29 +91,117 @@ static REMOVE_UNREACHABLE_PEER_INFO_AFTER: Duration = Duration::from_secs(90);
 
 type Version = u32;
 
-/// Check if `child` CIDR is a subset of `parent` CIDR.
-/// Returns true if `child` is contained within `parent`, or if they are equal.
-fn cidr_is_subset(child: &IpCidr, parent: &IpCidr) -> bool {
-    match (child, parent) {
-        (IpCidr::V4(c), IpCidr::V4(p)) => {
-            p.first_address() <= c.first_address() && c.last_address() <= p.last_address()
+pub trait IpNetExt: Sized {
+    type Subnets;
+    type Bits;
+    const SIZE: u32;
+    fn range(&self) -> RangeInclusive<Self::Bits>;
+    fn subnets(range: RangeInclusive<Self::Bits>) -> impl Iterator<Item = Self>;
+    fn cmp(&self, other: &Self) -> Ordering;
+    fn sort(items: &mut [Self]);
+    fn subtract_ordered(&self, others: &[Self]) -> Vec<Self>;
+    fn subtract(&self, others: &[Self]) -> Vec<Self>;
+}
+
+macro_rules! impl_ipnet_ext {
+    () => {
+        #[inline]
+        fn range(&self) -> RangeInclusive<Self::Bits> {
+            self.network().to_bits()..=self.broadcast().to_bits()
         }
-        (IpCidr::V6(c), IpCidr::V6(p)) => {
-            p.first_address() <= c.first_address() && c.last_address() <= p.last_address()
+
+        #[inline]
+        fn subnets(range: RangeInclusive<Self::Bits>) -> impl Iterator<Item = Self> {
+            let (start, end) = range.into_inner();
+            Self::Subnets::new(start.into(), end.into(), 0)
         }
-        _ => false, // mixed v4/v6
-    }
+
+        #[inline]
+        fn cmp(&self, other: &Self) -> Ordering {
+            self.network()
+                .cmp(&other.network())
+                .then(other.broadcast().cmp(&self.broadcast()))
+        }
+
+        #[inline]
+        fn sort(items: &mut [Self]) {
+            items.sort_unstable_by(IpNetExt::cmp)
+        }
+
+        #[inline]
+        fn subtract(&self, others: &[Self]) -> Vec<Self> {
+            let mut others = others
+                .into_iter()
+                .filter(|&other| self.contains(other))
+                .cloned()
+                .collect::<Vec<_>>();
+            Self::sort(&mut others);
+            self.subtract_ordered(&others)
+        }
+
+        fn subtract_ordered(&self, others: &[Self]) -> Vec<Self> {
+            let others = others
+                .iter()
+                .filter(|&other| self.contains(other))
+                .map(Self::range);
+
+            let mut cidrs = Vec::new();
+
+            let (start, end) = self.range().into_inner();
+
+            let mut current = start;
+
+            for (first, last) in others.into_iter().map(RangeInclusive::into_inner) {
+                if first > end {
+                    break;
+                }
+
+                if first < current || last > end {
+                    continue;
+                }
+
+                if first > current {
+                    cidrs.extend(<Self as IpNetExt>::subnets(current..=first - 1));
+                }
+
+                if last == Self::Bits::MAX {
+                    return cidrs;
+                }
+
+                current = last + 1;
+            }
+
+            if end >= current {
+                cidrs.extend(<Self as IpNetExt>::subnets(current..=end));
+            }
+
+            cidrs
+        }
+    };
+}
+
+impl IpNetExt for Ipv4Net {
+    type Subnets = Ipv4Subnets;
+    type Bits = u32;
+    const SIZE: u32 = 32;
+
+    impl_ipnet_ext! {}
+}
+
+impl IpNetExt for Ipv6Net {
+    type Subnets = Ipv6Subnets;
+    type Bits = u128;
+    const SIZE: u32 = 128;
+
+    impl_ipnet_ext! {}
 }
 
 /// Check if `child` CIDR is a subset of `parent` CIDR (both as string representations).
 fn cidr_is_subset_str(child: &str, parent: &str) -> bool {
-    let Ok(child_cidr) = child.parse::<IpCidr>() else {
+    let (Ok(child), Ok(parent)) = (child.parse::<IpNet>(), parent.parse::<IpNet>()) else {
         return false;
     };
-    let Ok(parent_cidr) = parent.parse::<IpCidr>() else {
-        return false;
-    };
-    cidr_is_subset(&child_cidr, &parent_cidr)
+    parent.contains(&child)
 }
 
 /// Patch specific fields in a raw DynamicMessage from a decoded RoutePeerInfo,
@@ -1327,8 +1416,8 @@ struct RouteTable {
     next_hop_map: NextHopMap,
     ipv4_peer_id_map: DashMap<Ipv4Addr, PeerIdVersion>,
     ipv6_peer_id_map: DashMap<Ipv6Addr, PeerIdVersion>,
-    cidr_peer_id_map: ArcSwap<PrefixMap<Ipv4Cidr, PeerIdVersion>>,
-    cidr_v6_peer_id_map: ArcSwap<PrefixMap<Ipv6Cidr, PeerIdVersion>>,
+    cidr_v4_peer_id_map: ArcSwap<PrefixMap<Ipv4Net, PeerIdVersion>>,
+    cidr_v6_peer_id_map: ArcSwap<PrefixMap<Ipv6Net, PeerIdVersion>>,
     next_hop_map_version: AtomicVersion,
 }
 
@@ -1339,7 +1428,7 @@ impl RouteTable {
             next_hop_map: DashMap::new(),
             ipv4_peer_id_map: DashMap::new(),
             ipv6_peer_id_map: DashMap::new(),
-            cidr_peer_id_map: ArcSwap::new(Arc::new(PrefixMap::new())),
+            cidr_v4_peer_id_map: ArcSwap::new(Arc::new(PrefixMap::new())),
             cidr_v6_peer_id_map: ArcSwap::new(Arc::new(PrefixMap::new())),
             next_hop_map_version: AtomicVersion::new(),
         }
@@ -1544,14 +1633,19 @@ impl RouteTable {
     ) {
         let version = synced_info.version.get();
 
-        let local_proxy_cidrs = synced_info
+        let (mut local_proxy_cidrs_v4, mut local_proxy_cidrs_v6): (Vec<_>, Vec<_>) = synced_info
             .peer_infos
             .read()
             .get(&my_peer_id)
             .into_iter()
             .flat_map(|info| &info.proxy_cidrs)
-            .filter_map(|cidr| cidr.parse::<IpCidr>().ok())
-            .collect::<Vec<_>>();
+            .filter_map(|cidr| cidr.parse::<IpNet>().ok())
+            .partition_map(|net| match net {
+                IpNet::V4(net) => Either::Left(net),
+                IpNet::V6(net) => Either::Right(net),
+            });
+        IpNetExt::sort(&mut local_proxy_cidrs_v4);
+        IpNetExt::sort(&mut local_proxy_cidrs_v6);
 
         // build next hop map
         let (graph, start_node) =
@@ -1580,7 +1674,7 @@ impl RouteTable {
             self.gen_next_hop_map_with_least_cost(&graph, &start_node, version);
         };
 
-        let mut new_cidr_prefix_trie = PrefixMap::new();
+        let mut new_cidr_v4_prefix_trie = PrefixMap::new();
         let mut new_cidr_v6_prefix_trie = PrefixMap::new();
 
         // build peer_infos, ipv4_peer_id_map, cidr_peer_id_map
@@ -1653,65 +1747,65 @@ impl RouteTable {
             }
 
             for cidr in info.proxy_cidrs.iter() {
-                let Ok(cidr) = cidr.parse::<IpCidr>() else {
+                let Ok(cidr) = cidr.parse::<IpNet>() else {
                     tracing::warn!("invalid proxy cidr: {:?}, from peer: {:?}", cidr, peer_id);
                     continue;
                 };
 
-                if *peer_id != my_peer_id
-                    && local_proxy_cidrs
-                        .iter()
-                        .any(|local_cidr| cidr_is_subset(&cidr, local_cidr))
-                {
-                    tracing::debug!(
-                        ?peer_id,
-                        ?my_peer_id,
-                        ?local_proxy_cidrs,
-                        ?cidr,
-                        "skip remote proxy cidr covered by local announced proxy cidr while building route table"
-                    );
+                if *peer_id == my_peer_id {
                     continue;
                 }
-                match cidr {
-                    IpCidr::V4(cidr) => {
-                        new_cidr_prefix_trie
-                            .entry(cidr)
-                            .and_modify(|e| {
-                                // if ourself has same cidr, ensure here put my peer id, so we can know deadloop may happen.
-                                if *peer_id == my_peer_id || is_new_peer_better(e) {
-                                    *e = peer_id_and_version;
-                                }
-                            })
-                            .or_insert(peer_id_and_version);
-                    }
 
-                    IpCidr::V6(cidr) => {
-                        new_cidr_v6_prefix_trie
-                            .entry(cidr)
-                            .and_modify(|e| {
-                                // if ourself has same cidr, ensure here put my peer id, so we can know deadloop may happen.
-                                if *peer_id == my_peer_id || is_new_peer_better(e) {
-                                    *e = peer_id_and_version;
-                                }
-                            })
-                            .or_insert(peer_id_and_version);
+                match cidr {
+                    IpNet::V4(cidr) => {
+                        for subcidr in cidr.subtract(&local_proxy_cidrs_v4) {
+                            new_cidr_v4_prefix_trie
+                                .entry(subcidr)
+                                .and_modify(|e| {
+                                    if is_new_peer_better(e) {
+                                        *e = peer_id_and_version;
+                                    }
+                                })
+                                .or_insert(peer_id_and_version);
+                            tracing::debug!(
+                                "add cidr: {:?} (original: {:?}) to peer: {:?}, my peer id: {:?}",
+                                subcidr,
+                                cidr,
+                                peer_id,
+                                my_peer_id
+                            );
+                        }
                     }
-                }
-                tracing::debug!(
-                    "add cidr: {:?} to peer: {:?}, my peer id: {:?}",
-                    cidr,
-                    peer_id,
-                    my_peer_id
-                );
+                    IpNet::V6(cidr) => {
+                        for subcidr in cidr.subtract(&local_proxy_cidrs_v6) {
+                            new_cidr_v6_prefix_trie
+                                .entry(subcidr)
+                                .and_modify(|e| {
+                                    if is_new_peer_better(e) {
+                                        *e = peer_id_and_version;
+                                    }
+                                })
+                                .or_insert(peer_id_and_version);
+                            tracing::debug!(
+                                "add cidr: {:?} (original: {:?}) to peer: {:?}, my peer id: {:?}",
+                                subcidr,
+                                cidr,
+                                peer_id,
+                                my_peer_id
+                            );
+                        }
+                    }
+                };
             }
         }
 
-        self.cidr_peer_id_map.store(Arc::new(new_cidr_prefix_trie));
+        self.cidr_v4_peer_id_map
+            .store(Arc::new(new_cidr_v4_prefix_trie));
         self.cidr_v6_peer_id_map
             .store(Arc::new(new_cidr_v6_prefix_trie));
         tracing::trace!(
             my_peer_id = my_peer_id,
-            cidrs = ?self.cidr_peer_id_map.load(),
+            cidrs = ?self.cidr_v4_peer_id_map.load(),
             cidrs_v6 = ?self.cidr_v6_peer_id_map.load(),
             "update peer cidr map"
         );
@@ -1720,14 +1814,14 @@ impl RouteTable {
     fn get_peer_id_for_proxy(&self, ip: &IpAddr) -> Option<PeerId> {
         match ip {
             IpAddr::V4(ipv4) => self
-                .cidr_peer_id_map
+                .cidr_v4_peer_id_map
                 .load()
-                .get_lpm(&Ipv4Cidr::new(*ipv4, 32).unwrap())
+                .get_lpm(&Ipv4Net::new(*ipv4, 32).unwrap())
                 .map(|x| x.1.peer_id),
             IpAddr::V6(ipv6) => self
                 .cidr_v6_peer_id_map
                 .load()
-                .get_lpm(&Ipv6Cidr::new(*ipv6, 128).unwrap())
+                .get_lpm(&Ipv6Net::new(*ipv6, 128).unwrap())
                 .map(|x| x.1.peer_id),
         }
     }
@@ -3953,11 +4047,11 @@ impl Route for PeerRoute {
         let my_peer_id = self.my_peer_id;
         self.service_impl
             .route_table
-            .cidr_peer_id_map
+            .cidr_v4_peer_id_map
             .load()
             .iter()
             .filter(|(_, pv)| pv.peer_id != my_peer_id)
-            .map(|(cidr, _)| *cidr)
+            .map(|(cidr, _)| Ipv4Cidr::new(cidr.network(), cidr.prefix_len()).unwrap())
             .collect()
     }
 
@@ -3969,7 +4063,7 @@ impl Route for PeerRoute {
             .load()
             .iter()
             .filter(|(_, pv)| pv.peer_id != my_peer_id)
-            .map(|(cidr, _)| *cidr)
+            .map(|(cidr, _)| Ipv6Cidr::new(cidr.network(), cidr.prefix_len()).unwrap())
             .collect()
     }
 
@@ -6588,7 +6682,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sync_route_info_prioritizes_local_over_remote_for_overlapped_proxy_cidrs() {
+    async fn sync_route_info_uses_lpm_for_overlapped_proxy_cidrs() {
         let peer_mgr = create_mock_pmgr().await;
         let route = create_mock_route(peer_mgr.clone()).await;
         let from_peer_id: PeerId = 11001;
@@ -6656,13 +6750,13 @@ mod tests {
         assert_eq!(stored.proxy_cidrs, sender_info.proxy_cidrs);
         drop(guard);
 
-        // Route-table filtering: local announced /16 should dominate remote equal/subset.
+        // Data plane uses LPM: remote /24 should win over local /16 for 10.10.1.1.
         assert_eq!(
             route
                 .service_impl
                 .route_table
                 .get_peer_id_for_proxy(&"10.10.1.1".parse::<IpAddr>().unwrap()),
-            Some(peer_mgr.my_peer_id())
+            Some(from_peer_id)
         );
         // Non-overlapped remote prefix should still route to remote.
         assert_eq!(
