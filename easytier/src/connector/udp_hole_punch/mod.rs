@@ -15,7 +15,7 @@ use tokio::{sync::Mutex, task::JoinHandle};
 use crate::{
     common::{PeerId, stun::StunInfoCollectorTrait},
     peers::{
-        peer_manager::PeerManager,
+        peer_manager::PtrPeerManager,
         peer_task::{PeerTaskLauncher, PeerTaskManager},
     },
     proto::{
@@ -62,7 +62,7 @@ struct UdpHolePunchServer {
 }
 
 impl UdpHolePunchServer {
-    pub fn new(peer_mgr: Arc<PeerManager>) -> Arc<Self> {
+    pub fn new(peer_mgr: PtrPeerManager) -> Arc<Self> {
         let common = Arc::new(PunchHoleServerCommon::new(peer_mgr));
         let cone_server = PunchConeHoleServer::new(common.clone());
         let sym_to_cone_server = PunchSymToConeHoleServer::new(common.clone());
@@ -112,7 +112,12 @@ impl UdpHolePunchRpc for UdpHolePunchServer {
         _ctrl: Self::Controller,
         input: SendPunchPacketHardSymRequest,
     ) -> rpc_types::error::Result<SendPunchPacketHardSymResponse> {
-        let _locked = get_sym_punch_lock(self.common.get_peer_mgr().my_peer_id())
+        let my_peer_id = self
+            .common
+            .get_peer_mgr()
+            .with(|pm, _| pm.my_peer_id())
+            .unwrap();
+        let _locked = get_sym_punch_lock(my_peer_id)
             .try_lock_owned()
             .with_context(|| "sym punch lock is busy")?;
         self.sym_to_cone_server
@@ -125,7 +130,12 @@ impl UdpHolePunchRpc for UdpHolePunchServer {
         _ctrl: Self::Controller,
         input: SendPunchPacketEasySymRequest,
     ) -> rpc_types::error::Result<Void> {
-        let _locked = get_sym_punch_lock(self.common.get_peer_mgr().my_peer_id())
+        let my_peer_id = self
+            .common
+            .get_peer_mgr()
+            .with(|pm, _| pm.my_peer_id())
+            .unwrap();
+        let _locked = get_sym_punch_lock(my_peer_id)
             .try_lock_owned()
             .with_context(|| "sym punch lock is busy")?;
         self.sym_to_cone_server
@@ -140,7 +150,12 @@ impl UdpHolePunchRpc for UdpHolePunchServer {
         _ctrl: Self::Controller,
         input: SendPunchPacketBothEasySymRequest,
     ) -> rpc_types::error::Result<SendPunchPacketBothEasySymResponse> {
-        let _locked = get_sym_punch_lock(self.common.get_peer_mgr().my_peer_id())
+        let my_peer_id = self
+            .common
+            .get_peer_mgr()
+            .with(|pm, _| pm.my_peer_id())
+            .unwrap();
+        let _locked = get_sym_punch_lock(my_peer_id)
             .try_lock_owned()
             .with_context(|| "sym punch lock is busy")?;
         self.both_easy_sym_server
@@ -201,12 +216,12 @@ struct UdpHoePunchConnectorData {
     cone_client: PunchConeHoleClient,
     sym_to_cone_client: PunchSymToConeHoleClient,
     both_easy_sym_client: PunchBothEasySymHoleClient,
-    peer_mgr: Arc<PeerManager>,
+    peer_mgr: PtrPeerManager,
     blacklist: Arc<timedmap::TimedMap<PeerId, ()>>,
 }
 
 impl UdpHoePunchConnectorData {
-    pub fn new(peer_mgr: Arc<PeerManager>) -> Arc<Self> {
+    pub fn new(peer_mgr: PtrPeerManager) -> Arc<Self> {
         let blacklist = Arc::new(timedmap::TimedMap::new());
         let cone_client = PunchConeHoleClient::new(peer_mgr.clone(), blacklist.clone());
         let sym_to_cone_client = PunchSymToConeHoleClient::new(peer_mgr.clone(), blacklist.clone());
@@ -246,7 +261,12 @@ impl UdpHoePunchConnectorData {
             Ok(Some(tunnel)) => {
                 tracing::info!(?tunnel, "hole punching get tunnel success");
 
-                if let Err(e) = self.peer_mgr.add_client_tunnel(tunnel, false).await {
+                if let Err(e) = self
+                    .peer_mgr
+                    .with_async(async move |pm, _| pm.add_client_tunnel(tunnel, false).await)
+                    .await
+                    .unwrap()
+                {
                     tracing::warn!("add client tunnel failed, err: {}", e);
                     op(true);
                     false
@@ -296,6 +316,7 @@ impl UdpHoePunchConnectorData {
             BackOff::new(vec![1000, 1000, 2000, 4000, 4000, 8000, 8000, 16000, 64000]);
         let mut round = 0;
         let mut port_idx = rand::random();
+        let my_peer_id = self.peer_mgr.with(|pm, _| pm.my_peer_id()).unwrap();
 
         loop {
             backoff.sleep_for_next_backoff().await;
@@ -312,9 +333,7 @@ impl UdpHoePunchConnectorData {
             }
 
             let ret = {
-                let _lock = get_sym_punch_lock(self.peer_mgr.my_peer_id())
-                    .lock_owned()
-                    .await;
+                let _lock = get_sym_punch_lock(my_peer_id).lock_owned().await;
                 self.sym_to_cone_client
                     .do_hole_punching(
                         task_info.dst_peer_id,
@@ -340,6 +359,7 @@ impl UdpHoePunchConnectorData {
     async fn both_easy_sym(self: Arc<Self>, task_info: PunchTaskInfo) -> Result<(), Error> {
         let mut backoff =
             BackOff::new(vec![1000, 1000, 2000, 4000, 4000, 8000, 8000, 16000, 64000]);
+        let my_peer_id = self.peer_mgr.with(|pm, _| pm.my_peer_id()).unwrap();
 
         loop {
             backoff.sleep_for_next_backoff().await;
@@ -358,9 +378,7 @@ impl UdpHoePunchConnectorData {
             let mut is_busy = false;
 
             let ret = {
-                let _lock = get_sym_punch_lock(self.peer_mgr.my_peer_id())
-                    .lock_owned()
-                    .await;
+                let _lock = get_sym_punch_lock(my_peer_id).lock_owned().await;
                 self.both_easy_sym_client
                     .do_hole_punching(
                         task_info.dst_peer_id,
@@ -401,14 +419,13 @@ impl PeerTaskLauncher for UdpHolePunchPeerTaskLauncher {
     type CollectPeerItem = PunchTaskInfo;
     type TaskRet = ();
 
-    fn new_data(&self, peer_mgr: Arc<PeerManager>) -> Self::Data {
+    fn new_data(&self, peer_mgr: PtrPeerManager) -> Self::Data {
         UdpHoePunchConnectorData::new(peer_mgr)
     }
 
     async fn collect_peers_need_task(&self, data: &Self::Data) -> Vec<Self::CollectPeerItem> {
-        let my_nat_type = data
-            .peer_mgr
-            .get_global_ctx()
+        let global_ctx = data.peer_mgr.with(|pm, _| pm.get_global_ctx()).unwrap();
+        let my_nat_type = global_ctx
             .get_stun_info_collector()
             .get_stun_info()
             .udp_nat_type;
@@ -427,8 +444,8 @@ impl PeerTaskLauncher for UdpHolePunchPeerTaskLauncher {
             return peers_to_connect;
         }
 
-        let my_peer_id = data.peer_mgr.my_peer_id();
-        let flags = data.peer_mgr.get_global_ctx().get_flags();
+        let my_peer_id = data.peer_mgr.with(|pm, _| pm.my_peer_id()).unwrap();
+        let flags = global_ctx.get_flags();
         let lazy_p2p = flags.lazy_p2p;
         let now = Instant::now();
 
@@ -438,7 +455,12 @@ impl PeerTaskLauncher for UdpHolePunchPeerTaskLauncher {
         // 1. peers without direct conns;
         // 2. peers is full cone (any restricted type);
         // 3. peers not in blacklist;
-        for route in data.peer_mgr.list_routes().await.iter() {
+        let routes = data
+            .peer_mgr
+            .with_async(async move |pm, _| pm.list_routes().await)
+            .await
+            .unwrap();
+        for route in routes.iter() {
             let static_allowed = should_background_p2p_with_peer(
                 route.feature_flag.as_ref(),
                 false,
@@ -446,12 +468,16 @@ impl PeerTaskLauncher for UdpHolePunchPeerTaskLauncher {
                 flags.disable_p2p,
                 flags.need_p2p,
             );
+            let has_recent = data
+                .peer_mgr
+                .with(|pm, _| pm.has_recent_traffic(route.peer_id, now))
+                .unwrap();
             let dynamic_allowed = should_try_p2p_with_peer(
                 route.feature_flag.as_ref(),
                 false,
                 flags.disable_p2p,
                 flags.need_p2p,
-            ) && data.peer_mgr.has_recent_traffic(route.peer_id, now);
+            ) && has_recent;
             if !static_allowed && !dynamic_allowed {
                 continue;
             }
@@ -474,12 +500,15 @@ impl PeerTaskLauncher for UdpHolePunchPeerTaskLauncher {
                 continue;
             }
 
-            if data.peer_mgr.get_peer_map().has_peer(peer_id) {
+            if data
+                .peer_mgr
+                .with(|pm, _| pm.get_peer_map().has_peer(peer_id))
+                .unwrap()
+            {
                 continue;
             }
 
-            let global_ctx = data.peer_mgr.get_global_ctx();
-            if !my_nat_type.can_punch_hole_as_client(peer_nat_type, my_peer_id, peer_id, global_ctx)
+            if !my_nat_type.can_punch_hole_as_client(peer_nat_type, my_peer_id, peer_id, global_ctx.clone())
             {
                 continue;
             }
@@ -507,7 +536,7 @@ impl PeerTaskLauncher for UdpHolePunchPeerTaskLauncher {
         item: Self::CollectPeerItem,
     ) -> JoinHandle<Result<Self::TaskRet, Error>> {
         let data = data.clone();
-        let global_ctx = data.peer_mgr.get_global_ctx();
+        let global_ctx = data.peer_mgr.with(|pm, _| pm.get_global_ctx()).unwrap();
         let punch_method = item
             .my_nat_type
             .get_punch_hole_method(item.dst_nat_type, global_ctx);
@@ -531,7 +560,7 @@ impl PeerTaskLauncher for UdpHolePunchPeerTaskLauncher {
 pub struct UdpHolePunchConnector {
     server: Arc<UdpHolePunchServer>,
     client: PeerTaskManager<UdpHolePunchPeerTaskLauncher>,
-    peer_mgr: Arc<PeerManager>,
+    peer_mgr: PtrPeerManager,
 }
 
 // Currently support:
@@ -542,14 +571,18 @@ pub struct UdpHolePunchConnector {
 // if different level of full cone, node with more strict level will be the initiator
 
 impl UdpHolePunchConnector {
-    pub fn new(peer_mgr: Arc<PeerManager>) -> Self {
+    pub fn new(peer_mgr: PtrPeerManager) -> Self {
+        let p2p_demand = peer_mgr
+            .with(|pm, _| pm.p2p_demand_notify())
+            .unwrap();
+        let mut psn = PeerTaskManager::new_with_external_signal(
+            UdpHolePunchPeerTaskLauncher {},
+            peer_mgr.clone(),
+            Some(p2p_demand),
+        );
         Self {
             server: UdpHolePunchServer::new(peer_mgr.clone()),
-            client: PeerTaskManager::new_with_external_signal(
-                UdpHolePunchPeerTaskLauncher {},
-                peer_mgr.clone(),
-                Some(peer_mgr.p2p_demand_notify()),
-            ),
+            client: psn,
             peer_mgr,
         }
     }
@@ -561,19 +594,22 @@ impl UdpHolePunchConnector {
 
     pub async fn run_as_server(&mut self) -> Result<(), Error> {
         self.peer_mgr
-            .get_peer_rpc_mgr()
-            .rpc_server()
-            .registry()
-            .register(
-                UdpHolePunchRpcServer::new(Arc::downgrade(&self.server)),
-                &self.peer_mgr.get_global_ctx().get_network_name(),
-            );
+            .with(|pm, _| {
+                pm.get_peer_rpc_mgr()
+                    .rpc_server()
+                    .registry()
+                    .register(
+                        UdpHolePunchRpcServer::new(Arc::downgrade(&self.server)),
+                        &pm.get_global_ctx().get_network_name(),
+                    );
+            })
+            .unwrap();
 
         Ok(())
     }
 
     pub async fn run(&mut self) -> Result<(), Error> {
-        let global_ctx = self.peer_mgr.get_global_ctx();
+        let global_ctx = self.peer_mgr.with(|pm, _| pm.get_global_ctx()).unwrap();
 
         if global_ctx.get_flags().disable_udp_hole_punching {
             return Ok(());
@@ -594,21 +630,21 @@ impl UdpHolePunchConnector {
 #[cfg(test)]
 pub mod tests {
 
-    use std::sync::Arc;
     use std::time::Duration;
 
     use crate::common::stun::MockStunInfoCollector;
     use crate::peers::{
-        peer_manager::PeerManager,
+        peer_manager::PtrPeerManager,
         peer_task::PeerTaskLauncher,
         tests::{connect_peer_manager, create_mock_peer_manager, wait_route_appear},
     };
     use crate::proto::common::NatType;
     use crate::tunnel::common::tests::wait_for_condition;
+    use crate::utils::ptr::SharedPtr;
 
     use super::{RUN_TESTING, UdpHolePunchConnector, UdpHolePunchPeerTaskLauncher};
 
-    pub fn replace_stun_info_collector(peer_mgr: Arc<PeerManager>, udp_nat_type: NatType) {
+    pub fn replace_stun_info_collector(peer_mgr: &SharedPtr<crate::peers::peer_manager::PeerManager>, udp_nat_type: NatType) {
         let collector = Box::new(MockStunInfoCollector { udp_nat_type });
         peer_mgr
             .get_global_ctx()
@@ -617,16 +653,16 @@ pub mod tests {
 
     pub async fn create_mock_peer_manager_with_mock_stun(
         udp_nat_type: NatType,
-    ) -> Arc<PeerManager> {
+    ) -> SharedPtr<crate::peers::peer_manager::PeerManager> {
         let p_a = create_mock_peer_manager().await;
         let mut flags = p_a.get_global_ctx().get_flags();
         flags.disable_upnp = true;
         p_a.get_global_ctx().set_flags(flags);
-        replace_stun_info_collector(p_a.clone(), udp_nat_type);
+        replace_stun_info_collector(&p_a, udp_nat_type);
         p_a
     }
 
-    async fn collect_lazy_punch_peers(peer_mgr: Arc<PeerManager>) -> Vec<u32> {
+    async fn collect_lazy_punch_peers(peer_mgr: PtrPeerManager) -> Vec<u32> {
         let launcher = UdpHolePunchPeerTaskLauncher {};
         let data = launcher.new_data(peer_mgr);
         launcher
@@ -647,11 +683,11 @@ pub mod tests {
         let p_a = create_mock_peer_manager_with_mock_stun(nat_type).await;
         let p_b = create_mock_peer_manager_with_mock_stun(NatType::PortRestricted).await;
         let p_c = create_mock_peer_manager_with_mock_stun(NatType::PortRestricted).await;
-        connect_peer_manager(p_a.clone(), p_b.clone()).await;
-        connect_peer_manager(p_b.clone(), p_c.clone()).await;
-        wait_route_appear(p_a.clone(), p_c.clone()).await.unwrap();
+        connect_peer_manager(p_a.share(), p_b.share()).await;
+        connect_peer_manager(p_b.share(), p_c.share()).await;
+        wait_route_appear(p_a.share(), p_c.share()).await.unwrap();
 
-        let mut hole_punching_a = UdpHolePunchConnector::new(p_a.clone());
+        let mut hole_punching_a = UdpHolePunchConnector::new(p_a.share());
 
         hole_punching_a.run().await.unwrap();
 
@@ -680,12 +716,12 @@ pub mod tests {
         flags.lazy_p2p = true;
         p_a.get_global_ctx().set_flags(flags);
 
-        connect_peer_manager(p_a.clone(), p_b.clone()).await;
-        connect_peer_manager(p_b.clone(), p_c.clone()).await;
-        wait_route_appear(p_a.clone(), p_c.clone()).await.unwrap();
+        connect_peer_manager(p_a.share(), p_b.share()).await;
+        connect_peer_manager(p_b.share(), p_c.share()).await;
+        wait_route_appear(p_a.share(), p_c.share()).await.unwrap();
 
         assert!(
-            !collect_lazy_punch_peers(p_a.clone())
+            !collect_lazy_punch_peers(p_a.share())
                 .await
                 .contains(&p_c.my_peer_id())
         );
@@ -693,7 +729,7 @@ pub mod tests {
         p_a.mark_recent_traffic(p_c.my_peer_id());
 
         assert!(
-            collect_lazy_punch_peers(p_a.clone())
+            collect_lazy_punch_peers(p_a.share())
                 .await
                 .contains(&p_c.my_peer_id())
         );

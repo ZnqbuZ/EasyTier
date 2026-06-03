@@ -18,6 +18,7 @@ use crate::tunnel::packet_def::{
     PacketType, PeerManagerHeader, TAIL_RESERVED_SIZE, ZCPacket, ZCPacketType,
 };
 use crate::tunnel::quic::{client_config, endpoint_config, server_config};
+use crate::utils::ptr::WeakPtr;
 use crate::utils::task::HedgeExt;
 use anyhow::{Context, Error, anyhow, bail, ensure};
 use atomic_refcell::AtomicRefCell;
@@ -281,7 +282,7 @@ impl From<(SendStream, RecvStream)> for QuicStream {
 #[derive(Debug, Clone)]
 pub struct NatDstQuicConnector {
     pub(crate) endpoint: Endpoint,
-    pub(crate) peer_mgr: Weak<PeerManager>,
+    pub(crate) peer_mgr: WeakPtr<PeerManager>,
     pub(crate) conn_map: Cache<PeerId, Connection>,
 }
 
@@ -294,21 +295,17 @@ impl NatDstConnector for NatDstQuicConnector {
         src: SocketAddr,
         nat_dst: SocketAddr,
     ) -> anyhow::Result<Self::DstStream> {
-        let peer_mgr = self
-            .peer_mgr
-            .upgrade()
-            .ok_or_else(|| anyhow!("peer manager is not available"))?;
+        let peer_mgr = self.peer_mgr.clone();
 
-        let dst_peer = {
+        let dst_peer = peer_mgr.with_async(async move |pm,_| {
             let SocketAddr::V4(addr) = nat_dst else {
                 bail!("ipv6 is not supported");
             };
-            peer_mgr
-                .get_peer_map()
+            pm.get_peer_map()
                 .get_peer_id_by_ipv4(addr.ip())
                 .await
-                .ok_or_else(|| anyhow!("no peer found for nat dst: {}", nat_dst))?
-        };
+                .ok_or_else(|| anyhow!("no peer found for nat dst: {}", nat_dst))
+        }).await.ok_or_else(|| anyhow!("peer manager is not available"))??;
 
         tracing::trace!(?nat_dst, ?dst_peer, "quic nat");
 
@@ -448,12 +445,13 @@ impl TcpProxyForWrappedSrcTrait for TcpProxyForQuicSrc {
 
     #[inline]
     async fn check_dst_allow_wrapped_input(&self, dst_ip: &Ipv4Addr) -> bool {
-        let Some(peer_manager) = self.0.get_peer_manager() else {
-            return false;
-        };
+        let peer_manager = self.0.get_peer_manager();
         peer_manager
-            .check_allow_quic_to_dst(&IpAddr::V4(*dst_ip))
+            .with_async(async move |pm, _| {
+                pm.check_allow_quic_to_dst(&IpAddr::V4(*dst_ip)).await
+            })
             .await
+            .unwrap_or(false)
     }
 }
 
@@ -515,7 +513,7 @@ impl PeerPacketFilter for QuicPacketReceiver {
 // Send to peers packets received from the QUIC endpoint
 #[derive(Debug)]
 struct QuicPacketSender {
-    peer_mgr: Arc<PeerManager>,
+    peer_mgr: WeakPtr<PeerManager>,
     rx: Receiver<QuicPacket>,
 
     header: Bytes,
@@ -542,15 +540,22 @@ impl QuicPacketSender {
                 let mut payload = payload.split_to(len);
                 payload[..self.margins.header].copy_from_slice(&self.header);
                 payload.truncate(len - self.margins.trailer);
+                let my_peer_id = self.peer_mgr.with(|pm, _| pm.my_peer_id()).unwrap_or_default();
                 let mut packet = ZCPacket::new_from_buf(payload, self.zc_packet_type);
 
                 packet.fill_peer_manager_hdr(
-                    self.peer_mgr.my_peer_id(),
+                    my_peer_id,
                     addr.peer_id,
                     addr.packet_type as u8,
                 );
 
-                if let Err(e) = self.peer_mgr.send_msg_for_proxy(packet, addr.peer_id).await {
+                let Some(send_result) = self.peer_mgr.with_async(async move |pm, _| {
+                    pm.send_msg_for_proxy(packet, addr.peer_id).await
+                }).await else {
+                    error!("peer manager is gone, quic packet sender exiting");
+                    return;
+                };
+                if let Err(e) = send_result {
                     error!("failed to send QUIC packet to peer: {:?}", e);
                 }
             }
@@ -569,13 +574,14 @@ struct QuicStreamContext {
 }
 
 impl QuicStreamContext {
-    fn new(peer_mgr: Arc<PeerManager>) -> Self {
-        let global_ctx = peer_mgr.get_global_ctx();
+    fn new(peer_mgr: WeakPtr<PeerManager>) -> Self {
+        let global_ctx = peer_mgr.with(|pm, _| pm.get_global_ctx()).unwrap();
+        let route = Arc::new(peer_mgr.with(|pm, _| pm.get_route()).unwrap());
         Self {
             global_ctx: global_ctx.clone(),
             proxy_entries: Arc::new(DashMap::new()),
             cidr_set: Arc::new(CidrSet::new(global_ctx.clone())),
-            route: Arc::new(peer_mgr.get_route()),
+            route,
         }
     }
 }
@@ -791,7 +797,7 @@ impl QuicStreamReceiver {
 }
 
 pub struct QuicProxy {
-    peer_mgr: Arc<PeerManager>,
+    peer_mgr: WeakPtr<PeerManager>,
 
     endpoint: Option<Endpoint>,
 
@@ -814,7 +820,7 @@ impl QuicProxy {
 }
 
 impl QuicProxy {
-    pub fn new(peer_mgr: Arc<PeerManager>) -> Self {
+    pub fn new(peer_mgr: WeakPtr<PeerManager>) -> Self {
         Self {
             peer_mgr,
             endpoint: None,
@@ -847,8 +853,9 @@ impl QuicProxy {
         let (in_tx, in_rx) = channel(1024);
         let (out_tx, out_rx) = channel(1024);
 
+        let my_peer_id = self.peer_mgr.with(|pm, _| pm.my_peer_id()).unwrap_or_default();
         let socket = QuicSocket {
-            addr: SocketAddr::new(Ipv4Addr::from(self.peer_mgr.my_peer_id()).into(), 0),
+            addr: SocketAddr::new(Ipv4Addr::from(my_peer_id).into(), 0),
             rx: AtomicRefCell::new(in_rx),
             tx: out_tx,
             margins,
@@ -888,7 +895,7 @@ impl QuicProxy {
                 peer_mgr.clone(),
                 NatDstQuicConnector {
                     endpoint: endpoint.clone(),
-                    peer_mgr: Arc::downgrade(&peer_mgr),
+                    peer_mgr: peer_mgr.clone(),
                     conn_map: Cache::builder()
                         .max_capacity(u8::MAX.into()) // cf. quinn transport config (max_concurrent_bidi_streams)
                         .time_to_idle(Duration::from_secs(600)) // cf. quinn transport config (max_idle_timeout)
@@ -936,7 +943,7 @@ impl QuicProxy {
 }
 
 pub struct QuicProxySrc {
-    peer_mgr: Arc<PeerManager>,
+    peer_mgr: WeakPtr<PeerManager>,
     tcp_proxy: TcpProxyForQuicSrc,
 
     tx: Sender<QuicPacket>,
@@ -952,24 +959,26 @@ impl QuicProxySrc {
 impl QuicProxySrc {
     async fn run(&self) {
         trace!("quic proxy src starting");
-        self.peer_mgr
-            .add_nic_packet_process_pipeline(Box::new(self.tcp_proxy.clone()))
-            .await;
-        self.peer_mgr
-            .add_packet_process_pipeline(Box::new(self.tcp_proxy.0.clone()))
-            .await;
-        self.peer_mgr
-            .add_packet_process_pipeline(Box::new(QuicPacketReceiver {
-                tx: self.tx.clone(),
+        let tcp_proxy = self.tcp_proxy.clone();
+        let tcp_proxy_inner = self.tcp_proxy.0.clone();
+        let tx = self.tx.clone();
+        self.peer_mgr.with_async(async move |pm, _| {
+            pm.add_nic_packet_process_pipeline(Box::new(tcp_proxy))
+                .await;
+            pm.add_packet_process_pipeline(Box::new(tcp_proxy_inner.clone()))
+                .await;
+            pm.add_packet_process_pipeline(Box::new(QuicPacketReceiver {
+                tx,
                 role: QuicProxyRole::Src,
             }))
             .await;
+        }).await.unwrap();
         self.tcp_proxy.0.start(false).await.unwrap();
     }
 }
 
 pub struct QuicProxyDst {
-    peer_mgr: Arc<PeerManager>,
+    peer_mgr: WeakPtr<PeerManager>,
 
     tx: Sender<QuicPacket>,
     stream_ctx: Arc<QuicStreamContext>,
@@ -978,12 +987,14 @@ pub struct QuicProxyDst {
 impl QuicProxyDst {
     async fn run(&self) {
         trace!("quic proxy dst starting");
-        self.peer_mgr
-            .add_packet_process_pipeline(Box::new(QuicPacketReceiver {
-                tx: self.tx.clone(),
+        let tx = self.tx.clone();
+        self.peer_mgr.with_async(async move |pm, _| {
+            pm.add_packet_process_pipeline(Box::new(QuicPacketReceiver {
+                tx,
                 role: QuicProxyRole::Dst,
             }))
             .await;
+        }).await.unwrap();
     }
 }
 

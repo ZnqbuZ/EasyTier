@@ -2,7 +2,7 @@ use std::{
     fmt::Debug,
     net::IpAddr,
     str::FromStr,
-    sync::{Arc, Weak},
+    sync::Arc,
 };
 
 use anyhow::Context;
@@ -21,6 +21,7 @@ use crate::{
         tcp::TcpTunnelListener, udp::UdpTunnelListener,
     },
     utils::BoxExt,
+    utils::ptr::WeakPtr,
 };
 
 pub fn create_listener_by_url(
@@ -97,18 +98,18 @@ pub struct ListenerManager<H> {
     global_ctx: ArcGlobalCtx,
     net_ns: NetNS,
     listeners: Vec<ListenerFactory>,
-    peer_manager: Weak<H>,
+        peer_manager: WeakPtr<H>,
 
     tasks: JoinSet<()>,
 }
 
 impl<H: TunnelHandlerForListener + Send + Sync + 'static + Debug> ListenerManager<H> {
-    pub fn new(global_ctx: ArcGlobalCtx, peer_manager: Arc<H>) -> Self {
+    pub fn new(global_ctx: ArcGlobalCtx, peer_manager: WeakPtr<H>) -> Self {
         Self {
             global_ctx: global_ctx.clone(),
             net_ns: global_ctx.net_ns.clone(),
             listeners: Vec::new(),
-            peer_manager: Arc::downgrade(&peer_manager),
+            peer_manager,
             tasks: JoinSet::new(),
         }
     }
@@ -179,7 +180,7 @@ impl<H: TunnelHandlerForListener + Send + Sync + 'static + Debug> ListenerManage
     #[tracing::instrument(skip(creator))]
     async fn run_listener(
         creator: Arc<ListenerCreator>,
-        peer_manager: Weak<H>,
+    peer_manager: WeakPtr<H>,
         global_ctx: ArcGlobalCtx,
     ) {
         let mut err_count = 0;
@@ -237,11 +238,13 @@ impl<H: TunnelHandlerForListener + Send + Sync + 'static + Debug> ListenerManage
                 let peer_manager = peer_manager.clone();
                 let global_ctx = global_ctx.clone();
                 tokio::spawn(async move {
-                    let Some(peer_manager) = peer_manager.upgrade() else {
+                    let Some(server_ret) = peer_manager
+                        .with_async(async move |pm, _| { pm.handle_tunnel(ret).await })
+                        .await
+                    else {
                         tracing::error!("peer manager is gone, cannot handle tunnel");
                         return;
                     };
-                    let server_ret = peer_manager.handle_tunnel(ret).await;
                     if let Err(e) = &server_ret {
                         global_ctx.issue_event(GlobalCtxEvent::ConnectionError(
                             tunnel_info.local_addr.unwrap_or_default().to_string(),
@@ -287,6 +290,7 @@ mod tests {
     use crate::{
         common::global_ctx::tests::get_mock_global_ctx,
         tunnel::{TunnelConnector, TunnelError, packet_def::ZCPacket, ring::RingTunnelConnector},
+        utils::ptr::SharedPtr,
     };
 
     use super::*;
@@ -308,8 +312,8 @@ mod tests {
 
     #[tokio::test]
     async fn handle_error_in_accept() {
-        let handler = Arc::new(MockListenerHandler {});
-        let mut listener_mgr = ListenerManager::new(get_mock_global_ctx(), handler.clone());
+        let handler = SharedPtr::make(MockListenerHandler {});
+        let mut listener_mgr = ListenerManager::new(get_mock_global_ctx(), handler.share());
 
         let ring_id = format!("ring://{}", uuid::Uuid::new_v4());
 
@@ -376,8 +380,8 @@ mod tests {
             }
         }
 
-        let handler = Arc::new(MockListenerHandler {});
-        let mut listener_mgr = ListenerManager::new(get_mock_global_ctx(), handler.clone());
+        let handler = SharedPtr::make(MockListenerHandler {});
+        let mut listener_mgr = ListenerManager::new(get_mock_global_ctx(), handler.share());
         let counter_clone = counter.clone();
         let drop_counter_clone = drop_counter.clone();
         listener_mgr

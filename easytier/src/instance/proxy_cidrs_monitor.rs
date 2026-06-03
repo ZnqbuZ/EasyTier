@@ -1,22 +1,22 @@
 use std::collections::BTreeSet;
-use std::sync::{Arc, Weak};
 use std::time::Instant;
 
 use crate::common::global_ctx::{ArcGlobalCtx, GlobalCtxEvent};
 use crate::peers::peer_manager::PeerManager;
+use crate::utils::ptr::{SharedPtr, WeakPtr};
 use tokio_util::task::AbortOnDropHandle;
 
 /// ProxyCidrsMonitor monitors changes in proxy CIDRs from peer routes
 /// and emits GlobalCtxEvent::ProxyCidrsUpdated with added/removed diffs.
 pub struct ProxyCidrsMonitor {
-    peer_mgr: Weak<PeerManager>,
+    peer_mgr: WeakPtr<PeerManager>,
     global_ctx: ArcGlobalCtx,
 }
 
 impl ProxyCidrsMonitor {
-    pub fn new(peer_mgr: Arc<PeerManager>, global_ctx: ArcGlobalCtx) -> Self {
+    pub fn new(peer_mgr: WeakPtr<PeerManager>, global_ctx: ArcGlobalCtx) -> Self {
         Self {
-            peer_mgr: Arc::downgrade(&peer_mgr),
+            peer_mgr,
             global_ctx,
         }
     }
@@ -66,21 +66,24 @@ impl ProxyCidrsMonitor {
             loop {
                 tokio::time::sleep(std::time::Duration::from_secs(1)).await;
 
-                let Some(peer_mgr) = self.peer_mgr.upgrade() else {
+                let global_ctx = self.global_ctx.clone();
+                let cur_cidrs = cur_proxy_cidrs.clone();
+                let Some(result) = self.peer_mgr.with_async(async move |pm: &SharedPtr<PeerManager>, _| {
+                    let last_update_time = pm.get_route_peer_info_last_update_time().await;
+                    let (new_cidrs, added, removed) =
+                        Self::diff_proxy_cidrs(&*pm, &global_ctx, &cur_cidrs).await;
+                    (last_update_time, new_cidrs, added, removed)
+                }).await else {
                     tracing::warn!("peer manager dropped, stopping ProxyCidrsMonitor");
                     break;
                 };
 
-                // Check if route info has been updated
-                let last_update_time = peer_mgr.get_route_peer_info_last_update_time().await;
+                let (last_update_time, new_proxy_cidrs, added, removed) = result;
+
                 if last_update == Some(last_update_time) {
                     continue;
                 }
                 last_update = Some(last_update_time);
-
-                let (new_proxy_cidrs, added, removed) =
-                    Self::diff_proxy_cidrs(peer_mgr.as_ref(), &self.global_ctx, &cur_proxy_cidrs)
-                        .await;
 
                 cur_proxy_cidrs = new_proxy_cidrs;
 

@@ -1,9 +1,10 @@
-use std::{sync::Arc, time::Duration};
+use std::time::Duration;
 
 use tokio::task::JoinSet;
 
 use crate::{
     peers::peer_manager::PeerManager,
+    utils::ptr::WeakPtr,
     proto::{
         api::instance::Route,
         common::Void,
@@ -22,12 +23,12 @@ use super::MAGIC_DNS_INSTANCE_ADDR;
 pub struct MagicDnsClientInstance {
     rpc_client: StandAloneClient<TcpTunnelConnector>,
     rpc_stub: Option<Box<dyn MagicDnsServerRpc<Controller = BaseController> + Send>>,
-    peer_mgr: Arc<PeerManager>,
+    peer_mgr: WeakPtr<PeerManager>,
     tasks: JoinSet<()>,
 }
 
 impl MagicDnsClientInstance {
-    pub async fn new(peer_mgr: Arc<PeerManager>) -> Result<Self, anyhow::Error> {
+    pub async fn new(peer_mgr: WeakPtr<PeerManager>) -> Result<Self, anyhow::Error> {
         let tcp_connector = TcpTunnelConnector::new(MAGIC_DNS_INSTANCE_ADDR.parse().unwrap());
         let mut rpc_client = StandAloneClient::new(tcp_connector);
         let rpc_stub = rpc_client
@@ -42,7 +43,7 @@ impl MagicDnsClientInstance {
     }
 
     async fn update_dns_task(
-        peer_mgr: Arc<PeerManager>,
+        peer_mgr: WeakPtr<PeerManager>,
         rpc_stub: Box<dyn MagicDnsServerRpc<Controller = BaseController> + Send>,
     ) -> Result<(), anyhow::Error> {
         let mut prev_last_update = None;
@@ -54,25 +55,30 @@ impl MagicDnsClientInstance {
                 .heartbeat(BaseController::default(), Void::default())
                 .await?;
 
-            let last_update = peer_mgr.get_route_peer_info_last_update_time().await;
+            let last_update = peer_mgr.with_async(async move |pm, _| {
+                pm.get_route_peer_info_last_update_time().await
+            }).await.ok_or_else(|| anyhow::anyhow!("peer manager dropped"))?;
             if Some(last_update) == prev_last_update {
                 tokio::time::sleep(Duration::from_millis(500)).await;
                 continue;
             }
 
-            let mut routes = peer_mgr.list_routes().await;
-            // add self as a route
-            let ctx = peer_mgr.get_global_ctx();
-            routes.push(Route {
-                hostname: ctx.get_hostname(),
-                ipv4_addr: ctx.get_ipv4().map(Into::into),
-                ..Default::default()
-            });
+            let (routes, zone) = peer_mgr.with_async(async move |pm, _| {
+                let mut routes = pm.list_routes().await;
+                let ctx = pm.get_global_ctx();
+                routes.push(Route {
+                    hostname: ctx.get_hostname(),
+                    ipv4_addr: ctx.get_ipv4().map(Into::into),
+                    ..Default::default()
+                });
+                let flags = ctx.config.get_flags();
+                (routes, flags.tld_dns_zone.clone())
+            }).await.ok_or_else(|| anyhow::anyhow!("peer manager dropped"))?;
+
             // Use configured tld_dns_zone (always set by default)
-            let flags = ctx.config.get_flags();
             let req = UpdateDnsRecordRequest {
                 routes,
-                zone: flags.tld_dns_zone.clone(),
+                zone,
             };
             tracing::debug!(
                 "MagicDnsClientInstance::update_dns_task: update dns records: {:?}",
@@ -82,7 +88,9 @@ impl MagicDnsClientInstance {
                 .update_dns_record(BaseController::default(), req)
                 .await?;
 
-            let last_update_after_rpc = peer_mgr.get_route_peer_info_last_update_time().await;
+            let last_update_after_rpc = peer_mgr.with_async(async move |pm, _| {
+                pm.get_route_peer_info_last_update_time().await
+            }).await.ok_or_else(|| anyhow::anyhow!("peer manager dropped"))?;
             if last_update_after_rpc == last_update {
                 prev_last_update = Some(last_update);
             }

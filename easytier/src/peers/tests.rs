@@ -19,21 +19,22 @@ use crate::{
         packet_def::{PacketType, ZCPacket},
         ring::create_ring_tunnel_pair,
     },
+    utils::ptr::SharedPtr,
 };
 
 use super::{
     create_packet_recv_chan,
     peer_conn::tests::set_secure_mode_cfg,
-    peer_manager::{PeerManager, RouteAlgoType},
+    peer_manager::{PeerManager, PtrPeerManager, RouteAlgoType},
     peer_map::PeerMap,
     peer_session::{PeerSession, PeerSessionStore, SessionKey},
     relay_peer_map::RelayPeerMap,
     route_trait::NextHopPolicy,
 };
 
-pub async fn create_mock_peer_manager() -> Arc<PeerManager> {
+pub async fn create_mock_peer_manager() -> SharedPtr<PeerManager> {
     let (s, _r) = create_packet_recv_chan();
-    let peer_mgr = Arc::new(PeerManager::new(
+    let peer_mgr = SharedPtr::make(PeerManager::new(
         RouteAlgoType::Ospf,
         get_mock_global_ctx(),
         s,
@@ -42,11 +43,11 @@ pub async fn create_mock_peer_manager() -> Arc<PeerManager> {
     peer_mgr
 }
 
-pub async fn create_mock_peer_manager_with_name(network_name: String) -> Arc<PeerManager> {
+pub async fn create_mock_peer_manager_with_name(network_name: String) -> SharedPtr<PeerManager> {
     let (s, _r) = create_packet_recv_chan();
     let g =
         get_mock_global_ctx_with_network(Some(NetworkIdentity::new(network_name, "".to_string())));
-    let peer_mgr = Arc::new(PeerManager::new(RouteAlgoType::Ospf, g, s));
+    let peer_mgr = SharedPtr::make(PeerManager::new(RouteAlgoType::Ospf, g, s));
     peer_mgr.run().await.unwrap();
     peer_mgr
 }
@@ -54,12 +55,12 @@ pub async fn create_mock_peer_manager_with_name(network_name: String) -> Arc<Pee
 pub async fn create_mock_peer_manager_secure(
     network_name: String,
     network_secret: String,
-) -> Arc<PeerManager> {
+) -> SharedPtr<PeerManager> {
     let (s, _r) = create_packet_recv_chan();
     let g =
         get_mock_global_ctx_with_network(Some(NetworkIdentity::new(network_name, network_secret)));
     set_secure_mode_cfg(&g, true);
-    let peer_mgr = Arc::new(PeerManager::new(RouteAlgoType::Ospf, g, s));
+    let peer_mgr = SharedPtr::make(PeerManager::new(RouteAlgoType::Ospf, g, s));
     peer_mgr.run().await.unwrap();
     peer_mgr
 }
@@ -72,36 +73,55 @@ fn set_private_mode(peer_mgr: &PeerManager, enabled: bool) {
 }
 
 async fn connect_client_and_server(
-    client: Arc<PeerManager>,
-    server: Arc<PeerManager>,
+    client: PtrPeerManager,
+    server: PtrPeerManager,
 ) -> (Result<(), Error>, Result<(), Error>) {
     let (client_ring, server_ring) = create_ring_tunnel_pair();
     tokio::join!(
         {
             let client = client.clone();
             async move {
-                client.add_client_tunnel(client_ring, false).await?;
+                client
+                    .with_async(async move |pm, _| {
+                        pm.add_client_tunnel(client_ring, false).await
+                    })
+                    .await
+                    .unwrap()
+                    .unwrap();
                 Ok(())
             }
         },
         {
             let server = server.clone();
-            async move { server.add_tunnel_as_server(server_ring, true).await }
+            async move {
+                server
+                    .with_async(async move |pm, _| {
+                        pm.add_tunnel_as_server(server_ring, true).await
+                    })
+                    .await
+                    .unwrap()
+                    .unwrap();
+                Ok::<(), Error>(())
+            }
         }
     )
 }
 
-async fn wait_for_foreign_network(server: Arc<PeerManager>, network_name: &'static str) {
+async fn wait_for_foreign_network(server: PtrPeerManager, network_name: &'static str) {
     wait_for_condition(
         || {
             let server = server.clone();
             async move {
                 server
-                    .get_foreign_network_manager()
-                    .list_foreign_networks()
+                    .with_async(async move |pm, _| {
+                        pm.get_foreign_network_manager()
+                            .list_foreign_networks()
+                            .await
+                            .foreign_networks
+                            .contains_key(network_name)
+                    })
                     .await
-                    .foreign_networks
-                    .contains_key(network_name)
+                    .unwrap()
             }
         },
         Duration::from_secs(10),
@@ -110,7 +130,7 @@ async fn wait_for_foreign_network(server: Arc<PeerManager>, network_name: &'stat
 }
 
 async fn wait_for_foreign_network_peer_count_at_least(
-    server: Arc<PeerManager>,
+    server: PtrPeerManager,
     network_name: &'static str,
     min_peer_count: usize,
 ) {
@@ -119,13 +139,17 @@ async fn wait_for_foreign_network_peer_count_at_least(
             let server = server.clone();
             async move {
                 server
-                    .get_foreign_network_manager()
-                    .list_foreign_networks()
+                    .with_async(async move |pm, _| {
+                        pm.get_foreign_network_manager()
+                            .list_foreign_networks()
+                            .await
+                            .foreign_networks
+                            .get(network_name)
+                            .map(|entry| entry.peers.len() >= min_peer_count)
+                            .unwrap_or(false)
+                    })
                     .await
-                    .foreign_networks
-                    .get(network_name)
-                    .map(|entry| entry.peers.len() >= min_peer_count)
-                    .unwrap_or(false)
+                    .unwrap()
             }
         },
         Duration::from_secs(10),
@@ -133,16 +157,20 @@ async fn wait_for_foreign_network_peer_count_at_least(
     .await;
 }
 
-async fn wait_for_public_peers_empty(client: Arc<PeerManager>) {
+async fn wait_for_public_peers_empty(client: PtrPeerManager) {
     wait_for_condition(
         || {
             let client = client.clone();
             async move {
                 client
-                    .get_foreign_network_client()
-                    .list_public_peers()
+                    .with_async(async move |pm, _| {
+                        pm.get_foreign_network_client()
+                            .list_public_peers()
+                            .await
+                            .is_empty()
+                    })
                     .await
-                    .is_empty()
+                    .unwrap()
             }
         },
         Duration::from_secs(5),
@@ -150,26 +178,37 @@ async fn wait_for_public_peers_empty(client: Arc<PeerManager>) {
     .await;
 }
 
-pub async fn connect_peer_manager(client: Arc<PeerManager>, server: Arc<PeerManager>) {
+pub async fn connect_peer_manager(client: PtrPeerManager, server: PtrPeerManager) {
     let (a_ring, b_ring) = create_ring_tunnel_pair();
     let a_mgr_copy = client;
     tokio::spawn(async move {
-        a_mgr_copy.add_client_tunnel(a_ring, false).await.unwrap();
+        a_mgr_copy
+            .with_async(async move |pm, _| pm.add_client_tunnel(a_ring, false).await)
+            .await
+            .unwrap()
+            .unwrap();
     });
     let b_mgr_copy = server;
     tokio::spawn(async move {
-        b_mgr_copy.add_tunnel_as_server(b_ring, true).await.unwrap();
+        b_mgr_copy
+            .with_async(async move |pm, _| pm.add_tunnel_as_server(b_ring, true).await)
+            .await
+            .unwrap()
+            .unwrap();
     });
 }
 
 pub async fn wait_route_appear_with_cost(
-    peer_mgr: Arc<PeerManager>,
+    peer_mgr: PtrPeerManager,
     node_id: PeerId,
     cost: Option<i32>,
 ) -> Result<(), Error> {
     let now = std::time::Instant::now();
     while now.elapsed().as_secs() < 5 {
-        let route = peer_mgr.list_routes().await;
+        let route = peer_mgr
+            .with_async(async move |pm, _| pm.list_routes().await)
+            .await
+            .unwrap();
         if route
             .iter()
             .any(|r| r.peer_id == node_id && (cost.is_none() || r.cost == cost.unwrap()))
@@ -182,11 +221,13 @@ pub async fn wait_route_appear_with_cost(
 }
 
 pub async fn wait_route_appear(
-    peer_mgr: Arc<PeerManager>,
-    target_peer: Arc<PeerManager>,
+    peer_mgr: PtrPeerManager,
+    target_peer: PtrPeerManager,
 ) -> Result<(), Error> {
-    wait_route_appear_with_cost(peer_mgr.clone(), target_peer.my_peer_id(), None).await?;
-    wait_route_appear_with_cost(target_peer, peer_mgr.my_peer_id(), None).await
+    let target_peer_id = target_peer.with(|pm, _| pm.my_peer_id()).unwrap();
+    let my_peer_id = peer_mgr.with(|pm, _| pm.my_peer_id()).unwrap();
+    wait_route_appear_with_cost(peer_mgr.clone(), target_peer_id, None).await?;
+    wait_route_appear_with_cost(target_peer, my_peer_id, None).await
 }
 
 fn metric_value(peer_mgr: &PeerManager, metric: MetricName, network_name: &str) -> u64 {

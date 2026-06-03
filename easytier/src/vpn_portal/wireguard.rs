@@ -25,6 +25,7 @@ use crate::{
         packet_def::{PacketType, ZCPacket, ZCPacketType},
         wireguard::{WgConfig, WgTunnelListener},
     },
+    utils::ptr::WeakPtr,
 };
 
 use super::VpnPortal;
@@ -47,7 +48,7 @@ struct ClientEntry {
 
 struct WireGuardImpl {
     global_ctx: ArcGlobalCtx,
-    peer_mgr: Arc<PeerManager>,
+    peer_mgr: WeakPtr<PeerManager>,
     wg_config: WgConfig,
     listener_addr: SocketAddr,
 
@@ -57,7 +58,7 @@ struct WireGuardImpl {
 }
 
 impl WireGuardImpl {
-    fn new(global_ctx: ArcGlobalCtx, peer_mgr: Arc<PeerManager>) -> Self {
+    fn new(global_ctx: ArcGlobalCtx, peer_mgr: WeakPtr<PeerManager>) -> Self {
         let nid = global_ctx.get_network_identity();
         let wg_config = get_wg_config_for_portal(&nid);
 
@@ -76,7 +77,7 @@ impl WireGuardImpl {
 
     async fn handle_incoming_conn(
         t: Box<dyn Tunnel>,
-        peer_mgr: Arc<PeerManager>,
+        peer_mgr: WeakPtr<PeerManager>,
         wg_peer_ip_table: WgPeerIpTable,
     ) {
         let info = t.info().unwrap_or_default();
@@ -86,12 +87,13 @@ impl WireGuardImpl {
 
         let remote_addr = info.remote_addr.clone();
         let endpoint_addr = remote_addr.clone().map(Into::into);
-        peer_mgr
-            .get_global_ctx()
-            .issue_event(GlobalCtxEvent::VpnPortalClientConnected(
-                info.local_addr.clone().unwrap_or_default().to_string(),
-                info.remote_addr.clone().unwrap_or_default().to_string(),
-            ));
+        peer_mgr.with(|pm, _| {
+            pm.get_global_ctx()
+                .issue_event(GlobalCtxEvent::VpnPortalClientConnected(
+                    info.local_addr.clone().unwrap_or_default().to_string(),
+                    info.remote_addr.clone().unwrap_or_default().to_string(),
+                ))
+        });
 
         let mut map_key = None;
 
@@ -120,25 +122,24 @@ impl WireGuardImpl {
                     sink: mpsc_tunnel.get_sink(),
                 });
                 map_key = Some(i.get_source());
-                // Be careful here: we may overwrite an existing entry if the client IP is reused,
-                // which is common when clients are behind NAT.
                 wg_peer_ip_table.insert(i.get_source(), client_entry.clone());
                 ip_registered = true;
             }
             tracing::trace!(?i, "Received from wg client");
             let dst = i.get_destination();
             let _ = peer_mgr
-                .send_msg_by_ip(
-                    ZCPacket::new_with_payload(inner.as_ref()),
-                    IpAddr::V4(dst),
-                    false,
-                )
+                .with_async(async move |pm, _| {
+                    pm.send_msg_by_ip(
+                        ZCPacket::new_with_payload(inner.as_ref()),
+                        IpAddr::V4(dst),
+                        false,
+                    )
+                    .await
+                })
                 .await;
         }
 
         if let Some(map_key) = map_key {
-            // Remove the client from the wg_peer_ip_table only when its endpoint address is unchanged,
-            // or we may break clients behind NAT.
             match wg_peer_ip_table
                 .remove_if(&map_key, |_, entry| entry.endpoint_addr == endpoint_addr)
             {
@@ -151,12 +152,13 @@ impl WireGuardImpl {
             shrink_dashmap(&wg_peer_ip_table, None);
         }
 
-        peer_mgr
-            .get_global_ctx()
-            .issue_event(GlobalCtxEvent::VpnPortalClientDisconnected(
-                info.local_addr.unwrap_or_default().to_string(),
-                info.remote_addr.unwrap_or_default().to_string(),
-            ));
+        peer_mgr.with(|pm, _| {
+            pm.get_global_ctx()
+                .issue_event(GlobalCtxEvent::VpnPortalClientDisconnected(
+                    info.local_addr.unwrap_or_default().to_string(),
+                    info.remote_addr.unwrap_or_default().to_string(),
+                ))
+        });
     }
 
     async fn start_pipeline_processor(&self) {
@@ -208,9 +210,12 @@ impl WireGuardImpl {
         }
 
         self.peer_mgr
-            .add_packet_process_pipeline(Box::new(PeerPacketFilterForVpnPortal {
-                wg_peer_ip_table: self.wg_peer_ip_table.clone(),
-            }))
+            .with_async(async move |pm, _| {
+                pm.add_packet_process_pipeline(Box::new(PeerPacketFilterForVpnPortal {
+                    wg_peer_ip_table: self.wg_peer_ip_table.clone(),
+                }))
+                .await
+            })
             .await;
     }
 
@@ -286,7 +291,7 @@ impl VpnPortal for WireGuard {
     async fn start(
         &mut self,
         global_ctx: ArcGlobalCtx,
-        peer_mgr: Arc<PeerManager>,
+        peer_mgr: WeakPtr<PeerManager>,
     ) -> anyhow::Result<()> {
         assert!(self.inner.is_none());
 
@@ -301,7 +306,7 @@ impl VpnPortal for WireGuard {
         Ok(())
     }
 
-    async fn dump_client_config(&self, peer_mgr: Arc<PeerManager>) -> String {
+    async fn dump_client_config(&self, peer_mgr: WeakPtr<PeerManager>) -> String {
         if self.inner.is_none() {
             return "ERROR: Wireguard VPN Portal Not Started".to_string();
         }
@@ -310,7 +315,12 @@ impl VpnPortal for WireGuard {
             return "ERROR: VPN Portal Config Not Set".to_string();
         }
 
-        let routes = peer_mgr.list_routes().await;
+        let routes = peer_mgr
+            .with_async(async move |pm, _| { pm.list_routes().await })
+            .await;
+        let Some(routes) = routes else {
+            return "ERROR: PeerManager not available".to_string();
+        };
         let mut allow_ips = routes
             .iter()
             .flat_map(|x| x.proxy_cidrs.iter().map(String::to_string))

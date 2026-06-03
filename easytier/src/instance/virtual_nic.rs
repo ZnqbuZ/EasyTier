@@ -3,7 +3,7 @@ use std::{
     io,
     net::{IpAddr, Ipv4Addr, Ipv6Addr},
     pin::Pin,
-    sync::{Arc, Weak},
+    sync::Arc,
     task::{Context, Poll},
 };
 
@@ -21,6 +21,7 @@ use crate::{
         common::{FramedWriter, TunnelWrapper, ZCPacketToBytes, reserve_buf},
         packet_def::{TAIL_RESERVED_SIZE, ZCPacket, ZCPacketType},
     },
+    utils::ptr::WeakPtr,
 };
 
 use byteorder::WriteBytesExt as _;
@@ -796,7 +797,7 @@ impl VirtualNic {
 
 pub struct NicCtx {
     global_ctx: ArcGlobalCtx,
-    peer_mgr: Weak<PeerManager>,
+    peer_mgr: WeakPtr<PeerManager>,
     peer_packet_receiver: Arc<Mutex<PacketRecvChanReceiver>>,
 
     close_notifier: Arc<Notify>,
@@ -811,13 +812,13 @@ pub struct NicCtx {
 impl NicCtx {
     pub fn new(
         global_ctx: ArcGlobalCtx,
-        peer_manager: &Arc<PeerManager>,
+        peer_manager: &WeakPtr<PeerManager>,
         peer_packet_receiver: Arc<Mutex<PacketRecvChanReceiver>>,
         close_notifier: Arc<Notify>,
     ) -> Self {
         NicCtx {
             global_ctx: global_ctx.clone(),
-            peer_mgr: Arc::downgrade(peer_manager),
+            peer_mgr: peer_manager.clone(),
             peer_packet_receiver,
 
             close_notifier,
@@ -973,9 +974,10 @@ impl NicCtx {
         mut stream: Pin<Box<dyn ZCPacketStream>>,
     ) -> Result<(), Error> {
         // read from nic and write to corresponding tunnel
-        let Some(mgr) = self.peer_mgr.upgrade() else {
+        let Some(_) = self.peer_mgr.with(|_, _| ()) else {
             return Err(anyhow::anyhow!("peer manager not available").into());
         };
+        let mgr = self.peer_mgr.clone();
         let close_notifier = self.close_notifier.clone();
         self.tasks.spawn(async move {
             while let Some(ret) = stream.next().await {
@@ -983,7 +985,12 @@ impl NicCtx {
                     tracing::error!("read from nic failed: {:?}", ret);
                     break;
                 }
-                Self::do_forward_nic_to_peers(ret.unwrap(), mgr.as_ref()).await;
+                let packet = ret.unwrap();
+                let Some(_) = mgr.with_async(async move |pm, _| {
+                    Self::do_forward_nic_to_peers(packet, &pm).await
+                }).await else {
+                    break;
+                };
             }
             close_notifier.notify_one();
             tracing::error!("nic closed when recving from it");
@@ -1019,12 +1026,12 @@ impl NicCtx {
             return;
         }
 
-        let Some(peer_manager) = self.peer_mgr.upgrade() else {
+        let Some(_) = self.peer_mgr.with(|_, _| ()) else {
             tracing::warn!("peer manager is dropped, skip Windows UDP broadcast relay");
             return;
         };
 
-        match super::windows_udp_broadcast::start(peer_manager, virtual_ipv4) {
+        match super::windows_udp_broadcast::start(self.peer_mgr.clone(), virtual_ipv4) {
             Ok(handle) => {
                 self.windows_udp_broadcast_relay = Some(handle);
                 tracing::info!("Windows UDP broadcast relay started");
@@ -1128,9 +1135,10 @@ impl NicCtx {
     }
 
     async fn run_proxy_cidrs_route_updater(&mut self) -> Result<(), Error> {
-        let Some(peer_mgr) = self.peer_mgr.upgrade() else {
+        let Some(_) = self.peer_mgr.with(|_, _| ()) else {
             return Err(anyhow::anyhow!("peer manager not available").into());
         };
+        let mgr = self.peer_mgr.clone();
         let global_ctx = self.global_ctx.clone();
         let net_ns = self.global_ctx.net_ns.clone();
         let nic = self.nic.lock().await;
@@ -1142,12 +1150,17 @@ impl NicCtx {
             let mut cur_proxy_cidrs = BTreeSet::<cidr::Ipv4Cidr>::new();
 
             // Initial sync: get current proxy_cidrs state and apply routes
-            let (_, added, removed) = ProxyCidrsMonitor::diff_proxy_cidrs(
-                peer_mgr.as_ref(),
-                &global_ctx,
-                &cur_proxy_cidrs,
-            )
-            .await;
+            let (new_set, added, removed) = {
+                let cur_ref = &cur_proxy_cidrs;
+                let global_ctx = global_ctx.clone();
+                mgr.with_async(async move |pm, _|
+                        ProxyCidrsMonitor::diff_proxy_cidrs(&pm, &global_ctx, cur_ref).await
+
+                )
+                .await
+                .unwrap()
+            };
+            cur_proxy_cidrs = new_set;
             Self::apply_route_changes(
                 &ifcfg,
                 &ifname,
@@ -1171,12 +1184,15 @@ impl NicCtx {
                         );
                         event_receiver = event_receiver.resubscribe();
                         // Full sync after lagged to recover consistent state
-                        let (_, added, removed) = ProxyCidrsMonitor::diff_proxy_cidrs(
-                            peer_mgr.as_ref(),
-                            &global_ctx,
-                            &cur_proxy_cidrs,
-                        )
-                        .await;
+                        let (new_set, added, removed) = {
+                            let cur_ref = &cur_proxy_cidrs;
+                            let global_ctx = global_ctx.clone();
+                            mgr.with_async(async move |pm, _|
+                                    ProxyCidrsMonitor::diff_proxy_cidrs(&pm, &global_ctx, cur_ref).await)
+                            .await
+                            .unwrap()
+                        };
+                        cur_proxy_cidrs = new_set;
                         GlobalCtxEvent::ProxyCidrsUpdated(added, removed)
                     }
                 };
@@ -1203,9 +1219,10 @@ impl NicCtx {
     }
 
     async fn run_public_ipv6_route_updater(&mut self) -> Result<(), Error> {
-        let Some(peer_mgr) = self.peer_mgr.upgrade() else {
+        let Some(_) = self.peer_mgr.with(|_, _| ()) else {
             return Err(anyhow::anyhow!("peer manager not available").into());
         };
+        let mgr = self.peer_mgr.clone();
         let global_ctx = self.global_ctx.clone();
         let net_ns = self.global_ctx.net_ns.clone();
         let nic = self.nic.lock().await;
@@ -1215,7 +1232,9 @@ impl NicCtx {
 
         self.tasks.spawn(async move {
             let mut cur_routes = BTreeSet::<cidr::Ipv6Inet>::new();
-            let initial_routes = peer_mgr.list_public_ipv6_routes().await;
+            let initial_routes = mgr.with_async(async move |pm, _| {
+                pm.list_public_ipv6_routes().await
+            }).await.unwrap();
             let initial_added = initial_routes.iter().copied().collect::<Vec<_>>();
             Self::apply_public_ipv6_route_changes(
                 &ifcfg,
@@ -1233,7 +1252,9 @@ impl NicCtx {
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
                         event_receiver = event_receiver.resubscribe();
-                        let latest = peer_mgr.list_public_ipv6_routes().await;
+                        let latest = mgr.with_async(async move |pm, _| {
+                            pm.list_public_ipv6_routes().await
+                        }).await.unwrap();
                         let added = latest.difference(&cur_routes).copied().collect::<Vec<_>>();
                         let removed = cur_routes.difference(&latest).copied().collect::<Vec<_>>();
                         GlobalCtxEvent::PublicIpv6RoutesUpdated(added, removed)
@@ -1261,15 +1282,18 @@ impl NicCtx {
     }
 
     async fn run_public_ipv6_addr_updater(&mut self) -> Result<(), Error> {
-        let Some(peer_mgr) = self.peer_mgr.upgrade() else {
+        let Some(_) = self.peer_mgr.with(|_, _| ()) else {
             return Err(anyhow::anyhow!("peer manager not available").into());
         };
+        let mgr = self.peer_mgr.clone();
         let global_ctx = self.global_ctx.clone();
         let nic = self.nic.clone();
         let mut event_receiver = global_ctx.subscribe();
 
         self.tasks.spawn(async move {
-            let mut current_addr = peer_mgr.get_my_public_ipv6_addr().await;
+            let mut current_addr = mgr.with_async(async move |pm, _| {
+                pm.get_my_public_ipv6_addr().await
+            }).await.unwrap();
             if let Some(addr) = current_addr {
                 let nic = nic.lock().await;
                 if let Err(err) = nic.link_up().await {
@@ -1292,7 +1316,9 @@ impl NicCtx {
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
                         event_receiver = event_receiver.resubscribe();
-                        let latest = peer_mgr.get_my_public_ipv6_addr().await;
+                        let latest = mgr.with_async(async move |pm, _| {
+                            pm.get_my_public_ipv6_addr().await
+                        }).await.unwrap();
                         GlobalCtxEvent::PublicIpv6Changed(current_addr, latest)
                     }
                 };

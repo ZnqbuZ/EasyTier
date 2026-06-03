@@ -14,7 +14,7 @@ use crate::{
         HOLE_PUNCH_PACKET_BODY_LEN, UdpHolePunchListener, try_connect_with_socket,
     },
     connector::udp_hole_punch::handle_rpc_result,
-    peers::peer_manager::PeerManager,
+    peers::peer_manager::PtrPeerManager,
     proto::{
         peer_rpc::{
             SendPunchPacketBothEasySymRequest, SendPunchPacketBothEasySymResponse,
@@ -172,13 +172,13 @@ impl PunchBothEasySymHoleServer {
 
 #[derive(Debug)]
 pub(crate) struct PunchBothEasySymHoleClient {
-    peer_mgr: Arc<PeerManager>,
+    peer_mgr: PtrPeerManager,
     blacklist: Arc<timedmap::TimedMap<PeerId, ()>>,
 }
 
 impl PunchBothEasySymHoleClient {
     pub(crate) fn new(
-        peer_mgr: Arc<PeerManager>,
+        peer_mgr: PtrPeerManager,
         blacklist: Arc<timedmap::TimedMap<PeerId, ()>>,
     ) -> Self {
         Self {
@@ -203,13 +203,15 @@ impl PunchBothEasySymHoleClient {
 
         *is_busy = false;
 
+        let global_ctx = self.peer_mgr.with(|pm, _| pm.get_global_ctx()).unwrap();
+        let my_peer_id = self.peer_mgr.with(|pm, _| pm.my_peer_id()).unwrap();
+
         let udp_array = UdpSocketArray::new(
             UDP_ARRAY_SIZE_FOR_BOTH_EASY_SYM,
-            self.peer_mgr.get_global_ctx().net_ns.clone(),
+            global_ctx.net_ns.clone(),
         );
         udp_array.start().await?;
 
-        let global_ctx = self.peer_mgr.get_global_ctx();
         let cur_mapped_addr = global_ctx
             .get_stun_info_collector()
             .get_udp_port_mapping(0)
@@ -230,13 +232,16 @@ impl PunchBothEasySymHoleClient {
 
         let rpc_stub = self
             .peer_mgr
-            .get_peer_rpc_mgr()
-            .rpc_client()
-            .scoped_client::<UdpHolePunchRpcClientFactory<BaseController>>(
-                self.peer_mgr.my_peer_id(),
-                dst_peer_id,
-                global_ctx.get_network_name(),
-            );
+            .with(|pm, _| {
+                pm.get_peer_rpc_mgr()
+                    .rpc_client()
+                    .scoped_client::<UdpHolePunchRpcClientFactory<BaseController>>(
+                        my_peer_id,
+                        dst_peer_id,
+                        pm.get_global_ctx().get_network_name(),
+                    )
+            })
+            .unwrap();
 
         let tid = rand::random();
         udp_array.add_intreast_tid(tid);

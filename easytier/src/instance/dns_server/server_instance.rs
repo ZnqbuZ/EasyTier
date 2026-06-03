@@ -56,6 +56,8 @@ use std::net::{SocketAddr, SocketAddrV4};
 use std::sync::Mutex;
 use std::{collections::BTreeMap, io, net::Ipv4Addr, str::FromStr, sync::Arc, time::Duration};
 
+use crate::utils::ptr::WeakPtr;
+
 static NIC_PIPELINE_NAME: &str = "magic_dns_server";
 
 pub(super) struct MagicDnsServerInstanceData {
@@ -485,7 +487,7 @@ impl RpcServerHook for MagicDnsServerInstanceData {
 pub struct MagicDnsServerInstance {
     rpc_server: StandAloneServer<TcpTunnelListener>,
     pub(super) data: Arc<MagicDnsServerInstanceData>,
-    peer_mgr: Arc<PeerManager>,
+    peer_mgr: WeakPtr<PeerManager>,
     tun_inet: Ipv4Inet,
 }
 
@@ -511,7 +513,7 @@ fn get_system_config(
 
 impl MagicDnsServerInstance {
     pub async fn new(
-        peer_mgr: Arc<PeerManager>,
+        peer_mgr: WeakPtr<PeerManager>,
         tun_dev: Option<String>,
         tun_inet: Ipv4Inet,
         fake_ip: Ipv4Addr,
@@ -541,12 +543,14 @@ impl MagicDnsServerInstance {
                 .await?;
         }
 
+        let my_peer_id = peer_mgr.with(|pm, _| pm.my_peer_id())
+            .ok_or_else(|| anyhow::anyhow!("peer manager dropped"))?;
         let data = Arc::new(MagicDnsServerInstanceData {
             dns_server,
             tun_dev: tun_dev.clone(),
             tun_ip: tun_inet.address(),
             fake_ip,
-            my_peer_id: peer_mgr.my_peer_id(),
+            my_peer_id,
             route_infos: DashMap::new(),
             system_config: get_system_config(tun_dev.as_deref())?,
         });
@@ -556,12 +560,17 @@ impl MagicDnsServerInstance {
             .register(MagicDnsServerRpcServer::new_arc(data.clone()), "");
         rpc_server.set_hook(data.clone());
 
+        let data_for_pipeline = data.clone();
         peer_mgr
-            .add_nic_packet_process_pipeline(Box::new(data.clone()))
-            .await;
+            .with_async(async move |pm, _| {
+                pm.add_nic_packet_process_pipeline(Box::new(data_for_pipeline)).await;
+            })
+            .await
+            .ok_or_else(|| anyhow::anyhow!("peer manager dropped"))?;
         // Use configured tld_dns_zone or fall back to DEFAULT_ET_DNS_ZONE if empty
-        let flags = peer_mgr.get_global_ctx().config.get_flags();
-        let tld_dns_zone_clone = flags.tld_dns_zone.clone();
+        let tld_dns_zone_clone = peer_mgr.with(|pm, _| {
+            pm.get_global_ctx().config.get_flags().tld_dns_zone.clone()
+        }).ok_or_else(|| anyhow::anyhow!("peer manager dropped"))?;
 
         data.update_dns_records(std::iter::empty(), &tld_dns_zone_clone)
             .await
@@ -598,7 +607,9 @@ impl MagicDnsServerInstance {
 
         let _ = self
             .peer_mgr
-            .remove_nic_packet_process_pipeline(NIC_PIPELINE_NAME.to_string())
+            .with_async(async move |pm, _| {
+                let _ = pm.remove_nic_packet_process_pipeline(NIC_PIPELINE_NAME.to_string()).await;
+            })
             .await;
     }
 }

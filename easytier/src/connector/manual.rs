@@ -28,7 +28,7 @@ use crate::{
         global_ctx::{ArcGlobalCtx, GlobalCtxEvent},
         netns::NetNS,
     },
-    peers::peer_manager::PeerManager,
+    peers::peer_manager::PtrPeerManager,
     use_global_var,
 };
 
@@ -46,7 +46,7 @@ struct ReconnResult {
 struct ConnectorManagerData {
     connectors: ConnectorMap,
     reconnecting: DashSet<url::Url>,
-    peer_manager: Weak<PeerManager>,
+    peer_manager: PtrPeerManager,
     alive_conn_urls: Arc<DashSet<url::Url>>,
     // user removed connector urls
     removed_conn_urls: Arc<DashSet<url::Url>>,
@@ -61,7 +61,7 @@ pub struct ManualConnectorManager {
 }
 
 impl ManualConnectorManager {
-    pub fn new(global_ctx: ArcGlobalCtx, peer_manager: Arc<PeerManager>) -> Self {
+    pub fn new(global_ctx: ArcGlobalCtx, peer_manager: PtrPeerManager) -> Self {
         let connectors = Arc::new(DashSet::new());
         let tasks = JoinSet::new();
 
@@ -70,7 +70,7 @@ impl ManualConnectorManager {
             data: Arc::new(ConnectorManagerData {
                 connectors,
                 reconnecting: DashSet::new(),
-                peer_manager: Arc::downgrade(&peer_manager),
+                peer_manager,
                 alive_conn_urls: Arc::new(DashSet::new()),
                 removed_conn_urls: Arc::new(DashSet::new()),
                 net_ns: global_ctx.net_ns.clone(),
@@ -274,16 +274,17 @@ impl ManualConnectorManager {
     async fn collect_dead_conns(data: Arc<ConnectorManagerData>) -> BTreeSet<url::Url> {
         Self::handle_remove_connector(data.clone());
         let mut ret = BTreeSet::new();
-        let Some(pm) = data.peer_manager.upgrade() else {
+        let Some(is_alive) = data.peer_manager.with(|pm, _| {
+            let foreign_peer_map = pm.get_foreign_network_client().get_peer_map();
+            let peer_map = pm.get_peer_map();
+            (peer_map, foreign_peer_map)
+        }) else {
             tracing::warn!("peer manager is gone, exit");
             return ret;
         };
         for url in data.connectors.iter().map(|x| x.key().clone()) {
-            if !pm.get_peer_map().is_client_url_alive(&url)
-                && !pm
-                    .get_foreign_network_client()
-                    .get_peer_map()
-                    .is_client_url_alive(&url)
+            if !is_alive.0.is_client_url_alive(&url)
+                && !is_alive.1.is_client_url_alive(&url)
             {
                 ret.insert(url.clone());
             }
@@ -309,25 +310,39 @@ impl ManualConnectorManager {
         data.global_ctx
             .issue_event(GlobalCtxEvent::Connecting(connector.remote_url()));
         tracing::info!("reconnect try connect... conn: {:?}", connector);
-        let Some(pm) = data.peer_manager.upgrade() else {
-            return Err(Error::AnyhowError(anyhow::anyhow!(
-                "peer manager is gone, cannot reconnect"
-            )));
-        };
 
+        let peer_mgr = data.peer_manager.clone();
         let tunnel = Self::with_reconnect_timeout(
             "connect",
             started_at,
             total_timeout,
-            pm.connect_tunnel(connector),
+            async {
+                peer_mgr
+                    .with_async(async move |pm, _| pm.connect_tunnel(connector).await)
+                    .await
+                    .ok_or(Error::AnyhowError(anyhow::anyhow!(
+                        "peer manager is gone, cannot reconnect"
+                    )))?
+            },
         )
         .await?;
 
+        let peer_mgr = data.peer_manager.clone();
         let (peer_id, conn_id) = Self::with_reconnect_timeout(
             "handshake",
             started_at,
             total_timeout,
-            pm.add_client_tunnel_with_peer_id_hint(tunnel, true, None),
+            async {
+                peer_mgr
+                    .with_async(async move |pm, _| {
+                        pm.add_client_tunnel_with_peer_id_hint(tunnel, true, None)
+                            .await
+                    })
+                    .await
+                    .ok_or(Error::AnyhowError(anyhow::anyhow!(
+                        "peer manager is gone, cannot reconnect"
+                    )))?
+            },
         )
         .await?;
 

@@ -15,6 +15,7 @@ use anyhow::Error;
 use tokio_util::task::AbortOnDropHandle;
 
 use super::peer_manager::PeerManager;
+use crate::utils::ptr::WeakPtr;
 
 pub struct ExternalTaskSignal {
     version: AtomicU64,
@@ -55,7 +56,7 @@ pub trait PeerTaskLauncher: Send + Sync + Clone + 'static {
     type CollectPeerItem;
     type TaskRet;
 
-    fn new_data(&self, peer_mgr: Arc<PeerManager>) -> Self::Data;
+    fn new_data(&self, peer_mgr: WeakPtr<PeerManager>) -> Self::Data;
     async fn collect_peers_need_task(&self, data: &Self::Data) -> Vec<Self::CollectPeerItem>;
     async fn launch_task(
         &self,
@@ -85,16 +86,16 @@ where
     T: Send + 'static,
     L: PeerTaskLauncher<Data = D, CollectPeerItem = C, TaskRet = T> + 'static,
 {
-    pub fn new(launcher: L, peer_mgr: Arc<PeerManager>) -> Self {
+    pub fn new(launcher: L, peer_mgr: WeakPtr<PeerManager>) -> Self {
         Self::new_with_external_signal(launcher, peer_mgr, None)
     }
 
     pub fn new_with_external_signal(
         launcher: L,
-        peer_mgr: Arc<PeerManager>,
+        peer_mgr: WeakPtr<PeerManager>,
         external_signal: Option<Arc<ExternalTaskSignal>>,
     ) -> Self {
-        let data = launcher.new_data(peer_mgr.clone());
+        let data = launcher.new_data(peer_mgr);
         Self {
             launcher,
             main_loop_task: Mutex::new(None),

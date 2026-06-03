@@ -2,7 +2,8 @@ use cidr::Ipv4Inet;
 use tokio_util::sync::CancellationToken;
 
 use crate::peers::peer_manager::PeerManager;
-use std::{net::Ipv4Addr, sync::Arc, time::Duration};
+use crate::utils::ptr::WeakPtr;
+use std::{net::Ipv4Addr, time::Duration};
 
 use super::{client_instance::MagicDnsClientInstance, server_instance::MagicDnsServerInstance};
 
@@ -11,7 +12,7 @@ static DEFAULT_ET_DNS_ZONE: &str = "et.net.";
 pub struct DnsRunner {
     client: Option<MagicDnsClientInstance>,
     server: Option<MagicDnsServerInstance>,
-    peer_mgr: Arc<PeerManager>,
+    peer_mgr: WeakPtr<PeerManager>,
     tun_dev: Option<String>,
     tun_inet: Ipv4Inet,
     fake_ip: Ipv4Addr,
@@ -19,7 +20,7 @@ pub struct DnsRunner {
 
 impl DnsRunner {
     pub fn new(
-        peer_mgr: Arc<PeerManager>,
+        peer_mgr: WeakPtr<PeerManager>,
         tun_dev: Option<String>,
         tun_inet: Ipv4Inet,
         fake_ip: Ipv4Addr,

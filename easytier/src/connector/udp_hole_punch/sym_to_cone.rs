@@ -23,7 +23,7 @@ use crate::{
         },
         handle_rpc_result,
     },
-    peers::peer_manager::PeerManager,
+    peers::peer_manager::PtrPeerManager,
     proto::{
         peer_rpc::{
             SelectPunchListenerRequest, SendPunchPacketEasySymRequest,
@@ -198,7 +198,7 @@ impl PunchSymToConeHoleServer {
 }
 
 pub(crate) struct PunchSymToConeHoleClient {
-    peer_mgr: Arc<PeerManager>,
+    peer_mgr: PtrPeerManager,
     udp_array: RwLock<Option<Arc<UdpSocketArray>>>,
     try_direct_connect: AtomicBool,
     punch_predicablely: AtomicBool,
@@ -208,7 +208,7 @@ pub(crate) struct PunchSymToConeHoleClient {
 
 impl PunchSymToConeHoleClient {
     pub(crate) fn new(
-        peer_mgr: Arc<PeerManager>,
+        peer_mgr: PtrPeerManager,
         blacklist: Arc<timedmap::TimedMap<PeerId, ()>>,
     ) -> Self {
         Self {
@@ -233,10 +233,11 @@ impl PunchSymToConeHoleClient {
             return Ok(udp_array);
         }
 
-        let udp_array = Arc::new(UdpSocketArray::new(
-            UDP_ARRAY_SIZE_FOR_HARD_SYM,
-            self.peer_mgr.get_global_ctx().net_ns.clone(),
-        ));
+        let net_ns = self
+            .peer_mgr
+            .with(|pm, _| pm.get_global_ctx().net_ns.clone())
+            .unwrap();
+        let udp_array = Arc::new(UdpSocketArray::new(UDP_ARRAY_SIZE_FOR_HARD_SYM, net_ns));
         udp_array.start().await?;
         wlocked.replace(udp_array.clone());
         Ok(udp_array)
@@ -248,7 +249,7 @@ impl PunchSymToConeHoleClient {
     }
 
     async fn get_base_port_for_easy_sym(&self, my_nat_info: UdpNatType) -> Option<u16> {
-        let global_ctx = self.peer_mgr.get_global_ctx();
+        let global_ctx = self.peer_mgr.with(|pm, _| pm.get_global_ctx()).unwrap();
         if my_nat_info.is_easy_sym() {
             match global_ctx
                 .get_stun_info_collector()
@@ -343,14 +344,23 @@ impl PunchSymToConeHoleClient {
         dst_peer_id: PeerId,
     ) -> Box<dyn UdpHolePunchRpc<Controller = BaseController> + std::marker::Send + Sync + 'static>
     {
-        self.peer_mgr
-            .get_peer_rpc_mgr()
-            .rpc_client()
-            .scoped_client::<UdpHolePunchRpcClientFactory<BaseController>>(
-                self.peer_mgr.my_peer_id(),
-                dst_peer_id,
-                self.peer_mgr.get_global_ctx().get_network_name(),
-            )
+        let peer_mgr = self.peer_mgr.clone();
+        let my_peer_id = self.peer_mgr.with(|pm, _| pm.my_peer_id()).unwrap();
+        let network_name = self
+            .peer_mgr
+            .with(|pm, _| pm.get_global_ctx().get_network_name())
+            .unwrap();
+        peer_mgr
+            .with(|pm, _| {
+                pm.get_peer_rpc_mgr()
+                    .rpc_client()
+                    .scoped_client::<UdpHolePunchRpcClientFactory<BaseController>>(
+                        my_peer_id,
+                        dst_peer_id,
+                        network_name.clone(),
+                    )
+            })
+            .unwrap()
     }
 
     async fn check_hole_punch_result<T>(
@@ -418,17 +428,22 @@ impl PunchSymToConeHoleClient {
         }
 
         let udp_array = self.prepare_udp_array().await?;
-        let global_ctx = self.peer_mgr.get_global_ctx();
+        let global_ctx = self.peer_mgr.with(|pm, _| pm.get_global_ctx()).unwrap();
+        let my_peer_id = self.peer_mgr.with(|pm, _| pm.my_peer_id()).unwrap();
+        let network_name = global_ctx.get_network_name();
 
         let rpc_stub = self
             .peer_mgr
-            .get_peer_rpc_mgr()
-            .rpc_client()
-            .scoped_client::<UdpHolePunchRpcClientFactory<BaseController>>(
-                self.peer_mgr.my_peer_id(),
-                dst_peer_id,
-                global_ctx.get_network_name(),
-            );
+            .with(|pm, _| {
+                pm.get_peer_rpc_mgr()
+                    .rpc_client()
+                    .scoped_client::<UdpHolePunchRpcClientFactory<BaseController>>(
+                        my_peer_id,
+                        dst_peer_id,
+                        network_name.clone(),
+                    )
+            })
+            .unwrap();
 
         let resp = rpc_stub
             .select_punch_listener(

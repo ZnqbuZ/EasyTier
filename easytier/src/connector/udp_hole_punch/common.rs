@@ -16,7 +16,7 @@ use crate::{
     common::{
         PeerId, error::Error, global_ctx::ArcGlobalCtx, join_joinset_background, netns::NetNS, upnp,
     },
-    peers::peer_manager::PeerManager,
+    peers::peer_manager::PtrPeerManager,
     proto::common::NatType,
     tunnel::{
         Tunnel, TunnelConnCounter, TunnelListener as _,
@@ -363,25 +363,26 @@ pub(crate) struct UdpHolePunchListener {
 
 impl UdpHolePunchListener {
     #[instrument(err)]
-    pub async fn new(peer_mgr: Arc<PeerManager>) -> Result<Self, Error> {
+    pub async fn new(peer_mgr: PtrPeerManager) -> Result<Self, Error> {
         Self::new_ext(peer_mgr, true, None).await
     }
 
     #[instrument(err)]
     pub async fn new_ext(
-        peer_mgr: Arc<PeerManager>,
+        peer_mgr: PtrPeerManager,
         with_mapped_addr: bool,
         port: Option<u16>,
     ) -> Result<Self, Error> {
+        let global_ctx = peer_mgr.with(|pm, _| pm.get_global_ctx()).unwrap();
         let socket = {
-            let _g = peer_mgr.get_global_ctx().net_ns.guard();
+            let _g = global_ctx.net_ns.guard();
             Arc::new(UdpSocket::bind((Ipv4Addr::UNSPECIFIED, port.unwrap_or(0))).await?)
         };
         let local_port = socket.local_addr()?.port();
         let listen_url: url::Url = format!("udp://0.0.0.0:{local_port}").parse().unwrap();
 
         let (mapped_addr, port_mapping_lease) = if with_mapped_addr {
-            upnp::resolve_udp_public_addr(peer_mgr.get_global_ctx(), &listen_url, socket.clone())
+            upnp::resolve_udp_public_addr(global_ctx.clone(), &listen_url, socket.clone())
                 .await?
         } else {
             (
@@ -393,7 +394,7 @@ impl UdpHolePunchListener {
         let mut listener = UdpTunnelListener::new_with_socket(listen_url, socket.clone());
 
         {
-            let _g = peer_mgr.get_global_ctx().net_ns.guard();
+            let _g = global_ctx.net_ns.guard();
             listener.listen().await?;
         }
         let socket = listener.get_socket().unwrap();
@@ -404,22 +405,25 @@ impl UdpHolePunchListener {
         let conn_counter = listener.get_conn_counter();
         let mut tasks = JoinSet::new();
 
-        tasks.spawn(async move {
-            while let Ok(conn) = listener.accept().await {
-                tracing::warn!(?conn, "udp hole punching listener got peer connection");
-                let peer_mgr = peer_mgr.clone();
-                tokio::spawn(async move {
-                    if let Err(e) = peer_mgr.add_tunnel_as_server(conn, false).await {
-                        tracing::error!(
-                            ?e,
-                            "failed to add tunnel as server in hole punch listener"
-                        );
-                    }
-                });
-            }
+        {
+            let peer_mgr = peer_mgr.clone();
+            tasks.spawn(async move {
+                while let Ok(conn) = listener.accept().await {
+                    tracing::warn!(?conn, "udp hole punching listener got peer connection");
+                    let peer_mgr = peer_mgr.clone();
+                    tokio::spawn(async move {
+                        if let Err(e) = peer_mgr.with_async(async move |pm, _| pm.add_tunnel_as_server(conn, false).await).await.unwrap() {
+                            tracing::error!(
+                                ?e,
+                                "failed to add tunnel as server in hole punch listener"
+                            );
+                        }
+                    });
+                }
 
-            running_clone.store(false);
-        });
+                running_clone.store(false);
+            });
+        }
 
         let last_active_time = Arc::new(AtomicCell::new(std::time::Instant::now()));
         let conn_counter_clone = conn_counter.clone();
@@ -461,14 +465,14 @@ impl UdpHolePunchListener {
 }
 
 pub(crate) struct PunchHoleServerCommon {
-    peer_mgr: Arc<PeerManager>,
+    peer_mgr: PtrPeerManager,
 
     listeners: Arc<Mutex<Vec<UdpHolePunchListener>>>,
     tasks: Arc<std::sync::Mutex<JoinSet<()>>>,
 }
 
 impl PunchHoleServerCommon {
-    pub(crate) fn new(peer_mgr: Arc<PeerManager>) -> Self {
+    pub(crate) fn new(peer_mgr: PtrPeerManager) -> Self {
         let tasks = Arc::new(std::sync::Mutex::new(JoinSet::new()));
         join_joinset_background(tasks.clone(), "PunchHoleServerCommon".to_owned());
 
@@ -512,10 +516,13 @@ impl PunchHoleServerCommon {
 
     pub(crate) async fn my_udp_nat_type(&self) -> i32 {
         self.peer_mgr
-            .get_global_ctx()
-            .get_stun_info_collector()
-            .get_stun_info()
-            .udp_nat_type
+            .with(|pm, _| {
+                pm.get_global_ctx()
+                    .get_stun_info_collector()
+                    .get_stun_info()
+                    .udp_nat_type
+            })
+            .unwrap()
     }
 
     #[async_recursion::async_recursion]
@@ -611,10 +618,12 @@ impl PunchHoleServerCommon {
     }
 
     pub(crate) fn get_global_ctx(&self) -> ArcGlobalCtx {
-        self.peer_mgr.get_global_ctx()
+        self.peer_mgr
+            .with(|pm, _| pm.get_global_ctx())
+            .unwrap()
     }
 
-    pub(crate) fn get_peer_mgr(&self) -> Arc<PeerManager> {
+    pub(crate) fn get_peer_mgr(&self) -> PtrPeerManager {
         self.peer_mgr.clone()
     }
 }

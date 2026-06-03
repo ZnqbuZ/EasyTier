@@ -1,6 +1,4 @@
 use std::{
-    ops::Deref,
-    sync::{Arc, Weak},
     time::Duration,
 };
 
@@ -19,20 +17,20 @@ use crate::{
         },
         rpc_types::{self, controller::BaseController},
     },
-    utils::weak_upgrade,
+    utils::ptr::WeakPtr,
 };
 
 use super::peer_manager::PeerManager;
 
 #[derive(Clone)]
 pub struct PeerManagerRpcService {
-    peer_manager: Weak<PeerManager>,
+    peer_manager: WeakPtr<PeerManager>,
 }
 
 impl PeerManagerRpcService {
-    pub fn new(peer_manager: Arc<PeerManager>) -> Self {
+    pub fn new(peer_manager: WeakPtr<PeerManager>) -> Self {
         PeerManagerRpcService {
-            peer_manager: Arc::downgrade(&peer_manager),
+            peer_manager,
         }
     }
 
@@ -86,17 +84,23 @@ impl PeerManageRpc for PeerManagerRpcService {
     async fn list_peer(
         &self,
         _: BaseController,
-        _request: ListPeerRequest, // Accept request of type HelloRequest
+        _request: ListPeerRequest,
     ) -> Result<ListPeerResponse, rpc_types::error::Error> {
-        let mut reply = ListPeerResponse::default();
-
-        let peers =
-            PeerManagerRpcService::list_peers(weak_upgrade(&self.peer_manager)?.deref()).await;
-        for peer in peers {
-            reply.peer_infos.push(peer);
-        }
-
-        Ok(reply)
+        self.peer_manager
+            .with_async(async move |pm, _| {
+                let mut reply = ListPeerResponse::default();
+                let peers = PeerManagerRpcService::list_peers(&*pm).await;
+                for peer in peers {
+                    reply.peer_infos.push(peer);
+                }
+                Ok(reply)
+            })
+            .await
+            .ok_or_else(|| {
+                rpc_types::error::Error::ExecutionError(anyhow::anyhow!(
+                    "PeerManager not available"
+                ))
+            })?
     }
 
     async fn list_public_ipv6_info(
@@ -104,30 +108,51 @@ impl PeerManageRpc for PeerManagerRpcService {
         _: BaseController,
         _request: ListPublicIpv6InfoRequest,
     ) -> Result<ListPublicIpv6InfoResponse, rpc_types::error::Error> {
-        Ok(weak_upgrade(&self.peer_manager)?
-            .get_local_public_ipv6_info()
-            .await)
+        self.peer_manager
+            .with_async(async move |pm, _| {
+                Ok(pm.get_local_public_ipv6_info().await)
+            })
+            .await
+            .ok_or_else(|| {
+                rpc_types::error::Error::ExecutionError(anyhow::anyhow!(
+                    "PeerManager not available"
+                ))
+            })?
     }
 
     async fn list_route(
         &self,
         _: BaseController,
-        _request: ListRouteRequest, // Accept request of type HelloRequest
+        _request: ListRouteRequest,
     ) -> Result<ListRouteResponse, rpc_types::error::Error> {
-        let reply = ListRouteResponse {
-            routes: weak_upgrade(&self.peer_manager)?.list_routes().await,
-        };
+        let routes = self
+            .peer_manager
+            .with_async(async move |pm, _| { pm.list_routes().await })
+            .await
+            .ok_or_else(|| {
+                rpc_types::error::Error::ExecutionError(anyhow::anyhow!(
+                    "PeerManager not available"
+                ))
+            })?;
+        let reply = ListRouteResponse { routes };
         Ok(reply)
     }
 
     async fn dump_route(
         &self,
         _: BaseController,
-        _request: DumpRouteRequest, // Accept request of type HelloRequest
+        _request: DumpRouteRequest,
     ) -> Result<DumpRouteResponse, rpc_types::error::Error> {
-        let reply = DumpRouteResponse {
-            result: weak_upgrade(&self.peer_manager)?.dump_route().await,
-        };
+        let result = self
+            .peer_manager
+            .with_async(async move |pm, _| { pm.dump_route().await })
+            .await
+            .ok_or_else(|| {
+                rpc_types::error::Error::ExecutionError(anyhow::anyhow!(
+                    "PeerManager not available"
+                ))
+            })?;
+        let reply = DumpRouteResponse { result };
         Ok(reply)
     }
 
@@ -136,10 +161,19 @@ impl PeerManageRpc for PeerManagerRpcService {
         _: BaseController,
         request: ListForeignNetworkRequest,
     ) -> Result<ListForeignNetworkResponse, rpc_types::error::Error> {
-        let reply = weak_upgrade(&self.peer_manager)?
-            .get_foreign_network_manager()
-            .list_foreign_networks_with_options(request.include_trusted_keys)
-            .await;
+        let reply = self
+            .peer_manager
+            .with_async(async move |pm, _| {
+                pm.get_foreign_network_manager()
+                    .list_foreign_networks_with_options(request.include_trusted_keys)
+                    .await
+            })
+            .await
+            .ok_or_else(|| {
+                rpc_types::error::Error::ExecutionError(anyhow::anyhow!(
+                    "PeerManager not available"
+                ))
+            })?;
         Ok(reply)
     }
 
@@ -148,9 +182,16 @@ impl PeerManageRpc for PeerManagerRpcService {
         _: BaseController,
         _request: ListGlobalForeignNetworkRequest,
     ) -> Result<ListGlobalForeignNetworkResponse, rpc_types::error::Error> {
-        Ok(weak_upgrade(&self.peer_manager)?
-            .list_global_foreign_network()
-            .await)
+        self.peer_manager
+            .with_async(async move |pm, _| {
+                Ok(pm.list_global_foreign_network().await)
+            })
+            .await
+            .ok_or_else(|| {
+                rpc_types::error::Error::ExecutionError(anyhow::anyhow!(
+                    "PeerManager not available"
+                ))
+            })?
     }
 
     async fn get_foreign_network_summary(
@@ -158,23 +199,37 @@ impl PeerManageRpc for PeerManagerRpcService {
         _: BaseController,
         _request: GetForeignNetworkSummaryRequest,
     ) -> Result<GetForeignNetworkSummaryResponse, rpc_types::error::Error> {
-        Ok(GetForeignNetworkSummaryResponse {
-            summary: Some(
-                weak_upgrade(&self.peer_manager)?
-                    .get_foreign_network_summary()
-                    .await,
-            ),
-        })
+        self.peer_manager
+            .with_async(async move |pm, _| {
+                Ok(GetForeignNetworkSummaryResponse {
+                    summary: Some(pm.get_foreign_network_summary().await),
+                })
+            })
+            .await
+            .ok_or_else(|| {
+                rpc_types::error::Error::ExecutionError(anyhow::anyhow!(
+                    "PeerManager not available"
+                ))
+            })?
     }
 
     async fn show_node_info(
         &self,
         _: BaseController,
-        _request: ShowNodeInfoRequest, // Accept request of type HelloRequest
+        _request: ShowNodeInfoRequest,
     ) -> Result<ShowNodeInfoResponse, rpc_types::error::Error> {
-        Ok(ShowNodeInfoResponse {
-            node_info: Some(weak_upgrade(&self.peer_manager)?.get_my_info().await),
-        })
+        self.peer_manager
+            .with_async(async move |pm, _| {
+                Ok(ShowNodeInfoResponse {
+                    node_info: Some(pm.get_my_info().await),
+                })
+            })
+            .await
+            .ok_or_else(|| {
+                rpc_types::error::Error::ExecutionError(anyhow::anyhow!(
+                    "PeerManager not available"
+                ))
+            })?
     }
 }
 
@@ -187,13 +242,22 @@ impl AclManageRpc for PeerManagerRpcService {
         _: BaseController,
         _request: GetAclStatsRequest,
     ) -> Result<GetAclStatsResponse, rpc_types::error::Error> {
-        let acl_stats = weak_upgrade(&self.peer_manager)?
-            .get_global_ctx()
-            .get_acl_filter()
-            .get_stats();
-        Ok(GetAclStatsResponse {
-            acl_stats: Some(acl_stats),
-        })
+        self.peer_manager
+            .with_async(async move |pm, _| {
+                let acl_stats = pm
+                    .get_global_ctx()
+                    .get_acl_filter()
+                    .get_stats();
+                Ok(GetAclStatsResponse {
+                    acl_stats: Some(acl_stats),
+                })
+            })
+            .await
+            .ok_or_else(|| {
+                rpc_types::error::Error::ExecutionError(anyhow::anyhow!(
+                    "PeerManager not available"
+                ))
+            })?
     }
 
     async fn get_whitelist(
@@ -201,18 +265,27 @@ impl AclManageRpc for PeerManagerRpcService {
         _: BaseController,
         _request: GetWhitelistRequest,
     ) -> Result<GetWhitelistResponse, rpc_types::error::Error> {
-        let global_ctx = weak_upgrade(&self.peer_manager)?.get_global_ctx();
-        let tcp_ports = global_ctx.config.get_tcp_whitelist();
-        let udp_ports = global_ctx.config.get_udp_whitelist();
-        tracing::info!(
-            "Getting whitelist - TCP: {:?}, UDP: {:?}",
-            tcp_ports,
-            udp_ports
-        );
-        Ok(GetWhitelistResponse {
-            tcp_ports,
-            udp_ports,
-        })
+        self.peer_manager
+            .with_async(async move |pm, _| {
+                let global_ctx = pm.get_global_ctx();
+                let tcp_ports = global_ctx.config.get_tcp_whitelist();
+                let udp_ports = global_ctx.config.get_udp_whitelist();
+                tracing::info!(
+                    "Getting whitelist - TCP: {:?}, UDP: {:?}",
+                    tcp_ports,
+                    udp_ports
+                );
+                Ok(GetWhitelistResponse {
+                    tcp_ports,
+                    udp_ports,
+                })
+            })
+            .await
+            .ok_or_else(|| {
+                rpc_types::error::Error::ExecutionError(anyhow::anyhow!(
+                    "PeerManager not available"
+                ))
+            })?
     }
 }
 
@@ -225,40 +298,49 @@ impl CredentialManageRpc for PeerManagerRpcService {
         _: BaseController,
         request: GenerateCredentialRequest,
     ) -> Result<GenerateCredentialResponse, rpc_types::error::Error> {
-        let pm = weak_upgrade(&self.peer_manager)?;
-        let global_ctx = pm.get_global_ctx();
+        self.peer_manager
+            .with_async(async move |pm, _| {
+                let global_ctx = pm.get_global_ctx();
 
-        if global_ctx.get_network_identity().network_secret.is_none() {
-            return Err(rpc_types::error::Error::ExecutionError(anyhow::anyhow!(
-                "only admin nodes (with network_secret) can generate credentials"
-            )));
-        }
+                if global_ctx.get_network_identity().network_secret.is_none() {
+                    return Err(rpc_types::error::Error::ExecutionError(anyhow::anyhow!(
+                        "only admin nodes (with network_secret) can generate credentials"
+                    )));
+                }
 
-        let ttl = if request.ttl_seconds > 0 {
-            Duration::from_secs(request.ttl_seconds as u64)
-        } else {
-            return Err(rpc_types::error::Error::ExecutionError(anyhow::anyhow!(
-                "ttl_seconds must be positive"
-            )));
-        };
+                let ttl = if request.ttl_seconds > 0 {
+                    Duration::from_secs(request.ttl_seconds as u64)
+                } else {
+                    return Err(rpc_types::error::Error::ExecutionError(anyhow::anyhow!(
+                        "ttl_seconds must be positive"
+                    )));
+                };
 
-        let (id, secret) = global_ctx
-            .get_credential_manager()
-            .generate_credential_with_options(
-                request.groups,
-                request.allow_relay,
-                request.allowed_proxy_cidrs,
-                ttl,
-                request.credential_id,
-                request.reusable.unwrap_or(true),
-            );
+                let (id, secret) = global_ctx
+                    .get_credential_manager()
+                    .generate_credential_with_options(
+                        request.groups,
+                        request.allow_relay,
+                        request.allowed_proxy_cidrs,
+                        ttl,
+                        request.credential_id,
+                        request.reusable.unwrap_or(true),
+                    );
 
-        global_ctx.issue_event(crate::common::global_ctx::GlobalCtxEvent::CredentialChanged);
+                global_ctx
+                    .issue_event(crate::common::global_ctx::GlobalCtxEvent::CredentialChanged);
 
-        Ok(GenerateCredentialResponse {
-            credential_id: id,
-            credential_secret: secret,
-        })
+                Ok(GenerateCredentialResponse {
+                    credential_id: id,
+                    credential_secret: secret,
+                })
+            })
+            .await
+            .ok_or_else(|| {
+                rpc_types::error::Error::ExecutionError(anyhow::anyhow!(
+                    "PeerManager not available"
+                ))
+            })?
     }
 
     async fn revoke_credential(
@@ -266,23 +348,33 @@ impl CredentialManageRpc for PeerManagerRpcService {
         _: BaseController,
         request: RevokeCredentialRequest,
     ) -> Result<RevokeCredentialResponse, rpc_types::error::Error> {
-        let pm = weak_upgrade(&self.peer_manager)?;
-        let global_ctx = pm.get_global_ctx();
-        if global_ctx.get_network_identity().network_secret.is_none() {
-            return Err(rpc_types::error::Error::ExecutionError(anyhow::anyhow!(
-                "only admin nodes (with network_secret) can revoke credentials"
-            )));
-        }
+        self.peer_manager
+            .with_async(async move |pm, _| {
+                let global_ctx = pm.get_global_ctx();
+                if global_ctx.get_network_identity().network_secret.is_none() {
+                    return Err(rpc_types::error::Error::ExecutionError(anyhow::anyhow!(
+                        "only admin nodes (with network_secret) can revoke credentials"
+                    )));
+                }
 
-        let success = global_ctx
-            .get_credential_manager()
-            .revoke_credential(&request.credential_id);
+                let success = global_ctx
+                    .get_credential_manager()
+                    .revoke_credential(&request.credential_id);
 
-        if success {
-            global_ctx.issue_event(crate::common::global_ctx::GlobalCtxEvent::CredentialChanged);
-        }
+                if success {
+                    global_ctx.issue_event(
+                        crate::common::global_ctx::GlobalCtxEvent::CredentialChanged,
+                    );
+                }
 
-        Ok(RevokeCredentialResponse { success })
+                Ok(RevokeCredentialResponse { success })
+            })
+            .await
+            .ok_or_else(|| {
+                rpc_types::error::Error::ExecutionError(anyhow::anyhow!(
+                    "PeerManager not available"
+                ))
+            })?
     }
 
     async fn list_credentials(
@@ -290,11 +382,19 @@ impl CredentialManageRpc for PeerManagerRpcService {
         _: BaseController,
         _request: ListCredentialsRequest,
     ) -> Result<ListCredentialsResponse, rpc_types::error::Error> {
-        let pm = weak_upgrade(&self.peer_manager)?;
-        let global_ctx = pm.get_global_ctx();
+        self.peer_manager
+            .with_async(async move |pm, _| {
+                let global_ctx = pm.get_global_ctx();
 
-        Ok(ListCredentialsResponse {
-            credentials: global_ctx.get_credential_manager().list_credentials(),
-        })
+                Ok(ListCredentialsResponse {
+                    credentials: global_ctx.get_credential_manager().list_credentials(),
+                })
+            })
+            .await
+            .ok_or_else(|| {
+                rpc_types::error::Error::ExecutionError(anyhow::anyhow!(
+                    "PeerManager not available"
+                ))
+            })?
     }
 }

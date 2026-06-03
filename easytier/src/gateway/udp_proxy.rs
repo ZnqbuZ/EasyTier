@@ -1,8 +1,10 @@
 use std::{
     net::{Ipv4Addr, SocketAddr, SocketAddrV4},
-    sync::{Arc, Weak, atomic::AtomicBool},
+    sync::{Arc, atomic::AtomicBool},
     time::Duration,
 };
+
+use crate::utils::ptr::WeakPtr;
 
 use bytes::{BufMut, BytesMut};
 use cidr::Ipv4Inet;
@@ -246,7 +248,7 @@ impl UdpNatEntry {
 #[derive(Debug)]
 pub struct UdpProxy {
     global_ctx: ArcGlobalCtx,
-    peer_manager: Weak<PeerManager>,
+    peer_manager: WeakPtr<PeerManager>,
 
     cidr_set: CidrSet,
 
@@ -405,13 +407,13 @@ impl PeerPacketFilter for UdpProxy {
 impl UdpProxy {
     pub fn new(
         global_ctx: ArcGlobalCtx,
-        peer_manager: Arc<PeerManager>,
+        peer_manager: WeakPtr<PeerManager>,
     ) -> Result<Arc<Self>, Error> {
         let cidr_set = CidrSet::new(global_ctx.clone());
         let (sender, receiver) = channel(1024);
         let ret = Self {
             global_ctx,
-            peer_manager: Arc::downgrade(&peer_manager),
+            peer_manager,
             cidr_set,
             nat_table: Arc::new(DashMap::new()),
             sender,
@@ -423,12 +425,10 @@ impl UdpProxy {
     }
 
     pub async fn start(self: &Arc<Self>) -> Result<(), Error> {
-        let Some(peer_manager) = self.peer_manager.upgrade() else {
-            return Err(anyhow::anyhow!("peer manager is gone").into());
-        };
-        peer_manager
-            .add_packet_process_pipeline(Box::new(self.clone()))
-            .await;
+        let me = self.clone();
+        self.peer_manager.with_async(async move |pm, _| {
+            pm.add_packet_process_pipeline(Box::new(me)).await;
+        }).await.ok_or_else(|| anyhow::anyhow!("peer manager is gone"))?;
 
         // clean up nat table
         let nat_table = self.nat_table.clone();
@@ -466,11 +466,12 @@ impl UdpProxy {
                 hdr.set_latency_first(is_latency_first);
                 let to_peer_id = hdr.to_peer_id.into();
                 tracing::trace!(?msg, ?to_peer_id, "udp nat packet response send");
-                let Some(pm) = peer_manager.upgrade() else {
+                let Some(ret) = peer_manager.with_async(async move |pm, _| {
+                    pm.send_msg_for_proxy(msg, to_peer_id).await
+                }).await else {
                     tracing::warn!("peer manager is gone, udp proxy send loop exit");
                     return;
                 };
-                let ret = pm.send_msg_for_proxy(msg, to_peer_id).await;
                 if ret.is_err() {
                     tracing::error!("send icmp packet to peer failed: {:?}", ret);
                 }

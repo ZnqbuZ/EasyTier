@@ -19,7 +19,7 @@ use crate::{
     connector::udp_hole_punch::handle_rpc_result,
     peers::{
         peer_conn::PeerConnId,
-        peer_manager::PeerManager,
+        peer_manager::{PeerManager, PtrPeerManager},
         peer_rpc::PeerRpcManager,
         peer_rpc_service::DirectConnectorManagerRpcServer,
         peer_task::{PeerTaskLauncher, PeerTaskManager},
@@ -133,13 +133,13 @@ struct DstListenerUrlBlackListItem(PeerId, String);
 
 struct DirectConnectorManagerData {
     global_ctx: ArcGlobalCtx,
-    peer_manager: Arc<PeerManager>,
+    peer_manager: PtrPeerManager,
     dst_listener_blacklist: timedmap::TimedMap<DstListenerUrlBlackListItem, ()>,
     peer_black_list: timedmap::TimedMap<PeerId, ()>,
 }
 
 impl DirectConnectorManagerData {
-    pub fn new(global_ctx: ArcGlobalCtx, peer_manager: Arc<PeerManager>) -> Self {
+    pub fn new(global_ctx: ArcGlobalCtx, peer_manager: PtrPeerManager) -> Self {
         Self {
             global_ctx,
             peer_manager,
@@ -162,21 +162,24 @@ impl DirectConnectorManagerData {
             .into());
         }
 
-        let global_ctx = self.peer_manager.get_global_ctx();
         let listener_port = mapped_listener_port(remote_url).ok_or(anyhow::anyhow!(
             "failed to parse port from remote url: {}",
             remote_url
         ))?;
 
+        let my_peer_id = self.peer_manager.with(|pm, _| pm.my_peer_id()).unwrap();
         let rpc_stub = self
             .peer_manager
-            .get_peer_rpc_mgr()
-            .rpc_client()
-            .scoped_client::<DirectConnectorRpcClientFactory<BaseController>>(
-            self.peer_manager.my_peer_id(),
-            dst_peer_id,
-            global_ctx.get_network_name(),
-        );
+            .with(|pm, _| {
+                pm.get_peer_rpc_mgr()
+                    .rpc_client()
+                    .scoped_client::<DirectConnectorRpcClientFactory<BaseController>>(
+                        my_peer_id,
+                        dst_peer_id,
+                        pm.get_global_ctx().get_network_name(),
+                    )
+            })
+            .unwrap();
 
         rpc_stub
             .send_udp_hole_punch_packet(
@@ -239,8 +242,12 @@ impl DirectConnectorManagerData {
 
         // NOTICE: must add as directly connected tunnel
         self.peer_manager
-            .add_client_tunnel_with_peer_id_hint(ret, true, Some(dst_peer_id))
+            .with_async(async move |pm, _| {
+                pm.add_client_tunnel_with_peer_id_hint(ret, true, Some(dst_peer_id))
+                    .await
+            })
             .await
+            .unwrap()
     }
 
     async fn connect_to_public_ipv4(
@@ -258,7 +265,8 @@ impl DirectConnectorManagerData {
         };
         let connector_addr = self
             .peer_manager
-            .get_global_ctx()
+            .with(|pm, _| pm.get_global_ctx())
+            .unwrap()
             .get_stun_info_collector()
             .get_udp_port_mapping_with_socket(local_socket.clone())
             .await
@@ -275,8 +283,12 @@ impl DirectConnectorManagerData {
             .await?;
 
         self.peer_manager
-            .add_client_tunnel_with_peer_id_hint(ret, true, Some(dst_peer_id))
+            .with_async(async move |pm, _| {
+                pm.add_client_tunnel_with_peer_id_hint(ret, true, Some(dst_peer_id))
+                    .await
+            })
             .await
+            .unwrap()
     }
 
     async fn do_try_connect_to_ip(&self, dst_peer_id: PeerId, addr: String) -> Result<(), Error> {
@@ -297,33 +309,49 @@ impl DirectConnectorManagerData {
                                 %remote_url,
                                 "udp public ipv4 listener punch failed, falling back to direct connect"
                             );
+                            let peer_mgr = self.peer_manager.clone();
                             timeout(
                                 std::time::Duration::from_secs(3),
-                                self.peer_manager.try_direct_connect_with_peer_id_hint(
-                                    connector,
-                                    Some(dst_peer_id),
-                                ),
+                                peer_mgr.with_async(async move |pm, _| {
+                                    pm.try_direct_connect_with_peer_id_hint(
+                                        connector,
+                                        Some(dst_peer_id),
+                                    )
+                                    .await
+                                }),
                             )
-                            .await??
+                            .await?
+                            .unwrap()?
                         }
                     }
                 }
                 _ => {
+                    let peer_mgr = self.peer_manager.clone();
                     timeout(
                         std::time::Duration::from_secs(3),
-                        self.peer_manager
-                            .try_direct_connect_with_peer_id_hint(connector, Some(dst_peer_id)),
+                        peer_mgr.with_async(async move |pm, _| {
+                            pm.try_direct_connect_with_peer_id_hint(
+                                connector,
+                                Some(dst_peer_id),
+                            )
+                            .await
+                        }),
                     )
-                    .await??
+                    .await?
+                    .unwrap()?
                 }
             }
         } else {
+            let peer_mgr = self.peer_manager.clone();
             timeout(
                 std::time::Duration::from_secs(3),
-                self.peer_manager
-                    .try_direct_connect_with_peer_id_hint(connector, Some(dst_peer_id)),
+                peer_mgr.with_async(async move |pm, _| {
+                    pm.try_direct_connect_with_peer_id_hint(connector, Some(dst_peer_id))
+                        .await
+                }),
             )
-            .await??
+            .await?
+            .unwrap()?
         };
 
         if peer_id != dst_peer_id && !TESTING.load(Ordering::Relaxed) {
@@ -333,7 +361,10 @@ impl DirectConnectorManagerData {
                 dst_peer_id,
                 peer_id
             );
-            self.peer_manager.close_peer_conn(peer_id, &conn_id).await?;
+            self.peer_manager
+                .with_async(async move |pm, _| pm.close_peer_conn(peer_id, &conn_id).await)
+                .await
+                .unwrap()?;
             return Err(Error::InvalidUrl(addr));
         }
 
@@ -362,7 +393,11 @@ impl DirectConnectorManagerData {
         }
 
         loop {
-            if self.peer_manager.has_directly_connected_conn(dst_peer_id) {
+            if self
+                .peer_manager
+                .with(|pm, _| pm.has_directly_connected_conn(dst_peer_id))
+                .unwrap()
+            {
                 return Ok(());
             }
 
@@ -373,7 +408,11 @@ impl DirectConnectorManagerData {
                 return Ok(());
             }
 
-            if self.peer_manager.has_directly_connected_conn(dst_peer_id) {
+            if self
+                .peer_manager
+                .with(|pm, _| pm.has_directly_connected_conn(dst_peer_id))
+                .unwrap()
+            {
                 return Ok(());
             }
 
@@ -611,7 +650,11 @@ impl DirectConnectorManagerData {
                 "all tasks finished for current scheme"
             );
 
-            if self.peer_manager.has_directly_connected_conn(dst_peer_id) {
+            if self
+                .peer_manager
+                .with(|pm, _| pm.has_directly_connected_conn(dst_peer_id))
+                .unwrap()
+            {
                 tracing::info!(
                     "direct connect to peer {} success, has direct conn",
                     dst_peer_id
@@ -641,17 +684,21 @@ impl DirectConnectorManagerData {
             }
             attempt += 1;
 
-            let peer_manager = self.peer_manager.clone();
+            let my_peer_id = self.peer_manager.with(|pm, _| pm.my_peer_id()).unwrap();
             tracing::debug!("try direct connect to peer: {}", dst_peer_id);
 
-            let rpc_stub = peer_manager
-                .get_peer_rpc_mgr()
-                .rpc_client()
-                .scoped_client::<DirectConnectorRpcClientFactory<BaseController>>(
-                peer_manager.my_peer_id(),
-                dst_peer_id,
-                self.global_ctx.get_network_name(),
-            );
+            let rpc_stub = self
+                .peer_manager
+                .with(|pm, _| {
+                    pm.get_peer_rpc_mgr()
+                        .rpc_client()
+                        .scoped_client::<DirectConnectorRpcClientFactory<BaseController>>(
+                            my_peer_id,
+                            dst_peer_id,
+                            pm.get_global_ctx().get_network_name(),
+                        )
+                })
+                .unwrap();
 
             let ip_list = rpc_stub
                 .get_ip_list(BaseController::default(), GetIpListRequest {})
@@ -666,7 +713,11 @@ impl DirectConnectorManagerData {
                 .await;
             tracing::info!(?ret, ?dst_peer_id, "do_try_direct_connect return");
 
-            if peer_manager.has_directly_connected_conn(dst_peer_id) {
+            if self
+                .peer_manager
+                .with(|pm, _| pm.has_directly_connected_conn(dst_peer_id))
+                .unwrap()
+            {
                 tracing::info!(
                     "direct connect to peer {} success, has direct conn",
                     dst_peer_id
@@ -709,20 +760,24 @@ impl PeerTaskLauncher for DirectConnectorLauncher {
     type CollectPeerItem = PeerId;
     type TaskRet = ();
 
-    fn new_data(&self, _peer_mgr: Arc<PeerManager>) -> Self::Data {
+    fn new_data(&self, _peer_mgr: PtrPeerManager) -> Self::Data {
         self.0.clone()
     }
 
     async fn collect_peers_need_task(&self, data: &Self::Data) -> Vec<Self::CollectPeerItem> {
         data.peer_black_list.cleanup();
-        let my_peer_id = data.peer_manager.my_peer_id();
+        let my_peer_id = data.peer_manager.with(|pm, _| pm.my_peer_id()).unwrap();
         data.peer_manager
-            .list_peers()
+            .with_async(async move |pm, _| pm.list_peers().await)
             .await
+            .unwrap()
             .into_iter()
             .filter(|peer_id| {
                 *peer_id != my_peer_id
-                    && !data.peer_manager.has_directly_connected_conn(*peer_id)
+                    && !data
+                        .peer_manager
+                        .with(|pm, _| pm.has_directly_connected_conn(*peer_id))
+                        .unwrap()
                     && !data.peer_black_list.contains(peer_id)
             })
             .collect()
@@ -745,7 +800,10 @@ impl PeerTaskLauncher for DirectConnectorLauncher {
 }
 
 impl DirectConnectorManager {
-    pub fn new(global_ctx: ArcGlobalCtx, peer_manager: Arc<PeerManager>) -> Self {
+    pub fn new(global_ctx: ArcGlobalCtx, peer_manager: PtrPeerManager) -> Self {
+        let p2p_demand = peer_manager
+            .with(|pm, _| pm.p2p_demand_notify())
+            .unwrap();
         let data = Arc::new(DirectConnectorManagerData::new(
             global_ctx.clone(),
             peer_manager.clone(),
@@ -753,7 +811,7 @@ impl DirectConnectorManager {
         let client = PeerTaskManager::new_with_external_signal(
             DirectConnectorLauncher(data.clone()),
             peer_manager.clone(),
-            Some(peer_manager.p2p_demand_notify()),
+            Some(p2p_demand),
         );
         Self {
             global_ctx,
@@ -771,15 +829,18 @@ impl DirectConnectorManager {
     pub fn run_as_server(&mut self) {
         self.data
             .peer_manager
-            .get_peer_rpc_mgr()
-            .rpc_server()
-            .registry()
-            .register(
-                DirectConnectorRpcServer::new(DirectConnectorManagerRpcServer::new(
-                    self.global_ctx.clone(),
-                )),
-                &self.data.global_ctx.get_network_name(),
-            );
+            .with(|pm, _| {
+                pm.get_peer_rpc_mgr()
+                    .rpc_server()
+                    .registry()
+                    .register(
+                        DirectConnectorRpcServer::new(DirectConnectorManagerRpcServer::new(
+                            self.global_ctx.clone(),
+                        )),
+                        &pm.get_global_ctx().get_network_name(),
+                    );
+            })
+            .unwrap();
     }
 
     pub fn run_as_client(&mut self) {

@@ -5,9 +5,11 @@
 // 2. openvpn (TODO)
 // 3. shadowsocks (TODO)
 
-use std::sync::Arc;
-
-use crate::{common::global_ctx::ArcGlobalCtx, peers::peer_manager::PeerManager};
+use crate::{
+    common::global_ctx::ArcGlobalCtx,
+    peers::peer_manager::PeerManager,
+    utils::ptr::WeakPtr,
+};
 
 #[cfg(feature = "wireguard")]
 pub mod wireguard;
@@ -17,9 +19,9 @@ pub trait VpnPortal: Send + Sync {
     async fn start(
         &mut self,
         global_ctx: ArcGlobalCtx,
-        peer_mgr: Arc<PeerManager>,
+        peer_mgr: WeakPtr<PeerManager>,
     ) -> anyhow::Result<()>;
-    async fn dump_client_config(&self, peer_mgr: Arc<PeerManager>) -> String;
+    async fn dump_client_config(&self, peer_mgr: WeakPtr<PeerManager>) -> String;
     fn name(&self) -> String;
     async fn list_clients(&self) -> Vec<String>;
 }
@@ -31,12 +33,12 @@ impl VpnPortal for NullVpnPortal {
     async fn start(
         &mut self,
         _global_ctx: ArcGlobalCtx,
-        _peer_mgr: Arc<PeerManager>,
+        _peer_mgr: WeakPtr<PeerManager>,
     ) -> anyhow::Result<()> {
         Ok(())
     }
 
-    async fn dump_client_config(&self, _peer_mgr: Arc<PeerManager>) -> String {
+    async fn dump_client_config(&self, _peer_mgr: WeakPtr<PeerManager>) -> String {
         "".to_string()
     }
 

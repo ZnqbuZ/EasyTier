@@ -8,6 +8,8 @@ use std::{
     time::{Duration, Instant},
 };
 
+use crate::utils::ptr::WeakPtr;
+
 use crossbeam::atomic::AtomicCell;
 #[cfg(feature = "kcp")]
 use kcp_sys::{endpoint::KcpEndpoint, stream::KcpStream};
@@ -216,7 +218,7 @@ impl Drop for SmolTcpConnector {
 #[cfg(feature = "kcp")]
 struct Socks5KcpConnector {
     kcp_endpoint: Weak<KcpEndpoint>,
-    peer_mgr: Weak<PeerManager>,
+    peer_mgr: WeakPtr<PeerManager>,
     src_addr: SocketAddr,
 }
 
@@ -248,7 +250,7 @@ impl AsyncTcpConnector for Socks5KcpConnector {
 struct Socks5AutoConnector {
     #[cfg(feature = "kcp")]
     kcp_endpoint: Option<Weak<KcpEndpoint>>,
-    peer_mgr: Weak<PeerManager>,
+    peer_mgr: WeakPtr<PeerManager>,
     entries: Socks5EntrySet,
     entry_count: Arc<AtomicUsize>,
     smoltcp_net: Option<Arc<Net>>,
@@ -270,10 +272,7 @@ impl AsyncTcpConnector for Socks5AutoConnector {
             return Err(anyhow::anyhow!("inner connector is already set").into());
         }
 
-        let Some(peer_mgr_arc) = self.peer_mgr.upgrade() else {
-            tracing::error!("peer manager is dropped");
-            return Err(anyhow::anyhow!("peer manager is dropped").into());
-        };
+        let peer_mgr = self.peer_mgr.clone();
 
         if let Some(local_addr) = self.smoltcp_net.as_ref().map(|n| n.get_address())
             && local_addr == addr.ip()
@@ -281,8 +280,12 @@ impl AsyncTcpConnector for Socks5AutoConnector {
             addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), addr.port());
         }
 
+        let msg_dst_peer_empty = peer_mgr.with_async(async move |pm, _| {
+            pm.get_msg_dst_peer(&addr.ip()).await.0.is_empty()
+        }).await.unwrap_or(true);
+
         if self.smoltcp_net.is_none()
-            || peer_mgr_arc.get_msg_dst_peer(&addr.ip()).await.0.is_empty()
+            || msg_dst_peer_empty
             || addr.ip().is_loopback()
         {
             // cannot find dst in virtual network, so try connect to dst directly
@@ -291,7 +294,9 @@ impl AsyncTcpConnector for Socks5AutoConnector {
             ));
         }
 
-        let dst_allow_kcp = peer_mgr_arc.check_allow_kcp_to_dst(&addr.ip()).await;
+        let dst_allow_kcp = peer_mgr.with_async(async move |pm, _| {
+            pm.check_allow_kcp_to_dst(&addr.ip()).await
+        }).await.unwrap_or(false);
         tracing::debug!("dst_allow_kcp: {:?}", dst_allow_kcp);
 
         #[cfg(feature = "kcp")]
@@ -337,7 +342,7 @@ impl Socks5ServerNet {
     pub fn new(
         ipv4_addr: cidr::Ipv4Inet,
         auth: Option<SimpleUserPassword>,
-        peer_manager: Weak<PeerManager>,
+        peer_manager: WeakPtr<PeerManager>,
         packet_recv: Arc<Mutex<mpsc::Receiver<ZCPacket>>>,
         entries: Socks5EntrySet,
     ) -> Self {
@@ -372,14 +377,13 @@ impl Socks5ServerNet {
 
                 let dst = ipv4.get_destination();
                 let packet = ZCPacket::new_with_payload(&data);
-                let Some(peer_manager) = peer_manager.upgrade() else {
+                let Some(send_result) = peer_manager.with_async(async move |pm, _| {
+                    pm.send_msg_by_ip(packet, IpAddr::V4(dst), false).await
+                }).await else {
                     tracing::warn!("peer manager is gone, smoltcp sender exited");
                     return;
                 };
-                if let Err(e) = peer_manager
-                    .send_msg_by_ip(packet, IpAddr::V4(dst), false)
-                    .await
-                {
+                if let Err(e) = send_result {
                     tracing::error!("send to peer failed in smoltcp sender: {:?}", e);
                 }
             }
@@ -460,7 +464,7 @@ struct UdpClientKey {
 
 pub struct Socks5Server {
     global_ctx: Arc<GlobalCtx>,
-    peer_manager: Weak<PeerManager>,
+    peer_manager: WeakPtr<PeerManager>,
     auth: Option<SimpleUserPassword>,
 
     tasks: Arc<std::sync::Mutex<JoinSet<()>>>,
@@ -568,13 +572,13 @@ impl PeerPacketFilter for Socks5Server {
 impl Socks5Server {
     pub fn new(
         global_ctx: Arc<GlobalCtx>,
-        peer_manager: Arc<PeerManager>,
+        peer_manager: WeakPtr<PeerManager>,
         auth: Option<SimpleUserPassword>,
     ) -> Arc<Self> {
         let (packet_sender, packet_recv) = mpsc::channel(1024);
         Arc::new(Self {
             global_ctx,
-            peer_manager: Arc::downgrade(&peer_manager),
+            peer_manager,
             auth,
 
             tasks: Arc::new(std::sync::Mutex::new(JoinSet::new())),
@@ -713,12 +717,10 @@ impl Socks5Server {
         let cfgs = self.global_ctx.config.get_port_forwards();
         self.reload_port_forwards(&cfgs).await?;
 
-        let Some(peer_manager) = self.peer_manager.upgrade() else {
-            return Err(anyhow::anyhow!("peer manager is gone").into());
-        };
-        peer_manager
-            .add_packet_process_pipeline(Box::new(self.clone()))
-            .await;
+        let me = self.clone();
+        self.peer_manager.with_async(async move |pm, _| {
+            pm.add_packet_process_pipeline(Box::new(me)).await;
+        }).await.ok_or_else(|| anyhow::anyhow!("peer manager is gone"))?;
 
         self.run_net_update_task().await;
 

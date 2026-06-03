@@ -13,7 +13,7 @@ use crate::{
         HOLE_PUNCH_PACKET_BODY_LEN, UdpSocketArray, try_connect_with_socket,
     },
     connector::udp_hole_punch::handle_rpc_result,
-    peers::peer_manager::PeerManager,
+    peers::peer_manager::PtrPeerManager,
     proto::{
         common::Void,
         peer_rpc::{
@@ -84,13 +84,13 @@ impl PunchConeHoleServer {
 }
 
 pub(crate) struct PunchConeHoleClient {
-    peer_mgr: Arc<PeerManager>,
+    peer_mgr: PtrPeerManager,
     blacklist: Arc<timedmap::TimedMap<PeerId, ()>>,
 }
 
 impl PunchConeHoleClient {
     pub(crate) fn new(
-        peer_mgr: Arc<PeerManager>,
+        peer_mgr: PtrPeerManager,
         blacklist: Arc<timedmap::TimedMap<PeerId, ()>>,
     ) -> Self {
         Self {
@@ -112,18 +112,23 @@ impl PunchConeHoleClient {
         tracing::info!(?dst_peer_id, "start hole punching");
         let tid = rand::random();
 
-        let global_ctx = self.peer_mgr.get_global_ctx();
-        let udp_array = UdpSocketArray::new(1, global_ctx.net_ns.clone());
+        let global_ctx = self.peer_mgr.with(|pm, _| pm.get_global_ctx()).unwrap();
+        let my_peer_id = self.peer_mgr.with(|pm, _| pm.my_peer_id()).unwrap();
+        let net_ns = global_ctx.net_ns.clone();
+        let udp_array = UdpSocketArray::new(1, net_ns);
 
         let rpc_stub = self
             .peer_mgr
-            .get_peer_rpc_mgr()
-            .rpc_client()
-            .scoped_client::<UdpHolePunchRpcClientFactory<BaseController>>(
-                self.peer_mgr.my_peer_id(),
-                dst_peer_id,
-                global_ctx.get_network_name(),
-            );
+            .with(|pm, _| {
+                pm.get_peer_rpc_mgr()
+                    .rpc_client()
+                    .scoped_client::<UdpHolePunchRpcClientFactory<BaseController>>(
+                        my_peer_id,
+                        dst_peer_id,
+                        pm.get_global_ctx().get_network_name(),
+                    )
+            })
+            .unwrap();
 
         let resp = rpc_stub
             .select_punch_listener(
@@ -142,7 +147,7 @@ impl PunchConeHoleClient {
         ))?;
 
         let local_socket = {
-            let _g = self.peer_mgr.get_global_ctx().net_ns.guard();
+            let _g = global_ctx.net_ns.guard();
             Arc::new(UdpSocket::bind("0.0.0.0:0").await?)
         };
         let local_addr = local_socket

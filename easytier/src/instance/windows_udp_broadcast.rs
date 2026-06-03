@@ -14,6 +14,7 @@ use {
         common::stats_manager::{CounterHandle, LabelSet, LabelType, MetricName},
         peers::peer_manager::PeerManager,
         tunnel::packet_def::ZCPacket,
+        utils::ptr::{SharedPtr, WeakPtr},
     },
     anyhow::Context,
     network_interface::{Addr, NetworkInterface, NetworkInterfaceConfig},
@@ -21,7 +22,6 @@ use {
     std::{
         io,
         net::{IpAddr, SocketAddrV4, UdpSocket as StdUdpSocket},
-        sync::Arc,
     },
     tokio_util::task::AbortOnDropHandle,
 };
@@ -805,7 +805,7 @@ async fn forward_normalized_packet(
 
 #[cfg(any(windows, test))]
 async fn capture_loop(
-    peer_manager: Arc<PeerManager>,
+    peer_manager: WeakPtr<PeerManager>,
     config: BroadcastRelayConfig,
     mut socket: CaptureSocket,
     stats: BroadcastRelayStats,
@@ -855,26 +855,30 @@ async fn capture_loop(
         };
 
         if let Some(normalized) = normalized {
-            forward_normalized_packet(&peer_manager, normalized, &stats).await;
+            let Some(_) = peer_manager.with_async(async move |pm, _| {
+                forward_normalized_packet(&pm, normalized, &stats).await
+            }).await else {
+                break;
+            };
         }
     }
 }
 
 #[cfg(any(windows, test))]
 pub(crate) fn start(
-    peer_manager: Arc<PeerManager>,
+    peer_manager: WeakPtr<PeerManager>,
     virtual_ipv4: Ipv4Inet,
 ) -> anyhow::Result<AbortOnDropHandle<()>> {
     let physical_interfaces = match collect_physical_interfaces(virtual_ipv4) {
         Ok(interfaces) => interfaces,
         Err(err) => {
-            issue_start_result_event(&peer_manager, None, Some(format!("{err:#}")));
+            peer_manager.with(|pm, _| issue_start_result_event(pm, None, Some(format!("{err:#}"))));
             return Err(err);
         }
     };
     if physical_interfaces.is_empty() {
         let msg = "no physical IPv4 interface is available for UDP broadcast relay";
-        issue_start_result_event(&peer_manager, None, Some(msg.to_owned()));
+        peer_manager.with(|pm, _| issue_start_result_event(pm, None, Some(msg.to_owned())));
         anyhow::bail!(msg);
     }
 
@@ -882,12 +886,12 @@ pub(crate) fn start(
     let socket = match open_capture_socket(&config) {
         Ok(socket) => socket,
         Err(err) => {
-            issue_start_result_event(&peer_manager, None, Some(format!("{err:#}")));
+            peer_manager.with(|pm, _| issue_start_result_event(pm, None, Some(format!("{err:#}"))));
             return Err(err);
         }
     };
     let capture_backend = socket.backend_name();
-    issue_start_result_event(&peer_manager, Some(capture_backend), None);
+    peer_manager.with(|pm, _| issue_start_result_event(pm, Some(capture_backend), None));
 
     tracing::debug!(
         virtual_ipv4 = %config.virtual_ipv4,
@@ -896,7 +900,8 @@ pub(crate) fn start(
         "starting Windows UDP broadcast relay"
     );
 
-    let stats = BroadcastRelayStats::new(&peer_manager);
+    let stats = peer_manager.with(|pm, _| BroadcastRelayStats::new(pm))
+        .ok_or_else(|| anyhow::anyhow!("peer manager dropped"))?;
     let task = tokio::spawn(capture_loop(peer_manager, config, socket, stats));
     Ok(AbortOnDropHandle::new(task))
 }

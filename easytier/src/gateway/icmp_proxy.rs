@@ -1,10 +1,12 @@
 use std::{
     mem::MaybeUninit,
     net::{IpAddr, Ipv4Addr, SocketAddrV4},
-    sync::{Arc, Weak},
+    sync::Arc,
     thread,
     time::Duration,
 };
+
+use crate::utils::ptr::WeakPtr;
 
 use anyhow::Context;
 use pnet::packet::{
@@ -73,7 +75,7 @@ type NewPacketReceiver = tokio::sync::mpsc::UnboundedReceiver<IcmpNatKey>;
 #[derive(Debug)]
 pub struct IcmpProxy {
     global_ctx: ArcGlobalCtx,
-    peer_manager: Weak<PeerManager>,
+    peer_manager: WeakPtr<PeerManager>,
 
     cidr_set: CidrSet,
     socket: std::sync::Mutex<Option<Arc<socket2::Socket>>>,
@@ -196,12 +198,12 @@ impl PeerPacketFilter for IcmpProxy {
 impl IcmpProxy {
     pub fn new(
         global_ctx: ArcGlobalCtx,
-        peer_manager: Arc<PeerManager>,
+        peer_manager: WeakPtr<PeerManager>,
     ) -> Result<Arc<Self>, Error> {
         let cidr_set = CidrSet::new(global_ctx.clone());
         let ret = Self {
             global_ctx,
-            peer_manager: Arc::downgrade(&peer_manager),
+            peer_manager,
             cidr_set,
             socket: std::sync::Mutex::new(None),
 
@@ -282,11 +284,12 @@ impl IcmpProxy {
                     let hdr = msg.mut_peer_manager_header().unwrap();
                     hdr.set_latency_first(is_latency_first);
                     let to_peer_id = hdr.to_peer_id.into();
-                    let Some(pm) = peer_manager.upgrade() else {
+                    let Some(ret) = peer_manager.with_async(async |pm, _| {
+                        pm.send_msg_for_proxy(msg, to_peer_id).await
+                    }).await else {
                         tracing::warn!("peer manager is gone, icmp proxy send loop exit");
                         return;
                     };
-                    let ret = pm.send_msg_for_proxy(msg, to_peer_id).await;
                     if ret.is_err() {
                         tracing::error!("send icmp packet to peer failed: {:?}", ret);
                     }
@@ -303,12 +306,13 @@ impl IcmpProxy {
             }
         });
 
-        let Some(pm) = self.peer_manager.upgrade() else {
+        let me = self.clone();
+        self.peer_manager.with_async(async move |pm, _| {
+            pm.add_packet_process_pipeline(Box::new(me)).await;
+        }).await.ok_or_else(|| {
             tracing::warn!("peer manager is gone, icmp proxy init failed");
-            return Err(anyhow::anyhow!("peer manager is gone").into());
-        };
-
-        pm.add_packet_process_pipeline(Box::new(self.clone())).await;
+            anyhow::anyhow!("peer manager is gone")
+        })?;
         Ok(())
     }
 

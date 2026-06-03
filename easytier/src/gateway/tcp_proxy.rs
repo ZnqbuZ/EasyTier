@@ -22,6 +22,7 @@ use tracing::Instrument;
 
 use crate::common::error::Result;
 use crate::common::global_ctx::{ArcGlobalCtx, GlobalCtx};
+use crate::utils::ptr::WeakPtr;
 use crate::common::join_joinset_background;
 use crate::common::log;
 use crate::common::stats_manager::{LabelSet, LabelType, MetricName};
@@ -315,7 +316,7 @@ type AddrConnSockMap = Arc<DashMap<SocketAddr, ArcNatDstEntry>>;
 #[derive(Debug)]
 pub struct TcpProxy<C: NatDstConnector> {
     global_ctx: Arc<GlobalCtx>,
-    peer_manager: Weak<PeerManager>,
+    peer_manager: WeakPtr<PeerManager>,
     local_port: AtomicU16,
 
     tasks: Arc<std::sync::Mutex<JoinSet<()>>>,
@@ -346,10 +347,13 @@ impl<C: NatDstConnector> PeerPacketFilter for TcpProxy<C> {
                 if let Err(e) = smoltcp_stack_sender.try_send(packet) {
                     tracing::error!("send to smoltcp stack failed: {:?}", e);
                 }
-            } else if let Some(peer_manager) = self.get_peer_manager()
-                && let Err(e) = peer_manager.get_nic_channel().send(packet).await
-            {
-                tracing::error!("send to nic failed: {:?}", e);
+            } else {
+                let send_result = self.peer_manager.with_async(async move |pm, _| {
+                    pm.get_nic_channel().send(packet).await
+                }).await;
+                if let Some(Err(e)) = send_result {
+                    tracing::error!("send to nic failed: {:?}", e);
+                }
             }
             return None;
         } else {
@@ -439,13 +443,13 @@ impl<C: NatDstConnector> NicPacketFilter for TcpProxy<C> {
 }
 
 impl<C: NatDstConnector> TcpProxy<C> {
-    pub fn new(peer_manager: Arc<PeerManager>, connector: C) -> Arc<Self> {
+    pub fn new(peer_manager: WeakPtr<PeerManager>, connector: C) -> Arc<Self> {
         let (smoltcp_stack_sender, smoltcp_stack_receiver) = mpsc::channel::<ZCPacket>(1000);
-        let global_ctx = peer_manager.get_global_ctx();
+        let global_ctx = peer_manager.with(|pm, _| pm.get_global_ctx()).unwrap();
 
         Arc::new(Self {
             global_ctx: global_ctx.clone(),
-            peer_manager: Arc::downgrade(&peer_manager),
+            peer_manager,
 
             local_port: AtomicU16::new(0),
             tasks: Arc::new(std::sync::Mutex::new(JoinSet::new())),
@@ -470,8 +474,8 @@ impl<C: NatDstConnector> TcpProxy<C> {
         })
     }
 
-    pub fn get_peer_manager(&self) -> Option<Arc<PeerManager>> {
-        self.peer_manager.upgrade()
+    pub fn get_peer_manager(&self) -> WeakPtr<PeerManager> {
+        self.peer_manager.clone()
     }
 
     fn update_tcp_packet_checksum(
@@ -494,15 +498,13 @@ impl<C: NatDstConnector> TcpProxy<C> {
         self.run_syn_map_cleaner().await?;
         self.run_listener().await?;
         if add_pipeline {
-            let peer_manager = self
-                .get_peer_manager()
-                .ok_or_else(|| anyhow::anyhow!("peer manager is gone"))?;
-            peer_manager
-                .add_packet_process_pipeline(Box::new(self.clone()))
-                .await;
-            peer_manager
-                .add_nic_packet_process_pipeline(Box::new(self.clone()))
-                .await;
+            let me = self.clone();
+            self.peer_manager.with_async(async move |pm, _| {
+                pm.add_packet_process_pipeline(Box::new(me.clone()))
+                    .await;
+                pm.add_nic_packet_process_pipeline(Box::new(me))
+                    .await;
+            }).await.ok_or_else(|| anyhow::anyhow!("peer manager is gone"))?;
         }
         join_joinset_background(self.tasks.clone(), "TcpProxy".to_owned());
 
@@ -582,14 +584,13 @@ impl<C: NatDstConnector> TcpProxy<C> {
 
                     let dst = ipv4.get_destination();
                     let packet = ZCPacket::new_with_payload(&data);
-                    let Some(peer_mgr) = peer_mgr.upgrade() else {
+                    let Some(send_result) = peer_mgr.with_async(async move |pm, _| {
+                        pm.send_msg_by_ip(packet, IpAddr::V4(dst), false).await
+                    }).await else {
                         tracing::warn!("peer manager is gone, smoltcp sender exited");
                         return;
                     };
-                    if let Err(e) = peer_mgr
-                        .send_msg_by_ip(packet, IpAddr::V4(dst), false)
-                        .await
-                    {
+                    if let Err(e) = send_result {
                         tracing::error!("send to peer failed in smoltcp sender: {:?}", e);
                     }
                 }
@@ -846,8 +847,7 @@ impl<C: NatDstConnector> TcpProxy<C> {
 
     pub fn get_my_peer_id(&self) -> u32 {
         self.peer_manager
-            .upgrade()
-            .map(|pm| pm.my_peer_id())
+            .with(|pm, _| pm.my_peer_id())
             .unwrap_or_default()
     }
 

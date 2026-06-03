@@ -4,6 +4,8 @@ use std::collections::HashSet;
 use std::net::{IpAddr, Ipv4Addr};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Weak};
+
+use crate::utils::ptr::{SharedPtr, WeakPtr};
 #[cfg(feature = "tun")]
 use std::time::Duration;
 
@@ -83,7 +85,7 @@ struct IpProxy {
 }
 
 impl IpProxy {
-    fn new(global_ctx: ArcGlobalCtx, peer_manager: Arc<PeerManager>) -> Result<Self, Error> {
+    fn new(global_ctx: ArcGlobalCtx, peer_manager: WeakPtr<PeerManager>) -> Result<Self, Error> {
         let tcp_proxy = TcpProxy::new(peer_manager.clone(), NatDstTcpConnector {});
         let icmp_proxy = IcmpProxy::new(global_ctx.clone(), peer_manager.clone())
             .with_context(|| "create icmp proxy failed")?;
@@ -252,7 +254,7 @@ pub struct InstanceConfigPatcher {
     global_ctx: Weak<GlobalCtx>,
     #[cfg(feature = "socks5")]
     socks5_server: Weak<Socks5Server>,
-    peer_manager: Weak<PeerManager>,
+    peer_manager: WeakPtr<PeerManager>,
     conn_manager: Weak<ManualConnectorManager>,
 }
 
@@ -467,10 +469,10 @@ impl InstanceConfigPatcher {
         global_ctx
             .get_acl_filter()
             .reload_rules(AclRuleBuilder::build(&global_ctx)?.as_ref());
-        weak_upgrade(&self.peer_manager)?
-            .get_route()
-            .refresh_acl_groups()
-            .await;
+        self.peer_manager
+            .with_async(async move |pm, _| pm.get_route().refresh_acl_groups().await)
+            .await
+            .ok_or_else(|| anyhow::anyhow!("peer manager not available"))?;
         Ok(())
     }
 
@@ -541,13 +543,17 @@ impl InstanceConfigPatcher {
             return Ok(());
         }
         let global_ctx = weak_upgrade(&self.global_ctx)?;
-        let peer_manager = weak_upgrade(&self.peer_manager)?;
-        let mut current_exit_nodes = global_ctx.config.get_exit_nodes();
-        let patches = exit_nodes.into_iter().map(Into::into).collect();
-        InstanceConfigPatcher::trace_patchables(&patches);
-        crate::proto::api::config::patch_vec(&mut current_exit_nodes, patches);
-        global_ctx.config.set_exit_nodes(current_exit_nodes);
-        peer_manager.update_exit_nodes().await;
+        self.peer_manager
+            .with_async(async move |pm, _| {
+                let mut current_exit_nodes = global_ctx.config.get_exit_nodes();
+                let patches = exit_nodes.into_iter().map(Into::into).collect();
+                InstanceConfigPatcher::trace_patchables(&patches);
+                crate::proto::api::config::patch_vec(&mut current_exit_nodes, patches);
+                global_ctx.config.set_exit_nodes(current_exit_nodes);
+                pm.update_exit_nodes().await
+            })
+            .await
+            .ok_or_else(|| anyhow::anyhow!("peer manager not available"))?;
 
         Ok(())
     }
@@ -618,7 +624,7 @@ pub struct Instance {
     nic_ctx: ArcNicCtx,
 
     peer_packet_receiver: Arc<Mutex<PacketRecvChanReceiver>>,
-    peer_manager: Arc<PeerManager>,
+    peer_manager: SharedPtr<PeerManager>,
     listener_manager: Arc<Mutex<ListenerManager<PeerManager>>>,
     conn_manager: Arc<ManualConnectorManager>,
     direct_conn_manager: Arc<DirectConnectorManager>,
@@ -660,7 +666,7 @@ impl Instance {
 
         let id = global_ctx.get_id();
 
-        let peer_manager = Arc::new(PeerManager::new(
+        let peer_manager = SharedPtr::make(PeerManager::new(
             RouteAlgoType::Ospf,
             global_ctx.clone(),
             peer_packet_sender,
@@ -670,25 +676,25 @@ impl Instance {
 
         let listener_manager = Arc::new(Mutex::new(ListenerManager::new(
             global_ctx.clone(),
-            peer_manager.clone(),
+            peer_manager.share(),
         )));
 
         let conn_manager = Arc::new(ManualConnectorManager::new(
             global_ctx.clone(),
-            peer_manager.clone(),
+            peer_manager.share(),
         ));
 
         let mut direct_conn_manager =
-            DirectConnectorManager::new(global_ctx.clone(), peer_manager.clone());
+            DirectConnectorManager::new(global_ctx.clone(), peer_manager.share());
         direct_conn_manager.run();
         let direct_conn_manager = Arc::new(direct_conn_manager);
 
         let udp_hole_puncher =
-            Arc::new(Mutex::new(UdpHolePunchConnector::new(peer_manager.clone())));
+            Arc::new(Mutex::new(UdpHolePunchConnector::new(peer_manager.share())));
         let tcp_hole_puncher =
-            Arc::new(Mutex::new(TcpHolePunchConnector::new(peer_manager.clone())));
+            Arc::new(Mutex::new(TcpHolePunchConnector::new(peer_manager.share())));
 
-        let peer_center = Arc::new(PeerCenterInstance::new(peer_manager.clone()));
+        let peer_center = Arc::new(PeerCenterInstance::new(peer_manager.share()));
 
         #[cfg(feature = "wireguard")]
         let vpn_portal_inst = vpn_portal::wireguard::WireGuard::default();
@@ -696,7 +702,7 @@ impl Instance {
         let vpn_portal_inst = vpn_portal::NullVpnPortal;
 
         #[cfg(feature = "socks5")]
-        let socks5_server = Socks5Server::new(global_ctx.clone(), peer_manager.clone(), None);
+        let socks5_server = Socks5Server::new(global_ctx.clone(), peer_manager.share(), None);
 
         Instance {
             inst_name: global_ctx.inst_name.clone(),
@@ -787,11 +793,13 @@ impl Instance {
 
     #[cfg(feature = "magic-dns")]
     fn create_magic_dns_runner(
-        peer_mgr: Arc<PeerManager>,
+        peer_mgr: WeakPtr<PeerManager>,
         tun_dev: Option<String>,
         tun_ip: Ipv4Inet,
     ) -> Option<DnsRunner> {
-        let ctx = peer_mgr.get_global_ctx();
+        let Some(ctx) = peer_mgr.with(|pm, _| pm.get_global_ctx()) else {
+            return None;
+        };
         if !ctx.config.get_flags().accept_dns {
             return None;
         }
@@ -823,7 +831,7 @@ impl Instance {
     // Warning, if there is an IP conflict in the network when using DHCP, the IP will be automatically changed.
     fn check_dhcp_ip_conflict(&self) {
         use rand::Rng;
-        let peer_manager_c = Arc::downgrade(&self.peer_manager.clone());
+        let peer_manager_c = self.peer_manager.share();
         let global_ctx_c = self.get_global_ctx();
         #[cfg(feature = "tun")]
         let nic_ctx = self.nic_ctx.clone();
@@ -836,18 +844,19 @@ impl Instance {
             loop {
                 tokio::time::sleep(std::time::Duration::from_secs(next_sleep_time)).await;
 
-                let Some(peer_manager_c) = peer_manager_c.upgrade() else {
-                    tracing::warn!("peer manager is dropped, stop dhcp check.");
-                    return;
-                };
-
                 if nic_closed_notifier.notified().now_or_never().is_some() {
                     tracing::debug!("nic ctx is closed, try recreate it");
                     current_dhcp_ip = None;
                 }
 
                 // do not allocate ip if no peer connected
-                let routes = peer_manager_c.list_routes().await;
+                let Some(routes) = peer_manager_c
+                    .with_async(async move |pm, _| pm.list_routes().await)
+                    .await
+                else {
+                    tracing::warn!("peer manager is dropped, stop dhcp check.");
+                    return;
+                };
                 if routes.is_empty() {
                     next_sleep_time = 1;
                     continue;
@@ -956,7 +965,7 @@ impl Instance {
         }
 
         let nic_ctx = self.nic_ctx.clone();
-        let peer_mgr = Arc::downgrade(&self.peer_manager);
+        let peer_mgr = self.peer_manager.share();
         let peer_packet_receiver = self.peer_packet_receiver.clone();
 
         tokio::spawn(async move {
@@ -964,23 +973,32 @@ impl Instance {
             loop {
                 let close_notifier = Arc::new(Notify::new());
                 {
-                    let Some(peer_mgr) = peer_mgr.upgrade() else {
+                    let peer_mgr_c = peer_mgr.clone();
+                    let peer_mgr_for_closure = peer_mgr_c.clone();
+                    let Some(run_result) = peer_mgr_c
+                        .with_async(async move |pm: &SharedPtr<PeerManager>, _| {
+                            let peer_packet_receiver = peer_packet_receiver.clone();
+                            let close_notifier = close_notifier.clone();
+                            let mut new_nic_ctx = NicCtx::new(
+                                pm.get_global_ctx(),
+                                &peer_mgr_for_closure,
+                                peer_packet_receiver,
+                                close_notifier,
+                            );
+                            let run_result = new_nic_ctx.run(ipv4_addr, ipv6_addr).await;
+                            (run_result, new_nic_ctx)
+                        })
+                        .await
+                    else {
                         tracing::warn!("peer manager is dropped, stop static ip check.");
                         if let Some(output_tx) = output_tx.take() {
                             let _ = output_tx.send(Err(Error::Unknown));
-                            return;
                         }
                         return;
                     };
 
-                    let mut new_nic_ctx = NicCtx::new(
-                        peer_mgr.get_global_ctx(),
-                        &peer_mgr,
-                        peer_packet_receiver.clone(),
-                        close_notifier.clone(),
-                    );
-
-                    if let Err(e) = new_nic_ctx.run(ipv4_addr, ipv6_addr).await {
+                    let (run_result, new_nic_ctx) = run_result;
+                    if let Err(e) = run_result {
                         if let Some(output_tx) = output_tx.take() {
                             let _ = output_tx.send(Err(e));
                             return;
@@ -995,7 +1013,7 @@ impl Instance {
                     {
                         let ifname = new_nic_ctx.ifname().await;
                         let dns_runner = if let Some(ipv4) = ipv4_addr {
-                            Self::create_magic_dns_runner(peer_mgr, ifname, ipv4)
+                            Self::create_magic_dns_runner(peer_mgr.clone(), ifname, ipv4)
                         } else {
                             None
                         };
@@ -1012,7 +1030,7 @@ impl Instance {
                 // NOTICE: make sure we do not hold the peer manager here,
                 while close_notifier.notified().now_or_never().is_none() {
                     tokio::time::sleep(Duration::from_secs(1)).await;
-                    if peer_mgr.strong_count() == 0 {
+                    if peer_mgr.with(|_, _| ()).is_none() {
                         tracing::warn!("peer manager is dropped, stop static ip check.");
                         return;
                     }
@@ -1097,7 +1115,7 @@ impl Instance {
         self.add_initial_peers().await?;
 
         let monitor = super::proxy_cidrs_monitor::ProxyCidrsMonitor::new(
-            self.peer_manager.clone(),
+            self.peer_manager.share(),
             self.global_ctx.clone(),
         );
         self.proxy_cidrs_monitor = Some(monitor.start());
@@ -1139,8 +1157,8 @@ impl Instance {
         Ok(())
     }
 
-    pub fn get_peer_manager(&self) -> Arc<PeerManager> {
-        self.peer_manager.clone()
+    pub fn get_peer_manager(&self) -> WeakPtr<PeerManager> {
+        self.peer_manager.share()
     }
 
     pub async fn close_peer_conn(
@@ -1172,7 +1190,7 @@ impl Instance {
     ) -> impl VpnPortalRpc<Controller = BaseController> + Clone + use<> {
         #[derive(Clone)]
         struct VpnPortalRpcService {
-            peer_mgr: Weak<PeerManager>,
+            peer_mgr: WeakPtr<PeerManager>,
             vpn_portal: Weak<Mutex<Box<dyn VpnPortal>>>,
         }
 
@@ -1189,17 +1207,22 @@ impl Instance {
                     return Err(anyhow::anyhow!("vpn portal not available").into());
                 };
 
-                let Some(peer_mgr) = self.peer_mgr.upgrade() else {
+                let vpn_portal = vpn_portal.clone();
+                let Some(ret) = self
+                    .peer_mgr
+                    .with_async(async move |pm, _| {
+                        let vpn_portal = vpn_portal.lock().await;
+                        GetVpnPortalInfoResponse {
+                            vpn_portal_info: Some(VpnPortalInfo {
+                                vpn_type: vpn_portal.name(),
+                                client_config: vpn_portal.dump_client_config(pm.share()).await,
+                                connected_clients: vpn_portal.list_clients().await,
+                            }),
+                        }
+                    })
+                    .await
+                else {
                     return Err(anyhow::anyhow!("peer manager not available").into());
-                };
-
-                let vpn_portal = vpn_portal.lock().await;
-                let ret = GetVpnPortalInfoResponse {
-                    vpn_portal_info: Some(VpnPortalInfo {
-                        vpn_type: vpn_portal.name(),
-                        client_config: vpn_portal.dump_client_config(peer_mgr).await,
-                        connected_clients: vpn_portal.list_clients().await,
-                    }),
                 };
 
                 Ok(ret)
@@ -1207,7 +1230,7 @@ impl Instance {
         }
 
         VpnPortalRpcService {
-            peer_mgr: Arc::downgrade(&self.peer_manager),
+            peer_mgr: self.peer_manager.share(),
             vpn_portal: Arc::downgrade(&self.vpn_portal),
         }
     }
@@ -1336,7 +1359,7 @@ impl Instance {
             global_ctx: Arc::downgrade(&self.global_ctx),
             #[cfg(feature = "socks5")]
             socks5_server: Arc::downgrade(&self.socks5_server),
-            peer_manager: Arc::downgrade(&self.peer_manager),
+            peer_manager: self.peer_manager.share(),
             conn_manager: Arc::downgrade(&self.conn_manager),
         }
     }
@@ -1479,7 +1502,7 @@ impl Instance {
         }
 
         ApiRpcServiceImpl {
-            peer_mgr_rpc_service: PeerManagerRpcService::new(self.peer_manager.clone()),
+            peer_mgr_rpc_service: PeerManagerRpcService::new(self.peer_manager.share()),
             connector_mgr_rpc_service: ConnectorManagerRpcService(Arc::downgrade(
                 &self.conn_manager,
             )),
@@ -1532,12 +1555,12 @@ impl Instance {
 
                 tcp_proxy_rpc_services
             },
-            acl_manage_rpc_service: PeerManagerRpcService::new(self.peer_manager.clone()),
+            acl_manage_rpc_service: PeerManagerRpcService::new(self.peer_manager.share()),
             port_forward_manage_rpc_service: self.get_port_forward_manager_rpc_service(),
             stats_rpc_service: self.get_stats_rpc_service(),
             config_rpc_service: self.get_config_service(),
             peer_center_rpc_service: Arc::new(self.peer_center.get_rpc_service()),
-            credential_manage_rpc_service: PeerManagerRpcService::new(self.peer_manager.clone()),
+            credential_manage_rpc_service: PeerManagerRpcService::new(self.peer_manager.share()),
         }
     }
 
@@ -1562,7 +1585,7 @@ impl Instance {
     pub async fn setup_nic_ctx_for_mobile(
         nic_ctx: ArcNicCtx,
         global_ctx: ArcGlobalCtx,
-        peer_manager: Arc<PeerManager>,
+        peer_manager: WeakPtr<PeerManager>,
         peer_packet_receiver: Arc<Mutex<PacketRecvChanReceiver>>,
         fd: i32,
     ) -> Result<(), anyhow::Error> {
@@ -1602,20 +1625,20 @@ impl Instance {
 impl Drop for Instance {
     fn drop(&mut self) {
         let my_peer_id = self.peer_manager.my_peer_id();
-        let pm = Arc::downgrade(&self.peer_manager);
+        let pm = self.peer_manager.share();
         #[cfg(feature = "tun")]
         let nic_ctx = self.nic_ctx.clone();
         tokio::spawn(async move {
             #[cfg(feature = "tun")]
             nic_ctx.lock().await.take();
-            if let Some(pm) = pm.upgrade() {
-                pm.clear_resources().await;
-            };
+            let _ = pm
+                .with_async(async move |pm: &SharedPtr<PeerManager>, _| pm.clear_resources().await)
+                .await;
 
             let now = std::time::Instant::now();
             while now.elapsed().as_secs() < 10 {
                 tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-                if pm.strong_count() == 0 {
+                if pm.with(|_, _| ()).is_none() {
                     tracing::info!(
                         "Instance for peer {} dropped, all resources cleared.",
                         my_peer_id

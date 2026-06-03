@@ -5,6 +5,8 @@ use std::{
 };
 
 use anyhow::{Context, anyhow, bail};
+
+use crate::utils::ptr::WeakPtr;
 use bytes::Bytes;
 use dashmap::DashMap;
 use guarden::defer;
@@ -81,7 +83,7 @@ impl PeerPacketFilter for KcpEndpointFilter {
 
 #[tracing::instrument]
 async fn handle_kcp_output(
-    peer_mgr: Arc<PeerManager>,
+    peer_mgr: WeakPtr<PeerManager>,
     mut output_receiver: KcpPacketReceiver,
     is_src: bool,
 ) {
@@ -97,9 +99,16 @@ async fn handle_kcp_output(
             PacketType::KcpDst as u8
         };
         let mut packet = ZCPacket::new_with_payload(&packet.inner().freeze());
-        packet.fill_peer_manager_hdr(peer_mgr.my_peer_id(), dst_peer_id, packet_type);
+        let my_peer_id = peer_mgr.with(|pm, _| pm.my_peer_id()).unwrap_or_default();
+        packet.fill_peer_manager_hdr(my_peer_id, dst_peer_id, packet_type);
 
-        if let Err(e) = peer_mgr.send_msg_for_proxy(packet, dst_peer_id).await {
+        let Some(send_result) = peer_mgr.with_async(async move |pm, _| {
+            pm.send_msg_for_proxy(packet, dst_peer_id).await
+        }).await else {
+            tracing::warn!("peer manager is gone, kcp output exiting");
+            return;
+        };
+        if let Err(e) = send_result {
             tracing::error!("failed to send kcp packet to peer: {:?}", e);
         }
     }
@@ -108,7 +117,7 @@ async fn handle_kcp_output(
 #[derive(Debug, Clone)]
 pub struct NatDstKcpConnector {
     pub(crate) kcp_endpoint: Arc<KcpEndpoint>,
-    pub(crate) peer_mgr: Weak<PeerManager>,
+    pub(crate) peer_mgr: WeakPtr<PeerManager>,
 }
 
 #[async_trait::async_trait]
@@ -120,21 +129,20 @@ impl NatDstConnector for NatDstKcpConnector {
         src: SocketAddr,
         nat_dst: SocketAddr,
     ) -> anyhow::Result<Self::DstStream> {
-        let peer_mgr = self
-            .peer_mgr
-            .upgrade()
-            .ok_or_else(|| anyhow!("peer manager is not available"))?;
+        let peer_mgr = self.peer_mgr.clone();
 
-        let dst_peer = {
-            let SocketAddr::V4(addr) = nat_dst else {
-                bail!("ipv6 is not supported");
+        let (my_peer_id, dst_peer) = peer_mgr.with_async(async move |pm,_| {
+            let dst_peer = {
+                let SocketAddr::V4(addr) = nat_dst else {
+                    bail!("ipv6 is not supported");
+                };
+                pm.get_peer_map()
+                    .get_peer_id_by_ipv4(addr.ip())
+                    .await
+                    .ok_or_else(|| anyhow!("no peer found for nat dst: {}", nat_dst))?
             };
-            peer_mgr
-                .get_peer_map()
-                .get_peer_id_by_ipv4(addr.ip())
-                .await
-                .ok_or_else(|| anyhow!("no peer found for nat dst: {}", nat_dst))?
-        };
+            Ok::<_, anyhow::Error>((pm.my_peer_id(), dst_peer))
+        }).await.ok_or_else(|| anyhow!("peer manager is not available"))??;
 
         tracing::trace!(?nat_dst, ?dst_peer, "kcp nat");
 
@@ -146,7 +154,6 @@ impl NatDstConnector for NatDstKcpConnector {
         let stream = (0..5)
             .map(|_| {
                 let kcp_endpoint = self.kcp_endpoint.clone();
-                let my_peer_id = peer_mgr.my_peer_id();
 
                 async move {
                     let conn_id = kcp_endpoint
@@ -204,25 +211,26 @@ impl TcpProxyForWrappedSrcTrait for TcpProxyForKcpSrc {
     }
 
     async fn check_dst_allow_wrapped_input(&self, dst_ip: &Ipv4Addr) -> bool {
-        let Some(peer_manager) = self.0.get_peer_manager() else {
-            return false;
-        };
+        let peer_manager = self.0.get_peer_manager();
         peer_manager
-            .check_allow_kcp_to_dst(&IpAddr::V4(*dst_ip))
+            .with_async(async move |pm, _| {
+                pm.check_allow_kcp_to_dst(&IpAddr::V4(*dst_ip)).await
+            })
             .await
+            .unwrap_or(false)
     }
 }
 
 pub struct KcpProxySrc {
     kcp_endpoint: Arc<KcpEndpoint>,
-    peer_manager: Arc<PeerManager>,
+    peer_manager: WeakPtr<PeerManager>,
 
     tcp_proxy: TcpProxyForKcpSrc,
     tasks: JoinSet<()>,
 }
 
 impl KcpProxySrc {
-    pub async fn new(peer_manager: Arc<PeerManager>) -> Self {
+    pub async fn new(peer_manager: WeakPtr<PeerManager>) -> Self {
         let mut kcp_endpoint = create_kcp_endpoint();
         kcp_endpoint.run().await;
 
@@ -241,7 +249,7 @@ impl KcpProxySrc {
             peer_manager.clone(),
             NatDstKcpConnector {
                 kcp_endpoint: kcp_endpoint.clone(),
-                peer_mgr: Arc::downgrade(&peer_manager),
+                peer_mgr: peer_manager.clone(),
             },
         );
 
@@ -254,18 +262,20 @@ impl KcpProxySrc {
     }
 
     pub async fn start(&self) {
-        self.peer_manager
-            .add_nic_packet_process_pipeline(Box::new(self.tcp_proxy.clone()))
-            .await;
-        self.peer_manager
-            .add_packet_process_pipeline(Box::new(self.tcp_proxy.0.clone()))
-            .await;
-        self.peer_manager
-            .add_packet_process_pipeline(Box::new(KcpEndpointFilter {
-                kcp_endpoint: self.kcp_endpoint.clone(),
+        let tcp_proxy = self.tcp_proxy.clone();
+        let tcp_proxy_inner = self.tcp_proxy.0.clone();
+        let kcp_endpoint = self.kcp_endpoint.clone();
+        self.peer_manager.with_async(async move |pm, _| {
+            pm.add_nic_packet_process_pipeline(Box::new(tcp_proxy))
+                .await;
+            pm.add_packet_process_pipeline(Box::new(tcp_proxy_inner.clone()))
+                .await;
+            pm.add_packet_process_pipeline(Box::new(KcpEndpointFilter {
+                kcp_endpoint,
                 is_src: true,
             }))
             .await;
+        }).await.unwrap();
         self.tcp_proxy.0.start(false).await.unwrap();
     }
 
@@ -280,14 +290,14 @@ impl KcpProxySrc {
 
 pub struct KcpProxyDst {
     kcp_endpoint: Arc<KcpEndpoint>,
-    peer_manager: Arc<PeerManager>,
+    peer_manager: WeakPtr<PeerManager>,
     proxy_entries: Arc<DashMap<ConnId, TcpProxyEntry>>,
     cidr_set: Arc<CidrSet>,
     tasks: JoinSet<()>,
 }
 
 impl KcpProxyDst {
-    pub async fn new(peer_manager: Arc<PeerManager>) -> Self {
+    pub async fn new(peer_manager: WeakPtr<PeerManager>) -> Self {
         let mut kcp_endpoint = create_kcp_endpoint();
         kcp_endpoint.run().await;
 
@@ -298,7 +308,7 @@ impl KcpProxyDst {
             output_receiver,
             false,
         ));
-        let cidr_set = CidrSet::new(peer_manager.get_global_ctx());
+        let cidr_set = peer_manager.with(|pm, _| CidrSet::new(pm.get_global_ctx())).unwrap();
         Self {
             kcp_endpoint: Arc::new(kcp_endpoint),
             peer_manager,
@@ -414,10 +424,10 @@ impl KcpProxyDst {
 
     async fn run_accept_task(&mut self) {
         let kcp_endpoint = self.kcp_endpoint.clone();
-        let global_ctx = self.peer_manager.get_global_ctx();
+        let global_ctx = self.peer_manager.with(|pm, _| pm.get_global_ctx()).unwrap();
         let proxy_entries = self.proxy_entries.clone();
         let cidr_set = self.cidr_set.clone();
-        let route = Arc::new(self.peer_manager.get_route());
+        let route = Arc::new(self.peer_manager.with(|pm, _| pm.get_route()).unwrap());
         self.tasks.spawn(async move {
             while let Ok(conn) = kcp_endpoint.accept().await {
                 let stream = KcpStream::new(&kcp_endpoint, conn)
@@ -444,12 +454,14 @@ impl KcpProxyDst {
 
     pub async fn start(&mut self) {
         self.run_accept_task().await;
-        self.peer_manager
-            .add_packet_process_pipeline(Box::new(KcpEndpointFilter {
-                kcp_endpoint: self.kcp_endpoint.clone(),
+        let kcp_endpoint = self.kcp_endpoint.clone();
+        self.peer_manager.with_async(async move |pm, _| {
+            pm.add_packet_process_pipeline(Box::new(KcpEndpointFilter {
+                kcp_endpoint,
                 is_src: false,
             }))
             .await;
+        }).await.unwrap();
     }
 }
 
