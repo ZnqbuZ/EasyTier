@@ -56,7 +56,7 @@ use crate::{
         packet_def::{CompressorAlgo, PacketType, ZCPacket},
     },
 };
-
+use crate::utils::ptr::WeakPtr;
 use super::{
     BoxNicPacketFilter, BoxPeerPacketFilter, PacketRecvChan, PacketRecvChanReceiver,
     create_packet_recv_chan,
@@ -2132,6 +2132,8 @@ impl PeerManager {
         *self.exit_nodes.write().await = exit_nodes;
     }
 }
+
+pub type PtrPeerManager = WeakPtr<PeerManager>;
 
 #[cfg(test)]
 mod tests {
