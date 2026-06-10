@@ -11,7 +11,7 @@ use super::{
     common::{FramedReader, FramedWriter, TunnelWrapper, wait_for_connect_futures},
 };
 
-const TCP_MTU_BYTES: usize = 2000;
+const TCP_MAX_PACKET_SIZE: usize = 1 << 16;
 
 #[derive(Debug)]
 pub struct TcpTunnelListener {
@@ -54,7 +54,7 @@ impl TcpTunnelListener {
 
         let (r, w) = stream.into_split();
         Ok(Box::new(TunnelWrapper::new(
-            FramedReader::new(r, TCP_MTU_BYTES),
+            FramedReader::new(r, TCP_MAX_PACKET_SIZE),
             FramedWriter::new(w),
             Some(info),
         )))
@@ -127,7 +127,7 @@ fn get_tunnel_with_tcp_stream(
 
     let (r, w) = stream.into_split();
     Ok(Box::new(TunnelWrapper::new(
-        FramedReader::new(r, TCP_MTU_BYTES),
+        FramedReader::new(r, TCP_MAX_PACKET_SIZE),
         FramedWriter::new(w),
         Some(info),
     )))

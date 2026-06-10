@@ -22,6 +22,8 @@ use std::sync::OnceLock;
 use std::{net::SocketAddr, sync::Arc, time::Duration};
 use tokio::net::UdpSocket;
 
+const QUIC_MAX_PACKET_SIZE: usize = 1 << 16;
+
 // region config
 pub fn transport_config() -> Arc<TransportConfig> {
     let mut config = TransportConfig::default();
@@ -519,7 +521,11 @@ impl QuicTunnelListener {
         };
 
         Ok(Box::new(TunnelWrapper::new(
-            FramedReader::new_with_associate_data(r, 2000, Some(Box::new(arc_conn.clone()))),
+            FramedReader::new_with_associate_data(
+                r,
+                QUIC_MAX_PACKET_SIZE,
+                Some(Box::new(arc_conn.clone())),
+            ),
             FramedWriter::new_with_associate_data(w, Some(Box::new(arc_conn))),
             Some(info),
         )))
@@ -616,7 +622,7 @@ impl TunnelConnector for QuicTunnelConnector {
 
         let arc_conn = Arc::new(ConnWrapper { conn: connection });
         Ok(Box::new(TunnelWrapper::new(
-            FramedReader::new_with_associate_data(r, 4500, Some(Box::new(arc_conn.clone()))),
+            FramedReader::new_with_associate_data(r, 65536, Some(Box::new(arc_conn.clone()))),
             FramedWriter::new_with_associate_data(w, Some(Box::new(arc_conn))),
             Some(info),
         )))
