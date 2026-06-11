@@ -21,6 +21,7 @@ use crate::{
         common::{FramedWriter, PacketConverter, TunnelWrapper, reserve_buf},
         packet_def::{TAIL_RESERVED_SIZE, ZCPacket, ZCPacketType},
     },
+    utils::buf::BufMargins,
 };
 
 use byteorder::WriteBytesExt as _;
@@ -44,27 +45,36 @@ use zerocopy::{NativeEndian, NetworkEndian};
 use crate::common::ifcfg::RegistryManager;
 use crate::tunnel::common::PacketBatch;
 
+const PI_LEN: usize = 4;
+const VNET_HDR_LEN: usize = 10;
+
+const TUN_READ_BUF_SIZE: usize = 2500;
+
 pin_project! {
     pub struct TunStream {
         #[pin]
         l: BiLock<AsyncDevice>,
-        cur_buf: BytesMut,
-        has_packet_info: bool,
-        payload_offset: usize,
+        buf: BytesMut,
+        margins: BufMargins,
     }
 }
 
 impl TunStream {
-    pub fn new(l: BiLock<AsyncDevice>, has_packet_info: bool) -> Self {
-        let mut payload_offset = ZCPacketType::NIC.get_packet_offsets().payload_offset;
-        if has_packet_info {
-            payload_offset -= 4;
+    pub fn new(l: BiLock<AsyncDevice>, has_pi: bool, has_vnet_hdr: bool) -> Self {
+        let mut header = ZCPacketType::NIC.get_packet_offsets().payload_offset;
+        if has_pi {
+            header -= PI_LEN;
+        }
+        if has_vnet_hdr {
+            header -= VNET_HDR_LEN;
         }
         Self {
             l,
-            cur_buf: BytesMut::new(),
-            has_packet_info,
-            payload_offset,
+            buf: BytesMut::with_capacity(1 << 20),
+            margins: BufMargins {
+                header,
+                trailer: TAIL_RESERVED_SIZE,
+            },
         }
     }
 }
@@ -73,36 +83,37 @@ impl Stream for TunStream {
     type Item = StreamItem;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<StreamItem>> {
-        let self_mut = self.project();
-        let mut g = ready!(self_mut.l.poll_lock(cx));
-        reserve_buf(self_mut.cur_buf, 2500, 4 * 1024);
-        if self_mut.cur_buf.is_empty() {
-            unsafe {
-                self_mut.cur_buf.set_len(*self_mut.payload_offset);
-            }
-        }
-        let buf = self_mut.cur_buf.chunk_mut().as_mut_ptr();
-        let buf = unsafe { std::slice::from_raw_parts_mut(buf, 2500) };
-        let mut buf = ReadBuf::new(buf);
+        let this = self.project();
 
-        let ret = ready!(g.as_pin_mut().poll_read(cx, &mut buf));
-        let len = buf.filled().len();
-        if len == 0 {
+        reserve_buf(this.buf, TUN_READ_BUF_SIZE + this.margins.size(), 1 << 20);
+
+        let mut buf = ReadBuf::uninit(unsafe {
+            this.buf
+                .spare_capacity_mut()
+                .get_unchecked_mut(this.margins.header..this.margins.header + TUN_READ_BUF_SIZE)
+        });
+
+        let written = {
+            let mut g = ready!(this.l.poll_lock(cx));
+            if let Err(error) = ready!(g.as_pin_mut().poll_read(cx, &mut buf)) {
+                log::error!(?error, "tun stream error");
+                return Poll::Ready(None);
+            }
+
+            buf.filled().len()
+        };
+
+        if written == 0 {
             return Poll::Ready(None);
         }
-        unsafe { self_mut.cur_buf.advance_mut(len + TAIL_RESERVED_SIZE) };
 
-        let mut ret_buf = self_mut.cur_buf.split();
-        let cur_len = ret_buf.len();
-        ret_buf.truncate(cur_len - TAIL_RESERVED_SIZE);
-
-        match ret {
-            Ok(_) => Poll::Ready(Some(Ok(ZCPacket::new_from_buf(ret_buf, ZCPacketType::NIC)))),
-            Err(err) => {
-                log::error!("tun stream error: {:?}", err);
-                Poll::Ready(None)
-            }
+        unsafe {
+            this.buf.advance_mut(written + this.margins.size());
         }
+        let mut packet = this.buf.split();
+        packet.truncate(this.margins.header + written);
+
+        Poll::Ready(Some(Ok(ZCPacket::new_from_buf(packet, ZCPacketType::NIC))))
     }
 }
 
