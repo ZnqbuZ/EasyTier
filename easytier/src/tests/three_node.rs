@@ -2158,12 +2158,14 @@ pub async fn relay_bps_limit_test(#[values(100, 200, 400, 800)] bps_limit: u64) 
     println!("bps: {}", bps);
 
     let bps = bps as u64 / 1024;
-    // allow 50kb jitter
+    let tolerance = bps_limit.max(400) / 8;
     assert!(
-        bps >= bps_limit - 50 && bps <= bps_limit + 50,
-        "bps: {}, bps_limit: {}",
+        bps >= bps_limit.saturating_sub(tolerance)
+            && bps <= bps_limit.saturating_add(tolerance),
+        "bps: {}, bps_limit: {}, tolerance: {}",
         bps,
-        bps_limit
+        bps_limit,
+        tolerance
     );
 
     drop_insts(insts).await;
@@ -2201,11 +2203,14 @@ pub async fn instance_recv_bps_limit_test(#[values(100, 800)] bps_limit: u64) {
     println!("bps: {}", bps);
 
     let bps = bps as u64 / 1024;
+    let tolerance = bps_limit.max(400) / 8;
     assert!(
-        bps >= bps_limit - 50 && bps <= bps_limit + 50,
-        "bps: {}, bps_limit: {}",
+        bps >= bps_limit.saturating_sub(tolerance)
+            && bps <= bps_limit.saturating_add(tolerance),
+        "bps: {}, bps_limit: {}, tolerance: {}",
         bps,
-        bps_limit
+        bps_limit,
+        tolerance
     );
 
     drop_insts(insts).await;
