@@ -20,6 +20,7 @@ use crate::common::netns::NetNS;
 use crate::tunnel::packet_def::{PEER_MANAGER_HEADER_SIZE, ZCPacket};
 use crate::utils::buf::BufList;
 use bytes::{Buf, BufMut, Bytes, BytesMut};
+use smallvec::SmallVec;
 use tokio::net::{TcpListener, TcpSocket, UdpSocket};
 use tokio_stream::StreamExt;
 use tokio_util::io::poll_write_buf;
@@ -190,12 +191,13 @@ where
 }
 
 pub trait ZCPacketToBytes {
-    fn zcpacket_into_bytes(&self, zc_packet: ZCPacket) -> Result<Bytes, TunnelError>;
+    fn zcpacket_into_bytes(&self, zc_packet: ZCPacket)
+    -> Result<SmallVec<[Bytes; 1]>, TunnelError>;
 }
 
 pub struct TcpZCPacketToBytes;
 impl ZCPacketToBytes for TcpZCPacketToBytes {
-    fn zcpacket_into_bytes(&self, item: ZCPacket) -> Result<Bytes, TunnelError> {
+    fn zcpacket_into_bytes(&self, item: ZCPacket) -> Result<SmallVec<[Bytes; 1]>, TunnelError> {
         let mut item = item.convert_type(ZCPacketType::TCP);
 
         let tcp_len = PEER_MANAGER_HEADER_SIZE + item.payload_len();
@@ -204,7 +206,7 @@ impl ZCPacketToBytes for TcpZCPacketToBytes {
         };
         header.len.set(tcp_len.try_into().unwrap());
 
-        Ok(item.into_bytes())
+        Ok([item.into_bytes()].into())
     }
 }
 
@@ -283,10 +285,10 @@ where
     }
 
     fn start_send(self: Pin<&mut Self>, item: ZCPacket) -> Result<(), Self::Error> {
-        let pinned = self.project();
-        pinned
-            .sending_bufs
-            .push(pinned.converter.zcpacket_into_bytes(item)?);
+        let this = self.project();
+
+        this.sending_bufs
+            .extend(this.converter.zcpacket_into_bytes(item)?);
 
         Ok(())
     }

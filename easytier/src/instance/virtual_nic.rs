@@ -30,6 +30,7 @@ use futures::{SinkExt, Stream, StreamExt, lock::BiLock, ready};
 use pin_project_lite::pin_project;
 use pnet::packet::ethernet::{EtherType, EtherTypes};
 use pnet::packet::{ipv4::Ipv4Packet, ipv6::Ipv6Packet};
+use smallvec::SmallVec;
 use tokio::{
     io::{AsyncRead, AsyncWrite, ReadBuf},
     sync::{Mutex, Notify},
@@ -154,7 +155,10 @@ impl TunZCPacketToBytes {
 }
 
 impl ZCPacketToBytes for TunZCPacketToBytes {
-    fn zcpacket_into_bytes(&self, zc_packet: ZCPacket) -> Result<Bytes, TunnelError> {
+    fn zcpacket_into_bytes(
+        &self,
+        zc_packet: ZCPacket,
+    ) -> Result<SmallVec<[Bytes; 1]>, TunnelError> {
         let payload_offset = zc_packet.payload_offset();
         let mut inner = zc_packet.inner();
         assert!(payload_offset >= 4);
@@ -171,7 +175,7 @@ impl ZCPacketToBytes for TunZCPacketToBytes {
         }
 
         tracing::debug!(?ret, ?payload_offset, "convert zc packet to tun packet");
-        Ok(ret.freeze())
+        Ok([ret.freeze()].into())
     }
 }
 
