@@ -746,7 +746,7 @@ impl VirtualNic {
         Ok(())
     }
 
-    async fn create_tun(&self) -> Result<tun::platform::Device, Error> {
+    async fn create_tun(&self) -> Result<tun::Device, Error> {
         let mut config = Configuration::default();
         config.layer(Layer::L3);
 
