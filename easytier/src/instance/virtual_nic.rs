@@ -1,3 +1,4 @@
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::{
     collections::BTreeSet,
     io,
@@ -7,30 +8,16 @@ use std::{
     task::{Context, Poll},
 };
 
-use crate::{
-    common::{
-        error::Error,
-        global_ctx::{ArcGlobalCtx, GlobalCtxEvent},
-        ifcfg::{IfConfiger, IfConfiguerTrait},
-        log,
-    },
-    instance::proxy_cidrs_monitor::ProxyCidrsMonitor,
-    peers::{PacketRecvChanReceiver, peer_manager::PeerManager, recv_packet_from_chan},
-    tunnel::{
-        StreamItem, Tunnel, TunnelError, ZCPacketSink, ZCPacketStream,
-        common::{FramedWriter, PacketConverter, TunnelWrapper, reserve_buf},
-        packet_def::{TAIL_RESERVED_SIZE, ZCPacket, ZCPacketType},
-    },
-    utils::buf::BufMargins,
-};
-
 use byteorder::WriteBytesExt as _;
-use bytes::{BufMut, BytesMut};
+use bytes::{Bytes, BytesMut};
 use cidr::{Ipv4Inet, Ipv6Inet};
 use futures::{SinkExt, Stream, StreamExt, lock::BiLock, ready};
 use pin_project_lite::pin_project;
 use pnet::packet::ethernet::{EtherType, EtherTypes};
-use pnet::packet::{ipv4::Ipv4Packet, ipv6::Ipv6Packet};
+use pnet::packet::ip::IpNextHeaderProtocols;
+use pnet::packet::ipv4::{Ipv4Flags, MutableIpv4Packet};
+use pnet::packet::tcp::{MutableTcpPacket, TcpFlags, TcpPacket};
+use pnet::packet::{ipv4, ipv4::Ipv4Packet, ipv6::Ipv6Packet};
 use tokio::{
     io::{AsyncRead, AsyncWrite, ReadBuf},
     sync::{Mutex, Notify},
@@ -43,24 +30,46 @@ use zerocopy::{NativeEndian, NetworkEndian};
 
 #[cfg(target_os = "windows")]
 use crate::common::ifcfg::RegistryManager;
-use crate::tunnel::common::PacketBatch;
+use crate::tunnel::common::{PacketBatch, PacketConverter};
+use crate::utils::buf::{BufMargins, BufPool};
+use crate::{
+    common::{
+        error::Error,
+        global_ctx::{ArcGlobalCtx, GlobalCtxEvent},
+        ifcfg::{IfConfiger, IfConfiguerTrait},
+        log,
+    },
+    instance::proxy_cidrs_monitor::ProxyCidrsMonitor,
+    peers::{PacketRecvChanReceiver, peer_manager::PeerManager, recv_packet_from_chan},
+    tunnel::{
+        StreamItem, Tunnel, TunnelError, ZCPacketSink, ZCPacketStream,
+        common::{FramedWriter, TunnelWrapper},
+        packet_def::{TAIL_RESERVED_SIZE, ZCPacket, ZCPacketType},
+    },
+};
 
 const PI_LEN: usize = 4;
 const VNET_HDR_LEN: usize = 10;
-
-const TUN_READ_BUF_SIZE: usize = 2500;
 
 pin_project! {
     pub struct TunStream {
         #[pin]
         l: BiLock<AsyncDevice>,
-        buf: BytesMut,
+        max_packet_size: usize,
+        buf: BufPool,
         margins: BufMargins,
+        has_pi: bool,
+        has_vnet_hdr: bool,
     }
 }
 
 impl TunStream {
-    pub fn new(l: BiLock<AsyncDevice>, has_pi: bool, has_vnet_hdr: bool) -> Self {
+    pub fn new(
+        l: BiLock<AsyncDevice>,
+        max_packet_size: usize,
+        has_pi: bool,
+        has_vnet_hdr: bool,
+    ) -> Self {
         let mut header = ZCPacketType::NIC.get_packet_offsets().payload_offset;
         if has_pi {
             header -= PI_LEN;
@@ -70,11 +79,39 @@ impl TunStream {
         }
         Self {
             l,
-            buf: BytesMut::with_capacity(1 << 20),
+            max_packet_size,
+            buf: BufPool::new(max_packet_size << 4),
             margins: BufMargins {
                 header,
                 trailer: TAIL_RESERVED_SIZE,
             },
+            has_pi,
+            has_vnet_hdr,
+        }
+    }
+}
+
+impl TunStream {
+    fn checksum(packet: &mut [u8], has_pi: bool) {
+        const VIRTIO_NET_HDR_F_NEEDS_CSUM: u8 = 1;
+
+        let len = packet.len();
+        if len < VNET_HDR_LEN {
+            return;
+        }
+
+        let flags = packet[0];
+
+        if (flags & VIRTIO_NET_HDR_F_NEEDS_CSUM) != 0 {
+            let ip_offset = VNET_HDR_LEN + if has_pi { PI_LEN } else { 0 };
+            let csum_start = u16::from_ne_bytes([packet[6], packet[7]]) as usize;
+            let csum_offset = u16::from_ne_bytes([packet[8], packet[9]]) as usize;
+
+            if ip_offset + csum_start + csum_offset + 2 <= len {
+                let data = &mut packet[ip_offset + csum_start..];
+                let csum = internet_checksum::checksum(data);
+                data[csum_offset..csum_offset + 2].copy_from_slice(&csum);
+            }
         }
     }
 }
@@ -85,14 +122,10 @@ impl Stream for TunStream {
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<StreamItem>> {
         let this = self.project();
 
-        reserve_buf(this.buf, TUN_READ_BUF_SIZE + this.margins.size(), 1 << 20);
-
-        let mut buf = ReadBuf::uninit(unsafe {
-            this.buf
-                .spare_capacity_mut()
-                .get_unchecked_mut(this.margins.header..this.margins.header + TUN_READ_BUF_SIZE)
-        });
-
+        let mut writer = this
+            .buf
+            .writer(*this.max_packet_size + this.margins.size(), *this.margins);
+        let mut buf = ReadBuf::uninit(writer.as_slice());
         let written = {
             let mut g = ready!(this.l.poll_lock(cx));
             if let Err(error) = ready!(g.as_pin_mut().poll_read(cx, &mut buf)) {
@@ -107,11 +140,14 @@ impl Stream for TunStream {
             return Poll::Ready(None);
         }
 
-        unsafe {
-            this.buf.advance_mut(written + this.margins.size());
+        writer.commit(written);
+
+        let mut packet = writer.split();
+        packet.truncate(packet.len() - this.margins.trailer);
+
+        if *this.has_vnet_hdr {
+            Self::checksum(&mut packet[this.margins.header..], *this.has_pi);
         }
-        let mut packet = this.buf.split();
-        packet.truncate(this.margins.header + written);
 
         Poll::Ready(Some(Ok(ZCPacket::new_from_buf(packet, ZCPacketType::NIC))))
     }
@@ -154,13 +190,182 @@ impl ProtoExt for EtherType {
     }
 }
 
+#[derive(Debug)]
 struct TunPacketConverter {
     has_pi: bool,
+    has_vnet_hdr: bool,
+    mtu: u16,
+    gso: bool,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct Ipv4TcpPacketInfo {
+    ip_hdr_len: usize,
+    tcp_hdr_len: usize,
+    total_len: usize,
+    source: Ipv4Addr,
+    destination: Ipv4Addr,
 }
 
 impl TunPacketConverter {
-    pub fn new(has_pi: bool) -> Self {
-        Self { has_pi }
+    pub fn new(has_pi: bool, has_vnet_hdr: bool, mtu: u16, gso: bool) -> Self {
+        Self {
+            has_pi,
+            has_vnet_hdr,
+            mtu,
+            gso,
+        }
+    }
+
+    fn ipv4_tcp_packet_info(buf: &[u8], hdr_len: usize) -> Option<Ipv4TcpPacketInfo> {
+        let ip = buf.get(hdr_len..)?;
+        let ipv4 = Ipv4Packet::new(ip)?;
+        if ipv4.get_version() != 4 || ipv4.get_next_level_protocol() != IpNextHeaderProtocols::Tcp {
+            return None;
+        }
+
+        let ip_hdr_len = (ipv4.get_header_length() as usize) * 4;
+        let total_len = ipv4.get_total_length() as usize;
+        if ip_hdr_len < Ipv4Packet::minimum_packet_size()
+            || total_len < ip_hdr_len + TcpPacket::minimum_packet_size()
+            || total_len > ip.len()
+        {
+            return None;
+        }
+
+        let tcp_off = hdr_len.checked_add(ip_hdr_len)?;
+        let packet_end = hdr_len.checked_add(total_len)?;
+        let tcp_len = total_len - ip_hdr_len;
+        let tcp = TcpPacket::new(buf.get(tcp_off..packet_end)?)?;
+        let tcp_hdr_len = (tcp.get_data_offset() as usize) * 4;
+        if tcp_hdr_len < TcpPacket::minimum_packet_size() || tcp_hdr_len > tcp_len {
+            return None;
+        }
+
+        Some(Ipv4TcpPacketInfo {
+            ip_hdr_len,
+            tcp_hdr_len,
+            total_len,
+            source: ipv4.get_source(),
+            destination: ipv4.get_destination(),
+        })
+    }
+
+    /// TCP segmentation (emulates TSO): splits a large TCP packet into
+    /// MTU-sized contiguous segments.
+    fn tcp_segment_ipv4(buf: Bytes, hdr_len: usize, mtu: u16) -> PacketBatch {
+        let info = match Self::ipv4_tcp_packet_info(&buf, hdr_len) {
+            Some(info) => info,
+            None => return buf.into(),
+        };
+        if info.total_len <= info.ip_hdr_len + info.tcp_hdr_len {
+            return buf.into();
+        }
+
+        let tcp_off = hdr_len + info.ip_hdr_len;
+        let tcp = match TcpPacket::new(&buf[tcp_off..hdr_len + info.total_len]) {
+            Some(t) => t,
+            None => return buf.into(),
+        };
+
+        let payload_off = tcp_off + info.tcp_hdr_len;
+        let total_payload = info.total_len - info.ip_hdr_len - info.tcp_hdr_len;
+
+        let seg_payload_size = (mtu as usize).saturating_sub(info.ip_hdr_len + info.tcp_hdr_len);
+        if seg_payload_size == 0 {
+            return buf.into();
+        }
+
+        let base_seq = tcp.get_sequence();
+        let tcp_flags = tcp.get_flags();
+        let orig_psh = tcp_flags & TcpFlags::PSH;
+        let orig_fin = tcp_flags & TcpFlags::FIN;
+        let non_data_flags = tcp_flags & !(TcpFlags::PSH | TcpFlags::FIN);
+        let total_segs = total_payload.div_ceil(seg_payload_size);
+        let ip_id = Ipv4Packet::new(&buf[hdr_len..])
+            .map(|ipv4| ipv4.get_identification())
+            .unwrap_or(0);
+
+        let header_len = payload_off;
+        let total_out_capacity = total_segs * header_len + total_payload;
+
+        // 仅分配容量，避免 memset 清零开销
+        let mut big = BytesMut::with_capacity(total_out_capacity);
+        let mut out = Vec::with_capacity(total_segs);
+
+        let mut offset = 0;
+        let mut seg_idx = 0u16;
+
+        let header_template = &buf[..header_len];
+
+        // 循环外预组装 TCP 伪首部常量部分
+        let mut pseudo_hdr = [0u8; 12];
+        pseudo_hdr[0..4].copy_from_slice(&info.source.octets());
+        pseudo_hdr[4..8].copy_from_slice(&info.destination.octets());
+        pseudo_hdr[8] = 0;
+        pseudo_hdr[9] = 6; // IPPROTO_TCP
+
+        while offset < total_payload {
+            let is_last = offset + seg_payload_size >= total_payload;
+            let this_seg = if is_last {
+                total_payload - offset
+            } else {
+                seg_payload_size
+            };
+
+            let pkt_len = header_len + this_seg;
+
+            // 自动推进底层指针写入数据
+            big.extend_from_slice(header_template);
+            big.extend_from_slice(&buf[payload_off + offset..payload_off + offset + this_seg]);
+
+            let new_ip_len = (info.ip_hdr_len + info.tcp_hdr_len + this_seg) as u16;
+            big[hdr_len + 2..hdr_len + 4].copy_from_slice(&new_ip_len.to_be_bytes());
+
+            // 修正 IPv4 头部参数与校验和
+            if let Some(mut ip_pkt) = MutableIpv4Packet::new(&mut big[hdr_len..pkt_len]) {
+                ip_pkt.set_total_length(new_ip_len);
+                ip_pkt.set_flags(Ipv4Flags::DontFragment);
+                ip_pkt.set_fragment_offset(0);
+                ip_pkt.set_identification(ip_id.wrapping_add(seg_idx));
+                ip_pkt.set_checksum(0);
+                let checksum = ipv4::checksum(&ip_pkt.to_immutable());
+                ip_pkt.set_checksum(checksum);
+            }
+
+            // 修正 TCP 序列号与标志位
+            let tcp_slice = &mut big[tcp_off..pkt_len];
+            if let Some(mut tcp_pkt) = MutableTcpPacket::new(tcp_slice) {
+                tcp_pkt.set_sequence(base_seq.wrapping_add(offset as u32));
+                let mut flags = non_data_flags;
+                if is_last {
+                    flags |= orig_psh | orig_fin;
+                }
+                tcp_pkt.set_flags(flags);
+                tcp_pkt.set_checksum(0); // 必须在计算校验和之前清零
+            }
+
+            // 更新伪首部长度字段
+            let tcp_len = (info.tcp_hdr_len + this_seg) as u16;
+            pseudo_hdr[10..12].copy_from_slice(&tcp_len.to_be_bytes());
+
+            // 联合计算伪首部与 TCP 段校验和
+            let mut csum_calc = internet_checksum::Checksum::new();
+            csum_calc.add_bytes(&pseudo_hdr);
+            csum_calc.add_bytes(&big[tcp_off..pkt_len]);
+            let final_csum = csum_calc.checksum();
+
+            // TCP Checksum 的固定偏移量为 16
+            big[tcp_off + 16..tcp_off + 18].copy_from_slice(&final_csum);
+
+            // 截断已写入片段进入出队缓存，底层 capacity 供下一次循环复用
+            out.push(big.split().freeze().into());
+
+            offset += this_seg;
+            seg_idx += 1;
+        }
+
+        out.into()
     }
 }
 
@@ -170,15 +375,70 @@ impl PacketConverter for TunPacketConverter {
         let mut inner = packet.inner();
         assert!(payload_offset >= 4);
 
-        let hdr_len = if self.has_pi { 4 } else { 0 };
+        let pi_len = if self.has_pi { 4 } else { 0 };
+        let vnet_hdr_len = if self.has_vnet_hdr { VNET_HDR_LEN } else { 0 };
+        let hdr_len = pi_len + vnet_hdr_len;
 
         let mut ret = inner.split_off(payload_offset - hdr_len);
         let proto = EtherType::infer(&ret[hdr_len..]);
 
         if self.has_pi {
-            let mut pi = &mut ret[..hdr_len];
+            let mut pi = &mut ret[hdr_len - pi_len..hdr_len];
             pi.write_u16::<NativeEndian>(0)?;
             pi.write_u16::<NetworkEndian>(proto.into_pi()?)?;
+        }
+
+        if self.has_vnet_hdr {
+            let ip = &ret[hdr_len..];
+            let mut vnet_hdr = [0u8; VNET_HDR_LEN];
+
+            if let Some((ip_hdr_len, gso_type)) = match proto {
+                EtherTypes::Ipv4
+                    if let Some(ipv4) = Ipv4Packet::new(ip)
+                        && ipv4.get_next_level_protocol() == IpNextHeaderProtocols::Tcp =>
+                {
+                    Some(((ipv4.get_header_length() * 4) as usize, 0x01))
+                }
+                EtherTypes::Ipv6
+                    if let Some(ipv6) = Ipv6Packet::new(ip)
+                        && ipv6.get_next_header() == IpNextHeaderProtocols::Tcp =>
+                {
+                    Some((40, 0x02))
+                }
+                _ => None,
+            } && let Some(tcp) = TcpPacket::new(&ip[ip_hdr_len..])
+            {
+                let tcp_hdr_len = ip_hdr_len + (tcp.get_data_offset() * 4) as usize;
+
+                vnet_hdr[0] = 0x01;
+                vnet_hdr[6..8].copy_from_slice(&(ip_hdr_len as u16).to_ne_bytes());
+                vnet_hdr[8..10].copy_from_slice(&16u16.to_ne_bytes());
+
+                if self.gso
+                    && ip.len() > self.mtu as usize
+                    && tcp_hdr_len > 0
+                    && ip.len() > tcp_hdr_len
+                {
+                    vnet_hdr[1] = gso_type;
+                    vnet_hdr[2..4].copy_from_slice(&(tcp_hdr_len as u16).to_ne_bytes());
+                    let gso_size = (ip.len() - tcp_hdr_len)
+                        .min(self.mtu.saturating_sub(tcp_hdr_len as u16) as usize)
+                        as u16;
+                    vnet_hdr[4..6].copy_from_slice(&gso_size.to_ne_bytes());
+                }
+            }
+
+            ret[..vnet_hdr_len].copy_from_slice(&vnet_hdr);
+        }
+
+        // On platforms without GSO (or when GSO offload failed), segment large
+        // TCP packets into MTU-sized TCP segments before writing to TUN.
+        if !self.gso {
+            let ip = &ret[hdr_len..];
+            if ip.len() > self.mtu as usize && Self::ipv4_tcp_packet_info(&ret, hdr_len).is_some() {
+                let frozen = ret.freeze();
+                return Ok(Self::tcp_segment_ipv4(frozen, hdr_len, self.mtu));
+            }
         }
 
         tracing::debug!(?ret, ?payload_offset, "convert zc packet to tun packet");
@@ -236,6 +496,7 @@ pub struct VirtualNic {
 
     ifname: Option<String>,
     ifcfg: Box<dyn IfConfiguerTrait + Send + Sync + 'static>,
+    gso: AtomicBool,
 }
 
 impl Drop for VirtualNic {
@@ -262,6 +523,7 @@ impl VirtualNic {
             global_ctx,
             ifname: None,
             ifcfg: Box::new(IfConfiger {}),
+            gso: AtomicBool::new(false),
         }
     }
 
@@ -567,8 +829,55 @@ impl VirtualNic {
 
         config.up();
 
+        let gso = self.global_ctx.config.get_flags().gso;
+
+        if gso {
+            #[cfg(target_os = "linux")]
+            {
+                config.platform_config(|config| {
+                    config.vnet_hdr(true);
+                });
+            }
+        }
+
         let _g = self.global_ctx.net_ns.guard();
-        Ok(tun::create(&config)?)
+        let mut dev = tun::create(&config)?;
+
+        if gso {
+            #[cfg(target_os = "linux")]
+            {
+                use nix::libc;
+                use std::os::fd::AsRawFd;
+
+                let enabled = unsafe {
+                    libc::ioctl(
+                        dev.as_raw_fd() as libc::c_int,
+                        libc::TUNSETOFFLOAD,
+                        libc::TUN_F_CSUM | libc::TUN_F_TSO4 | libc::TUN_F_TSO6,
+                    )
+                } == 0;
+
+                if enabled {
+                    log::info!("GSO enabled");
+                } else {
+                    log::warn!(
+                        error =? std::io::Error::last_os_error(),
+                        "failed to enable GSO on TUN"
+                    );
+                    drop(dev);
+
+                    config.platform_config(|config| {
+                        config.vnet_hdr(false);
+                    });
+
+                    dev = tun::create(&config)?;
+                }
+
+                self.gso.store(enabled, Ordering::Relaxed);
+            }
+        }
+
+        Ok(dev)
     }
 
     #[cfg(mobile)]
@@ -590,18 +899,20 @@ impl VirtualNic {
         config.close_fd_on_drop(false);
         config.up();
 
-        let has_packet_info = cfg!(any(
+        let has_pi = cfg!(any(
             target_os = "ios",
             all(target_os = "macos", feature = "macos-ne")
         ));
+        let has_vnet_hdr = false;
         let dev = tun::create(&config)?;
+        let mtu = dev.mtu()?;
         let dev = AsyncDevice::new(dev)?;
         let (a, b) = BiLock::new(dev);
         let ft = TunnelWrapper::new(
-            TunStream::new(a, has_packet_info),
+            TunStream::new(a, mtu, has_pi, has_vnet_hdr),
             FramedWriter::with_converter(
                 TunAsyncWrite { l: b },
-                TunPacketConverter::new(has_packet_info),
+                TunPacketConverter::new(has_pi, has_vnet_hdr, mtu, false),
             ),
             None,
         );
@@ -661,23 +972,30 @@ impl VirtualNic {
         let dev = AsyncDevice::new(dev)?;
 
         let flags = self.global_ctx.config.get_flags();
-        let mut mtu_in_config = flags.mtu;
+        let mut mtu = flags.mtu;
         if flags.enable_encryption {
-            mtu_in_config -= 20;
+            mtu -= 20;
         }
         {
             // set mtu by ourselves, rust-tun does not handle it correctly on windows
             let _g = self.global_ctx.net_ns.guard();
-            self.ifcfg.set_mtu(ifname.as_str(), mtu_in_config).await?;
+            self.ifcfg.set_mtu(ifname.as_str(), mtu).await?;
         }
 
-        let has_packet_info = cfg!(all(target_os = "macos", not(feature = "macos-ne")));
+        let gso = self.gso.load(Ordering::Relaxed);
+        let has_pi = cfg!(all(target_os = "macos", not(feature = "macos-ne")));
+        let has_vnet_hdr = gso && cfg!(target_os = "linux");
         let (a, b) = BiLock::new(dev);
         let ft = TunnelWrapper::new(
-            TunStream::new(a, has_packet_info),
+            TunStream::new(
+                a,
+                if gso { 1 << 16 } else { mtu as usize },
+                has_pi,
+                has_vnet_hdr,
+            ),
             FramedWriter::with_converter(
                 TunAsyncWrite { l: b },
-                TunPacketConverter::new(has_packet_info),
+                TunPacketConverter::new(has_pi, has_vnet_hdr, mtu as u16, gso),
             ),
             None,
         );
