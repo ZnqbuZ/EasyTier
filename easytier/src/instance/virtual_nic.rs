@@ -18,7 +18,7 @@ use crate::{
     peers::{PacketRecvChanReceiver, peer_manager::PeerManager, recv_packet_from_chan},
     tunnel::{
         StreamItem, Tunnel, TunnelError, ZCPacketSink, ZCPacketStream,
-        common::{FramedWriter, TunnelWrapper, ZCPacketToBytes, reserve_buf},
+        common::{FramedWriter, PacketConverter, TunnelWrapper, reserve_buf},
         packet_def::{TAIL_RESERVED_SIZE, ZCPacket, ZCPacketType},
     },
 };
@@ -35,7 +35,6 @@ use tokio::{
     sync::{Mutex, Notify},
     task::JoinSet,
 };
-use tokio_util::bytes::Bytes;
 #[cfg(target_os = "windows")]
 use tokio_util::task::AbortOnDropHandle;
 use tun::{AbstractDevice, AsyncDevice, Configuration, Layer};
@@ -43,6 +42,7 @@ use zerocopy::{NativeEndian, NetworkEndian};
 
 #[cfg(target_os = "windows")]
 use crate::common::ifcfg::RegistryManager;
+use crate::tunnel::common::PacketBatch;
 
 pin_project! {
     pub struct TunStream {
@@ -143,20 +143,20 @@ impl ProtoExt for EtherType {
     }
 }
 
-struct TunZCPacketToBytes {
+struct TunPacketConverter {
     has_pi: bool,
 }
 
-impl TunZCPacketToBytes {
+impl TunPacketConverter {
     pub fn new(has_pi: bool) -> Self {
         Self { has_pi }
     }
 }
 
-impl ZCPacketToBytes for TunZCPacketToBytes {
-    fn zcpacket_into_bytes(&self, zc_packet: ZCPacket) -> Result<Bytes, TunnelError> {
-        let payload_offset = zc_packet.payload_offset();
-        let mut inner = zc_packet.inner();
+impl PacketConverter for TunPacketConverter {
+    fn convert(&self, packet: ZCPacket) -> Result<PacketBatch, TunnelError> {
+        let payload_offset = packet.payload_offset();
+        let mut inner = packet.inner();
         assert!(payload_offset >= 4);
 
         let hdr_len = if self.has_pi { 4 } else { 0 };
@@ -171,7 +171,7 @@ impl ZCPacketToBytes for TunZCPacketToBytes {
         }
 
         tracing::debug!(?ret, ?payload_offset, "convert zc packet to tun packet");
-        Ok(ret.freeze())
+        Ok(PacketBatch::Single(ret.freeze().into()))
     }
 }
 
@@ -590,7 +590,7 @@ impl VirtualNic {
             TunStream::new(a, has_packet_info),
             FramedWriter::with_converter(
                 TunAsyncWrite { l: b },
-                TunZCPacketToBytes::new(has_packet_info),
+                TunPacketConverter::new(has_packet_info),
             ),
             None,
         );
@@ -666,7 +666,7 @@ impl VirtualNic {
             TunStream::new(a, has_packet_info),
             FramedWriter::with_converter(
                 TunAsyncWrite { l: b },
-                TunZCPacketToBytes::new(has_packet_info),
+                TunPacketConverter::new(has_packet_info),
             ),
             None,
         );

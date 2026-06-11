@@ -1,8 +1,12 @@
 use bon::builder;
-use futures::{Future, Sink, Stream, stream::FuturesUnordered};
+use bytes::{Buf, Bytes, BytesMut};
+use derive_more::From;
+use futures::{Future, Sink, stream::FuturesUnordered};
 use network_interface::NetworkInterfaceConfig as _;
 use pin_project_lite::pin_project;
+use smallvec::SmallVec;
 use std::collections::VecDeque;
+use std::io::IoSlice;
 use std::{
     any::Any,
     net::{IpAddr, SocketAddr},
@@ -10,21 +14,19 @@ use std::{
     sync::{Arc, Mutex},
     task::{Poll, ready},
 };
-use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+use tokio::io::AsyncWrite;
+use tokio::net::{TcpListener, TcpSocket, UdpSocket};
+use tokio_stream::StreamExt;
+use tokio_util::codec::Decoder;
+use zerocopy::FromBytes as _;
 
 use super::TunnelInfo;
 use super::{
-    SinkItem, StreamItem, Tunnel, TunnelError, ZCPacketSink, ZCPacketStream,
+    SinkItem, Tunnel, TunnelError, ZCPacketSink, ZCPacketStream,
     packet_def::{TCP_TUNNEL_HEADER_SIZE, TCPTunnelHeader, ZCPacketType},
 };
 use crate::common::netns::NetNS;
 use crate::tunnel::packet_def::{PEER_MANAGER_HEADER_SIZE, ZCPacket};
-use bytes::{Buf, BufMut, Bytes, BytesMut};
-use tokio::net::{TcpListener, TcpSocket, UdpSocket};
-use tokio_stream::StreamExt;
-use tokio_util::codec::{Decoder, FramedRead};
-use tokio_util::io::poll_write_buf;
-use zerocopy::FromBytes as _;
 
 pub struct TunnelWrapper<R, W> {
     reader: Arc<Mutex<Option<R>>>,
@@ -106,22 +108,73 @@ impl Decoder for TunnelCodec {
     }
 }
 
-pub trait ZCPacketToBytes {
-    fn zcpacket_into_bytes(&self, zc_packet: ZCPacket) -> Result<Bytes, TunnelError>;
+#[derive(Debug, From)]
+pub enum PacketData {
+    Continuous(Bytes),
+    Fragmented(SmallVec<[Bytes; 3]>),
 }
 
-pub struct TcpZCPacketToBytes;
-impl ZCPacketToBytes for TcpZCPacketToBytes {
-    fn zcpacket_into_bytes(&self, item: ZCPacket) -> Result<Bytes, TunnelError> {
-        let mut item = item.convert_type(ZCPacketType::TCP);
+impl PacketData {
+    pub fn advance(&mut self, mut n: usize) {
+        match self {
+            PacketData::Continuous(bytes) => {
+                bytes.advance(n);
+            }
+            PacketData::Fragmented(frags) => {
+                while n > 0 && !frags.is_empty() {
+                    let len = frags[0].len();
+                    if len <= n {
+                        n -= len;
+                        frags.remove(0);
+                    } else {
+                        frags[0].advance(n);
+                        break;
+                    }
+                }
+            }
+        }
+    }
 
-        let tcp_len = PEER_MANAGER_HEADER_SIZE + item.payload_len();
-        let Some(header) = item.mut_tcp_tunnel_header() else {
+    pub fn is_empty(&self) -> bool {
+        match self {
+            PacketData::Continuous(bytes) => bytes.is_empty(),
+            PacketData::Fragmented(frags) => frags.is_empty(),
+        }
+    }
+}
+
+#[derive(Debug, From)]
+pub enum PacketBatch {
+    Single(PacketData),
+    Multiple(Vec<PacketData>),
+}
+
+impl From<Bytes> for PacketBatch {
+    fn from(value: Bytes) -> Self {
+        Self::Single(value.into())
+    }
+}
+
+pub trait PacketConverter {
+    fn convert(&self, packet: ZCPacket) -> Result<PacketBatch, TunnelError>;
+}
+
+pub struct TcpPacketConverter;
+
+impl PacketConverter for TcpPacketConverter {
+    fn convert(&self, packet: ZCPacket) -> Result<PacketBatch, TunnelError> {
+        let mut packet = packet.convert_type(ZCPacketType::TCP);
+
+        let len = packet.payload_len();
+
+        let Some(header) = packet.mut_tcp_tunnel_header() else {
             return Err(TunnelError::InvalidPacket("packet too short".to_string()));
         };
-        header.len.set(tcp_len.try_into().unwrap());
+        header
+            .len
+            .set((PEER_MANAGER_HEADER_SIZE + len).try_into().unwrap());
 
-        Ok(item.into_bytes())
+        Ok(packet.into_bytes().into())
     }
 }
 
@@ -131,19 +184,19 @@ pin_project! {
     pub struct FramedWriter<W, C> {
         #[pin]
         writer: W,
-        queue: VecDeque<Bytes>,
+        queue: VecDeque<PacketData>,
 
         converter: C,
     }
 }
 
-impl<W> FramedWriter<W, TcpZCPacketToBytes> {
+impl<W> FramedWriter<W, TcpPacketConverter> {
     pub fn new(writer: W) -> Self {
-        Self::with_converter(writer, TcpZCPacketToBytes)
+        Self::with_converter(writer, TcpPacketConverter)
     }
 }
 
-impl<W, C: ZCPacketToBytes + Send + 'static> FramedWriter<W, C> {
+impl<W, C: PacketConverter + Send + 'static> FramedWriter<W, C> {
     pub fn with_converter(writer: W, converter: C) -> Self {
         FramedWriter {
             writer,
@@ -153,10 +206,55 @@ impl<W, C: ZCPacketToBytes + Send + 'static> FramedWriter<W, C> {
     }
 }
 
+impl<W, C> FramedWriter<W, C>
+where
+    W: AsyncWrite + Send + 'static,
+{
+    fn poll_queue(
+        self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        threshold: usize,
+    ) -> Poll<Result<(), TunnelError>> {
+        let mut this = self.project();
+
+        while this.queue.len() >= threshold {
+            let Some(packet) = this.queue.front_mut() else {
+                break;
+            };
+
+            let n = match packet {
+                PacketData::Continuous(bytes) => {
+                    ready!(this.writer.as_mut().poll_write(cx, bytes))?
+                }
+                PacketData::Fragmented(frags) => {
+                    let slices: SmallVec<[IoSlice<'_>; 4]> =
+                        frags.iter().map(|b| IoSlice::new(b)).collect();
+                    ready!(this.writer.as_mut().poll_write_vectored(cx, &slices))?
+                }
+            };
+
+            if n == 0 {
+                return Poll::Ready(Err(TunnelError::IOError(std::io::Error::new(
+                    std::io::ErrorKind::WriteZero,
+                    "failed to write packet to transport",
+                ))));
+            }
+
+            packet.advance(n);
+
+            if packet.is_empty() {
+                this.queue.pop_front();
+            }
+        }
+
+        Poll::Ready(Ok(()))
+    }
+}
+
 impl<W, C> Sink<SinkItem> for FramedWriter<W, C>
 where
     W: AsyncWrite + Send + 'static,
-    C: ZCPacketToBytes + Send + 'static,
+    C: PacketConverter + Send + 'static,
 {
     type Error = TunnelError;
 
@@ -164,54 +262,27 @@ where
         self: Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> Poll<Result<(), Self::Error>> {
-        let mut this = self.project();
-
-        while this.queue.len() >= TX_QUEUE_LEN {
-            if let Some(packet) = this.queue.front() {
-                let n = ready!(this.writer.as_mut().poll_write(cx, packet))?;
-
-                if n == 0 {
-                    return Poll::Ready(Err(TunnelError::IOError(std::io::Error::new(
-                        std::io::ErrorKind::WriteZero,
-                        "failed to write packet to transport",
-                    ))));
-                }
-
-                this.queue.pop_front();
-            } else {
-                break;
-            }
-        }
-
-        Poll::Ready(Ok(()))
+        self.poll_queue(cx, TX_QUEUE_LEN)
     }
 
     fn start_send(self: Pin<&mut Self>, item: ZCPacket) -> Result<(), Self::Error> {
         let this = self.project();
 
-        this.queue.extend(this.converter.zcpacket_into_bytes(item)?);
+        match this.converter.convert(item)? {
+            PacketBatch::Single(packet) => this.queue.push_back(packet),
+            PacketBatch::Multiple(packets) => this.queue.extend(packets),
+        }
 
         Ok(())
     }
 
     fn poll_flush(
-        self: Pin<&mut Self>,
+        mut self: Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> Poll<Result<(), Self::Error>> {
-        let mut pinned = self.project();
+        ready!(self.as_mut().poll_queue(cx, 1))?;
+        ready!(self.project().writer.poll_flush(cx))?;
 
-        while let Some(packet) = pinned.queue.front() {
-            let n = ready!(pinned.writer.as_mut().poll_write(cx, packet))?;
-            if n == 0 {
-                return Poll::Ready(Err(TunnelError::IOError(std::io::Error::new(
-                    std::io::ErrorKind::WriteZero,
-                    "failed to write packet to transport",
-                ))));
-            }
-            pinned.queue.pop_front();
-        }
-
-        ready!(pinned.writer.poll_flush(cx))?;
         Poll::Ready(Ok(()))
     }
 
