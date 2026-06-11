@@ -282,6 +282,7 @@ impl TunPacketConverter {
         let orig_fin = tcp_flags & TcpFlags::FIN;
         let non_data_flags = tcp_flags & !(TcpFlags::PSH | TcpFlags::FIN);
         let total_segs = total_payload.div_ceil(seg_payload_size);
+
         let ip_id = Ipv4Packet::new(&buf[hdr_len..])
             .map(|ipv4| ipv4.get_identification())
             .unwrap_or(0);
@@ -289,21 +290,26 @@ impl TunPacketConverter {
         let header_len = payload_off;
         let total_out_capacity = total_segs * header_len + total_payload;
 
-        // 仅分配容量，避免 memset 清零开销
         let mut big = BytesMut::with_capacity(total_out_capacity);
         let mut out = Vec::with_capacity(total_segs);
 
-        let mut offset = 0;
-        let mut seg_idx = 0u16;
+        // ================= 核心优化：预构建 Header 模板 =================
+        let mut template = buf[..header_len].to_vec();
 
-        let header_template = &buf[..header_len];
+        // 提取循环外的常量赋值
+        if let Some(mut ip_pkt) = MutableIpv4Packet::new(&mut template[hdr_len..]) {
+            ip_pkt.set_flags(Ipv4Flags::DontFragment);
+            ip_pkt.set_fragment_offset(0);
+        }
 
-        // 循环外预组装 TCP 伪首部常量部分
         let mut pseudo_hdr = [0u8; 12];
         pseudo_hdr[0..4].copy_from_slice(&info.source.octets());
         pseudo_hdr[4..8].copy_from_slice(&info.destination.octets());
         pseudo_hdr[8] = 0;
         pseudo_hdr[9] = 6; // IPPROTO_TCP
+
+        let mut offset = 0;
+        let mut seg_idx = 0u16;
 
         while offset < total_payload {
             let is_last = offset + seg_payload_size >= total_payload;
@@ -313,52 +319,47 @@ impl TunPacketConverter {
                 seg_payload_size
             };
 
-            let pkt_len = header_len + this_seg;
-
-            // 自动推进底层指针写入数据
-            big.extend_from_slice(header_template);
-            big.extend_from_slice(&buf[payload_off + offset..payload_off + offset + this_seg]);
-
+            // 1. 在模板上就地更新 IP 变异字段
             let new_ip_len = (info.ip_hdr_len + info.tcp_hdr_len + this_seg) as u16;
-            big[hdr_len + 2..hdr_len + 4].copy_from_slice(&new_ip_len.to_be_bytes());
-
-            // 修正 IPv4 头部参数与校验和
-            if let Some(mut ip_pkt) = MutableIpv4Packet::new(&mut big[hdr_len..pkt_len]) {
+            if let Some(mut ip_pkt) = MutableIpv4Packet::new(&mut template[hdr_len..]) {
                 ip_pkt.set_total_length(new_ip_len);
-                ip_pkt.set_flags(Ipv4Flags::DontFragment);
-                ip_pkt.set_fragment_offset(0);
                 ip_pkt.set_identification(ip_id.wrapping_add(seg_idx));
                 ip_pkt.set_checksum(0);
                 let checksum = ipv4::checksum(&ip_pkt.to_immutable());
                 ip_pkt.set_checksum(checksum);
             }
 
-            // 修正 TCP 序列号与标志位
-            let tcp_slice = &mut big[tcp_off..pkt_len];
-            if let Some(mut tcp_pkt) = MutableTcpPacket::new(tcp_slice) {
+            // 2. 在模板上就地更新 TCP 变异字段
+            if let Some(mut tcp_pkt) = MutableTcpPacket::new(&mut template[tcp_off..]) {
                 tcp_pkt.set_sequence(base_seq.wrapping_add(offset as u32));
-                let mut flags = non_data_flags;
-                if is_last {
-                    flags |= orig_psh | orig_fin;
-                }
+                let flags = if is_last {
+                    non_data_flags | orig_psh | orig_fin
+                } else {
+                    non_data_flags
+                };
                 tcp_pkt.set_flags(flags);
-                tcp_pkt.set_checksum(0); // 必须在计算校验和之前清零
+                tcp_pkt.set_checksum(0);
             }
 
-            // 更新伪首部长度字段
+            let payload_slice = &buf[payload_off + offset..payload_off + offset + this_seg];
+
+            // 3. 增量计算 TCP 校验和 (直接在 L1 Cache 内完成，避免扫描完整报文)
             let tcp_len = (info.tcp_hdr_len + this_seg) as u16;
             pseudo_hdr[10..12].copy_from_slice(&tcp_len.to_be_bytes());
 
-            // 联合计算伪首部与 TCP 段校验和
             let mut csum_calc = internet_checksum::Checksum::new();
             csum_calc.add_bytes(&pseudo_hdr);
-            csum_calc.add_bytes(&big[tcp_off..pkt_len]);
+            csum_calc.add_bytes(&template[tcp_off..]);
+            csum_calc.add_bytes(payload_slice);
             let final_csum = csum_calc.checksum();
 
-            // TCP Checksum 的固定偏移量为 16
-            big[tcp_off + 16..tcp_off + 18].copy_from_slice(&final_csum);
+            // 写入最终的 TCP 校验和到模板
+            template[tcp_off + 16..tcp_off + 18].copy_from_slice(&final_csum);
 
-            // 截断已写入片段进入出队缓存，底层 capacity 供下一次循环复用
+            // 4. 一次性组装完整切片至底层的 BytesMut
+            big.extend_from_slice(&template);
+            big.extend_from_slice(payload_slice);
+
             out.push(big.split().freeze());
 
             offset += this_seg;
