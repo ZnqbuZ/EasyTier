@@ -2,6 +2,7 @@ use bon::builder;
 use futures::{Future, Sink, Stream, stream::FuturesUnordered};
 use network_interface::NetworkInterfaceConfig as _;
 use pin_project_lite::pin_project;
+use std::collections::VecDeque;
 use std::{
     any::Any,
     net::{IpAddr, SocketAddr},
@@ -18,7 +19,6 @@ use super::{
 };
 use crate::common::netns::NetNS;
 use crate::tunnel::packet_def::{PEER_MANAGER_HEADER_SIZE, ZCPacket};
-use crate::utils::buf::BufList;
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use tokio::net::{TcpListener, TcpSocket, UdpSocket};
 use tokio_stream::StreamExt;
@@ -208,55 +208,29 @@ impl ZCPacketToBytes for TcpZCPacketToBytes {
     }
 }
 
+const TX_QUEUE_LEN: usize = 1 << 10;
+
 pin_project! {
     pub struct FramedWriter<W, C> {
         #[pin]
         writer: W,
-        sending_bufs: BufList<Bytes>,
-        associate_data: Option<Box<dyn Any + Send + 'static>>,
+        queue: VecDeque<Bytes>,
 
         converter: C,
-    }
-}
-
-impl<W, C> FramedWriter<W, C> {
-    fn max_buffer_count(&self) -> usize {
-        64
     }
 }
 
 impl<W> FramedWriter<W, TcpZCPacketToBytes> {
     pub fn new(writer: W) -> Self {
-        Self::new_with_associate_data(writer, None)
-    }
-
-    pub fn new_with_associate_data(
-        writer: W,
-        associate_data: Option<Box<dyn Any + Send + 'static>>,
-    ) -> Self {
-        FramedWriter {
-            writer,
-            sending_bufs: BufList::new(),
-            associate_data,
-            converter: TcpZCPacketToBytes {},
-        }
+        Self::with_converter(writer, TcpZCPacketToBytes)
     }
 }
 
 impl<W, C: ZCPacketToBytes + Send + 'static> FramedWriter<W, C> {
-    pub fn new_with_converter(writer: W, converter: C) -> Self {
-        Self::new_with_converter_and_associate_data(writer, converter, None)
-    }
-
-    pub fn new_with_converter_and_associate_data(
-        writer: W,
-        converter: C,
-        associate_data: Option<Box<dyn Any + Send + 'static>>,
-    ) -> Self {
+    pub fn with_converter(writer: W, converter: C) -> Self {
         FramedWriter {
             writer,
-            sending_bufs: BufList::new(),
-            associate_data,
+            queue: VecDeque::new(),
             converter,
         }
     }
@@ -270,23 +244,35 @@ where
     type Error = TunnelError;
 
     fn poll_ready(
-        mut self: Pin<&mut Self>,
+        self: Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Result<(), Self::Error>> {
-        let max_buffer_count = self.max_buffer_count();
-        if self.sending_bufs.len() >= max_buffer_count {
-            self.as_mut().poll_flush(cx)
-        } else {
-            tracing::trace!(bufs_cnt = self.sending_bufs.len(), "ready to send");
-            Poll::Ready(Ok(()))
+    ) -> Poll<Result<(), Self::Error>> {
+        let mut this = self.project();
+
+        while this.queue.len() >= TX_QUEUE_LEN {
+            if let Some(packet) = this.queue.front() {
+                let n = ready!(this.writer.as_mut().poll_write(cx, packet))?;
+
+                if n == 0 {
+                    return Poll::Ready(Err(TunnelError::IOError(std::io::Error::new(
+                        std::io::ErrorKind::WriteZero,
+                        "failed to write packet to transport",
+                    ))));
+                }
+
+                this.queue.pop_front();
+            } else {
+                break;
+            }
         }
+
+        Poll::Ready(Ok(()))
     }
 
     fn start_send(self: Pin<&mut Self>, item: ZCPacket) -> Result<(), Self::Error> {
-        let pinned = self.project();
-        pinned
-            .sending_bufs
-            .push(pinned.converter.zcpacket_into_bytes(item)?);
+        let this = self.project();
+
+        this.queue.extend(this.converter.zcpacket_into_bytes(item)?);
 
         Ok(())
     }
@@ -296,28 +282,19 @@ where
         cx: &mut std::task::Context<'_>,
     ) -> Poll<Result<(), Self::Error>> {
         let mut pinned = self.project();
-        let mut remaining = pinned.sending_bufs.remaining();
-        while remaining != 0 {
-            let n = ready!(poll_write_buf(
-                pinned.writer.as_mut(),
-                cx,
-                pinned.sending_bufs
-            ))?;
+
+        while let Some(packet) = pinned.queue.front() {
+            let n = ready!(pinned.writer.as_mut().poll_write(cx, packet))?;
             if n == 0 {
                 return Poll::Ready(Err(TunnelError::IOError(std::io::Error::new(
                     std::io::ErrorKind::WriteZero,
-                    "failed to \
-                     write frame to transport",
+                    "failed to write packet to transport",
                 ))));
             }
-            remaining -= n;
+            pinned.queue.pop_front();
         }
 
-        tracing::trace!(?remaining, "flushed");
-
-        // Try flushing the underlying IO
         ready!(pinned.writer.poll_flush(cx))?;
-
         Poll::Ready(Ok(()))
     }
 
