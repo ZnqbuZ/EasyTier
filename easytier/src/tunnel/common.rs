@@ -22,6 +22,7 @@ use crate::tunnel::packet_def::{PEER_MANAGER_HEADER_SIZE, ZCPacket};
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use tokio::net::{TcpListener, TcpSocket, UdpSocket};
 use tokio_stream::StreamExt;
+use tokio_util::codec::{Decoder, FramedRead};
 use tokio_util::io::poll_write_buf;
 use zerocopy::FromBytes as _;
 
@@ -68,124 +69,40 @@ where
     }
 }
 
-// a length delimited codec for async reader
-pin_project! {
-    pub struct FramedReader<R> {
-        #[pin]
-        reader: R,
-        buf: BytesMut,
-        max_packet_size: usize,
-        associate_data: Option<Box<dyn Any + Send + 'static>>,
-        error: Option<TunnelError>,
-    }
+pub struct TunnelCodec {
+    pub max_packet_size: usize,
 }
 
-impl<R> FramedReader<R> {
-    pub fn new(reader: R, max_packet_size: usize) -> Self {
-        Self::new_with_associate_data(reader, max_packet_size, None)
-    }
+impl Decoder for TunnelCodec {
+    type Item = ZCPacket;
+    type Error = TunnelError;
 
-    pub fn new_with_associate_data(
-        reader: R,
-        max_packet_size: usize,
-        associate_data: Option<Box<dyn Any + Send + 'static>>,
-    ) -> Self {
-        FramedReader {
-            reader,
-            buf: BytesMut::with_capacity(max_packet_size),
-            max_packet_size,
-            associate_data,
-            error: None,
-        }
-    }
+    fn decode(&mut self, src: &mut BytesMut) -> Result<Option<Self::Item>, Self::Error> {
+        let Some(header) = TCPTunnelHeader::ref_from_prefix(src) else {
+            return Ok(None);
+        };
 
-    fn extract_one_packet(
-        buf: &mut BytesMut,
-        max_packet_size: usize,
-    ) -> Option<Result<ZCPacket, TunnelError>> {
-        if buf.len() < TCP_TUNNEL_HEADER_SIZE {
-            // header is not complete
-            return None;
-        }
-
-        let header = TCPTunnelHeader::ref_from_prefix(&buf[..]).unwrap();
-        let body_len = header.len.get() as usize;
-        if body_len > max_packet_size {
-            // body is too long
-            return Some(Err(TunnelError::InvalidPacket("body too long".to_string())));
-        }
-
-        if body_len < PEER_MANAGER_HEADER_SIZE {
-            return Some(Err(TunnelError::InvalidPacket(
-                "body too short".to_string(),
-            )));
-        }
-
-        if buf.len() < TCP_TUNNEL_HEADER_SIZE + body_len {
-            // body is not complete
-            return None;
-        }
-
-        // extract one packet
-        let packet_buf = buf.split_to(TCP_TUNNEL_HEADER_SIZE + body_len);
-        Some(Ok(ZCPacket::new_from_buf(packet_buf, ZCPacketType::TCP)))
-    }
-}
-
-impl<R> Stream for FramedReader<R>
-where
-    R: AsyncRead + Send + 'static + Unpin,
-{
-    type Item = StreamItem;
-
-    fn poll_next(
-        self: Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Option<Self::Item>> {
-        let mut self_mut = self.project();
-
-        loop {
-            if let Some(e) = self_mut.error.as_ref() {
-                tracing::warn!("poll_next on a failed FramedReader, {:?}", e);
-                return Poll::Ready(None);
+        let len = {
+            let len = header.len.get() as usize;
+            if len > self.max_packet_size {
+                return Err(TunnelError::InvalidPacket("body too long".to_string()));
+            }
+            if len < PEER_MANAGER_HEADER_SIZE {
+                return Err(TunnelError::InvalidPacket("body too short".to_string()));
             }
 
-            if let Some(packet) = Self::extract_one_packet(self_mut.buf, *self_mut.max_packet_size)
-            {
-                if let Err(TunnelError::InvalidPacket(msg)) = packet.as_ref() {
-                    self_mut
-                        .error
-                        .replace(TunnelError::InvalidPacket(msg.clone()));
-                }
-                return Poll::Ready(Some(packet));
+            TCP_TUNNEL_HEADER_SIZE + len
+        };
+
+        if src.len() < len {
+            if src.capacity() < len {
+                src.reserve((len - src.len()).max(self.max_packet_size << 4));
             }
-
-            reserve_buf(
-                self_mut.buf,
-                *self_mut.max_packet_size,
-                *self_mut.max_packet_size * 2,
-            );
-
-            let cap = self_mut.buf.capacity() - self_mut.buf.len();
-            let buf = self_mut.buf.chunk_mut().as_mut_ptr();
-            let buf = unsafe { std::slice::from_raw_parts_mut(buf, cap) };
-            let mut buf = ReadBuf::new(buf);
-
-            let ret = ready!(self_mut.reader.as_mut().poll_read(cx, &mut buf));
-            let len = buf.filled().len();
-            unsafe { self_mut.buf.advance_mut(len) };
-
-            match ret {
-                Ok(_) => {
-                    if len == 0 {
-                        return Poll::Ready(None);
-                    }
-                }
-                Err(e) => {
-                    return Poll::Ready(Some(Err(TunnelError::IOError(e))));
-                }
-            }
+            return Ok(None);
         }
+
+        let packet_buf = src.split_to(len);
+        Ok(Some(ZCPacket::new_from_buf(packet_buf, ZCPacketType::TCP)))
     }
 }
 
@@ -561,20 +478,18 @@ pub fn reserve_buf(buf: &mut BytesMut, min_size: usize, max_size: usize) {
 
 pub mod tests {
     use atomic_shim::AtomicU64;
-    use std::{sync::Arc, time::Instant};
-
     use futures::{Future, SinkExt, StreamExt};
+    use std::{sync::Arc, time::Instant};
     use tokio_util::bytes::{BufMut, Bytes, BytesMut};
-
-    use crate::{
-        common::netns::NetNS,
-        tunnel::{TunnelConnector, TunnelListener, packet_def::ZCPacket},
-    };
 
     #[cfg(test)]
     use crate::tunnel::{
         TunnelError,
         packet_def::{PEER_MANAGER_HEADER_SIZE, TCP_TUNNEL_HEADER_SIZE},
+    };
+    use crate::{
+        common::netns::NetNS,
+        tunnel::{TunnelConnector, TunnelListener, packet_def::ZCPacket},
     };
 
     #[cfg(any(target_os = "android", target_os = "fuchsia", target_os = "linux"))]
@@ -632,15 +547,21 @@ pub mod tests {
 
     #[test]
     fn framed_reader_rejects_short_peer_manager_body() {
+        use crate::tunnel::common::TunnelCodec;
+        use tokio_util::codec::Decoder;
+
         let mut buf = BytesMut::new();
         buf.put_u32_le((PEER_MANAGER_HEADER_SIZE - 1) as u32);
         buf.resize(TCP_TUNNEL_HEADER_SIZE + PEER_MANAGER_HEADER_SIZE - 1, 0);
 
-        let ret = super::FramedReader::<tokio::io::Empty>::extract_one_packet(&mut buf, 2000);
+        let ret = TunnelCodec {
+            max_packet_size: 2000,
+        }
+        .decode(&mut buf);
 
         assert!(matches!(
             ret,
-            Some(Err(TunnelError::InvalidPacket(msg))) if msg == "body too short"
+            Err(TunnelError::InvalidPacket(msg)) if msg == "body too short"
         ));
     }
 
