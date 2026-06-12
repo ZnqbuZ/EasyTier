@@ -592,7 +592,7 @@ impl VirtualNic {
         let (a, b) = BiLock::new(dev);
         let ft = TunnelWrapper::new(
             TunStream::new(a, has_packet_info),
-            FramedWriter::new_with_converter(
+            FramedWriter::with_converter(
                 TunAsyncWrite { l: b },
                 TunZCPacketToBytes::new(has_packet_info),
             ),
@@ -668,7 +668,7 @@ impl VirtualNic {
         let (a, b) = BiLock::new(dev);
         let ft = TunnelWrapper::new(
             TunStream::new(a, has_packet_info),
-            FramedWriter::new_with_converter(
+            FramedWriter::with_converter(
                 TunAsyncWrite { l: b },
                 TunZCPacketToBytes::new(has_packet_info),
             ),
