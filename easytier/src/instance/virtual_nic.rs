@@ -253,11 +253,7 @@ impl TunPacketConverter {
 
     /// TCP segmentation (emulates TSO): splits a large TCP packet into
     /// MTU-sized contiguous segments.
-    fn tcp_segment_ipv4(buf: Bytes, hdr_len: usize, mtu: u16) -> PacketBatch {
-        let info = match Self::ipv4_tcp_packet_info(&buf, hdr_len) {
-            Some(info) => info,
-            None => return buf.into(),
-        };
+    fn tcp_segment_ipv4(buf: Bytes, hdr_len: usize, mtu: u16, info: Ipv4TcpPacketInfo) -> PacketBatch {
         if info.total_len <= info.ip_hdr_len + info.tcp_hdr_len {
             return buf.into();
         }
@@ -289,7 +285,6 @@ impl TunPacketConverter {
         let header_len = payload_off;
         let total_out_capacity = total_segs * header_len + total_payload;
 
-        // 仅分配容量，避免 memset 清零开销
         let mut big = BytesMut::with_capacity(total_out_capacity);
         let mut out = Vec::with_capacity(total_segs);
 
@@ -298,12 +293,11 @@ impl TunPacketConverter {
 
         let header_template = &buf[..header_len];
 
-        // 循环外预组装 TCP 伪首部常量部分
         let mut pseudo_hdr = [0u8; 12];
         pseudo_hdr[0..4].copy_from_slice(&info.source.octets());
         pseudo_hdr[4..8].copy_from_slice(&info.destination.octets());
         pseudo_hdr[8] = 0;
-        pseudo_hdr[9] = 6; // IPPROTO_TCP
+        pseudo_hdr[9] = 6;
 
         while offset < total_payload {
             let is_last = offset + seg_payload_size >= total_payload;
@@ -315,14 +309,12 @@ impl TunPacketConverter {
 
             let pkt_len = header_len + this_seg;
 
-            // 自动推进底层指针写入数据
             big.extend_from_slice(header_template);
             big.extend_from_slice(&buf[payload_off + offset..payload_off + offset + this_seg]);
 
             let new_ip_len = (info.ip_hdr_len + info.tcp_hdr_len + this_seg) as u16;
             big[hdr_len + 2..hdr_len + 4].copy_from_slice(&new_ip_len.to_be_bytes());
 
-            // 修正 IPv4 头部参数与校验和
             if let Some(mut ip_pkt) = MutableIpv4Packet::new(&mut big[hdr_len..pkt_len]) {
                 ip_pkt.set_total_length(new_ip_len);
                 ip_pkt.set_flags(Ipv4Flags::DontFragment);
@@ -333,7 +325,6 @@ impl TunPacketConverter {
                 ip_pkt.set_checksum(checksum);
             }
 
-            // 修正 TCP 序列号与标志位
             let tcp_slice = &mut big[tcp_off..pkt_len];
             if let Some(mut tcp_pkt) = MutableTcpPacket::new(tcp_slice) {
                 tcp_pkt.set_sequence(base_seq.wrapping_add(offset as u32));
@@ -342,23 +333,19 @@ impl TunPacketConverter {
                     flags |= orig_psh | orig_fin;
                 }
                 tcp_pkt.set_flags(flags);
-                tcp_pkt.set_checksum(0); // 必须在计算校验和之前清零
+                tcp_pkt.set_checksum(0);
             }
 
-            // 更新伪首部长度字段
             let tcp_len = (info.tcp_hdr_len + this_seg) as u16;
             pseudo_hdr[10..12].copy_from_slice(&tcp_len.to_be_bytes());
 
-            // 联合计算伪首部与 TCP 段校验和
             let mut csum_calc = internet_checksum::Checksum::new();
             csum_calc.add_bytes(&pseudo_hdr);
             csum_calc.add_bytes(&big[tcp_off..pkt_len]);
             let final_csum = csum_calc.checksum();
 
-            // TCP Checksum 的固定偏移量为 16
             big[tcp_off + 16..tcp_off + 18].copy_from_slice(&final_csum);
 
-            // 截断已写入片段进入出队缓存，底层 capacity 供下一次循环复用
             out.push(big.split().freeze().into());
 
             offset += this_seg;
@@ -388,30 +375,19 @@ impl PacketConverter for TunPacketConverter {
             pi.write_u16::<NetworkEndian>(proto.into_pi()?)?;
         }
 
+        // 统一解析入口：针对 IPv4 TCP 报文仅执行一次完整解析
+        let ipv4_tcp_info = Self::ipv4_tcp_packet_info(&ret, hdr_len);
+
         if self.has_vnet_hdr {
             let ip = &ret[hdr_len..];
             let mut vnet_hdr = [0u8; VNET_HDR_LEN];
 
-            if let Some((ip_hdr_len, gso_type)) = match proto {
-                EtherTypes::Ipv4
-                    if let Some(ipv4) = Ipv4Packet::new(ip)
-                        && ipv4.get_next_level_protocol() == IpNextHeaderProtocols::Tcp =>
-                {
-                    Some(((ipv4.get_header_length() * 4) as usize, 0x01))
-                }
-                EtherTypes::Ipv6
-                    if let Some(ipv6) = Ipv6Packet::new(ip)
-                        && ipv6.get_next_header() == IpNextHeaderProtocols::Tcp =>
-                {
-                    Some((40, 0x02))
-                }
-                _ => None,
-            } && let Some(tcp) = TcpPacket::new(&ip[ip_hdr_len..])
-            {
-                let tcp_hdr_len = ip_hdr_len + (tcp.get_data_offset() * 4) as usize;
+            if let Some(info) = &ipv4_tcp_info {
+                // IPv4 分支：直接复用预解析的元数据
+                let tcp_hdr_len = info.ip_hdr_len + info.tcp_hdr_len;
 
                 vnet_hdr[0] = 0x01;
-                vnet_hdr[6..8].copy_from_slice(&(ip_hdr_len as u16).to_ne_bytes());
+                vnet_hdr[6..8].copy_from_slice(&(info.ip_hdr_len as u16).to_ne_bytes());
                 vnet_hdr[8..10].copy_from_slice(&16u16.to_ne_bytes());
 
                 if self.gso
@@ -419,25 +395,57 @@ impl PacketConverter for TunPacketConverter {
                     && tcp_hdr_len > 0
                     && ip.len() > tcp_hdr_len
                 {
-                    vnet_hdr[1] = gso_type;
+                    vnet_hdr[1] = 0x01; // GSO_TCPV4
                     vnet_hdr[2..4].copy_from_slice(&(tcp_hdr_len as u16).to_ne_bytes());
                     let gso_size = (ip.len() - tcp_hdr_len)
                         .min(self.mtu.saturating_sub(tcp_hdr_len as u16) as usize)
                         as u16;
                     vnet_hdr[4..6].copy_from_slice(&gso_size.to_ne_bytes());
                 }
+            } else {
+                // 非 IPv4 TCP 分支（如 IPv6）：保持原位解析逻辑
+                if let Some((ip_hdr_len, gso_type)) = match proto {
+                    EtherTypes::Ipv6
+                    if let Some(ipv6) = Ipv6Packet::new(ip)
+                        && ipv6.get_next_header() == IpNextHeaderProtocols::Tcp =>
+                        {
+                            Some((40, 0x02)) // GSO_TCPV6
+                        }
+                    _ => None,
+                } && let Some(tcp) = TcpPacket::new(&ip[ip_hdr_len..])
+                {
+                    let tcp_hdr_len = ip_hdr_len + (tcp.get_data_offset() * 4) as usize;
+
+                    vnet_hdr[0] = 0x01;
+                    vnet_hdr[6..8].copy_from_slice(&(ip_hdr_len as u16).to_ne_bytes());
+                    vnet_hdr[8..10].copy_from_slice(&16u16.to_ne_bytes());
+
+                    if self.gso
+                        && ip.len() > self.mtu as usize
+                        && tcp_hdr_len > 0
+                        && ip.len() > tcp_hdr_len
+                    {
+                        vnet_hdr[1] = gso_type;
+                        vnet_hdr[2..4].copy_from_slice(&(tcp_hdr_len as u16).to_ne_bytes());
+                        let gso_size = (ip.len() - tcp_hdr_len)
+                            .min(self.mtu.saturating_sub(tcp_hdr_len as u16) as usize)
+                            as u16;
+                        vnet_hdr[4..6].copy_from_slice(&gso_size.to_ne_bytes());
+                    }
+                }
             }
 
             ret[..vnet_hdr_len].copy_from_slice(&vnet_hdr);
         }
 
-        // On platforms without GSO (or when GSO offload failed), segment large
-        // TCP packets into MTU-sized TCP segments before writing to TUN.
+        // 分片逻辑分支：复用预解析元数据，彻底去除二次解析
         if !self.gso {
             let ip = &ret[hdr_len..];
-            if ip.len() > self.mtu as usize && Self::ipv4_tcp_packet_info(&ret, hdr_len).is_some() {
-                let frozen = ret.freeze();
-                return Ok(Self::tcp_segment_ipv4(frozen, hdr_len, self.mtu));
+            if ip.len() > self.mtu as usize {
+                if let Some(info) = ipv4_tcp_info {
+                    let frozen = ret.freeze();
+                    return Ok(Self::tcp_segment_ipv4(frozen, hdr_len, self.mtu, info));
+                }
             }
         }
 
