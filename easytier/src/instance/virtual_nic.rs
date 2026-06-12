@@ -1,3 +1,5 @@
+use std::collections::VecDeque;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::{
     collections::BTreeSet,
     io,
@@ -7,6 +9,29 @@ use std::{
     task::{Context, Poll},
 };
 
+use byteorder::WriteBytesExt as _;
+use bytes::Bytes;
+use cidr::{Ipv4Inet, Ipv6Inet};
+use futures::{Sink, SinkExt, Stream, StreamExt, ready};
+use pnet::packet::ethernet::{EtherType, EtherTypes};
+use pnet::packet::ip::IpNextHeaderProtocols;
+use pnet::packet::tcp::TcpPacket;
+use pnet::packet::{Packet, ipv4::Ipv4Packet, ipv6::Ipv6Packet};
+use tokio::{
+    sync::{Mutex, Notify},
+    task::JoinSet,
+};
+#[cfg(target_os = "windows")]
+use tokio_util::task::AbortOnDropHandle;
+use tun::{AbstractDevice, AsyncDevice, AsyncReader, AsyncWriter, Configuration, Layer};
+use tun::{AsyncRead, AsyncWrite};
+use zerocopy::{NativeEndian, NetworkEndian};
+
+#[cfg(target_os = "windows")]
+use crate::common::ifcfg::RegistryManager;
+use crate::tunnel::{SinkError, SinkItem};
+use crate::utils::buf::{BufMargins, BufPool};
+use crate::utils::net::{Segmenter, ipv6_skip_exthdr};
 use crate::{
     common::{
         error::Error,
@@ -17,54 +42,119 @@ use crate::{
     instance::proxy_cidrs_monitor::ProxyCidrsMonitor,
     peers::{PacketRecvChanReceiver, peer_manager::PeerManager, recv_packet_from_chan},
     tunnel::{
-        StreamItem, Tunnel, TunnelError, ZCPacketSink, ZCPacketStream,
-        common::{FramedWriter, TunnelWrapper, ZCPacketToBytes, reserve_buf},
+        StreamItem, ZCPacketSink, ZCPacketStream,
         packet_def::{TAIL_RESERVED_SIZE, ZCPacket, ZCPacketType},
     },
 };
 
-use byteorder::WriteBytesExt as _;
-use bytes::{BufMut, BytesMut};
-use cidr::{Ipv4Inet, Ipv6Inet};
-use futures::{SinkExt, Stream, StreamExt, lock::BiLock, ready};
-use pin_project_lite::pin_project;
-use pnet::packet::ethernet::{EtherType, EtherTypes};
-use pnet::packet::{ipv4::Ipv4Packet, ipv6::Ipv6Packet};
-use tokio::{
-    io::{AsyncRead, AsyncWrite, ReadBuf},
-    sync::{Mutex, Notify},
-    task::JoinSet,
-};
-use tokio_util::bytes::Bytes;
-#[cfg(target_os = "windows")]
-use tokio_util::task::AbortOnDropHandle;
-use tun::{AbstractDevice, AsyncDevice, Configuration, Layer};
-use zerocopy::{NativeEndian, NetworkEndian};
+// region tun
+#[cfg(target_os = "linux")]
+mod virtio {
+    mod constants {
+        use virtio_bindings::virtio_net::{
+            VIRTIO_NET_HDR_F_NEEDS_CSUM, VIRTIO_NET_HDR_GSO_TCPV4, VIRTIO_NET_HDR_GSO_TCPV6,
+        };
 
-#[cfg(target_os = "windows")]
-use crate::common::ifcfg::RegistryManager;
+        pub const VNET_HDR_LEN: usize = 10;
+        pub const VNET_HDR_F_NEEDS_CSUM: u8 = VIRTIO_NET_HDR_F_NEEDS_CSUM as _;
+        pub const VNET_HDR_GSO_TCPV4: u8 = VIRTIO_NET_HDR_GSO_TCPV4 as _;
+        pub const VNET_HDR_GSO_TCPV6: u8 = VIRTIO_NET_HDR_GSO_TCPV6 as _;
+    }
 
-pin_project! {
-    pub struct TunStream {
-        #[pin]
-        l: BiLock<AsyncDevice>,
-        cur_buf: BytesMut,
-        has_packet_info: bool,
-        payload_offset: usize,
+    pub use constants::*;
+
+    use super::PI_LEN;
+
+    pub fn write_checksum(frame: &mut [u8], has_pi: bool) {
+        let len = frame.len();
+        if len < VNET_HDR_LEN {
+            return;
+        }
+
+        let flags = frame[0];
+
+        if (flags & VNET_HDR_F_NEEDS_CSUM) != 0 {
+            let hdr_len = VNET_HDR_LEN + if has_pi { PI_LEN } else { 0 };
+            let csum_start = u16::from_ne_bytes([frame[6], frame[7]]) as usize;
+            let csum_offset = u16::from_ne_bytes([frame[8], frame[9]]) as usize;
+
+            if hdr_len + csum_start + csum_offset + 2 <= len {
+                let data = &mut frame[hdr_len + csum_start..];
+                let csum = internet_checksum::checksum(data);
+                data[csum_offset..csum_offset + 2].copy_from_slice(&csum);
+            }
+        }
+    }
+
+    pub fn write_vnet_hdr(
+        vnet_hdr: &mut [u8],
+        len: usize,
+        mtu: usize,
+        gso_type: u8,
+        hdr_len: u16,
+        csum_start: u16,
+    ) {
+        vnet_hdr[0] = VNET_HDR_F_NEEDS_CSUM;
+        vnet_hdr[6..8].copy_from_slice(&csum_start.to_ne_bytes());
+        vnet_hdr[8..10].copy_from_slice(&16u16.to_ne_bytes());
+
+        let hdr_len = hdr_len as usize;
+        if len > mtu && hdr_len > 0 && len > hdr_len {
+            vnet_hdr[1] = gso_type;
+            vnet_hdr[2..4].copy_from_slice(&(hdr_len as u16).to_ne_bytes());
+            let gso_size = (len - hdr_len).min(mtu.saturating_sub(hdr_len)) as u16;
+            vnet_hdr[4..6].copy_from_slice(&gso_size.to_ne_bytes());
+        } else {
+            vnet_hdr[1] = 0;
+            vnet_hdr[2..6].fill(0);
+        }
     }
 }
 
+#[cfg(target_os = "linux")]
+use virtio::*;
+
+pub const PI_LEN: usize = 4;
+
+pub struct TunStream {
+    reader: AsyncReader,
+    buf: BufPool,
+    margins: BufMargins,
+
+    has_pi: bool,
+    #[cfg(target_os = "linux")]
+    has_vnet_hdr: bool,
+
+    max_packet_size: usize,
+}
+
 impl TunStream {
-    pub fn new(l: BiLock<AsyncDevice>, has_packet_info: bool) -> Self {
-        let mut payload_offset = ZCPacketType::NIC.get_packet_offsets().payload_offset;
-        if has_packet_info {
-            payload_offset -= 4;
+    pub fn new(reader: AsyncReader, has_pi: bool, has_vnet_hdr: bool, mtu: usize) -> Self {
+        debug_assert!(!has_vnet_hdr || cfg!(target_os = "linux"));
+
+        let mut header = ZCPacketType::NIC.get_packet_offsets().payload_offset;
+
+        if has_pi {
+            header -= PI_LEN;
         }
+        #[cfg(target_os = "linux")]
+        if has_vnet_hdr {
+            header -= VNET_HDR_LEN;
+        }
+
+        let max_packet_size = if has_vnet_hdr { 1 << 16 } else { mtu };
+
         Self {
-            l,
-            cur_buf: BytesMut::new(),
-            has_packet_info,
-            payload_offset,
+            reader,
+            buf: BufPool::new(max_packet_size << 4),
+            margins: BufMargins {
+                header,
+                trailer: TAIL_RESERVED_SIZE,
+            },
+            has_pi,
+            #[cfg(target_os = "linux")]
+            has_vnet_hdr,
+            max_packet_size,
         }
     }
 }
@@ -73,36 +163,37 @@ impl Stream for TunStream {
     type Item = StreamItem;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<StreamItem>> {
-        let self_mut = self.project();
-        let mut g = ready!(self_mut.l.poll_lock(cx));
-        reserve_buf(self_mut.cur_buf, 2500, 4 * 1024);
-        if self_mut.cur_buf.is_empty() {
-            unsafe {
-                self_mut.cur_buf.set_len(*self_mut.payload_offset);
-            }
-        }
-        let buf = self_mut.cur_buf.chunk_mut().as_mut_ptr();
-        let buf = unsafe { std::slice::from_raw_parts_mut(buf, 2500) };
-        let mut buf = ReadBuf::new(buf);
+        let this = self.get_mut();
 
-        let ret = ready!(g.as_pin_mut().poll_read(cx, &mut buf));
-        let len = buf.filled().len();
-        if len == 0 {
+        let mut writer = this
+            .buf
+            .writer(this.max_packet_size + this.margins.size(), this.margins);
+        let slice = writer.as_slice();
+        let buf =
+            unsafe { std::slice::from_raw_parts_mut(slice.as_mut_ptr() as *mut u8, slice.len()) };
+        let written = match ready!(this.reader.poll_read(cx, buf)) {
+            Ok(n) => n,
+            Err(error) => {
+                log::error!(?error, "tun reader error");
+                return Poll::Ready(None);
+            }
+        };
+
+        if written == 0 {
             return Poll::Ready(None);
         }
-        unsafe { self_mut.cur_buf.advance_mut(len + TAIL_RESERVED_SIZE) };
 
-        let mut ret_buf = self_mut.cur_buf.split();
-        let cur_len = ret_buf.len();
-        ret_buf.truncate(cur_len - TAIL_RESERVED_SIZE);
+        writer.commit(written);
 
-        match ret {
-            Ok(_) => Poll::Ready(Some(Ok(ZCPacket::new_from_buf(ret_buf, ZCPacketType::NIC)))),
-            Err(err) => {
-                log::error!("tun stream error: {:?}", err);
-                Poll::Ready(None)
-            }
+        let mut packet = writer.split();
+        packet.truncate(packet.len() - this.margins.trailer);
+
+        #[cfg(target_os = "linux")]
+        if this.has_vnet_hdr {
+            write_checksum(&mut packet[this.margins.header..], this.has_pi);
         }
+
+        Poll::Ready(Some(Ok(ZCPacket::new_from_buf(packet, ZCPacketType::NIC))))
     }
 }
 
@@ -127,104 +218,180 @@ impl ProtoExt for EtherType {
         let (ipv4, ipv6) = cfg_select! {
             any(target_os = "linux", target_os = "android", target_env = "ohos") => {{
                 use nix::libc;
-                (libc::ETH_P_IP, libc::ETH_P_IPV6)
+                (libc::ETH_P_IP as _, libc::ETH_P_IPV6 as _)
             }}
             any(target_os = "macos", target_os = "ios", target_os = "freebsd") => {{
                 use nix::libc;
-                (libc::PF_INET, libc::PF_INET6)
+                (libc::PF_INET as _, libc::PF_INET6 as _)
             }}
-            _ => unimplemented!(),
+            _ => return unimplemented!(),
         };
         match self {
-            EtherTypes::Ipv4 => Ok(ipv4 as u16),
-            EtherTypes::Ipv6 => Ok(ipv6 as u16),
+            EtherTypes::Ipv4 => Ok(ipv4),
+            EtherTypes::Ipv6 => Ok(ipv6),
             _ => Err(io::Error::other("neither an IPv4 nor IPv6 packet")),
         }
     }
 }
 
-struct TunZCPacketToBytes {
+const TUN_TX_QUEUE_LEN: usize = 256;
+
+pub struct TunSink {
+    writer: AsyncWriter,
+    queue: VecDeque<Bytes>,
+
     has_pi: bool,
+    #[cfg(target_os = "linux")]
+    has_vnet_hdr: bool,
+
+    mtu: usize,
+    segmenter: Option<Segmenter>,
 }
 
-impl TunZCPacketToBytes {
-    pub fn new(has_pi: bool) -> Self {
-        Self { has_pi }
+impl TunSink {
+    pub fn new(writer: AsyncWriter, has_pi: bool, has_vnet_hdr: bool, mtu: usize) -> Self {
+        debug_assert!(!has_vnet_hdr || cfg!(target_os = "linux"));
+
+        TunSink {
+            writer,
+            queue: VecDeque::new(),
+            has_pi,
+            #[cfg(target_os = "linux")]
+            has_vnet_hdr,
+            mtu,
+            segmenter: (!has_vnet_hdr).then(Segmenter::new),
+        }
     }
 }
 
-impl ZCPacketToBytes for TunZCPacketToBytes {
-    fn zcpacket_into_bytes(&self, zc_packet: ZCPacket) -> Result<Bytes, TunnelError> {
-        let payload_offset = zc_packet.payload_offset();
-        let mut inner = zc_packet.inner();
-        assert!(payload_offset >= 4);
+impl Sink<SinkItem> for TunSink {
+    type Error = SinkError;
 
-        let hdr_len = if self.has_pi { 4 } else { 0 };
+    fn poll_ready(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        if self.queue.len() >= TUN_TX_QUEUE_LEN {
+            self.as_mut().poll_flush(cx)
+        } else {
+            Poll::Ready(Ok(()))
+        }
+    }
 
-        let mut ret = inner.split_off(payload_offset - hdr_len);
-        let proto = EtherType::infer(&ret[hdr_len..]);
+    fn start_send(self: Pin<&mut Self>, item: SinkItem) -> Result<(), Self::Error> {
+        let this = self.get_mut();
 
-        if self.has_pi {
-            let mut pi = &mut ret[..hdr_len];
+        let vnet_hdr_len = cfg_select! {
+            target_os = "linux" => if this.has_vnet_hdr { VNET_HDR_LEN } else { 0 },
+            _ => 0
+        };
+        let pi_len = if this.has_pi { 4 } else { 0 };
+        let hdr_len = vnet_hdr_len + pi_len;
+
+        let mut frame = {
+            let offset = item.payload_offset();
+            item.inner().split_off(offset - hdr_len)
+        };
+        let (hdr, packet) = frame.split_at_mut(hdr_len);
+        let proto = EtherType::infer(packet);
+
+        if this.has_pi {
+            let mut pi = &mut hdr[hdr_len - pi_len..];
             pi.write_u16::<NativeEndian>(0)?;
             pi.write_u16::<NetworkEndian>(proto.into_pi()?)?;
         }
 
-        tracing::debug!(?ret, ?payload_offset, "convert zc packet to tun packet");
-        Ok(ret.freeze())
+        'segment: {
+            match proto {
+                EtherTypes::Ipv4
+                    if let Some(ip) = Ipv4Packet::new(packet)
+                        && ip.get_next_level_protocol() == IpNextHeaderProtocols::Tcp
+                        && let Some(tcp) = TcpPacket::new(ip.payload()) =>
+                {
+                    #[cfg(target_os = "linux")]
+                    if this.has_vnet_hdr {
+                        let csum_start = (ip.get_header_length() as u16) * 4;
+                        write_vnet_hdr(
+                            &mut hdr[..VNET_HDR_LEN],
+                            ip.get_total_length() as _,
+                            this.mtu,
+                            VNET_HDR_GSO_TCPV4,
+                            csum_start + (tcp.get_data_offset() as u16) * 4,
+                            csum_start,
+                        );
+                        break 'segment;
+                    }
+
+                    if let Some(frames) = this
+                        .segmenter
+                        .as_mut()
+                        .unwrap()
+                        .tcp_segment_ipv4(hdr, &ip, &tcp, this.mtu)
+                    {
+                        this.queue.extend(frames);
+                        return Ok(());
+                    }
+                }
+                EtherTypes::Ipv6
+                    if let Some(ip) = Ipv6Packet::new(packet)
+                        && let Some((ip_hdr_len, ip_hdr)) = ipv6_skip_exthdr(packet)
+                        && ip_hdr == IpNextHeaderProtocols::Tcp
+                        && let Some(tcp) = TcpPacket::new(&packet[ip_hdr_len..]) =>
+                {
+                    #[cfg(target_os = "linux")]
+                    if this.has_vnet_hdr {
+                        let csum_start = ip_hdr_len as u16;
+                        write_vnet_hdr(
+                            &mut hdr[..VNET_HDR_LEN],
+                            40 + ip.get_payload_length() as usize,
+                            this.mtu,
+                            VNET_HDR_GSO_TCPV6,
+                            csum_start + (tcp.get_data_offset() as u16) * 4,
+                            csum_start,
+                        );
+                        break 'segment;
+                    }
+
+                    if let Some(frames) = this
+                        .segmenter
+                        .as_mut()
+                        .unwrap()
+                        .tcp_segment_ipv6(hdr, &ip, ip_hdr_len, &tcp, this.mtu)
+                    {
+                        this.queue.extend(frames);
+                        return Ok(());
+                    }
+                }
+                _ => hdr[..vnet_hdr_len].fill(0),
+            }
+        }
+
+        this.queue.push_back(frame.freeze());
+
+        Ok(())
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        let this = self.get_mut();
+
+        while let Some(data) = this.queue.front_mut() {
+            ready!(this.writer.poll_write(cx, data))?;
+            this.queue.pop_front();
+        }
+
+        Poll::Ready(Ok(()))
+    }
+
+    fn poll_close(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        ready!(self.as_mut().poll_flush(cx))?;
+        Poll::Ready(Ok(()))
     }
 }
-
-pin_project! {
-    pub struct TunAsyncWrite {
-        #[pin]
-        l: BiLock<AsyncDevice>,
-    }
-}
-
-impl AsyncWrite for TunAsyncWrite {
-    fn poll_write(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &[u8],
-    ) -> Poll<Result<usize, io::Error>> {
-        let self_mut = self.project();
-        let mut g = ready!(self_mut.l.poll_lock(cx));
-        g.as_pin_mut().poll_write(cx, buf)
-    }
-
-    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), io::Error>> {
-        let self_mut = self.project();
-        let mut g = ready!(self_mut.l.poll_lock(cx));
-        g.as_pin_mut().poll_flush(cx)
-    }
-
-    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), io::Error>> {
-        let self_mut = self.project();
-        let mut g = ready!(self_mut.l.poll_lock(cx));
-        g.as_pin_mut().poll_shutdown(cx)
-    }
-
-    fn poll_write_vectored(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        bufs: &[io::IoSlice<'_>],
-    ) -> Poll<Result<usize, io::Error>> {
-        let self_mut = self.project();
-        let mut g = ready!(self_mut.l.poll_lock(cx));
-        g.as_pin_mut().poll_write_vectored(cx, bufs)
-    }
-
-    fn is_write_vectored(&self) -> bool {
-        true
-    }
-}
+// endregion
 
 pub struct VirtualNic {
     global_ctx: ArcGlobalCtx,
 
     ifname: Option<String>,
     ifcfg: Box<dyn IfConfiguerTrait + Send + Sync + 'static>,
+    gso: AtomicBool,
 }
 
 impl Drop for VirtualNic {
@@ -251,6 +418,7 @@ impl VirtualNic {
             global_ctx,
             ifname: None,
             ifcfg: Box::new(IfConfiger {}),
+            gso: AtomicBool::new(false),
         }
     }
 
@@ -274,8 +442,8 @@ impl VirtualNic {
         // Check if TUN kernel module is available
         let tun_module_available = tokio::fs::metadata("/proc/net/dev").await.is_ok()
             && (tokio::fs::read_to_string("/proc/modules").await)
-            .map(|content| content.contains("tun"))
-            .unwrap_or(false);
+                .map(|content| content.contains("tun"))
+                .unwrap_or(false);
 
         if !tun_module_available {
             log::warn!("TUN kernel module may not be available.");
@@ -557,14 +725,48 @@ impl VirtualNic {
         config.up();
 
         let _g = self.global_ctx.net_ns.guard();
-        Ok(tun::create(&config)?)
+
+        let (dev, gso) = cfg_select! {
+            all(target_os = "linux", not(target_env = "ohos")) => {{
+                let gso = self.global_ctx.config.get_flags().gso;
+                config.platform_config(|c| { c.vnet_hdr(gso); });
+                let dev = tun::create(&config)?;
+
+                if gso {
+                    let enabled = unsafe {
+                        nix::libc::ioctl(
+                            std::os::fd::AsRawFd::as_raw_fd(&dev) as nix::libc::c_int,
+                            nix::libc::TUNSETOFFLOAD,
+                            nix::libc::TUN_F_CSUM | nix::libc::TUN_F_TSO4 | nix::libc::TUN_F_TSO6,
+                        )
+                    } == 0;
+
+                    if enabled {
+                        log::info!("GSO enabled");
+                        (dev, true)
+                    } else {
+                        log::warn!(error =? io::Error::last_os_error(), "failed to enable GSO on TUN, falling back");
+                        drop(dev);
+                        config.platform_config(|c| { c.vnet_hdr(false); });
+                        (tun::create(&config)?, false)
+                    }
+                } else {
+                    (dev, false)
+                }
+            }}
+            _ => (tun::create(&config)?, false),
+        };
+
+        self.gso.store(gso, Ordering::Relaxed);
+
+        Ok(dev)
     }
 
     #[cfg(mobile)]
     pub async fn create_dev_for_mobile(
         &mut self,
         tun_fd: std::os::fd::RawFd,
-    ) -> Result<Box<dyn Tunnel>, Error> {
+    ) -> Result<(TunStream, TunSink), Error> {
         log::debug!(%tun_fd);
         let mut config = Configuration::default();
         config.layer(Layer::L3);
@@ -579,28 +781,22 @@ impl VirtualNic {
         config.close_fd_on_drop(false);
         config.up();
 
-        let has_packet_info = cfg!(any(
+        let has_pi = cfg!(any(
             target_os = "ios",
             all(target_os = "macos", feature = "macos-ne")
         ));
         let dev = tun::create(&config)?;
+        let mtu = dev.mtu()?.into();
         let dev = AsyncDevice::new(dev)?;
-        let (a, b) = BiLock::new(dev);
-        let ft = TunnelWrapper::new(
-            TunStream::new(a, has_packet_info),
-            FramedWriter::with_converter(
-                TunAsyncWrite { l: b },
-                TunZCPacketToBytes::new(has_packet_info),
-            ),
-            None,
-        );
-
+        let (reader, writer) = dev.split();
         self.ifname = Some(format!("tunfd_{}", tun_fd));
-
-        Ok(Box::new(ft))
+        Ok((
+            TunStream::new(reader, has_pi, false, mtu),
+            TunSink::new(writer, has_pi, false, mtu),
+        ))
     }
 
-    pub async fn create_dev(&mut self) -> Result<Box<dyn Tunnel>, Error> {
+    pub async fn create_dev(&mut self) -> Result<(TunStream, TunSink), Error> {
         let dev = self.create_tun().await?;
 
         #[cfg(not(target_os = "freebsd"))]
@@ -650,28 +846,20 @@ impl VirtualNic {
         let dev = AsyncDevice::new(dev)?;
 
         let flags = self.global_ctx.config.get_flags();
-        let mut mtu_in_config = flags.mtu;
-        if flags.enable_encryption {
-            mtu_in_config -= 20;
-        }
-        {
+        let mtu = {
+            let mut mtu = flags.mtu;
+            if flags.enable_encryption {
+                mtu -= 20;
+            }
             // set mtu by ourselves, rust-tun does not handle it correctly on windows
             let _g = self.global_ctx.net_ns.guard();
-            self.ifcfg.set_mtu(ifname.as_str(), mtu_in_config).await?;
-        }
+            self.ifcfg.set_mtu(ifname.as_str(), mtu).await?;
+            mtu as usize
+        };
 
-        let has_packet_info = cfg!(all(target_os = "macos", not(feature = "macos-ne")));
-        let (a, b) = BiLock::new(dev);
-        let ft = TunnelWrapper::new(
-            TunStream::new(a, has_packet_info),
-            FramedWriter::with_converter(
-                TunAsyncWrite { l: b },
-                TunZCPacketToBytes::new(has_packet_info),
-            ),
-            None,
-        );
-
-        self.ifname = Some(ifname.to_owned());
+        let gso = self.gso.load(Ordering::Relaxed);
+        let has_pi = cfg!(all(target_os = "macos", not(feature = "macos-ne")));
+        let (reader, writer) = dev.split();
 
         #[cfg(target_os = "windows")]
         {
@@ -680,10 +868,6 @@ impl VirtualNic {
                 Ok(_) => {
                     tracing::info!(
                         "Successfully configured Windows Firewall for interface: {}",
-                        ifname
-                    );
-                    tracing::info!(
-                        "All protocols (TCP/UDP/ICMP) are now allowed on interface: {}",
                         ifname
                     );
                 }
@@ -696,7 +880,11 @@ impl VirtualNic {
             }
         }
 
-        Ok(Box::new(ft))
+        self.ifname = Some(ifname.to_owned());
+        Ok((
+            TunStream::new(reader, has_pi, gso, mtu),
+            TunSink::new(writer, has_pi, gso, mtu),
+        ))
     }
 
     pub fn ifname(&self) -> &str {
@@ -1128,7 +1316,7 @@ impl NicCtx {
                 &global_ctx,
                 &cur_proxy_cidrs,
             )
-                .await;
+            .await;
             Self::apply_route_changes(
                 &ifcfg,
                 &ifname,
@@ -1137,7 +1325,7 @@ impl NicCtx {
                 added,
                 removed,
             )
-                .await;
+            .await;
 
             loop {
                 let event = match event_receiver.recv().await {
@@ -1157,7 +1345,7 @@ impl NicCtx {
                             &global_ctx,
                             &cur_proxy_cidrs,
                         )
-                            .await;
+                        .await;
                         GlobalCtxEvent::ProxyCidrsUpdated(added, removed)
                     }
                 };
@@ -1176,7 +1364,7 @@ impl NicCtx {
                     added,
                     removed,
                 )
-                    .await;
+                .await;
             }
         });
 
@@ -1206,7 +1394,7 @@ impl NicCtx {
                 initial_added,
                 Vec::new(),
             )
-                .await;
+            .await;
 
             loop {
                 let event = match event_receiver.recv().await {
@@ -1234,7 +1422,7 @@ impl NicCtx {
                     added,
                     removed,
                 )
-                    .await;
+                .await;
             }
         });
 
@@ -1319,7 +1507,7 @@ impl NicCtx {
         ipv4_addr: Option<cidr::Ipv4Inet>,
         ipv6_addr: Option<cidr::Ipv6Inet>,
     ) -> Result<(), Error> {
-        let tunnel = {
+        let (stream, sink) = {
             let mut nic = self.nic.lock().await;
             match nic.create_dev().await {
                 Ok(ret) => {
@@ -1353,10 +1541,8 @@ impl NicCtx {
             }
         };
 
-        let (stream, sink) = tunnel.split();
-
-        self.do_forward_nic_to_peers_task(stream)?;
-        self.do_forward_peers_to_nic(sink);
+        self.do_forward_nic_to_peers_task(Box::pin(stream))?;
+        self.do_forward_peers_to_nic(Box::pin(sink));
 
         // Assign IPv4 address if provided
         if let Some(ipv4_addr) = ipv4_addr {
@@ -1381,7 +1567,7 @@ impl NicCtx {
 
     #[cfg(mobile)]
     pub async fn run_for_mobile(&mut self, tun_fd: std::os::fd::RawFd) -> Result<(), Error> {
-        let tunnel = {
+        let (stream, sink) = {
             let mut nic = self.nic.lock().await;
             match nic.create_dev_for_mobile(tun_fd).await {
                 Ok(ret) => {
@@ -1397,10 +1583,8 @@ impl NicCtx {
             }
         };
 
-        let (stream, sink) = tunnel.split();
-
-        self.do_forward_nic_to_peers_task(stream)?;
-        self.do_forward_peers_to_nic(sink);
+        self.do_forward_nic_to_peers_task(Box::pin(stream))?;
+        self.do_forward_peers_to_nic(Box::pin(sink));
 
         Ok(())
     }
@@ -1414,7 +1598,7 @@ mod tests {
 
     async fn run_test_helper() -> Result<VirtualNic, Error> {
         let mut dev = VirtualNic::new(get_mock_global_ctx());
-        let _tunnel = dev.create_dev().await?;
+        let (_stream, _sink) = dev.create_dev().await?;
 
         tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
 
