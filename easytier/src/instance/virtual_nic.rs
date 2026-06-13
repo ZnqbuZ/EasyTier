@@ -29,7 +29,7 @@ use tokio::{
 use tokio_util::task::AbortOnDropHandle;
 use tun::{AbstractDevice, AsyncDevice, Configuration, Layer};
 use tun::{DeviceReader, DeviceWriter};
-use zerocopy::{NativeEndian, NetworkEndian};
+use zerocopy::{AsBytes, NativeEndian, NetworkEndian};
 
 #[cfg(target_os = "windows")]
 use crate::common::ifcfg::RegistryManager;
@@ -278,20 +278,20 @@ impl TunSink {
         })
     }
 
-    fn tcp_segment_ipv4(
+    fn tcp_segment_ipv4_new(
         buf: Bytes,
         hdr_len: usize,
         mtu: usize,
         info: Ipv4TcpPacketInfo,
-    ) -> Vec<Bytes> {
+    ) -> PacketBatch {
         if info.total_len <= info.ip_hdr_len + info.tcp_hdr_len {
-            return vec![buf];
+            return buf.into();
         }
 
         let tcp_off = hdr_len + info.ip_hdr_len;
         let tcp = match TcpPacket::new(&buf[tcp_off..hdr_len + info.total_len]) {
             Some(t) => t,
-            None => return vec![buf],
+            None => return buf.into(),
         };
 
         let payload_off = tcp_off + info.tcp_hdr_len;
@@ -299,7 +299,7 @@ impl TunSink {
 
         let seg_payload_size = mtu.saturating_sub(info.ip_hdr_len + info.tcp_hdr_len);
         if seg_payload_size == 0 {
-            return vec![buf];
+            return buf.into();
         }
 
         let base_seq = tcp.get_sequence();
@@ -313,14 +313,6 @@ impl TunSink {
             .unwrap_or(0);
 
         let header_len = payload_off;
-        let total_out_capacity = total_segs * header_len + total_payload;
-
-        let mut big = BytesMut::with_capacity(total_out_capacity);
-        let mut out = Vec::with_capacity(total_segs);
-
-        let mut offset = 0;
-        let mut seg_idx = 0u16;
-
         let header_template = &buf[..header_len];
 
         let mut pseudo_hdr = [0u8; 12];
@@ -328,6 +320,12 @@ impl TunSink {
         pseudo_hdr[4..8].copy_from_slice(&info.destination.octets());
         pseudo_hdr[8] = 0;
         pseudo_hdr[9] = 6;
+
+        let mut packets = Vec::with_capacity(total_segs);
+        let mut offset = 0;
+        let mut seg_idx = 0u16;
+
+        let mut hdr_buf = BytesMut::with_capacity(header_len * total_segs);
 
         while offset < total_payload {
             let is_last = offset + seg_payload_size >= total_payload;
@@ -337,15 +335,13 @@ impl TunSink {
                 seg_payload_size
             };
 
-            let pkt_len = header_len + this_seg;
-
-            big.extend_from_slice(header_template);
-            big.extend_from_slice(&buf[payload_off + offset..payload_off + offset + this_seg]);
+            hdr_buf.extend_from_slice(header_template);
 
             let new_ip_len = (info.ip_hdr_len + info.tcp_hdr_len + this_seg) as u16;
-            big[hdr_len + 2..hdr_len + 4].copy_from_slice(&new_ip_len.to_be_bytes());
+            hdr_buf[hdr_len + 2..hdr_len + 4].copy_from_slice(&new_ip_len.to_be_bytes());
 
-            if let Some(mut ip_pkt) = MutableIpv4Packet::new(&mut big[hdr_len..pkt_len]) {
+            let ip_hdr_end = tcp_off;
+            if let Some(mut ip_pkt) = MutableIpv4Packet::new(&mut hdr_buf[hdr_len..ip_hdr_end]) {
                 ip_pkt.set_total_length(new_ip_len);
                 ip_pkt.set_flags(Ipv4Flags::DontFragment);
                 ip_pkt.set_fragment_offset(0);
@@ -355,8 +351,7 @@ impl TunSink {
                 ip_pkt.set_checksum(checksum);
             }
 
-            let tcp_slice = &mut big[tcp_off..pkt_len];
-            if let Some(mut tcp_pkt) = MutableTcpPacket::new(tcp_slice) {
+            if let Some(mut tcp_pkt) = MutableTcpPacket::new(&mut hdr_buf[tcp_off..header_len]) {
                 tcp_pkt.set_sequence(base_seq.wrapping_add(offset as u32));
                 let mut flags = non_data_flags;
                 if is_last {
@@ -369,20 +364,54 @@ impl TunSink {
             let tcp_len = (info.tcp_hdr_len + this_seg) as u16;
             pseudo_hdr[10..12].copy_from_slice(&tcp_len.to_be_bytes());
 
+            let payload = buf.slice(payload_off + offset..payload_off + offset + this_seg);
+
             let mut csum_calc = internet_checksum::Checksum::new();
             csum_calc.add_bytes(&pseudo_hdr);
-            csum_calc.add_bytes(&big[tcp_off..pkt_len]);
+            csum_calc.add_bytes(&hdr_buf[tcp_off..header_len]);
+            csum_calc.add_bytes(&payload);
             let final_csum = csum_calc.checksum();
 
-            big[tcp_off + 16..tcp_off + 18].copy_from_slice(&final_csum);
+            hdr_buf[tcp_off + 16..tcp_off + 18].copy_from_slice(&final_csum);
 
-            out.push(big.split().freeze());
+            let hdr = hdr_buf.split().freeze();
+
+            let mut frags: SmallVec<[Bytes; 3]> = SmallVec::new();
+            frags.push(hdr);
+            frags.push(payload);
+            packets.push(PacketData::Fragmented(frags));
 
             offset += this_seg;
             seg_idx += 1;
         }
 
-        out
+        PacketBatch::Multiple(packets)
+    }
+
+    fn tcp_segment_ipv4(
+        buf: Bytes,
+        hdr_len: usize,
+        mtu: usize,
+        info: Ipv4TcpPacketInfo,
+    ) -> Vec<Bytes> {
+        match Self::tcp_segment_ipv4_new(buf, hdr_len, mtu, info) {
+            PacketBatch::Single(PacketData::Continuous(bytes)) => vec![bytes],
+            PacketBatch::Multiple(packets) => {
+                let mut out = Vec::with_capacity(packets.len());
+                let mut big = BytesMut::with_capacity(1 << 16);
+                for packet in packets {
+                    let PacketData::Fragmented(frags) = packet else {
+                        unreachable!()
+                    };
+                    for frag in frags {
+                        big.extend_from_slice(frag.as_bytes());
+                    }
+                    out.push(big.split().freeze());
+                }
+                out
+            }
+            _ => unreachable!()
+        }
     }
 }
 
