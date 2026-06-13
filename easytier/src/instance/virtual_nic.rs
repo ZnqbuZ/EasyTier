@@ -19,7 +19,6 @@ use pnet::packet::ip::IpNextHeaderProtocols;
 use pnet::packet::ipv4::{Ipv4Flags, MutableIpv4Packet};
 use pnet::packet::tcp::{MutableTcpPacket, TcpFlags, TcpPacket};
 use pnet::packet::{ipv4, ipv4::Ipv4Packet, ipv6::Ipv6Packet};
-use smallvec::SmallVec;
 use tokio::{
     sync::{Mutex, Notify},
     task::JoinSet,
@@ -188,21 +187,9 @@ impl ProtoExt for EtherType {
 }
 
 #[derive(Debug, From)]
-pub enum PacketData {
-    Continuous(Bytes),
-    Fragmented(SmallVec<[Bytes; 3]>),
-}
-
-#[derive(Debug)]
 pub enum PacketBatch {
-    Single(PacketData),
-    Multiple(Vec<PacketData>),
-}
-
-impl From<Bytes> for PacketBatch {
-    fn from(value: Bytes) -> Self {
-        Self::Single(PacketData::Continuous(value))
-    }
+    Single(Bytes),
+    Multiple(Vec<Bytes>),
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -218,7 +205,7 @@ const TUN_TX_QUEUE_LEN: usize = 256;
 
 pub struct TunWriter {
     writer: AsyncWriter,
-    queue: VecDeque<PacketData>,
+    queue: VecDeque<Bytes>,
 
     has_pi: bool,
     has_vnet_hdr: bool,
@@ -243,7 +230,7 @@ impl TunWriter {
             has_vnet_hdr,
             mtu,
             gso,
-            buf: BytesMut::with_capacity(1 << 20),
+            buf: BytesMut::with_capacity(if !gso { 1 << 20 } else { 0 }),
         }
     }
 
@@ -281,20 +268,21 @@ impl TunWriter {
         })
     }
 
-    fn tcp_segment_ipv4_inner(
-        buf: Bytes,
+    fn tcp_segment_ipv4(
+        packet: Bytes,
+        buf: &mut BytesMut,
         hdr_len: usize,
         mtu: usize,
         info: Ipv4TcpPacketInfo,
-    ) -> Vec<PacketData> {
+    ) -> PacketBatch {
         if info.total_len <= info.ip_hdr_len + info.tcp_hdr_len {
-            return vec![buf.into()];
+            return packet.into();
         }
 
         let tcp_off = hdr_len + info.ip_hdr_len;
-        let tcp = match TcpPacket::new(&buf[tcp_off..hdr_len + info.total_len]) {
+        let tcp = match TcpPacket::new(&packet[tcp_off..hdr_len + info.total_len]) {
             Some(t) => t,
-            None => return vec![buf.into()],
+            None => return packet.into(),
         };
 
         let payload_off = tcp_off + info.tcp_hdr_len;
@@ -302,7 +290,7 @@ impl TunWriter {
 
         let seg_payload_size = mtu.saturating_sub(info.ip_hdr_len + info.tcp_hdr_len);
         if seg_payload_size == 0 {
-            return vec![buf.into()];
+            return packet.into();
         }
 
         let base_seq = tcp.get_sequence();
@@ -311,20 +299,22 @@ impl TunWriter {
         let orig_fin = tcp_flags & TcpFlags::FIN;
         let non_data_flags = tcp_flags & !(TcpFlags::PSH | TcpFlags::FIN);
         let total_segs = total_payload.div_ceil(seg_payload_size);
-        let ip_id = Ipv4Packet::new(&buf[hdr_len..])
+        let ip_id = Ipv4Packet::new(&packet[hdr_len..])
             .map(|ipv4| ipv4.get_identification())
             .unwrap_or(0);
 
         let header_len = payload_off;
         let total_out_capacity = total_segs * header_len + total_payload;
 
-        let mut big = BytesMut::with_capacity(total_out_capacity);
+        if buf.capacity() < total_out_capacity {
+            buf.reserve(1 << 20);
+        }
         let mut out = Vec::with_capacity(total_segs);
 
         let mut offset = 0;
         let mut seg_idx = 0u16;
 
-        let header_template = &buf[..header_len];
+        let header_template = &packet[..header_len];
 
         let mut pseudo_hdr = [0u8; 12];
         pseudo_hdr[0..4].copy_from_slice(&info.source.octets());
@@ -342,13 +332,13 @@ impl TunWriter {
 
             let pkt_len = header_len + this_seg;
 
-            big.extend_from_slice(header_template);
-            big.extend_from_slice(&buf[payload_off + offset..payload_off + offset + this_seg]);
+            buf.extend_from_slice(header_template);
+            buf.extend_from_slice(&packet[payload_off + offset..payload_off + offset + this_seg]);
 
             let new_ip_len = (info.ip_hdr_len + info.tcp_hdr_len + this_seg) as u16;
-            big[hdr_len + 2..hdr_len + 4].copy_from_slice(&new_ip_len.to_be_bytes());
+            buf[hdr_len + 2..hdr_len + 4].copy_from_slice(&new_ip_len.to_be_bytes());
 
-            if let Some(mut ip_pkt) = MutableIpv4Packet::new(&mut big[hdr_len..pkt_len]) {
+            if let Some(mut ip_pkt) = MutableIpv4Packet::new(&mut buf[hdr_len..pkt_len]) {
                 ip_pkt.set_total_length(new_ip_len);
                 ip_pkt.set_flags(Ipv4Flags::DontFragment);
                 ip_pkt.set_fragment_offset(0);
@@ -358,7 +348,7 @@ impl TunWriter {
                 ip_pkt.set_checksum(checksum);
             }
 
-            let tcp_slice = &mut big[tcp_off..pkt_len];
+            let tcp_slice = &mut buf[tcp_off..pkt_len];
             if let Some(mut tcp_pkt) = MutableTcpPacket::new(tcp_slice) {
                 tcp_pkt.set_sequence(base_seq.wrapping_add(offset as u32));
                 let mut flags = non_data_flags;
@@ -374,27 +364,18 @@ impl TunWriter {
 
             let mut csum_calc = internet_checksum::Checksum::new();
             csum_calc.add_bytes(&pseudo_hdr);
-            csum_calc.add_bytes(&big[tcp_off..pkt_len]);
+            csum_calc.add_bytes(&buf[tcp_off..pkt_len]);
             let final_csum = csum_calc.checksum();
 
-            big[tcp_off + 16..tcp_off + 18].copy_from_slice(&final_csum);
+            buf[tcp_off + 16..tcp_off + 18].copy_from_slice(&final_csum);
 
-            out.push(big.split().freeze().into());
+            out.push(buf.split().freeze());
 
             offset += this_seg;
             seg_idx += 1;
         }
 
-        out
-    }
-
-    fn tcp_segment_ipv4(
-        buf: Bytes,
-        hdr_len: usize,
-        mtu: usize,
-        info: Ipv4TcpPacketInfo,
-    ) -> PacketBatch {
-        PacketBatch::Multiple(Self::tcp_segment_ipv4_inner(buf,hdr_len,mtu,info))
+        out.into()
     }
 }
 
@@ -487,7 +468,7 @@ impl Sink<ZCPacket> for TunWriter {
                 && let Some(info) = ipv4_tcp_info
             {
                 let frozen = ret.freeze();
-                match Self::tcp_segment_ipv4(frozen, hdr_len, this.mtu, info) {
+                match Self::tcp_segment_ipv4(frozen, &mut this.buf, hdr_len, this.mtu, info) {
                     PacketBatch::Single(packet) => this.queue.push_back(packet),
                     PacketBatch::Multiple(packets) => this.queue.extend(packets),
                 }
@@ -495,7 +476,7 @@ impl Sink<ZCPacket> for TunWriter {
             }
         }
 
-        this.queue.push_back(PacketData::Continuous(ret.freeze()));
+        this.queue.push_back(ret.freeze());
 
         Ok(())
     }
@@ -504,29 +485,7 @@ impl Sink<ZCPacket> for TunWriter {
         let this = self.get_mut();
 
         while let Some(data) = this.queue.front_mut() {
-            match data {
-                PacketData::Continuous(bytes) => {
-                    ready!(this.writer.poll_write(cx, bytes))?;
-                }
-                PacketData::Fragmented(frags) => {
-                    // let slices: SmallVec<[io::IoSlice<'_>; 4]> =
-                    //     frags.iter().map(|b| io::IoSlice::new(b)).collect();
-                    // ready!(this.writer.poll_write_vectored(cx, &slices))?;
-                    let len = frags.iter().map(|f| f.len()).sum::<usize>();
-                    if this.buf.capacity() < len {
-                        this.buf.reserve(1 << 20);
-                    }
-                    unsafe {
-                        this.buf.set_len(len);
-                    }
-                    let mut bytes = this.buf.split();
-                    bytes.clear();
-                    for frag in frags {
-                        bytes.extend_from_slice(&frag);
-                    }
-                    ready!(this.writer.poll_write(cx, &bytes))?;
-                }
-            };
+            ready!(this.writer.poll_write(cx, data))?;
             this.queue.pop_front();
         }
 
