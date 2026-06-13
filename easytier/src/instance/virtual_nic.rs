@@ -223,6 +223,8 @@ pub struct TunWriter {
     has_vnet_hdr: bool,
     mtu: usize,
     gso: bool,
+
+    buf: BytesMut,
 }
 
 impl TunWriter {
@@ -240,6 +242,7 @@ impl TunWriter {
             has_vnet_hdr,
             mtu,
             gso,
+            buf: BytesMut::with_capacity(1 << 20),
         }
     }
 
@@ -499,9 +502,22 @@ impl Sink<ZCPacket> for TunWriter {
                     ready!(this.writer.poll_write(cx, bytes))?;
                 }
                 PacketData::Fragmented(frags) => {
-                    let slices: SmallVec<[io::IoSlice<'_>; 4]> =
-                        frags.iter().map(|b| io::IoSlice::new(b)).collect();
-                    ready!(this.writer.poll_write_vectored(cx, &slices))?;
+                    // let slices: SmallVec<[io::IoSlice<'_>; 4]> =
+                    //     frags.iter().map(|b| io::IoSlice::new(b)).collect();
+                    // ready!(this.writer.poll_write_vectored(cx, &slices))?;
+                    let len = frags.iter().map(|f| f.len()).sum::<usize>();
+                    if this.buf.capacity() < len {
+                        this.buf.reserve(1 << 20);
+                    }
+                    unsafe {
+                        this.buf.set_len(len);
+                    }
+                    let mut bytes = this.buf.split();
+                    bytes.clear();
+                    for frag in frags {
+                        bytes.extend_from_slice(&frag);
+                    }
+                    ready!(this.writer.poll_write(cx, &bytes))?;
                 }
             };
             this.queue.pop_front();
