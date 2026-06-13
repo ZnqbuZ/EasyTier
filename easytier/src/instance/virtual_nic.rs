@@ -10,7 +10,7 @@ use std::{
 };
 
 use byteorder::WriteBytesExt as _;
-use bytes::{Buf, Bytes, BytesMut};
+use bytes::{Bytes, BytesMut};
 use cidr::{Ipv4Inet, Ipv6Inet};
 use futures::{Sink, SinkExt, Stream, StreamExt, ready};
 use pnet::packet::ethernet::{EtherType, EtherTypes};
@@ -19,16 +19,14 @@ use pnet::packet::ipv4::{Ipv4Flags, MutableIpv4Packet};
 use pnet::packet::tcp::{MutableTcpPacket, TcpFlags, TcpPacket};
 use pnet::packet::{ipv4, ipv4::Ipv4Packet, ipv6::Ipv6Packet};
 use smallvec::SmallVec;
-use tokio::io::AsyncWrite;
 use tokio::{
-    io::{AsyncRead, ReadBuf},
     sync::{Mutex, Notify},
     task::JoinSet,
 };
 #[cfg(target_os = "windows")]
 use tokio_util::task::AbortOnDropHandle;
-use tun::{AbstractDevice, AsyncDevice, Configuration, Layer};
-use tun::{DeviceReader, DeviceWriter};
+use tun::{AbstractDevice, AsyncDevice, AsyncReader, AsyncWriter, Configuration, Layer};
+use tun::{AsyncRead, AsyncWrite};
 use zerocopy::{NativeEndian, NetworkEndian};
 
 #[cfg(target_os = "windows")]
@@ -52,8 +50,8 @@ use crate::{
 const PI_LEN: usize = 4;
 const VNET_HDR_LEN: usize = 10;
 
-pub struct TunStream {
-    reader: DeviceReader,
+pub struct TunReader {
+    reader: AsyncReader,
     max_packet_size: usize,
     buf: BufPool,
     margins: BufMargins,
@@ -61,9 +59,9 @@ pub struct TunStream {
     has_vnet_hdr: bool,
 }
 
-impl TunStream {
+impl TunReader {
     pub fn new(
-        reader: DeviceReader,
+        reader: AsyncReader,
         max_packet_size: usize,
         has_pi: bool,
         has_vnet_hdr: bool,
@@ -89,7 +87,7 @@ impl TunStream {
     }
 }
 
-impl TunStream {
+impl TunReader {
     fn checksum(packet: &mut [u8], has_pi: bool) {
         const VIRTIO_NET_HDR_F_NEEDS_CSUM: u8 = 1;
 
@@ -114,7 +112,7 @@ impl TunStream {
     }
 }
 
-impl Stream for TunStream {
+impl Stream for TunReader {
     type Item = StreamItem;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<StreamItem>> {
@@ -123,14 +121,15 @@ impl Stream for TunStream {
         let mut writer = this
             .buf
             .writer(this.max_packet_size + this.margins.size(), this.margins);
-        let mut buf = ReadBuf::uninit(writer.as_slice());
-        let written = {
-            if let Err(error) = ready!(Pin::new(&mut this.reader).poll_read(cx, &mut buf)) {
-                log::error!(?error, "tun stream error");
+        let slice = writer.as_slice();
+        let buf =
+            unsafe { std::slice::from_raw_parts_mut(slice.as_mut_ptr() as *mut u8, slice.len()) };
+        let written = match ready!(this.reader.poll_read(cx, buf)) {
+            Ok(n) => n,
+            Err(error) => {
+                log::error!(?error, "tun reader error");
                 return Poll::Ready(None);
             }
-
-            buf.filled().len()
         };
 
         if written == 0 {
@@ -216,8 +215,8 @@ struct Ipv4TcpPacketInfo {
 
 const TUN_TX_QUEUE_LEN: usize = 256;
 
-pub struct TunSink {
-    writer: DeviceWriter,
+pub struct TunWriter {
+    writer: AsyncWriter,
     queue: VecDeque<PacketData>,
 
     has_pi: bool,
@@ -226,15 +225,15 @@ pub struct TunSink {
     gso: bool,
 }
 
-impl TunSink {
+impl TunWriter {
     pub fn new(
-        writer: DeviceWriter,
+        writer: AsyncWriter,
         has_pi: bool,
         has_vnet_hdr: bool,
         mtu: usize,
         gso: bool,
     ) -> Self {
-        TunSink {
+        TunWriter {
             writer,
             queue: VecDeque::new(),
             has_pi,
@@ -283,15 +282,15 @@ impl TunSink {
         hdr_len: usize,
         mtu: usize,
         info: Ipv4TcpPacketInfo,
-    ) -> Vec<Bytes> {
+    ) -> PacketBatch {
         if info.total_len <= info.ip_hdr_len + info.tcp_hdr_len {
-            return vec![buf];
+            return buf.into();
         }
 
         let tcp_off = hdr_len + info.ip_hdr_len;
         let tcp = match TcpPacket::new(&buf[tcp_off..hdr_len + info.total_len]) {
             Some(t) => t,
-            None => return vec![buf],
+            None => return buf.into(),
         };
 
         let payload_off = tcp_off + info.tcp_hdr_len;
@@ -299,7 +298,7 @@ impl TunSink {
 
         let seg_payload_size = mtu.saturating_sub(info.ip_hdr_len + info.tcp_hdr_len);
         if seg_payload_size == 0 {
-            return vec![buf];
+            return buf.into();
         }
 
         let base_seq = tcp.get_sequence();
@@ -313,14 +312,6 @@ impl TunSink {
             .unwrap_or(0);
 
         let header_len = payload_off;
-        let total_out_capacity = total_segs * header_len + total_payload;
-
-        let mut big = BytesMut::with_capacity(total_out_capacity);
-        let mut out = Vec::with_capacity(total_segs);
-
-        let mut offset = 0;
-        let mut seg_idx = 0u16;
-
         let header_template = &buf[..header_len];
 
         let mut pseudo_hdr = [0u8; 12];
@@ -328,6 +319,12 @@ impl TunSink {
         pseudo_hdr[4..8].copy_from_slice(&info.destination.octets());
         pseudo_hdr[8] = 0;
         pseudo_hdr[9] = 6;
+
+        let mut packets = Vec::with_capacity(total_segs);
+        let mut offset = 0;
+        let mut seg_idx = 0u16;
+
+        let mut hdr_buf = BytesMut::with_capacity(header_len * total_segs);
 
         while offset < total_payload {
             let is_last = offset + seg_payload_size >= total_payload;
@@ -337,15 +334,13 @@ impl TunSink {
                 seg_payload_size
             };
 
-            let pkt_len = header_len + this_seg;
-
-            big.extend_from_slice(header_template);
-            big.extend_from_slice(&buf[payload_off + offset..payload_off + offset + this_seg]);
+            hdr_buf.extend_from_slice(header_template);
 
             let new_ip_len = (info.ip_hdr_len + info.tcp_hdr_len + this_seg) as u16;
-            big[hdr_len + 2..hdr_len + 4].copy_from_slice(&new_ip_len.to_be_bytes());
+            hdr_buf[hdr_len + 2..hdr_len + 4].copy_from_slice(&new_ip_len.to_be_bytes());
 
-            if let Some(mut ip_pkt) = MutableIpv4Packet::new(&mut big[hdr_len..pkt_len]) {
+            let ip_hdr_end = tcp_off;
+            if let Some(mut ip_pkt) = MutableIpv4Packet::new(&mut hdr_buf[hdr_len..ip_hdr_end]) {
                 ip_pkt.set_total_length(new_ip_len);
                 ip_pkt.set_flags(Ipv4Flags::DontFragment);
                 ip_pkt.set_fragment_offset(0);
@@ -355,8 +350,7 @@ impl TunSink {
                 ip_pkt.set_checksum(checksum);
             }
 
-            let tcp_slice = &mut big[tcp_off..pkt_len];
-            if let Some(mut tcp_pkt) = MutableTcpPacket::new(tcp_slice) {
+            if let Some(mut tcp_pkt) = MutableTcpPacket::new(&mut hdr_buf[tcp_off..header_len]) {
                 tcp_pkt.set_sequence(base_seq.wrapping_add(offset as u32));
                 let mut flags = non_data_flags;
                 if is_last {
@@ -369,24 +363,32 @@ impl TunSink {
             let tcp_len = (info.tcp_hdr_len + this_seg) as u16;
             pseudo_hdr[10..12].copy_from_slice(&tcp_len.to_be_bytes());
 
+            let payload = buf.slice(payload_off + offset..payload_off + offset + this_seg);
+
             let mut csum_calc = internet_checksum::Checksum::new();
             csum_calc.add_bytes(&pseudo_hdr);
-            csum_calc.add_bytes(&big[tcp_off..pkt_len]);
+            csum_calc.add_bytes(&hdr_buf[tcp_off..header_len]);
+            csum_calc.add_bytes(&payload);
             let final_csum = csum_calc.checksum();
 
-            big[tcp_off + 16..tcp_off + 18].copy_from_slice(&final_csum);
+            hdr_buf[tcp_off + 16..tcp_off + 18].copy_from_slice(&final_csum);
 
-            out.push(big.split().freeze());
+            let hdr = hdr_buf.split().freeze();
+
+            let mut frags: SmallVec<[Bytes; 3]> = SmallVec::new();
+            frags.push(hdr);
+            frags.push(payload);
+            packets.push(PacketData::Fragmented(frags));
 
             offset += this_seg;
             seg_idx += 1;
         }
 
-        out
+        PacketBatch::Multiple(packets)
     }
 }
 
-impl Sink<ZCPacket> for TunSink {
+impl Sink<ZCPacket> for TunWriter {
     type Error = TunnelError;
 
     fn poll_ready(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
@@ -475,10 +477,10 @@ impl Sink<ZCPacket> for TunSink {
                 && let Some(info) = ipv4_tcp_info
             {
                 let frozen = ret.freeze();
-                let segments = Self::tcp_segment_ipv4(frozen, hdr_len, this.mtu, info);
-                let batch: Vec<PacketData> =
-                    segments.into_iter().map(PacketData::Continuous).collect();
-                this.queue.extend(batch);
+                match Self::tcp_segment_ipv4(frozen, hdr_len, this.mtu, info) {
+                    PacketBatch::Single(packet) => this.queue.push_back(packet),
+                    PacketBatch::Multiple(packets) => this.queue.extend(packets),
+                }
                 return Ok(());
             }
         }
@@ -492,44 +494,17 @@ impl Sink<ZCPacket> for TunSink {
         let this = self.get_mut();
 
         while let Some(data) = this.queue.front_mut() {
-            let n = match data {
+            match data {
                 PacketData::Continuous(bytes) => {
-                    ready!(Pin::new(&mut this.writer).poll_write(cx, bytes))?
+                    ready!(this.writer.poll_write(cx, bytes))?;
                 }
                 PacketData::Fragmented(frags) => {
                     let slices: SmallVec<[io::IoSlice<'_>; 4]> =
                         frags.iter().map(|b| io::IoSlice::new(b)).collect();
-                    ready!(Pin::new(&mut this.writer).poll_write_vectored(cx, &slices))?
+                    ready!(this.writer.poll_write_vectored(cx, &slices))?;
                 }
             };
-            if n == 0 {
-                return Poll::Ready(Err(TunnelError::IOError(std::io::Error::new(
-                    std::io::ErrorKind::WriteZero,
-                    "failed to write packet to TUN",
-                ))));
-            }
-            match data {
-                PacketData::Continuous(bytes) => bytes.advance(n),
-                PacketData::Fragmented(frags) => {
-                    let mut remaining = n;
-                    while remaining > 0 && !frags.is_empty() {
-                        let len = frags[0].len();
-                        if len <= remaining {
-                            remaining -= len;
-                            frags.remove(0);
-                        } else {
-                            frags[0].advance(remaining);
-                            break;
-                        }
-                    }
-                }
-            }
-            if match data {
-                PacketData::Continuous(bytes) => bytes.is_empty(),
-                PacketData::Fragmented(frags) => frags.is_empty(),
-            } {
-                this.queue.pop_front();
-            }
+            this.queue.pop_front();
         }
 
         Poll::Ready(Ok(()))
@@ -934,7 +909,7 @@ impl VirtualNic {
     pub async fn create_dev_for_mobile(
         &mut self,
         tun_fd: std::os::fd::RawFd,
-    ) -> Result<(TunStream, TunSink), Error> {
+    ) -> Result<(TunReader, TunWriter), Error> {
         log::debug!(%tun_fd);
         let mut config = Configuration::default();
         config.layer(Layer::L3);
@@ -960,12 +935,12 @@ impl VirtualNic {
         let (reader, writer) = dev.split();
         self.ifname = Some(format!("tunfd_{}", tun_fd));
         Ok((
-            TunStream::new(reader, mtu, has_pi, has_vnet_hdr),
-            TunSink::new(writer, has_pi, has_vnet_hdr, mtu, false),
+            TunReader::new(reader, mtu, has_pi, has_vnet_hdr),
+            TunWriter::new(writer, has_pi, has_vnet_hdr, mtu, false),
         ))
     }
 
-    pub async fn create_dev(&mut self) -> Result<(TunStream, TunSink), Error> {
+    pub async fn create_dev(&mut self) -> Result<(TunReader, TunWriter), Error> {
         let dev = self.create_tun().await?;
 
         #[cfg(not(target_os = "freebsd"))]
@@ -1051,13 +1026,13 @@ impl VirtualNic {
 
         self.ifname = Some(ifname.to_owned());
         Ok((
-            TunStream::new(
+            TunReader::new(
                 reader,
                 if gso { 1 << 16 } else { mtu as usize },
                 has_pi,
                 has_vnet_hdr,
             ),
-            TunSink::new(writer, has_pi, has_vnet_hdr, mtu as usize, gso),
+            TunWriter::new(writer, has_pi, has_vnet_hdr, mtu as usize, gso),
         ))
     }
 
