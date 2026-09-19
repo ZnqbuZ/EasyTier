@@ -16,7 +16,7 @@ use crate::{
     tunnel::{SinkError, SinkItem, TunnelError, buf::BufList},
 };
 
-pub const TCP_MTU_BYTES: usize = 2000;
+pub const TCP_MTU_BYTES: usize = 1 << 16;
 
 #[derive(Copy, Clone, Debug)]
 pub struct TunnelCodec {

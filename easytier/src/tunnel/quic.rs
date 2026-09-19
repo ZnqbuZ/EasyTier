@@ -33,6 +33,8 @@ use tokio_util::codec::FramedRead;
 use tokio_util::task::AbortOnDropHandle;
 
 mod session_socket;
+
+const QUIC_MAX_PACKET_SIZE: usize = 1 << 16;
 pub(crate) use session_socket::QuicUdpSessionSocket;
 
 // region config
@@ -468,7 +470,7 @@ pub(crate) async fn upgrade_connected(
         FramedRead::new(
             read,
             TunnelCodec {
-                max_packet_size: 4500,
+                max_packet_size: QUIC_MAX_PACKET_SIZE,
             },
         ),
         FramedWriter::new(write),
@@ -514,7 +516,7 @@ async fn finish_quic_session_tunnel(
         FramedRead::new(
             read,
             TunnelCodec {
-                max_packet_size: 2000,
+                max_packet_size: QUIC_MAX_PACKET_SIZE,
             },
         ),
         FramedWriter::new(write),
@@ -759,7 +761,7 @@ mod tests {
             let mut recv = FramedRead::new(
                 second_read,
                 TunnelCodec {
-                    max_packet_size: 4500,
+                    max_packet_size: QUIC_MAX_PACKET_SIZE,
                 },
             );
             let ready = recv.next().await.unwrap().unwrap();
