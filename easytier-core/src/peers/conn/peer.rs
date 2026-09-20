@@ -298,6 +298,20 @@ impl Peer {
         })
     }
 
+    pub fn get_tunnel_type_bits(&self) -> u32 {
+        let mut bits = 0u32;
+        for conn in self.conns.iter() {
+            if !conn.is_closed() {
+                let info = conn.get_conn_info();
+                if let Some(tunnel) = info.tunnel {
+                    let kind = easytier_attrs::TunnelKind::from_scheme(&tunnel.tunnel_type);
+                    bits |= kind.to_bit();
+                }
+            }
+        }
+        bits
+    }
+
     pub fn get_directly_connections(&self) -> DashSet<uuid::Uuid> {
         self.conns
             .iter()

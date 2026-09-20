@@ -33,6 +33,7 @@ cidr = { workspace = true, features = ["serde"] }
 crossbeam.workspace = true
 dashmap.workspace = true
 bon.workspace = true
+easytier-attrs.workspace = true
 easytier-proto = { workspace = true, features = ["core"] }
 futures.workspace = true
 guarden.workspace = true

@@ -76,8 +76,14 @@ async fn peer_conn_handshake_over_memory_tunnel() {
     server_ret.unwrap();
     assert_eq!(client.get_peer_id(), 2);
     assert_eq!(server.get_peer_id(), 1);
-    assert_eq!(client.get_conn_info().features, ["liveness-echo-v1"]);
-    assert_eq!(server.get_conn_info().features, ["liveness-echo-v1"]);
+    assert_eq!(
+        client.get_conn_info().features,
+        ["liveness-echo-v1", "conn-attrs-v1"]
+    );
+    assert_eq!(
+        server.get_conn_info().features,
+        ["liveness-echo-v1", "conn-attrs-v1"]
+    );
 }
 
 #[tokio::test]
@@ -170,8 +176,14 @@ async fn peer_conn_noise_handshake_advertises_liveness_echo() {
 
     client_ret.unwrap();
     server_ret.unwrap();
-    assert_eq!(client.get_conn_info().features, ["liveness-echo-v1"]);
-    assert_eq!(server.get_conn_info().features, ["liveness-echo-v1"]);
+    assert_eq!(
+        client.get_conn_info().features,
+        ["liveness-echo-v1", "conn-attrs-v1"]
+    );
+    assert_eq!(
+        server.get_conn_info().features,
+        ["liveness-echo-v1", "conn-attrs-v1"]
+    );
 }
 
 #[tokio::test]

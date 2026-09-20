@@ -33,6 +33,8 @@ use super::{
     peer_conn_ping::PeerConnPinger,
     peer_session::{PeerSession, PeerSessionAction},
 };
+
+pub(crate) const CONN_ATTRS_FEATURE: &str = "conn-attrs-v1";
 use crate::peers::{
     PacketRecvChan, PeerConnectionOrigin, PeerPacketIngress,
     context::{ArcPeerContext, NetworkIdentity, NetworkSecretDigest},
@@ -536,7 +538,10 @@ impl PeerConn {
             magic: MAGIC,
             my_peer_id: self.my_peer_id,
             version: VERSION,
-            features: vec![LIVENESS_ECHO_FEATURE.to_owned()],
+            features: vec![
+                LIVENESS_ECHO_FEATURE.to_owned(),
+                CONN_ATTRS_FEATURE.to_owned(),
+            ],
             network_name: network.network_name.clone(),
             ..Default::default()
         };
@@ -807,7 +812,10 @@ impl PeerConn {
             a_session_generation,
             a_conn_id: Some(a_conn_id.into()),
             client_encryption_algorithm: self.my_encrypt_algo.clone(),
-            features: vec![LIVENESS_ECHO_FEATURE.to_owned()],
+            features: vec![
+                LIVENESS_ECHO_FEATURE.to_owned(),
+                CONN_ATTRS_FEATURE.to_owned(),
+            ],
         };
 
         let mut hs = builder
@@ -1080,7 +1088,10 @@ impl PeerConn {
             a_conn_id_echo: msg1_pb.a_conn_id,
             secret_proof_32,
             server_encryption_algorithm: algo,
-            features: vec![LIVENESS_ECHO_FEATURE.to_owned()],
+            features: vec![
+                LIVENESS_ECHO_FEATURE.to_owned(),
+                CONN_ATTRS_FEATURE.to_owned(),
+            ],
         };
         self.send_noise_msg(
             msg2_pb,

@@ -1319,6 +1319,10 @@ impl PeerManagerCore {
         self.get_route().get_foreign_network_summary().await
     }
 
+    pub async fn is_gso_path_available(&self, dst: PeerId) -> bool {
+        self.get_route().is_gso_path_available(dst).await
+    }
+
     pub fn acl_stats(&self) -> crate::proto::acl::AclStats {
         self.acl_filter.get_stats()
     }
@@ -2638,6 +2642,11 @@ impl PeerOutboundPacketRouter {
         .await
     }
 
+    #[allow(dead_code)]
+    pub async fn is_gso_path_available(&self, dst: PeerId) -> bool {
+        self.route.is_gso_path_available(dst).await
+    }
+
     pub async fn send_msg_for_proxy(
         &self,
         mut msg: ZCPacket,
@@ -3437,6 +3446,13 @@ impl RouteInterface for PeerManagerRouteInterface {
     async fn get_peer_identity_type(&self, peer_id: PeerId) -> Option<PeerIdentityType> {
         let peer_map = self.peers.upgrade()?;
         peer_map.get_peer_identity_type(peer_id)
+    }
+
+    async fn get_peer_conn_tunnel_type_bits(&self, peer_id: PeerId) -> u32 {
+        let Some(peer_map) = self.peers.upgrade() else {
+            return 0;
+        };
+        peer_map.get_peer_tunnel_type_bits(peer_id)
     }
 
     async fn list_foreign_networks(&self) -> ForeignNetworkRouteInfoMap {

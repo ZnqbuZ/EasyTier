@@ -62,10 +62,16 @@ message RouteConnBitmap {
   bytes bitmap = 2;
 }
 
+message ConnEdgeAttrs {
+  uint32 peer_id = 1;
+  uint32 tunnel_type_bits = 2; // TunnelKind 的位集
+}
+
 message RouteConnPeerList {
   message PeerConnInfo {
     PeerIdVersion peer_id = 1;
     repeated uint32 connected_peer_ids = 2;
+    repeated ConnEdgeAttrs edge_attrs = 3;
   }
   repeated PeerConnInfo peer_conn_infos = 1;
 }

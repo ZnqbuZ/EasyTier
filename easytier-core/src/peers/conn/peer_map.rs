@@ -330,6 +330,12 @@ impl PeerMap {
             .and_then(|p| p.get_peer_public_key())
     }
 
+    pub fn get_peer_tunnel_type_bits(&self, peer_id: PeerId) -> u32 {
+        self.get_peer_by_id(peer_id)
+            .map(|p| p.get_tunnel_type_bits())
+            .unwrap_or(0)
+    }
+
     pub async fn close_peer_conn(
         &self,
         peer_id: PeerId,

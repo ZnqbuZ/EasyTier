@@ -58,8 +58,127 @@ impl<K: PartialOrd, T> Ord for MinScored<K, T> {
     }
 }
 
+use easytier_attrs::{AttrDecl, AttrSet, ConstraintState, fold_into};
+use std::collections::HashSet;
+
+#[allow(dead_code)]
 pub type DijkstraResult<K, NodeId> = (HashMap<NodeId, K>, HashMap<NodeId, (NodeId, usize)>);
 
+pub type ConstrainedDijkstraResult<K, NodeId> = (
+    HashMap<(NodeId, ConstraintState), K>,
+    HashMap<(NodeId, ConstraintState), (NodeId, usize)>,
+);
+
+pub fn dijkstra_with_first_hop_and_constraints<G, F, E, N, K>(
+    graph: G,
+    start: G::NodeId,
+    mut edge_cost: F,
+    mut edge_attrs: E,
+    node_attrs: N,
+    tracked_decls: &[AttrDecl],
+) -> ConstrainedDijkstraResult<K, G::NodeId>
+where
+    G: IntoEdges,
+    G::NodeId: Eq + Hash + Clone + Ord,
+    F: FnMut(G::EdgeRef) -> K,
+    E: FnMut(G::EdgeRef) -> AttrSet,
+    N: Fn(G::NodeId) -> AttrSet,
+    K: Measure + Copy,
+{
+    let mut scores = HashMap::new();
+    let mut first_hop = HashMap::new();
+    let mut visit_next = BinaryHeap::new();
+    let zero_score = K::default();
+
+    // 1. Unconstrained state
+    let unconstrained = ConstraintState::unconstrained();
+    scores.insert((start, unconstrained.clone()), zero_score);
+    first_hop.insert((start, unconstrained.clone()), (start, 0));
+    visit_next.push(MinScored(zero_score, (start, unconstrained)));
+
+    // 2. Initial constrained state
+    let start_node_attrs = node_attrs(start);
+    let init_state = ConstraintState::initial(tracked_decls, &start_node_attrs);
+    let mut initial_state_count = 1;
+    if let Some(init_state) = init_state {
+        scores.insert((start, init_state.clone()), zero_score);
+        first_hop.insert((start, init_state.clone()), (start, 0));
+        visit_next.push(MinScored(zero_score, (start, init_state)));
+        initial_state_count = 2;
+    }
+
+    let mut node_state_counts: HashMap<G::NodeId, usize> = HashMap::new();
+    node_state_counts.insert(start, initial_state_count);
+
+    let mut visited: HashSet<(G::NodeId, ConstraintState)> = HashSet::new();
+
+    while let Some(MinScored(node_score, (node, state))) = visit_next.pop() {
+        let node_state_key = (node, state.clone());
+        if visited.contains(&node_state_key) {
+            continue;
+        }
+
+        if scores
+            .get(&node_state_key)
+            .is_some_and(|best| node_score > *best)
+        {
+            continue;
+        }
+
+        for edge in graph.edges(node) {
+            let next_node = edge.target();
+            let e_attrs = edge_attrs(edge);
+            let target_node_attrs = node_attrs(next_node);
+
+            let next_state = match fold_into(&state, &e_attrs, &target_node_attrs, tracked_decls) {
+                Some(s) => s,
+                None => continue,
+            };
+
+            let next_key = (next_node, next_state);
+            if visited.contains(&next_key) {
+                continue;
+            }
+
+            let next_score = node_score + edge_cost(edge);
+            match scores.entry(next_key.clone()) {
+                Occupied(mut ent) => {
+                    if next_score < *ent.get() {
+                        *ent.get_mut() = next_score;
+                        visit_next.push(MinScored(next_score, next_key.clone()));
+                        let hop = if node == start {
+                            (next_node, 0)
+                        } else {
+                            first_hop[&node_state_key]
+                        };
+                        first_hop.insert(next_key, (hop.0, hop.1 + 1));
+                    }
+                }
+                Vacant(ent) => {
+                    let count = node_state_counts.entry(next_node).or_insert(0);
+                    if *count >= easytier_attrs::MAX_CONSTRAINT_STATES {
+                        tracing::warn!("exceeded max constraint states per node");
+                        continue;
+                    }
+                    *count += 1;
+                    ent.insert(next_score);
+                    visit_next.push(MinScored(next_score, next_key.clone()));
+                    let hop = if node == start {
+                        (next_node, 0)
+                    } else {
+                        first_hop[&node_state_key]
+                    };
+                    first_hop.insert(next_key, (hop.0, hop.1 + 1));
+                }
+            }
+        }
+        visited.insert(node_state_key);
+    }
+
+    (scores, first_hop)
+}
+
+#[allow(dead_code)]
 pub fn dijkstra_with_first_hop<G, F, K>(
     graph: G,
     start: G::NodeId,
@@ -172,5 +291,65 @@ mod tests {
         assert_eq!(first_hop[&c], (c, 1));
         assert_eq!(first_hop[&d], (b, 2)); // d is reached via b
         assert_eq!(first_hop[&e], (b, 3)); // e is reached via d
+    }
+
+    #[test]
+    fn test_dijkstra_with_first_hop_and_constraints() {
+        use easytier_attrs::{Constraint, GSO_CAPABLE, TUNNEL_TYPE, TunnelKind, Value};
+
+        let mut graph = DiGraph::<&str, (u32, TunnelKind)>::new();
+        let a = graph.add_node("a");
+        let b = graph.add_node("b");
+        let c = graph.add_node("c");
+        let d = graph.add_node("d");
+
+        // Path 1: a -> b -> d: cost 1 + 1 = 2, but b -> d is UDP!
+        graph.add_edge(a, b, (1, TunnelKind::Tcp));
+        graph.add_edge(b, d, (1, TunnelKind::Udp));
+
+        // Path 2: a -> c -> d: cost 2 + 2 = 4, both are TCP!
+        graph.add_edge(a, c, (2, TunnelKind::Tcp));
+        graph.add_edge(c, d, (2, TunnelKind::Tcp));
+
+        let tracked = [TUNNEL_TYPE.clone(), GSO_CAPABLE.clone()];
+
+        let node_attrs = |_n| {
+            let mut s = AttrSet::new();
+            s.set_decl(&GSO_CAPABLE, Value::Flag(true));
+            s
+        };
+
+        let (scores, first_hop) = dijkstra_with_first_hop_and_constraints(
+            &graph,
+            a,
+            |e| e.weight().0,
+            |e| {
+                let mut s = AttrSet::new();
+                s.set_decl(&TUNNEL_TYPE, Value::Enum(e.weight().1 as u16));
+                s
+            },
+            node_attrs,
+            &tracked,
+        );
+
+        // Unconstrained: d should be reached via b with cost 2
+        let unconstrained = ConstraintState::unconstrained();
+        assert_eq!(scores[&(d, unconstrained.clone())], 2);
+        assert_eq!(first_hop[&(d, unconstrained)].0, b);
+
+        // Constrained (TCP + GSO):
+        let req = [
+            Constraint::new(&TUNNEL_TYPE, Value::Enum(TunnelKind::Tcp as u16)),
+            Constraint::new(&GSO_CAPABLE, Value::Flag(true)),
+        ];
+
+        let tcp_d = scores
+            .iter()
+            .find(|((n, s), _)| *n == d && s.satisfies_requirement(&req));
+        assert!(tcp_d.is_some());
+        let ((_, state), &cost) = tcp_d.unwrap();
+        // Path a -> c -> d has cost 4
+        assert_eq!(cost, 4);
+        assert_eq!(first_hop[&(d, state.clone())].0, c);
     }
 }

@@ -54,7 +54,7 @@ use crate::{
             PublicIpv6LeaseInfo as CorePublicIpv6LeaseInfo, Route as CoreRouteInfo,
         },
         peer_rpc::{
-            ForeignNetworkRouteInfoEntry, ForeignNetworkRouteInfoKey, OspfRouteRpc,
+            ConnEdgeAttrs, ForeignNetworkRouteInfoEntry, ForeignNetworkRouteInfoKey, OspfRouteRpc,
             OspfRouteRpcClientFactory, OspfRouteRpcServer, PeerGroupInfo, PeerIdVersion,
             PeerIdentityType, PublicIpv6AddrRpcServer, RouteForeignNetworkInfos,
             RouteForeignNetworkSummary, RoutePeerInfo, RoutePeerInfos, SyncRouteInfoError,
@@ -69,10 +69,17 @@ use crate::{
     },
 };
 
+use easytier_attrs::{
+    AttrDecl, AttrSet, Constraint, ConstraintState, GSO_CAPABLE, TUNNEL_TYPE, TunnelKind, Value,
+    edge_attrs_from_tunnel_type_bits,
+};
+
+const TRACKED_DECLS: &[AttrDecl] = &[TUNNEL_TYPE, GSO_CAPABLE];
+
 use super::{
-    DefaultRouteCostCalculator, ForeignNetworkRouteInfoMap, NextHopPolicy, Route,
-    RouteCostCalculator, RouteCostCalculatorInterface, RouteInterfaceBox,
-    graph_algo::dijkstra_with_first_hop,
+    DefaultRouteCostCalculator, ForeignNetworkRouteInfoMap, NextHopPolicy, NextHopWithPathAttrs,
+    Route, RouteCostCalculator, RouteCostCalculatorInterface, RouteInterfaceBox,
+    graph_algo::dijkstra_with_first_hop_and_constraints,
     route_peer_wire::{
         self, RawRoutePeerInfo, extract_route_peer_infos, patch_credential_route_peer_info,
         raw_credential_bytes, raw_route_peer_info,
@@ -147,6 +154,7 @@ pub struct OspfPeerInfo {
 pub struct OspfPeerConnInfo {
     pub peer_id: PeerId,
     pub connected_peers: BTreeSet<PeerId>,
+    pub edge_attrs: BTreeMap<PeerId, AttrSet>,
 }
 
 #[derive(Debug, Clone)]
@@ -190,6 +198,12 @@ impl OspfRouteSnapshotLookup<'_> {
             .map(|entry| entry.connected_peers.iter().copied().collect())
     }
 
+    fn edge_attrs(&self, src: PeerId, dst: PeerId) -> Option<&AttrSet> {
+        self.conn_map
+            .get(&src)
+            .and_then(|entry| entry.edge_attrs.get(&dst))
+    }
+
     fn get_avoid_relay_data(&self, peer_id: PeerId) -> bool {
         // if avoid relay, just set all outgoing edges to a large value: AVOID_RELAY_COST.
         self.peer_info(peer_id)
@@ -199,7 +213,13 @@ impl OspfRouteSnapshotLookup<'_> {
     }
 }
 
-type PeerGraph = Graph<PeerId, usize, Directed>;
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PeerEdgeWeight {
+    pub cost: usize,
+    pub attrs: AttrSet,
+}
+
+type PeerGraph = Graph<PeerId, PeerEdgeWeight, Directed>;
 type PeerIdToNodeIdxMap = DashMap<PeerId, NodeIndex>;
 
 #[derive(Debug, Clone, Copy)]
@@ -210,7 +230,7 @@ pub struct OspfNextHopInfo {
     pub version: Version,
 }
 
-type NextHopMap = DashMap<PeerId, OspfNextHopInfo>;
+type NextHopMap = DashMap<(PeerId, ConstraintState), OspfNextHopInfo>;
 
 // computed with SyncedRouteInfo snapshot. used to get next hop.
 #[derive(Debug)]
@@ -248,13 +268,63 @@ impl OspfRouteTable {
 
     pub fn get_topology_next_hop(&self, dst_peer_id: PeerId) -> Option<OspfNextHopInfo> {
         let cur_version = self.next_hop_map_version.get();
-        self.next_hop_map.get(&dst_peer_id).and_then(|x| {
-            if x.version >= cur_version {
-                Some(*x)
-            } else {
-                None
+        self.next_hop_map
+            .get(&(dst_peer_id, ConstraintState::Unconstrained))
+            .and_then(|x| {
+                if x.version >= cur_version {
+                    Some(*x)
+                } else {
+                    None
+                }
+            })
+    }
+
+    pub fn get_next_hop_with_requirement(
+        &self,
+        dst_peer_id: PeerId,
+        require: &[Constraint],
+    ) -> Option<NextHopWithPathAttrs> {
+        if self.suppressed_peer_ids.contains_key(&dst_peer_id) {
+            return None;
+        }
+        let cur_version = self.next_hop_map_version.get();
+        let mut best: Option<NextHopWithPathAttrs> = None;
+
+        for item in self.next_hop_map.iter() {
+            let (peer_id, state) = item.key();
+            if *peer_id != dst_peer_id {
+                continue;
             }
-        })
+            if item.value().version < cur_version {
+                continue;
+            }
+            if state.satisfies_requirement(require) {
+                let info = item.value();
+                let candidate = NextHopWithPathAttrs {
+                    next_hop_peer_id: info.next_hop_peer_id,
+                    path_latency: info.path_latency,
+                    path_len: info.path_len,
+                    constraint_state: state.clone(),
+                };
+                match &best {
+                    None => best = Some(candidate),
+                    Some(b) if candidate.path_latency < b.path_latency => {
+                        best = Some(candidate);
+                    }
+                    _ => {}
+                }
+            }
+        }
+        best
+    }
+
+    pub fn is_gso_path_available(&self, dst_peer_id: PeerId) -> bool {
+        let require = [
+            Constraint::new(&TUNNEL_TYPE, Value::Enum(TunnelKind::Tcp as u16)),
+            Constraint::new(&GSO_CAPABLE, Value::Flag(true)),
+        ];
+        self.get_next_hop_with_requirement(dst_peer_id, &require)
+            .is_some()
     }
 
     pub fn peer_reachable(&self, peer_id: PeerId) -> bool {
@@ -343,7 +413,19 @@ impl OspfRouteTable {
                     cost += AVOID_RELAY_COST;
                 }
 
-                graph.add_edge(*src_node_idx, *dst_node_idx, cost);
+                let edge_attrs = lookup
+                    .edge_attrs(src_peer_id, *dst_peer_id)
+                    .cloned()
+                    .unwrap_or_default();
+
+                graph.add_edge(
+                    *src_node_idx,
+                    *dst_node_idx,
+                    PeerEdgeWeight {
+                        cost,
+                        attrs: edge_attrs,
+                    },
+                );
             }
         }
 
@@ -380,6 +462,7 @@ impl OspfRouteTable {
         &self,
         graph: &PeerGraph,
         start_node: &NodeIndex,
+        lookup: &OspfRouteSnapshotLookup<'_>,
         version: Version,
     ) {
         if graph.node_weight(*start_node).is_none() {
@@ -390,8 +473,8 @@ impl OspfRouteTable {
             );
             return;
         }
-        let normalize_edge_cost = |e: petgraph::graph::EdgeReference<usize>| {
-            if *e.weight() >= AVOID_RELAY_COST {
+        let normalize_edge_cost = |e: petgraph::graph::EdgeReference<'_, PeerEdgeWeight>| {
+            if e.weight().cost >= AVOID_RELAY_COST {
                 AVOID_RELAY_COST + 1
             } else {
                 1
@@ -403,8 +486,10 @@ impl OspfRouteTable {
         // Step 2: build subgraph containing only shortest-hop and AVOID RELAY edges.
         let mut subgraph: PeerGraph = PeerGraph::new();
         let mut start_node_idx = None;
+        let mut old_to_sub = HashMap::new();
         for (node_idx, peer_id) in graph.node_references() {
             let new_node_idx = subgraph.add_node(*peer_id);
+            old_to_sub.insert(node_idx, new_node_idx);
             if node_idx == *start_node {
                 start_node_idx = Some(new_node_idx);
             }
@@ -419,18 +504,19 @@ impl OspfRouteTable {
                 continue;
             };
             if *src_path_len + normalize_edge_cost(edge) == *tgt_path_len {
-                subgraph.add_edge(src, tgt, *edge.weight());
+                subgraph.add_edge(old_to_sub[&src], old_to_sub[&tgt], edge.weight().clone());
             }
         }
 
         // Step 3: second Dijkstra on subgraph, choose least-cost among shortest-hop paths.
-        self.gen_next_hop_map_with_least_cost(&subgraph, &start_node_idx.unwrap(), version);
+        self.gen_next_hop_map_with_least_cost(&subgraph, &start_node_idx.unwrap(), lookup, version);
     }
 
     fn gen_next_hop_map_with_least_cost(
         &self,
         graph: &PeerGraph,
         start_node: &NodeIndex,
+        lookup: &OspfRouteSnapshotLookup<'_>,
         version: Version,
     ) {
         if graph.node_weight(*start_node).is_none() {
@@ -441,18 +527,43 @@ impl OspfRouteTable {
             );
             return;
         }
-        let (costs, next_hops) = dijkstra_with_first_hop(graph, *start_node, |e| *e.weight());
+        let (costs, next_hops) = dijkstra_with_first_hop_and_constraints(
+            graph,
+            *start_node,
+            |e| e.weight().cost,
+            |e| e.weight().attrs.clone(),
+            |n| {
+                let mut s = AttrSet::new();
+                if let Some(ff) = graph
+                    .node_weight(n)
+                    .and_then(|peer_id| lookup.peer_info(*peer_id))
+                    .and_then(|info| info.feature_flag.as_ref())
+                {
+                    s.set_decl(&GSO_CAPABLE, Value::Flag(ff.gso));
+                }
+                s
+            },
+            TRACKED_DECLS,
+        );
 
-        for (dst, (next_hop, path_len)) in next_hops.iter() {
+        for ((dst, state), (next_hop, path_len)) in next_hops.into_iter() {
+            let Some(next_hop_peer_id) = graph.node_weight(next_hop).copied() else {
+                continue;
+            };
+            let Some(cost) = costs.get(&(dst, state.clone())).copied() else {
+                continue;
+            };
             let info = OspfNextHopInfo {
-                next_hop_peer_id: *graph.node_weight(*next_hop).unwrap(),
-                path_latency: (*costs.get(dst).unwrap() % AVOID_RELAY_COST) as i32,
-                path_len: *path_len,
+                next_hop_peer_id,
+                path_latency: (cost % AVOID_RELAY_COST) as i32,
+                path_len,
                 version,
             };
-            let dst_peer_id = *graph.node_weight(*dst).unwrap();
+            let Some(dst_peer_id) = graph.node_weight(dst).copied() else {
+                continue;
+            };
             self.next_hop_map
-                .entry(dst_peer_id)
+                .entry((dst_peer_id, state))
                 .and_modify(|x| {
                     if x.version < version {
                         *x = info;
@@ -504,9 +615,9 @@ impl OspfRouteTable {
         }
 
         if matches!(policy, NextHopPolicy::LeastHop) {
-            self.gen_next_hop_map_with_least_hop(&graph, &start_node, version);
+            self.gen_next_hop_map_with_least_hop(&graph, &start_node, &lookup, version);
         } else {
-            self.gen_next_hop_map_with_least_cost(&graph, &start_node, version);
+            self.gen_next_hop_map_with_least_cost(&graph, &start_node, &lookup, version);
         };
 
         let mut new_cidr_prefix_trie = PrefixMap::new();
@@ -515,26 +626,27 @@ impl OspfRouteTable {
         // build peer_infos, ipv4_peer_id_map, cidr_peer_id_map
         // only set map for peers we can reach.
         for item in self.next_hop_map.iter() {
+            let (peer_id, state) = item.key();
+            if !state.is_unconstrained() {
+                continue;
+            }
+            let peer_id = *peer_id;
             if item.version < version {
                 // skip if the next hop entry is outdated. (peer is unreachable)
                 continue;
             }
 
-            let peer_id = item.key();
-            if !self.peer_reachable(*peer_id) {
+            if !self.peer_reachable(peer_id) {
                 continue;
             }
 
-            let Some(info) = lookup.peer_info(*peer_id).cloned() else {
+            let Some(info) = lookup.peer_info(peer_id).cloned() else {
                 continue;
             };
 
-            self.peer_infos.insert(*peer_id, info.clone());
+            self.peer_infos.insert(peer_id, info.clone());
 
-            let peer_id_and_version = PeerIdVersion {
-                peer_id: *peer_id,
-                version,
-            };
+            let peer_id_and_version = PeerIdVersion { peer_id, version };
 
             let is_new_peer_better = |old_peer: &PeerIdVersion| -> bool {
                 if peer_id_and_version.version > old_peer.version {
@@ -591,7 +703,7 @@ impl OspfRouteTable {
                     continue;
                 };
 
-                if *peer_id != my_peer_id
+                if peer_id != my_peer_id
                     && local_proxy_cidrs
                         .iter()
                         .any(|local_cidr| cidr_is_subset(&cidr, local_cidr))
@@ -611,7 +723,7 @@ impl OspfRouteTable {
                             .entry(cidr)
                             .and_modify(|e| {
                                 // if ourself has same cidr, ensure here put my peer id, so we can know deadloop may happen.
-                                if *peer_id == my_peer_id || is_new_peer_better(e) {
+                                if peer_id == my_peer_id || is_new_peer_better(e) {
                                     *e = peer_id_and_version;
                                 }
                             })
@@ -623,7 +735,7 @@ impl OspfRouteTable {
                             .entry(cidr)
                             .and_modify(|e| {
                                 // if ourself has same cidr, ensure here put my peer id, so we can know deadloop may happen.
-                                if *peer_id == my_peer_id || is_new_peer_better(e) {
+                                if peer_id == my_peer_id || is_new_peer_better(e) {
                                     *e = peer_id_and_version;
                                 }
                             })
@@ -867,6 +979,7 @@ type Error = SyncRouteInfoError;
 #[derive(Debug, Clone)]
 struct RouteConnInfo {
     connected_peers: BTreeSet<PeerId>,
+    edge_attrs: BTreeMap<PeerId, AttrSet>,
     version: AtomicVersion,
     last_update: SystemTime,
 }
@@ -875,6 +988,7 @@ impl Default for RouteConnInfo {
     fn default() -> Self {
         Self {
             connected_peers: BTreeSet::new(),
+            edge_attrs: BTreeMap::new(),
             version: AtomicVersion::new(),
             last_update: SystemTime::now(),
         }
@@ -887,6 +1001,7 @@ struct InterfacePeerSnapshot {
     peers: BTreeSet<PeerId>,
     identity_types: BTreeMap<PeerId, Option<PeerIdentityType>>,
     public_keys: BTreeMap<PeerId, Option<Vec<u8>>>,
+    tunnel_type_bits: BTreeMap<PeerId, u32>,
 }
 
 // constructed with all infos synced from all peers.
@@ -1223,6 +1338,7 @@ impl SyncedRouteInfo {
                 .map(|(peer_id, info)| OspfPeerConnInfo {
                     peer_id: *peer_id,
                     connected_peers: info.connected_peers.clone(),
+                    edge_attrs: info.edge_attrs.clone(),
                 })
                 .collect(),
             suppressed_peer_ids: self
@@ -1412,6 +1528,7 @@ impl SyncedRouteInfo {
         &self,
         peer_id_version: &PeerIdVersion,
         connected_peers: BTreeSet<PeerId>,
+        edge_attrs: BTreeMap<PeerId, AttrSet>,
     ) -> bool {
         let mut guard = self.conn_map.write();
         if guard
@@ -1422,6 +1539,7 @@ impl SyncedRouteInfo {
                 peer_id_version.peer_id,
                 RouteConnInfo {
                     connected_peers,
+                    edge_attrs,
                     version: peer_id_version.version.into(),
                     last_update: SystemTime::now(),
                 },
@@ -1440,7 +1558,8 @@ impl SyncedRouteInfo {
         for (peer_idx, peer_id_version) in conn_bitmap.peer_ids.iter().enumerate() {
             let connceted_peers = conn_bitmap.get_connected_peers(peer_idx);
             self.fill_empty_peer_info(&connceted_peers);
-            need_inc_version |= self.update_conn_info_one_peer(peer_id_version, connceted_peers);
+            need_inc_version |=
+                self.update_conn_info_one_peer(peer_id_version, connceted_peers, BTreeMap::new());
         }
         if need_inc_version {
             self.version.inc();
@@ -1457,8 +1576,17 @@ impl SyncedRouteInfo {
             let connected_peers: BTreeSet<PeerId> =
                 peer_conn_info.connected_peer_ids.iter().copied().collect();
 
+            let mut edge_attrs = BTreeMap::new();
+            for attr in &peer_conn_info.edge_attrs {
+                if attr.tunnel_type_bits != 0 {
+                    let s = edge_attrs_from_tunnel_type_bits(attr.tunnel_type_bits);
+                    edge_attrs.insert(attr.peer_id, s);
+                }
+            }
+
             self.fill_empty_peer_info(&connected_peers);
-            need_inc_version |= self.update_conn_info_one_peer(&peer_id_version, connected_peers);
+            need_inc_version |=
+                self.update_conn_info_one_peer(&peer_id_version, connected_peers, edge_attrs);
         }
         if need_inc_version {
             self.version.inc();
@@ -1551,19 +1679,27 @@ impl SyncedRouteInfo {
         }
     }
 
-    fn update_my_conn_info(&self, my_peer_id: PeerId, connected_peers: BTreeSet<PeerId>) -> bool {
+    fn update_my_conn_info(
+        &self,
+        my_peer_id: PeerId,
+        connected_peers: BTreeSet<PeerId>,
+        edge_attrs: BTreeMap<PeerId, AttrSet>,
+    ) -> bool {
         self.fill_empty_peer_info(&connected_peers);
 
         let guard = self.conn_map.upgradable_read();
         let my_conn_info = guard.get(&my_peer_id);
         let new_version = my_conn_info.map(|x| x.version.get()).unwrap_or(0) + 1;
 
-        if my_conn_info.is_none_or(|old| old.connected_peers != connected_peers) {
+        if my_conn_info.is_none_or(|old| {
+            old.connected_peers != connected_peers || old.edge_attrs != edge_attrs
+        }) {
             let mut guard = RwLockUpgradableReadGuard::upgrade(guard);
             guard.insert(
                 my_peer_id,
                 RouteConnInfo {
                     connected_peers,
+                    edge_attrs,
                     version: new_version.into(),
                     last_update: SystemTime::now(),
                 },
@@ -2535,11 +2671,14 @@ impl PeerRouteServiceImpl {
         let peers: BTreeSet<_> = interface.list_peers().await.into_iter().collect();
         let mut identity_types = BTreeMap::new();
         let mut public_keys = BTreeMap::new();
+        let mut tunnel_type_bits = BTreeMap::new();
         for peer_id in peers.iter().copied() {
             identity_types.insert(peer_id, interface.get_peer_identity_type(peer_id).await);
             if self.peer_relay_projection_enabled() {
                 public_keys.insert(peer_id, interface.get_peer_public_key(peer_id).await);
             }
+            let bits = interface.get_peer_conn_tunnel_type_bits(peer_id).await;
+            tunnel_type_bits.insert(peer_id, bits);
         }
 
         InterfacePeerSnapshot {
@@ -2547,6 +2686,7 @@ impl PeerRouteServiceImpl {
             peers,
             identity_types,
             public_keys,
+            tunnel_type_bits,
         }
     }
 
@@ -2692,9 +2832,16 @@ impl PeerRouteServiceImpl {
         interface_snapshot_changed: bool,
     ) -> bool {
         let advertised_peers = self.derive_advertised_connected_peers(snapshot);
+        let mut edge_attrs = BTreeMap::new();
+        for peer_id in &advertised_peers {
+            let bits = snapshot.tunnel_type_bits.get(peer_id).copied().unwrap_or(0);
+            if bits != 0 {
+                edge_attrs.insert(*peer_id, edge_attrs_from_tunnel_type_bits(bits));
+            }
+        }
         if self
             .synced_route_info
-            .update_my_conn_info(self.my_peer_id, advertised_peers)
+            .update_my_conn_info(self.my_peer_id, advertised_peers, edge_attrs)
         {
             return true;
         }
@@ -3027,12 +3174,33 @@ impl PeerRouteServiceImpl {
         let mut unreachable_peers_for_conn_info = session.unreachable_peers_for_conn_info.lock();
 
         let mut add_to_conn_peer_list = |peer_id: PeerId, conn_info: &RouteConnInfo| {
+            let edge_attrs = conn_info
+                .edge_attrs
+                .iter()
+                .filter_map(|(dst_peer, attr_set)| {
+                    let bits = if let Some(Value::Enum(k)) = attr_set.get_decl(&TUNNEL_TYPE) {
+                        TunnelKind::from_u16(*k).to_bit()
+                    } else {
+                        0
+                    };
+                    if bits != 0 {
+                        Some(ConnEdgeAttrs {
+                            peer_id: *dst_peer,
+                            tunnel_type_bits: bits,
+                        })
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+
             peer_conn_infos.push(PeerConnInfo {
                 peer_id: Some(PeerIdVersion {
                     peer_id,
                     version: conn_info.version.get(),
                 }),
                 connected_peer_ids: conn_info.connected_peers.iter().copied().collect(),
+                edge_attrs,
             });
             *estimated_size += std::mem::size_of::<PeerIdVersion>()
                 + conn_info.connected_peers.len() * std::mem::size_of::<PeerId>();
@@ -4513,6 +4681,22 @@ impl Route for PeerRoute {
             .map(|x| x.next_hop_peer_id)
     }
 
+    async fn get_next_hop_with_requirement(
+        &self,
+        dst_peer_id: PeerId,
+        require: &[Constraint],
+    ) -> Option<NextHopWithPathAttrs> {
+        self.service_impl
+            .route_table
+            .get_next_hop_with_requirement(dst_peer_id, require)
+    }
+
+    async fn is_gso_path_available(&self, dst_peer_id: PeerId) -> bool {
+        self.service_impl
+            .route_table
+            .is_gso_path_available(dst_peer_id)
+    }
+
     async fn list_routes(&self) -> Vec<CoreRouteInfo> {
         self.service_impl
             .route_table
@@ -4911,6 +5095,7 @@ mod tests {
                 .into_iter()
                 .map(|(peer_id, _, public_key)| (peer_id, public_key))
                 .collect(),
+            tunnel_type_bits: BTreeMap::new(),
         }
     }
 
@@ -4963,6 +5148,7 @@ mod tests {
             peer_id,
             RouteConnInfo {
                 connected_peers: connected_peers.into_iter().collect(),
+                edge_attrs: BTreeMap::new(),
                 version: 1.into(),
                 last_update: SystemTime::now(),
             },
@@ -5010,6 +5196,7 @@ mod tests {
         OspfPeerConnInfo {
             peer_id,
             connected_peers: connected_peers.into_iter().collect(),
+            edge_attrs: BTreeMap::new(),
         }
     }
 
@@ -6074,5 +6261,370 @@ mod tests {
             table.get_peer_id_for_proxy(&"10.10.1.1".parse::<IpAddr>().unwrap()),
             Some(3)
         );
+    }
+
+    fn connected_with_attrs(
+        peer_id: PeerId,
+        connected_peers: impl IntoIterator<Item = PeerId>,
+        edge_attrs: impl IntoIterator<Item = (PeerId, AttrSet)>,
+    ) -> OspfPeerConnInfo {
+        OspfPeerConnInfo {
+            peer_id,
+            connected_peers: connected_peers.into_iter().collect(),
+            edge_attrs: edge_attrs.into_iter().collect(),
+        }
+    }
+
+    fn peer_with_gso(peer_id: PeerId, gso: bool) -> OspfPeerInfo {
+        OspfPeerInfo {
+            peer_id,
+            info: RoutePeerInfo {
+                peer_id,
+                version: 1,
+                feature_flag: Some(crate::proto::common::PeerFeatureFlag {
+                    gso,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        }
+    }
+
+    fn tcp_edge() -> AttrSet {
+        let mut s = AttrSet::new();
+        s.set_decl(&TUNNEL_TYPE, Value::Enum(TunnelKind::Tcp as u16));
+        s
+    }
+
+    fn udp_edge() -> AttrSet {
+        let mut s = AttrSet::new();
+        s.set_decl(&TUNNEL_TYPE, Value::Enum(TunnelKind::Udp as u16));
+        s
+    }
+
+    struct MapCostCalculator<F: Fn(PeerId, PeerId) -> i32 + Send + Sync>(F);
+    impl<F: Fn(PeerId, PeerId) -> i32 + Send + Sync> RouteCostCalculatorInterface
+        for MapCostCalculator<F>
+    {
+        fn calculate_cost(&self, src: PeerId, dst: PeerId) -> i32 {
+            (self.0)(src, dst)
+        }
+    }
+
+    #[test]
+    fn test_unconstrained_equivalence_across_topologies() {
+        // 1. Linear topology: 1 - 2 - 3 - 4 - 5
+        let linear_snapshot = OspfRouteSnapshot {
+            peer_infos: vec![peer(1), peer(2), peer(3), peer(4), peer(5)],
+            conn_map: vec![
+                connected(1, [2]),
+                connected(2, [1, 3]),
+                connected(3, [2, 4]),
+                connected(4, [3, 5]),
+                connected(5, [4]),
+            ],
+            suppressed_peer_ids: BTreeSet::new(),
+            version: 1,
+        };
+
+        let linear_table = OspfRouteTable::new();
+        linear_table.build_from_snapshot(
+            1,
+            &linear_snapshot,
+            NextHopPolicy::LeastCost,
+            &DefaultRouteCostCalculator,
+        );
+        for dst in 2..=5 {
+            let hop = linear_table
+                .get_next_hop(dst)
+                .expect("linear hop reachable");
+            assert_eq!(hop.next_hop_peer_id, 2);
+            assert_eq!(hop.path_len, dst as usize - 1);
+        }
+
+        // 2. Diamond topology: 1 -> 2 (cost 10) -> 4 (cost 10); 1 -> 3 (cost 30) -> 4 (cost 5)
+        let diamond_cost = |src: PeerId, dst: PeerId| -> i32 {
+            match (src, dst) {
+                (1, 2) | (2, 1) => 10,
+                (2, 4) | (4, 2) => 10,
+                (1, 3) | (3, 1) => 30,
+                (3, 4) | (4, 3) => 5,
+                _ => 1,
+            }
+        };
+        let diamond_snapshot = OspfRouteSnapshot {
+            peer_infos: vec![peer(1), peer(2), peer(3), peer(4)],
+            conn_map: vec![
+                connected(1, [2, 3]),
+                connected(2, [1, 4]),
+                connected(3, [1, 4]),
+                connected(4, [2, 3]),
+            ],
+            suppressed_peer_ids: BTreeSet::new(),
+            version: 1,
+        };
+        let diamond_table = OspfRouteTable::new();
+        diamond_table.build_from_snapshot(
+            1,
+            &diamond_snapshot,
+            NextHopPolicy::LeastCost,
+            &MapCostCalculator(diamond_cost),
+        );
+        // Next hop to 4 must be 2 with latency 20 (since 10+10 < 30+5)
+        let hop4 = diamond_table.get_next_hop(4).expect("diamond 4 reachable");
+        assert_eq!(hop4.next_hop_peer_id, 2);
+        assert_eq!(hop4.path_latency, 20);
+
+        // 3. 6-node mesh topology with avoid_relay on node 2
+        let mut avoid_relay_peer2 = peer(2);
+        avoid_relay_peer2.info.feature_flag = Some(crate::proto::common::PeerFeatureFlag {
+            avoid_relay_data: true,
+            ..Default::default()
+        });
+        let mesh_snapshot = OspfRouteSnapshot {
+            peer_infos: vec![
+                peer(1),
+                avoid_relay_peer2,
+                peer(3),
+                peer(4),
+                peer(5),
+                peer(6),
+            ],
+            conn_map: vec![
+                connected(1, [2, 3]),
+                connected(2, [1, 4]),
+                connected(3, [1, 4, 5]),
+                connected(4, [2, 3, 6]),
+                connected(5, [3, 6]),
+                connected(6, [4, 5]),
+            ],
+            suppressed_peer_ids: BTreeSet::new(),
+            version: 1,
+        };
+        let mesh_table = OspfRouteTable::new();
+        mesh_table.build_from_snapshot(
+            1,
+            &mesh_snapshot,
+            NextHopPolicy::LeastCost,
+            &DefaultRouteCostCalculator,
+        );
+        // Destination 4 should route via 3 instead of 2 because 2 avoids relay
+        let hop4_mesh = mesh_table.get_next_hop(4).expect("mesh 4 reachable");
+        assert_eq!(hop4_mesh.next_hop_peer_id, 3);
+    }
+
+    #[test]
+    fn test_gso_constraint_routing_and_fallback() {
+        // Diamond topology:
+        // Path A (shorter/cheaper): 1 -> 2 (cost 10, TCP) -> 4 (cost 10, UDP) = cost 20
+        // Path B (longer/expensive): 1 -> 3 (cost 20, TCP) -> 4 (cost 20, TCP) = cost 40
+        let cost_fn = |src: PeerId, dst: PeerId| -> i32 {
+            match (src, dst) {
+                (1, 2) | (2, 1) => 10,
+                (2, 4) | (4, 2) => 10,
+                (1, 3) | (3, 1) => 20,
+                (3, 4) | (4, 3) => 20,
+                _ => 1,
+            }
+        };
+
+        // All 4 nodes have GSO = true
+        let snapshot = OspfRouteSnapshot {
+            peer_infos: vec![
+                peer_with_gso(1, true),
+                peer_with_gso(2, true),
+                peer_with_gso(3, true),
+                peer_with_gso(4, true),
+            ],
+            conn_map: vec![
+                connected_with_attrs(1, [2, 3], [(2, tcp_edge()), (3, tcp_edge())]),
+                connected_with_attrs(2, [1, 4], [(1, tcp_edge()), (4, udp_edge())]),
+                connected_with_attrs(3, [1, 4], [(1, tcp_edge()), (4, tcp_edge())]),
+                connected_with_attrs(4, [2, 3], [(2, udp_edge()), (3, tcp_edge())]),
+            ],
+            suppressed_peer_ids: BTreeSet::new(),
+            version: 1,
+        };
+
+        let table = OspfRouteTable::new();
+        table.build_from_snapshot(
+            1,
+            &snapshot,
+            NextHopPolicy::LeastCost,
+            &MapCostCalculator(cost_fn),
+        );
+
+        // 1. Unconstrained: destination 4 routes through cheaper path via node 2
+        let unconstrained = table.get_next_hop(4).expect("node 4 reachable");
+        assert_eq!(unconstrained.next_hop_peer_id, 2);
+        assert_eq!(unconstrained.path_latency, 20);
+
+        // 2. Constrained (TCP + GSO): destination 4 routes through all-TCP path via node 3
+        let req = [
+            Constraint::new(&TUNNEL_TYPE, Value::Enum(TunnelKind::Tcp as u16)),
+            Constraint::new(&GSO_CAPABLE, Value::Flag(true)),
+        ];
+        let constrained = table
+            .get_next_hop_with_requirement(4, &req)
+            .expect("gso path available");
+        assert_eq!(constrained.next_hop_peer_id, 3);
+        assert_eq!(constrained.path_latency, 40);
+
+        // 3. is_gso_path_available helper
+        assert!(table.is_gso_path_available(4));
+
+        // 4. Fallback: If node 3 does NOT have GSO, GSO path is unavailable
+        let snapshot_no_gso = OspfRouteSnapshot {
+            peer_infos: vec![
+                peer_with_gso(1, true),
+                peer_with_gso(2, true),
+                peer_with_gso(3, false), // GSO disabled on node 3
+                peer_with_gso(4, true),
+            ],
+            conn_map: snapshot.conn_map.clone(),
+            suppressed_peer_ids: BTreeSet::new(),
+            version: 2,
+        };
+        let table2 = OspfRouteTable::new();
+        table2.build_from_snapshot(
+            1,
+            &snapshot_no_gso,
+            NextHopPolicy::LeastCost,
+            &MapCostCalculator(cost_fn),
+        );
+
+        assert_eq!(table2.get_next_hop(4).unwrap().next_hop_peer_id, 2);
+        assert!(!table2.is_gso_path_available(4));
+        assert!(table2.get_next_hop_with_requirement(4, &req).is_none());
+
+        // 5. Fallback: Older node doesn't advertise edge attributes
+        let snapshot_old_node = OspfRouteSnapshot {
+            peer_infos: vec![
+                peer_with_gso(1, true),
+                peer_with_gso(2, true),
+                peer_with_gso(3, true),
+                peer_with_gso(4, true),
+            ],
+            conn_map: vec![
+                connected(1, [2, 3]), // no edge attributes!
+                connected(2, [1, 4]),
+                connected(3, [1, 4]),
+                connected(4, [2, 3]),
+            ],
+            suppressed_peer_ids: BTreeSet::new(),
+            version: 3,
+        };
+        let table3 = OspfRouteTable::new();
+        table3.build_from_snapshot(
+            1,
+            &snapshot_old_node,
+            NextHopPolicy::LeastCost,
+            &MapCostCalculator(cost_fn),
+        );
+        assert_eq!(table3.get_next_hop(4).unwrap().next_hop_peer_id, 2);
+        assert!(!table3.is_gso_path_available(4));
+    }
+
+    #[test]
+    fn test_extensible_second_constraint_attribute() {
+        use easytier_attrs::{Fold, Order, Role, Scope, ValueKind};
+
+        // Decisive metric test (Section 7):
+        // Add a second constraint attribute `RELAY_ALLOWED` (1 declaration + 1 value source)
+        // Verify constraint-based Dijkstra works without modifying the algorithm or table!
+        const RELAY_ALLOWED: AttrDecl = AttrDecl {
+            id: 100,
+            name: "relay_allowed",
+            kind: ValueKind::Flag,
+            fold: Fold::AllTrue,
+            order: Order::HigherBetter,
+            role: Role::Constraint,
+            scope: Scope::Node,
+            stale_after: None,
+        };
+
+        let mut graph = petgraph::graph::DiGraph::<PeerId, PeerEdgeWeight>::new();
+        let n1 = graph.add_node(1);
+        let n2 = graph.add_node(2);
+        let n3 = graph.add_node(3);
+        let n4 = graph.add_node(4);
+
+        // Path via 2 is cheaper (cost 2)
+        graph.add_edge(
+            n1,
+            n2,
+            PeerEdgeWeight {
+                cost: 1,
+                attrs: tcp_edge(),
+            },
+        );
+        graph.add_edge(
+            n2,
+            n4,
+            PeerEdgeWeight {
+                cost: 1,
+                attrs: tcp_edge(),
+            },
+        );
+
+        // Path via 3 is more expensive (cost 4)
+        graph.add_edge(
+            n1,
+            n3,
+            PeerEdgeWeight {
+                cost: 2,
+                attrs: tcp_edge(),
+            },
+        );
+        graph.add_edge(
+            n3,
+            n4,
+            PeerEdgeWeight {
+                cost: 2,
+                attrs: tcp_edge(),
+            },
+        );
+
+        let tracked = [
+            TUNNEL_TYPE.clone(),
+            GSO_CAPABLE.clone(),
+            RELAY_ALLOWED.clone(),
+        ];
+
+        // Node 2 has RELAY_ALLOWED = false, Node 3 has RELAY_ALLOWED = true
+        let node_attrs = |n: petgraph::graph::NodeIndex| {
+            let mut s = AttrSet::new();
+            s.set_decl(&GSO_CAPABLE, Value::Flag(true));
+            let peer_id = graph[n];
+            let allow_relay = peer_id != 2;
+            s.set_decl(&RELAY_ALLOWED, Value::Flag(allow_relay));
+            s
+        };
+
+        let (scores, first_hop) = dijkstra_with_first_hop_and_constraints(
+            &graph,
+            n1,
+            |e| e.weight().cost,
+            |e| e.weight().attrs.clone(),
+            node_attrs,
+            &tracked,
+        );
+
+        // Unconstrained query finds destination 4 via node 2 with cost 2
+        assert_eq!(first_hop[&(n4, ConstraintState::Unconstrained)], (n2, 2));
+        assert_eq!(scores[&(n4, ConstraintState::Unconstrained)], 2);
+
+        // Constrained query requiring RELAY_ALLOWED == true automatically routes via node 3 with cost 4
+        let relay_req = [Constraint::new(&RELAY_ALLOWED, Value::Flag(true))];
+        let mut best_constrained = None;
+        for ((dst, state), hop) in &first_hop {
+            if *dst == n4 && state.satisfies_requirement(&relay_req) {
+                let cost = scores[&(dst.clone(), state.clone())];
+                best_constrained = Some((hop.0, cost));
+            }
+        }
+        let (hop_node, cost) = best_constrained.expect("path with RELAY_ALLOWED=true found");
+        assert_eq!(hop_node, n3);
+        assert_eq!(cost, 4);
     }
 }

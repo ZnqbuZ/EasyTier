@@ -2637,6 +2637,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "easytier-attrs"
+version = "2.7.0"
+dependencies = [
+ "rand 0.8.8",
+ "thiserror 2.0.20",
+]
+
+[[package]]
 name = "easytier-core"
 version = "2.7.0"
 dependencies = [
@@ -2658,6 +2666,7 @@ dependencies = [
  "cidr",
  "crossbeam",
  "dashmap",
+ "easytier-attrs",
  "easytier-proto",
  "futures",
  "getrandom 0.2.17",

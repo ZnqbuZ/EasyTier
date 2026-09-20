@@ -27,6 +27,16 @@ use crate::{
     },
 };
 
+use easytier_attrs::{Constraint, ConstraintState, GSO_CAPABLE, TUNNEL_TYPE, TunnelKind, Value};
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NextHopWithPathAttrs {
+    pub next_hop_peer_id: PeerId,
+    pub path_latency: i32,
+    pub path_len: usize,
+    pub constraint_state: ConstraintState,
+}
+
 #[derive(Clone, Debug, Default)]
 pub enum NextHopPolicy {
     #[default]
@@ -50,6 +60,9 @@ pub trait RouteInterface {
     }
     async fn get_peer_identity_type(&self, _peer_id: PeerId) -> Option<PeerIdentityType> {
         None
+    }
+    async fn get_peer_conn_tunnel_type_bits(&self, _peer_id: PeerId) -> u32 {
+        0
     }
     async fn list_foreign_networks(&self) -> ForeignNetworkRouteInfoMap {
         DashMap::new()
@@ -96,6 +109,22 @@ pub trait Route {
         _policy: NextHopPolicy,
     ) -> Option<PeerId> {
         self.get_next_hop(peer_id).await
+    }
+    async fn get_next_hop_with_requirement(
+        &self,
+        _peer_id: PeerId,
+        _require: &[Constraint],
+    ) -> Option<NextHopWithPathAttrs> {
+        None
+    }
+    async fn is_gso_path_available(&self, dst: PeerId) -> bool {
+        let req = [
+            Constraint::new(&TUNNEL_TYPE, Value::Enum(TunnelKind::Tcp as u16)),
+            Constraint::new(&GSO_CAPABLE, Value::Flag(true)),
+        ];
+        self.get_next_hop_with_requirement(dst, &req)
+            .await
+            .is_some()
     }
 
     async fn list_routes(&self) -> Vec<CoreRoute>;

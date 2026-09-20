@@ -1,0 +1,16 @@
+[package]
+name = "easytier-attrs"
+description = "Path attribute constraint engine and declarations for EasyTier."
+version = "2.7.0"
+edition.workspace = true
+rust-version.workspace = true
+license-file = "../LICENSE"
+
+[dependencies]
+thiserror = { workspace = true, optional = true }
+
+[dev-dependencies]
+rand = { workspace = true }
+
+[features]
+default = []

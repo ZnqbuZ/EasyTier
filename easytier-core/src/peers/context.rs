@@ -139,6 +139,7 @@ impl PeerRuntimeSnapshot {
             need_p2p: flags.need_p2p,
             disable_p2p: flags.disable_p2p,
             avoid_relay_data: flags.disable_relay_data,
+            gso: flags.gso,
             ..Default::default()
         };
         let peer_policy = PeerPolicyConfig {
