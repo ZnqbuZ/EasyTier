@@ -13,7 +13,10 @@ use easytier_core::{
 };
 use easytier_core::{
     events::{CoreEvent, CoreEventSink},
-    instance::{CoreHostAdapters, CoreInstance, CoreInstanceConfig, PacketEgressHost},
+    instance::{
+        CoreHostAdapters, CoreInstance, CoreInstanceConfig, PacketEgressHost,
+        PreparedInstanceConfig,
+    },
     process_runtime::CoreProcessRuntime,
 };
 
@@ -52,10 +55,10 @@ pub(crate) fn compose_native_core_instance(
     } else {
         runtime_core_host_config()
     };
-    let normalized = CoreInstanceConfig::from_toml_with_host(&toml_config, &host_config)?;
+    let prepared = PreparedInstanceConfig::from_toml(toml_config, &host_config)?;
     let global_ctx = Arc::new(GlobalCtx::new_with_runtime_config(
-        toml_config.clone(),
-        &normalized,
+        prepared.toml_config().unwrap().clone(),
+        prepared.normalized(),
         &host_config,
     ));
     let runtime_host = NativeInstanceRuntimeHost::new(global_ctx.clone());
@@ -66,7 +69,7 @@ pub(crate) fn compose_native_core_instance(
         host_config,
     );
     adapters.instance_runtime = runtime_host;
-    NativeCoreInstance::from_toml(toml_config, adapters)
+    NativeCoreInstance::from_prepared(prepared, adapters)
 }
 
 impl CoreEventSink for GlobalCtx {

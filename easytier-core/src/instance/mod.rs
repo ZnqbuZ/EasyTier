@@ -112,7 +112,7 @@ use crate::gateway::{
 };
 #[cfg(feature = "public-ipv6-provider")]
 use crate::peers::public_ipv6::provider::PublicIpv6ProviderRuntime;
-pub use config::CoreInstanceHostConfig;
+pub use config::{CoreInstanceHostConfig, PreparedInstanceConfig};
 use management_state::ManagementState;
 pub use packet_io::PacketEgressHost;
 use packet_io::PacketSinkEgress;
@@ -481,15 +481,27 @@ where
         Self::new_inner(config, None, host_config, adapters)
     }
 
+    pub fn from_prepared(
+        prepared: PreparedInstanceConfig,
+        adapters: CoreHostAdapters<H>,
+    ) -> anyhow::Result<Arc<Self>> {
+        let host_config = adapters.config.clone();
+        Self::new_inner(
+            prepared.normalized,
+            prepared.toml_config,
+            host_config,
+            adapters,
+        )
+    }
+
     /// Constructs an instance from the shared TOML model and retains that
     /// model as the authoritative management configuration.
     pub fn from_toml(
         toml_config: TomlConfig,
         adapters: CoreHostAdapters<H>,
     ) -> anyhow::Result<Arc<Self>> {
-        let host_config = adapters.config.clone();
-        let config = CoreInstanceConfig::from_toml_with_host(&toml_config, &host_config)?;
-        Self::new_inner(config, Some(toml_config), host_config, adapters)
+        let prepared = PreparedInstanceConfig::from_toml(toml_config, &adapters.config)?;
+        Self::from_prepared(prepared, adapters)
     }
 
     fn new_inner(
