@@ -13,10 +13,7 @@ use easytier_core::{
 };
 use easytier_core::{
     events::{CoreEvent, CoreEventSink},
-    instance::{
-        CoreHostAdapters, CoreInstance, CoreInstanceConfig, PacketEgressHost,
-        PreparedInstanceConfig,
-    },
+    instance::{CoreHostAdapters, CoreInstance, CoreInstanceConfig, PacketEgressHost},
     process_runtime::CoreProcessRuntime,
 };
 
@@ -55,21 +52,27 @@ pub(crate) fn compose_native_core_instance(
     } else {
         runtime_core_host_config()
     };
-    let prepared = PreparedInstanceConfig::from_toml(toml_config, &host_config)?;
-    let global_ctx = Arc::new(GlobalCtx::new_with_runtime_config(
-        prepared.toml_config().unwrap().clone(),
-        prepared.normalized(),
-        &host_config,
-    ));
-    let runtime_host = NativeInstanceRuntimeHost::new(global_ctx.clone());
-    let mut adapters = runtime_core_host_adapters_with_packet_egress_and_config(
-        global_ctx.clone(),
-        process_runtime,
-        runtime_host.clone(),
-        host_config,
-    );
-    adapters.instance_runtime = runtime_host;
-    NativeCoreInstance::from_prepared(prepared, adapters)
+
+    NativeCoreInstance::compose_with_toml(
+        &toml_config,
+        host_config.clone(),
+        |normalized, management_toml| {
+            let global_ctx = Arc::new(GlobalCtx::new_with_runtime_config(
+                management_toml.clone(),
+                normalized,
+                &host_config,
+            ));
+            let runtime_host = NativeInstanceRuntimeHost::new(global_ctx.clone());
+            let mut adapters = runtime_core_host_adapters_with_packet_egress_and_config(
+                global_ctx,
+                process_runtime,
+                runtime_host.clone(),
+                host_config,
+            );
+            adapters.instance_runtime = runtime_host;
+            Ok(adapters)
+        },
+    )
 }
 
 impl CoreEventSink for GlobalCtx {

@@ -138,9 +138,14 @@ pub fn normalize_secure_mode_config(
     Ok(config)
 }
 
+pub(crate) fn default_network_secret() -> Option<String> {
+    Some(String::new())
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NetworkIdentity {
     pub network_name: String,
+    #[serde(default = "default_network_secret")]
     pub network_secret: Option<String>,
     pub network_secret_digest: Option<NetworkSecretDigest>,
 }

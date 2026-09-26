@@ -123,7 +123,7 @@ pub trait ConfigLoader: Send + Sync {
     fn set_stun_servers_v6(&self, servers: Option<Vec<String>>);
 
     fn get_secure_mode(&self) -> Option<SecureModeConfig>;
-    fn set_secure_mode(&self, secure_mode: Option<SecureModeConfig>);
+    fn set_secure_mode(&self, secure_mode: Option<SecureModeConfig>) -> anyhow::Result<()>;
 
     fn get_credential_file(&self) -> Option<std::path::PathBuf> {
         None
@@ -157,6 +157,7 @@ use super::NetworkSecretDigest;
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct NetworkIdentity {
     pub network_name: String,
+    #[serde(default = "super::default_network_secret")]
     pub network_secret: Option<String>,
     #[serde(skip)]
     pub network_secret_digest: Option<NetworkSecretDigest>,
@@ -537,7 +538,7 @@ impl TomlConfig {
         })
     }
 
-    fn new_from_raw(raw: InstanceConfigRaw) -> Result<Self, anyhow::Error> {
+    pub(crate) fn new_from_raw(raw: InstanceConfigRaw) -> Result<Self, anyhow::Error> {
         let instance_config = InstanceConfig::try_from(raw)?;
         Ok(TomlConfig {
             config: Arc::new(Mutex::new(instance_config.into_raw())),
@@ -894,8 +895,10 @@ impl ConfigLoader for TomlConfig {
         self.config.lock().unwrap().secure_mode.clone()
     }
 
-    fn set_secure_mode(&self, secure_mode: Option<SecureModeConfig>) {
-        self.config.lock().unwrap().secure_mode = secure_mode;
+    fn set_secure_mode(&self, value: Option<SecureModeConfig>) -> anyhow::Result<()> {
+        let value = value.map(super::normalize_secure_mode_config).transpose()?;
+        self.config.lock().unwrap().secure_mode = value;
+        Ok(())
     }
 
     fn get_credential_file(&self) -> Option<PathBuf> {

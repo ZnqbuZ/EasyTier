@@ -39,26 +39,23 @@ pub fn normalize_network_identity(
     raw_id: Option<&NetworkIdentity>,
     secure_mode: Option<&SecureModeConfig>,
 ) -> NetworkIdentity {
-    let has_network_identity = raw_id.is_some();
-    let old_ns = raw_id.cloned().unwrap_or_default();
+    let Some(raw_id) = raw_id else {
+        return NetworkIdentity::default();
+    };
 
-    let is_credential = has_network_identity
-        && (secure_mode.map(|sm| sm.enabled).unwrap_or(false) || old_ns.network_secret.is_none())
-        && old_ns
-            .network_secret
-            .as_deref()
-            .is_none_or(|s| s.is_empty())
-        && old_ns.network_secret_digest.is_none();
+    let secure_enabled = secure_mode.map(|sm| sm.enabled).unwrap_or(false);
 
-    if is_credential {
-        NetworkIdentity::new_credential(old_ns.network_name)
-    } else if has_network_identity {
-        NetworkIdentity::new(
-            old_ns.network_name,
-            old_ns.network_secret.unwrap_or_default(),
-        )
-    } else {
-        NetworkIdentity::default()
+    match (&raw_id.network_secret, raw_id.network_secret_digest) {
+        (None, Some(digest)) => NetworkIdentity {
+            network_name: raw_id.network_name.clone(),
+            network_secret: None,
+            network_secret_digest: Some(digest),
+        },
+        (None, None) => NetworkIdentity::new_credential(raw_id.network_name.clone()),
+        (Some(secret), None) if secret.is_empty() && secure_enabled => {
+            NetworkIdentity::new_credential(raw_id.network_name.clone())
+        }
+        (Some(secret), _) => NetworkIdentity::new(raw_id.network_name.clone(), secret.clone()),
     }
 }
 
@@ -523,5 +520,65 @@ enabled = true
         assert_eq!(cleared.ipv4, None);
         assert_eq!(cleared.hostname, "review");
         assert!(original.ipv4.is_some());
+    }
+
+    #[test]
+    fn secure_mode_setter_should_not_make_snapshots_rotate_keys() {
+        let config = TomlConfig::default();
+        let template = TomlConfig::new_from_str("[secure_mode]\nenabled = true").unwrap();
+        let mut secure = template.get_secure_mode().unwrap();
+        secure.local_private_key = None;
+        secure.local_public_key = None;
+        config.set_secure_mode(Some(secure)).unwrap();
+        let first = config.snapshot().unwrap();
+        let second = config.snapshot().unwrap();
+        // Do not print private key material on failure.
+        assert!(
+            first.secure_mode.as_ref().unwrap().local_private_key
+                == second.secure_mode.as_ref().unwrap().local_private_key
+        );
+    }
+
+    #[test]
+    fn secure_mode_setter_with_invalid_key_errors_and_preserves_old_config() {
+        let config = TomlConfig::default();
+        let old_secure = crate::proto::common::SecureModeConfig {
+            enabled: false,
+            ..Default::default()
+        };
+        config.set_secure_mode(Some(old_secure.clone())).unwrap();
+
+        let invalid_secure = crate::proto::common::SecureModeConfig {
+            enabled: true,
+            local_private_key: Some("not-a-valid-hex-or-base64-key".into()),
+            local_public_key: None,
+        };
+        assert!(config.set_secure_mode(Some(invalid_secure)).is_err());
+        assert_eq!(config.get_secure_mode().as_ref(), Some(&old_secure));
+    }
+
+    #[test]
+    fn digest_only_identity_should_keep_its_digest() {
+        let config = TomlConfig::default();
+        config.set_network_identity(NetworkIdentity {
+            network_name: "review".into(),
+            network_secret: None,
+            network_secret_digest: Some([7; 32]),
+        });
+        assert_eq!(
+            config
+                .snapshot()
+                .unwrap()
+                .network_identity
+                .network_secret_digest,
+            Some([7; 32])
+        );
+    }
+
+    #[test]
+    fn file_without_secret_should_keep_legacy_identity_mode() {
+        let config: InstanceConfig =
+            toml::from_str("[network_identity]\nnetwork_name = 'review'").unwrap();
+        assert_eq!(config.network_identity.network_secret.as_deref(), Some(""));
     }
 }

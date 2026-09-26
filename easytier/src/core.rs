@@ -19,7 +19,7 @@ use crate::{
 use anyhow::Context;
 use cidr::IpCidr;
 use clap::{Arg, ArgMatches, CommandFactory, FromArgMatches, Parser};
-use easytier_core::config::{EncryptionAlgorithm, normalize_secure_mode_config};
+use easytier_core::config::EncryptionAlgorithm;
 use guarden::defer;
 use prost_types::field_descriptor_proto::Type;
 use rust_i18n::t;
@@ -866,7 +866,7 @@ impl NetworkOptions {
                 local_private_key: Some(credential_secret.clone()),
                 local_public_key: None,
             };
-            cfg.set_secure_mode(Some(normalize_secure_mode_config(c)?));
+            cfg.set_secure_mode(Some(c))?;
         } else if let Some(secure_mode) = self.secure_mode
             && secure_mode
         {
@@ -886,7 +886,7 @@ impl NetworkOptions {
                 local_private_key,
                 local_public_key,
             };
-            cfg.set_secure_mode(Some(normalize_secure_mode_config(c)?));
+            cfg.set_secure_mode(Some(c))?;
         }
 
         cfg.patch_flags(self.flags.clone());

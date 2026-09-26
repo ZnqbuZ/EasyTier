@@ -173,8 +173,9 @@ impl CoreInstanceConfig {
         config: &TomlConfig,
         host: &CoreInstanceHostConfig,
     ) -> anyhow::Result<Self> {
-        let prepared = PreparedInstanceConfig::from_toml(config.clone(), host)?;
-        Ok(prepared.into_normalized())
+        config.ensure_id();
+        let snapshot = config.snapshot()?;
+        Self::from_parsed_with_host(&snapshot, host)
     }
 
     /// Normalizes the typed configuration values with explicit Host facts and policy.
@@ -413,46 +414,6 @@ impl CoreInstanceConfig {
                 },
             },
         })
-    }
-}
-
-#[derive(Clone)]
-pub struct PreparedInstanceConfig {
-    pub(crate) normalized: CoreInstanceConfig,
-    pub(crate) toml_config: Option<TomlConfig>,
-}
-
-impl PreparedInstanceConfig {
-    pub fn from_toml(
-        toml_config: TomlConfig,
-        host_config: &CoreInstanceHostConfig,
-    ) -> anyhow::Result<Self> {
-        toml_config.ensure_id();
-        let snapshot = toml_config.snapshot()?;
-        let normalized = CoreInstanceConfig::from_parsed_with_host(&snapshot, host_config)?;
-        Ok(Self {
-            normalized,
-            toml_config: Some(toml_config),
-        })
-    }
-
-    pub fn from_normalized(normalized: CoreInstanceConfig) -> Self {
-        Self {
-            normalized,
-            toml_config: None,
-        }
-    }
-
-    pub fn normalized(&self) -> &CoreInstanceConfig {
-        &self.normalized
-    }
-
-    pub fn into_normalized(self) -> CoreInstanceConfig {
-        self.normalized
-    }
-
-    pub fn toml_config(&self) -> Option<&TomlConfig> {
-        self.toml_config.as_ref()
     }
 }
 

@@ -101,23 +101,19 @@ impl TestConfigPatcher {
 
 #[cfg(test)]
 mod tests {
-    use easytier_core::config::{
-        normalize_secure_mode_config,
-        toml::{ConfigLoader as _, TomlConfig},
-    };
+    use easytier_core::config::toml::{ConfigLoader as _, TomlConfig};
 
     use super::*;
 
     #[tokio::test]
     async fn composition_preserves_secure_admin_identity() {
         let config = TomlConfig::default();
-        config.set_secure_mode(Some(
-            normalize_secure_mode_config(crate::proto::common::SecureModeConfig {
+        config
+            .set_secure_mode(Some(crate::proto::common::SecureModeConfig {
                 enabled: true,
                 ..Default::default()
-            })
-            .unwrap(),
-        ));
+            }))
+            .unwrap();
 
         let instance = TestInstance::new_with_process_runtime(config, CoreProcessRuntime::new());
 

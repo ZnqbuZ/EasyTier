@@ -112,7 +112,7 @@ use crate::gateway::{
 };
 #[cfg(feature = "public-ipv6-provider")]
 use crate::peers::public_ipv6::provider::PublicIpv6ProviderRuntime;
-pub use config::{CoreInstanceHostConfig, PreparedInstanceConfig};
+pub use config::CoreInstanceHostConfig;
 use management_state::ManagementState;
 pub use packet_io::PacketEgressHost;
 use packet_io::PacketSinkEgress;
@@ -481,27 +481,37 @@ where
         Self::new_inner(config, None, host_config, adapters)
     }
 
-    pub fn from_prepared(
-        prepared: PreparedInstanceConfig,
-        adapters: CoreHostAdapters<H>,
-    ) -> anyhow::Result<Arc<Self>> {
-        let host_config = adapters.config.clone();
-        Self::new_inner(
-            prepared.normalized,
-            prepared.toml_config,
-            host_config,
-            adapters,
-        )
+    pub fn compose_with_toml<F>(
+        toml_config: &TomlConfig,
+        host_config: CoreInstanceHostConfig,
+        build_adapters: F,
+    ) -> anyhow::Result<Arc<Self>>
+    where
+        F: FnOnce(&CoreInstanceConfig, &TomlConfig) -> anyhow::Result<CoreHostAdapters<H>>,
+    {
+        toml_config.ensure_id();
+        let snapshot = toml_config.snapshot()?;
+        let normalized = CoreInstanceConfig::from_parsed_with_host(&snapshot, &host_config)?;
+        let management_toml = TomlConfig::new_from_raw(snapshot.into_raw())?;
+        let adapters = build_adapters(&normalized, &management_toml)?;
+        if adapters.config != host_config {
+            anyhow::bail!(
+                "adapters host configuration does not match the instance host configuration"
+            );
+        }
+        Self::new_inner(normalized, Some(management_toml), host_config, adapters)
     }
 
     /// Constructs an instance from the shared TOML model and retains that
     /// model as the authoritative management configuration.
     pub fn from_toml(
-        toml_config: TomlConfig,
+        toml_config: impl std::borrow::Borrow<TomlConfig>,
         adapters: CoreHostAdapters<H>,
     ) -> anyhow::Result<Arc<Self>> {
-        let prepared = PreparedInstanceConfig::from_toml(toml_config, &adapters.config)?;
-        Self::from_prepared(prepared, adapters)
+        let host_config = adapters.config.clone();
+        Self::compose_with_toml(toml_config.borrow(), host_config, |_normalized, _toml| {
+            Ok(adapters)
+        })
     }
 
     fn new_inner(
