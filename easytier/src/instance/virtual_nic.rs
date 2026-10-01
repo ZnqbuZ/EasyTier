@@ -32,7 +32,7 @@ use crate::common::{
 use crate::utils::buf::{BufMargins, BufPool};
 use crate::utils::net;
 #[cfg(target_os = "linux")]
-use crate::utils::net::{SegmentError, Segmenter};
+use crate::utils::net::Segmenter;
 use easytier_core::{
     host::packet::{HostPacket, HostPacketReceiver},
     instance::CorePacketPlane,
@@ -125,20 +125,8 @@ impl TunRx {
 
         #[cfg(target_os = "linux")]
         if let Some(segmenter) = &mut self.segmenter {
-            match segmenter.segment(&mut self.buf, &packet, self.margins.header) {
-                Ok(_) => {
-                    if let Some(packet) = segmenter.pop() {
-                        return Ok(Some(packet));
-                    }
-                }
-                Err(SegmentError::NotGso) => {}
-                Err(error) => {
-                    tracing::warn!(
-                        ?error,
-                        "failed to software-segment GSO packet, passing through"
-                    );
-                }
-            }
+            segmenter.push(&mut self.buf, packet, self.margins.header);
+            return Ok(segmenter.pop());
         }
 
         Ok(Some(ZCPacket::new_from_buf(packet, ZCPacketType::NIC)))
@@ -254,6 +242,10 @@ impl TunTx {
             inner
         };
         let (hdr, packet) = frame.split_at_mut(hdr_len);
+
+        if self.has_vnet_hdr() {
+            hdr[..4].fill(0);
+        }
 
         if self.has_pi() {
             let mut pi = &mut hdr[hdr_len - self.pi_len..];
