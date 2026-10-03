@@ -3308,4 +3308,70 @@ virtual_ip = "10.82.0.2/24"
 
         instance.stop().await;
     }
+
+    #[tokio::test]
+    async fn core_instance_maintains_route_demands_lifecycle() {
+        let (packet_sink, _packet_receiver) = tokio::sync::mpsc::channel(16);
+        let adapters = adapters(None, Arc::new(packet_sink));
+        let config = test_config("route-demands-lifecycle");
+        let instance = CoreInstance::new(config, adapters).unwrap();
+
+        let demands = instance.route_demands();
+        let (mut sub, initial_snap) = demands.subscribe();
+        assert!(!initial_snap.is_closed);
+
+        instance.start().await.unwrap();
+
+        // After start, core sources are registered and active
+        let mut snap = demands.current();
+        while snap.sources.is_empty()
+            || snap
+                .sources
+                .values()
+                .any(|s| s.status == crate::route_demand::model::SourceStatus::Initializing)
+        {
+            snap = sub.wait_next().await.unwrap();
+        }
+
+        assert_eq!(snap.sources.len(), 2);
+
+        // Update runtime config to add manual route
+        let mut updated = instance.runtime_config.snapshot().as_ref().clone();
+        let manual_net: cidr::Ipv4Cidr = "192.168.100.0/24".parse().unwrap();
+        updated.services.manual_routes = Some(vec![manual_net].into_iter().collect());
+        instance.update_runtime_config(updated).await.unwrap();
+
+        // Wait for reactive demand update
+        let mut found_manual = false;
+        for _ in 0..10 {
+            snap = sub.wait_next().await.unwrap();
+            for s in snap.sources.values() {
+                if let Some(snapshot) = &s.latest_snapshot {
+                    if snapshot
+                        .demands
+                        .iter()
+                        .any(|d| d.destination == cidr::IpCidr::V4(manual_net))
+                    {
+                        found_manual = true;
+                        break;
+                    }
+                }
+            }
+            if found_manual {
+                break;
+            }
+        }
+        assert!(found_manual, "manual route demand was not projected");
+
+        // Stop instance: demand registry must be closed and sources revoked
+        instance.stop().await;
+        let final_snap = demands.current();
+        assert!(final_snap.is_closed);
+        for s in final_snap.sources.values() {
+            assert!(matches!(
+                s.status,
+                crate::route_demand::model::SourceStatus::Revoked { .. }
+            ));
+        }
+    }
 }

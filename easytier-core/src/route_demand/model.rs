@@ -70,6 +70,8 @@ pub enum SourceKind {
     PublicIpv6Egress,
     /// Public IPv6 peer network routes.
     PublicIpv6Peer,
+    /// Unified Public IPv6 source (combines egress ::/0 and peer routes).
+    PublicIpv6,
     /// Magic DNS fake IP (/32) virtual routes.
     MagicDns,
     /// Platform explicit virtual interface subnet prefix (e.g. macOS / FreeBSD).

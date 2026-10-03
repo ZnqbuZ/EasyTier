@@ -16,8 +16,12 @@ mod packet_plane;
 mod packet_proxy_extension;
 #[cfg(feature = "public-ipv6-provider")]
 mod public_ipv6_extension;
+pub mod route_demands;
 #[cfg(feature = "vpn-portal")]
 mod vpn_portal_extension;
+
+pub use route_demands::{CoreRouteDemands, HostRouteDemandContext};
+pub(crate) use route_demands::RouteDemandSupervisor;
 
 use std::sync::{
     Arc,
@@ -229,6 +233,9 @@ fn proxy_cidr_snapshot(config: &CoreInstanceRuntimeConfig) -> ProxyCidrSnapshot 
 /// lifetime, such as a native packet interface.
 #[async_trait::async_trait]
 pub trait InstanceRuntimeHost: std::any::Any + Send + Sync + 'static {
+    /// Transfers host route demand context to the host runtime before preparation.
+    fn initialize_route_demands(&self, _context: HostRouteDemandContext) {}
+
     async fn prepare(
         &self,
         packet_plane: Arc<CorePacketPlane>,
@@ -441,6 +448,8 @@ where
     #[cfg(feature = "proxy-packet")]
     pub(super) startup_plan: CoreInstanceStartupPlan,
     pub(super) runtime_config: CoreRuntimeConfigStore,
+    pub(super) route_demands: RouteDemandSupervisor,
+    pub(super) public_ipv6_runtime: Arc<CorePublicIpv6Runtime>,
     #[cfg(feature = "test-utils")]
     acl_reload_count: AtomicUsize,
 }
@@ -822,7 +831,7 @@ where
         let public_ipv6_provider = PublicIpv6ProviderRuntime::new(
             public_ipv6_provider,
             runtime_config.clone(),
-            public_ipv6_runtime,
+            public_ipv6_runtime.clone(),
         );
         #[cfg(feature = "vpn-portal")]
         let vpn_portal = PortalModule::new(
@@ -844,6 +853,7 @@ where
             runtime_config.clone(),
             proxy_cidr_monitor_available,
         ));
+        let route_demands = RouteDemandSupervisor::new(crate::route_demand::model::InstanceRuntimeId::random());
 
         Ok(Arc::new(Self {
             instance_name,
@@ -889,9 +899,16 @@ where
             #[cfg(feature = "proxy-packet")]
             startup_plan,
             runtime_config,
+            route_demands,
+            public_ipv6_runtime,
             #[cfg(feature = "test-utils")]
             acl_reload_count: AtomicUsize::new(0),
         }))
+    }
+
+    /// Read-only access to instance route demands.
+    pub fn route_demands(&self) -> CoreRouteDemands {
+        self.route_demands.demands()
     }
 
     pub fn state(&self) -> CoreInstanceState {

@@ -77,10 +77,7 @@ pub(crate) fn resolve_proxy_cidrs(
     peer_routes: BTreeSet<Ipv4Cidr>,
     config: ProxyCidrConfigSnapshot,
 ) -> BTreeSet<Ipv4Cidr> {
-    if let Some(manual_routes) = config.manual_routes {
-        return manual_routes;
-    }
-    peer_routes
+    crate::route_demand::projection::resolve_proxy_cidrs(&peer_routes, config.manual_routes.as_ref())
 }
 
 pub(crate) fn diff_proxy_cidrs(

@@ -124,6 +124,17 @@ where
         #[cfg(feature = "public-ipv6-provider")]
         self.public_ipv6_provider.start().await;
 
+        self.instance_runtime
+            .initialize_route_demands(self.route_demands.host_context());
+        self.route_demands
+            .start(
+                self.peer_manager.clone(),
+                self.runtime_config.clone(),
+                self.public_ipv6_runtime.clone(),
+                self.cancel.clone(),
+            )
+            .await?;
+
         let dhcp_host = self.instance_runtime.prepare(self.packet_plane()).await?;
         #[cfg(feature = "dhcp-ipv4")]
         self.start_dhcp_ipv4(dhcp_host).await?;
@@ -162,6 +173,8 @@ where
     }
 
     async fn stop_components(&self) {
+        self.route_demands.stop().await;
+
         if !self.peer_manager.withdraw_routes_before_stop().await {
             tracing::warn!(
                 instance = %self.instance_name,
