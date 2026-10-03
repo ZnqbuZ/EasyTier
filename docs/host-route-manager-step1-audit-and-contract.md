@@ -1,6 +1,6 @@
-# HostRouteManager 第一步：行为契约、路由审计与平台能力矩阵（第二轮修订版）
+# HostRouteManager 第一步：行为契约、路由审计与平台能力矩阵（第三轮修订版）
 
-状态：已根据第二轮审查意见（[`docs/host-route-manager-step1-review-2.md`](host-route-manager-step1-review-2.md)）完成深度修订。修复了超时归属判定漏洞、共享需求语义合并缺陷、接口复用删除守卫缺陷、退出租约泄漏风险及版本协议未闭合问题；确立了有界延迟与调度公平性规范。  
+状态：已根据第三轮审查意见（[`docs/host-route-manager-step1-review-3.md`](host-route-manager-step1-review-3.md)）完成全面闭环修订。消除了崩溃恢复错误认领外部条目的漏洞，恢复了严格的 WAL 持久化与失败停机契约，纠正了 Linux 槽位键与共存判定，闭合了包含需求撤销、守卫清理与委托宿主接管的停机协议，恢复了快照作为唯一事实源的版本化流转契约，规范了等待令牌与冲突状态，并诚实校准了平台验证证据边界。  
 依据：《[HostRouteManager 实施总纲](host-route-manager-master-plan.md)》第一步要求。  
 基线代码：本地 `main` 分支 `a017dc13`；涉及 DNS 需求部分核对 `feat/dns-policy` (`2569f35f`)；移动端核对 `tauri-plugin-vpnservice`、`easytier-gui` 及 `easytier-ohrs`。所有文件链接使用相对路径，注明分支与源码位置。
 
@@ -18,11 +18,11 @@
 flowchart TD
     subgraph Core ["Core 业务与需求层 (easytier-core)"]
         direction TB
-        C1[RouteManager / OSPF 路由] --> RSnap[版本化需求快照投影]
+        C1[RouteManager / OSPF 路由] --> RSnap[全量需求快照投影]
         C2[配置管理 manual_routes] --> RSnap
         C3[Public IPv6 服务] --> RSnap
         C4[DNS / Magic DNS 服务] --> RSnap
-        RSnap --> Demands[RouteDemands 快照发布: SourceEpoch + SourceRev]
+        RSnap --> Demands[RouteDemands 全量快照发布: SourceEpoch + SourceRev]
     end
 
     subgraph HostControl ["Host 路由控制公共层 (easytier)"]
@@ -160,9 +160,9 @@ flowchart TD
 
 ---
 
-## 4. 稳定路由域、资源作用域与生命周期代际模型
+## 4. 稳定路由域、资源作用域、代际绑定与条目匹配
 
-针对审查意见 S2、S3，彻底解耦被混淆的四层概念：
+针对审查意见 T3，彻底厘清需求等价性、内核冲突与选路冲突的边界：
 
 ```mermaid
 classDiagram
@@ -211,25 +211,24 @@ classDiagram
 4. **`RouteIdentity` (条目精确身份键)**：
    - 用于在平台底层精确定位一条路由：必须完整包含目标前缀、路由表 ID、优先级/Metric 以及出接口 (`oif`) / 下一跳 (`next_hop`)。
 
-### 4.2 平台槽位键、匹配条件与需求等价性解耦 (Addressing S2)
+### 4.2 需求等价性、内核操作冲突与多表共存 (Addressing T3)
 
-必须严格区分三个容易被混同的维度：
+严格区分三个维度的概念，杜绝冻结未经验证的单一键公式：
 
-1. **平台对象槽位键 (Platform Slot Key)**：
-   - 操作系统底层用于区分路由唯一槽位的键组合：
-     - **Linux**：`DestinationPrefix` + `Table` + `Priority` + `Tos` + `EgressIfindex (oif)`。
-     - **Windows**：`DestinationPrefix` + `InterfaceLuid` + `NextHop`（在 Windows IP Helper 中，相同目标、接口与下一跳无法通过不同 metric 创建两条独立路由）。
-     - **macOS/BSD**：`DestinationAddress` + `Netmask` + `Interface/Gateway`。
-2. **操作匹配条件 (Operation Match Condition)**：
-   - 执行 `Delete` 或 `Replace` 时，操作系统 API 要求的精确匹配字段。
-3. **需求等价性 (Demand Equivalence) 与共享引用条件**：
-   - 两个需求能够合并并共享引用的**充要条件**是：**具有完全相同的转发语义与属性**（同一 Domain、同一目标前缀、同一出口网卡、同一下一跳、相同路由表、兼容的 metric）。
-   - **业务路由冲突 (Routing Conflict)**：若同域内的实例 A（要求送往 `tunA`）与实例 B（要求送往 `tunB`）请求相同的目标前缀，这属于**不可调和的业务路由冲突**，严禁因前缀相同而合并引用计数！必须由冲突仲裁器根据策略报错或按优先级处理。
+1. **需求等价性 (Demand Equivalence) 与共享引用条件**：
+   - 两个业务需求能够合并并共享引用的**充要条件**是：**具有完全相同的转发语义与属性**（同一 Domain、同一目标前缀、同一出口网卡、同一下一跳、相同路由表、兼容的 metric）。
    - **快照幂等引用计数**：引用计数必须由**有效来源集合派生**（`HashSet<SourceId>`），重复提交相同快照不得重复增减引用。
+2. **内核操作冲突 (Kernel Operation Collision)**：
+   - 内核在单次系统调用中判定条目冲突的规则因平台和地址族而异：
+     - **Linux IPv4 主表**：采用 `NLM_F_CREATE | NLM_F_EXCL` 下发时，只要 `Table + Prefix + Priority + Tos` 相同，即使 `oif` 不同，内核 `fib_table_insert` 也会返回 `EEXIST` 冲突。因此，不能将 `oif` 误当作防止内核冲突的独立分区键。
+     - **Windows IP Helper**：`CreateIpForwardEntry2` 要求 `DestinationPrefix + InterfaceLuid + NextHop` 唯一，相同槽位不能仅因 Metric 不同而创建两条独立条目。
+3. **选路冲突 vs 多表安全共存**：
+   - **同一流量的选路冲突 (Routing Conflict)**：同域内的两个实例（如实例 A 要送往 `tunA`，实例 B 要送往 `tunB`）若在同一选路规则下争抢相同的目的地址，属于业务冲突，必须由冲突仲裁器报错或退避。
+   - **多表安全共存 (Multi-Table Coexistence)**：若两个相同前缀的需求分配在不同的路由表（如 table 10001 与 table 10002），且通过互斥的 IP rules（如根据入接口、源 IP 或 `socket_mark` 匹配）导向不同表，它们在内核中**完全可以安全共存**。不等价绝不等于不可共存！
 
-### 4.3 代际生命周期与历史清理守卫 (Addressing S3)
+### 4.3 代际生命周期与历史清理守卫 (Addressing S3/T1)
 
-为彻底解决“历史台账误删新代际相同属性路由”的严重缺陷，重构清理契约：
+为彻底解决“历史台账误删新代际相同属性路由”的严重缺陷，确立以下规则：
 
 1. **历史台账性质**：`RetiredBindingsLedger` 仅证明存在尚未交接的**清理责任**，不证明当前观测到的条目仍是旧代际对象。
 2. **强绑定资源的生命周期终结**：当原接口被确认已物理销毁时，内核自动剥离的网卡绑定路由，其清理责任**立即安全终结**，从台账注销。
@@ -243,9 +242,9 @@ classDiagram
 
 ---
 
-## 5. 四维状态模型、精确条目身份与安全归属
+## 5. 四维状态模型、严格归属准入与操作核验
 
-针对审查意见 S1，彻底杜绝凭“条目存在”补记归属与缺乏前置核验的更新漏洞。
+针对审查意见 T1，统一所有正常与故障分支的归属证据标准，严禁以弱证据认领外部资源。
 
 ### 5.1 四维并发正交状态模型
 
@@ -267,101 +266,163 @@ graph TD
     P -->|执行结果核验| W
 ```
 
-### 5.2 归属准入与按 Action 严格核对契约 (Addressing S1)
+### 5.2 统一归属准入标准与按 Action 严格核验 (Addressing T1)
 
 无论常态执行、操作超时、还是崩溃恢复，必须遵循**完全统一的归属证据标准**：
 
 1. **统一归属准入规则**：
    - 严禁在故障或恢复分支降低证据门槛。
-   - 仅当系统调用成功确认、或持有明确授权的历史 Journal 凭据时，才允许记录 `Owned(CreatedByUs)`。
+   - **Intent + Binding + Desired 绝不构成成功创建的证据**！若系统崩溃前仅有 `Intent` 而无 `Commit`，重启后读回即使条目存在，**严禁补写 `Owned(CreatedByUs)`**！必须将其标记为 `OutcomeUnknown`，若属性吻合则降级视为 `ExternalSatisfied`，绝不承担本方创建的所有权，退出时绝不执行删除。
 2. **按 Action 定义核对结果**：
    - **Add 操作**：
      - 前态：确认系统中不存在。
      - 目标后态：存在且属性完全匹配。
-     - **超时核对**：若 Add 操作超时后读回发现条目存在，**但无法排除外部并发创建（如返回过 EEXIST）**，严禁补记 `Owned`！必须降级标记为 `OutcomeUnknown` 或 `ExternalSatisfied`，**绝不记录为本方创建**。
+     - **超时核对**：若 Add 操作超时后读回发现条目存在，但无法排除外部并发创建（如返回过 `EEXIST` 或响应丢失），严禁补记 `Owned`！必须降级标记为 `OutcomeUnknown` 或 `ExternalSatisfied`。
    - **Delete 操作**：
      - 前态：存在。
      - 目标后态：不存在。
-     - **超时核对**：若 Delete 操作超时后读回发现条目依然存在，说明**删除未生效**，保持为 `DeleteFailed` 或 `DeletePending`，**绝不能判定为成功**！
+     - **超时核对**：若 Delete 操作超时后读回发现条目依然存在，**绝不能武断判定为“删除失败并再次删除”**！读回存在仅证明当前存在，不能证明当前条目的身份与原条目连续（可能原删除已完成，第三方随后建立了同属性条目；也可能原请求仍在底层积压）。必须先核实旧执行者状态与归属连续性；若无法确证，保持 `Uncertain` / `DeletePending`，严禁盲目发起二次删除。
    - **Replace 操作 (PlannedMismatch 严格前置核验)**：
      - 前态必须验证：系统当前条目必须严格匹配本方最后确认的前态属性 $A$。
      - 目标后态：新属性 $B$。
      - **并发外部篡改拦截**：若在准备 Replace 时，系统当前条目变成了第三种属性 $C$ ($C \neq A$ 且 $C \neq B$)，说明发生了外部并发修改，**严禁盲目执行 Replace**！必须立刻终止替换，转入 `Conflicted` 状态并报警。
-3. **平台协作假设声明**：
-   - 在缺乏原子条件更新能力（CAS / Conditional Route Update）的共享路由表平台上，系统陈述协作假设：假定外部工具不会以高频方式并发改写同一条目；一旦检测到外部竞争，主动退避并报告冲突，不进行无限对抗。
+3. **共享表协作假设与保证边界**：
+   - 在缺乏原子条件操作（CAS）和独占锁的共享表上，即使单次外部并发修改落在读回与写入之间，也可能破坏一致性。系统明确陈述协作假设：假定外部工具不会恶意并发介入；一旦检测到外部竞争（如 Replace 前置核验失败），主动退避并报告冲突，绝不通过高频重试强行争抢。
 
 ---
 
-## 6. Provider 反馈防御与选路策略边界
+## 6. Write-Ahead 恢复日志与持久化失败停机契约
 
-针对审查意见 S6，消除 LAN 优先、冲突状态与外层绕行之间的表述矛盾：
+针对审查意见 T2，恢复严格的 WAL 顺序契约与持久化失败边界：
 
-### 6.1 策略允许优先 vs 意外抢占冲突 (Addressing S6)
+### 6.1 严格的 WAL (Write-Ahead Logging) 写入顺序契约 (Addressing T2)
 
-必须严格区分三类运行状态，消除规划器自相矛盾：
+任何在宿主操作系统中产生、需要承担恢复或清理责任的系统修改（包括 `Add`、`Delete`、`Replace`），必须严格遵循以下三阶段顺序：
 
-1. **`Installed` (本方路由已就绪)**：本方期望的路由已在内核正确安装。
-2. **`PolicyPermittedPrecedence` (策略允许的外部优先)**：
-   - 例如经配置认可的本地局域网物理直连路由（LAN Bypass），其优先级高于 EasyTier 路由是**符合设计预期的正常策略**，**绝不能被规划器误报为 `TrafficHijackedConflict`**。
-3. **`TrafficHijackedConflict` (意外抢占冲突)**：
-   - 只有在未经授权的外部路由以更高优先级覆盖了 EasyTier 期望管理的专属网段时，才判定为劫持冲突。
+1. **预写意图 (Log Intent & Flush)**：
+   - 执行引擎必须先将操作意图落盘并完成持久化刷新：
+     $$\text{Write Journal: Intent}(\text{OpId}, \text{Action}, \text{RouteIdentity}, \text{ExpectedPreState}, \text{TargetPostState}, \text{Gen}) \to \text{fsync / flush}$$
+   - **前置屏障**：在 `Intent` 确认落盘前，**严禁向底层网络栈下发任何系统调用**！
+2. **底层执行 (Execute Platform Action)**：
+   - 调用底层原生 API（Netlink / IP Helper / Shell CLI）执行操作。
+3. **记录确认 (Log Commit & Flush)**：
+   - 收到平台确认成功或读回验证吻合后，写入完成标记并落盘：
+     $$\text{Write Journal: Committed}(\text{OpId}, \text{ResultProof}) \to \text{fsync / flush}$$
 
-### 6.2 外层传输防环的可验证包路径要求
+### 6.2 持久化失败与停机契约 (Disk Failure Boundary)
 
-- **包路径不变量**：EasyTier 传输层报文（物理 UDP/TCP 连接、STUN 探测、P2P 穿透报文）必须直达物理上行网卡，**绝对不得路由进入 EasyTier 自身的 TUN 网卡**。
-- **机制适配而非绝对定理**：
-  - 承认 `socket_mark` 的局限性（如 [`easytier/src/socket/fake_tcp/mod.rs:440`](../easytier/src/socket/fake_tcp/mod.rs#L440) 中 FakeTCP 仅对 decoy socket 生效）。
-  - 外层绕行根据平台传输能力灵活适配（Linux 下结合 `SO_BINDTODEVICE` 物理网卡绑定、源地址绑定与 socket mark），不把单一标记宣称为绝对防环手段。
-
-### 6.3 Public IPv6 Provider 反馈回路防御契约
-
-为防止 [`public_ipv6_provider/linux.rs:338`](../easytier/src/instance/public_ipv6_provider/linux.rs#L338) 将 EasyTier 自身的 `::/0` 路由当成上游物理出口：
-
-1. **接口分类与排除**：Provider 模块在调用 `list_ipv6_route_messages` 扫描 WAN 接口时，必须依据**接口身份（排除所有已知 EasyTier TUN 接口）**，不得依赖不可靠的 magic protocol。
-2. **保留 NDP 同步需求**：保留 [`linux.rs:523`](../easytier/src/instance/public_ipv6_provider/linux.rs#L523) 中的 `collect_public_ipv6_tun_routes`，用于获取 EasyTier TUN 设备上的 public IPv6 路由以同步 NDP 代理。
-
----
-
-## 7. 四维分层平台能力矩阵
-
-针对审查意见 S7，依据代码现状、系统潜力与真实测试证据重构矩阵：
-
-| 平台分类 | 系统底层 API 潜力 | 当前代码库已实现 | 本次实施目标 (HostRouteManager) | 验证状态与依据说明 |
-| :--- | :--- | :--- | :--- | :--- |
-| **Linux** | **原生完全**：Netlink dump/replace/event, 多表, FIB rule, netns | **原生可用**：`NetlinkIfConfiger` 支持基本增删与 dump；但 NetNSGuard 存在多线程跨 await 调度隐患 | **原生高强度**：Netlink Socket 显式绑定 netns；实现精确 Replace、异步组播读回验证、专用表策略 | **已验证系统调用**（基于主线 CI 与日常 Linux 运行）；netns 跨 await 隔离待第四步专项测试 |
-| **Windows** | **原生完全**：IP Helper NetIO (`GetIpForwardTable2`, `DeleteIpForwardEntry2`, `NotifyRouteChange2`) | **原生部分**：`WindowsIfConfiger` 使用 LUID 增删；缺乏精确读回与异步变更订阅 | **原生高强度**：完善 `MIB_IPFORWARD_ROW2` 规范化（Metric 为 offset，必须提供 DestinationPrefix、NextHop 与 LUID/Index），利用 NotifyRouteChange2 监听变化，实现基于 Win32 API + 读回的高确认强度 | **代码静态核对完成**；Windows 平台基础增删已有主线测试，精确删除匹配与 Metric offset 逻辑待新单元测试验证 |
-| **macOS** | **原生中等**：BSD Route Socket (`PF_ROUTE`) 支持结构化监听与 sysctl dump | **Shell CLI 包装**：`MacIfConfiger` 通过 `sh -c route -n` 执行命令，按进程退出状态码判定成功 | **架构目标明确**：在公共层确立纯函数规划与读回核对；实现可替换的原生适配层，首期交付带读回核对的稳定 CLI 适配器，为结构化 route socket 预留明确接口 | **代码静态核对完成**；现有 CI 覆盖 macOS 基本连通，高频并发下的稳定性待第四步端到端验证 |
-| **FreeBSD** | **原生中等**：BSD Route Socket, setfib 多 FIB 支持 | **Shell CLI 包装**：同 macOS，使用 `route` 命令 | **架构目标同 macOS**；为多 FIB 策略预留扩展能力 | **代码静态核对完成**；待真实环境专项回归 |
-| **Android** | **委托支持**：`VpnService.Builder` 支持 IPv4/IPv6 地址与路由完整批次声明 | **委托部分**：`TauriVpnService.kt` 具备 `builder.addRoute`，支持 IPv6 地址，但前端仅下发 IPv4 | **委托闭环**：实现 `DelegatedHostRouteBackend`，支持全量快照声明式下发、IPv4/IPv6 对等支持、以代际确认 (`HostConfirmed`) 代替底层读回 | **已验证 Android IPv4 建立**；IPv6 路由下发与 VPN 频繁重建待验证 |
-| **iOS** | **系统支持**：`NEPacketTunnelNetworkSettings` | **未实现 (占位 Stub)**：`tauri-plugin-vpnservice/ios/Sources/ExamplePlugin.swift` 仅为返回 `running=false` 的空壳 | **标记为未支持**：本轮不作生产承诺，明确归类为待开发后端 | **未支持 (Unsupported Stub)**；文档内严格如实标注 |
-| **OpenHarmony** (`ohrs`) | **系统支持**：`VpnExtensionAbility` 支持声明式路由配置 | **外部聚合**：`easytier-ohos-core/src/routing.rs` 实现了多实例需求聚合，但下游实际生效脱节 | **委托接入**：对接统一的 `RouteDemandsSnapshot` 导出接口，交由鸿蒙宿主执行 | **待验证实际应用闭环** |
-| **macOS NE** (`macos-ne`) | **系统支持**：`NEPacketTunnelNetworkSettings` | **未实现** | **委托后端预留**：与 iOS 采用相同的委托模型 | **未支持** |
-| **WASI / 嵌入宿主** | **无原生路由能力** | 仅有事件字符串映射 (`event.rs:52`) | **显式跳过**：绑定 `NoTunRouteBackend`，不报虚假成功 | **已验证事件序列化代码** |
-| **No-TUN** | **不适用** | **逻辑脱节**：`ProxyCidrMonitor` 在 no-tun 下仍然空转并误发事件 | **显式支持**：绑定 `NoTunRouteBackend`，业务层透明，宿主层完全跳过底层操作，不空转轮询 | **已验证代码逻辑**；重构后彻底消除虚假事件 |
+1. **常规修改全面停机**：
+   - 当日志持久化发生 I/O 错误（如磁盘满、只读文件系统、权限错误）时，**所有常规的路由与规则修改（包括 `Add`）必须立即中止**！
+   - 严禁将 `Add` 误当作“非破坏性操作”而在无日志保护下继续执行。
+2. **在途操作降级核对**：
+   - 既有在途操作的副作用被标记为 `Degraded(JournalIoError)`，系统进入只读降级状态，保留现场供人工排查，防止产生无法被追踪和恢复的脏路由。
+3. **紧急退出清理**：
+   - 在日志完全不可写的情况下若被要求退出，执行引擎仅在内存凭据允许的范围内执行尽力而为（Best-Effort）的清理，并在完成报告中明确返回 `CleanupIncomplete(JournalUnavailable)`。
 
 ---
 
-## 8. 运行契约、完成语义与恢复规范
+## 7. 完整停止屏障、清理失败与跨进程接管契约
 
-针对审查意见 S4、S5、S8，彻底补齐后续步骤所需的关键行为契约：
+针对审查意见 T4，彻底闭合停机状态转换、依赖清理与崩溃安全交接协议：
 
-### 8.1 来源版本、订阅窗口与撤销契约 (Addressing S5)
+### 7.1 停止协议完整生命周期状态机 (Addressing T4)
+
+退出停机过程分为 5 个连续阶段，杜绝带着需求执行删除，杜绝因超时无条件释放租约：
+
+```mermaid
+sequenceDiagram
+    participant User as 业务调用方
+    participant Coord as 域协调器
+    participant Planner as 纯函数规划器
+    participant Executor as 执行引擎
+    participant OS as 宿主操作系统
+    
+    User->>Coord: shutdown(timeout)
+    Note over Coord: 阶段 1: 撤销本实例需求 (Revoke Demands)
+    Coord->>Planner: 重新规划: 共享需求递减引用, 独立需求转为待删除
+    Note over Coord: 阶段 2: 关停摄取与排队 (Stop Scheduling)
+    Coord->>Executor: 取消未下发的待定任务
+    Note over Coord: 阶段 3: 隔离/排空在途 (Fence/Drain In-Flight)
+    Executor-->>Coord: 在途任务排空完成
+    Note over Coord: 阶段 4: 按依赖顺序安全清理 (Ordered Safe Reclaim)
+    loop 按照拓扑依赖逆序执行 (Rules -> Tables -> Routes)
+        Executor->>OS: 下发精确删除 (严格校验四重守卫)
+        OS-->>Executor: ACK / 成功
+    end
+    Note over Coord: 阶段 5: 判定交接与释放租约
+    alt 全部在途排空且清理确认完成
+        Coord->>Coord: 释放 ResourceScope 独占租约
+        Coord-->>User: 返回 ShutdownReport::Success
+    else 存在未明在途操作或清理超时/失败
+        Coord->>Coord: 保持独占租约! 记录未决责任至 Journal
+        Coord-->>User: 返回 ShutdownReport::CleanupIncomplete(LeaseRetained)
+    end
+```
+
+1. **阶段 1：撤销本实例需求 (Revoke Instance Demands)**：
+   - 实例注销自身持有的全部需求快照。
+   - 协调器重新运行规划器：多实例共享的需求引用计数递减；只有引用归零的需求才从 Desired 移除，并转化为规划器的待清理目标。**杜绝在 Desired 依然有效时强行删除，也杜绝误删其他实例仍需要的共享路由**。
+2. **阶段 2：停止摄取与排队 (Stop Scheduling)**：
+   - 关停新快照接收通道，取消所有尚未下发到底层的排队任务。
+3. **阶段 3：隔离与排空在途 (Fence/Drain In-Flight)**：
+   - 等待已下发的底层操作在超时时限内返回。
+4. **阶段 4：按依赖拓扑安全清理 (Ordered Safe Reclaim)**：
+   - 严格按照资源依赖顺序逆序清理（例如：必须先清理依赖某表的 IP 规则，再清理专用表内的路由；先清理依赖接口的路由，再注销接口）。
+   - 每项删除必须严格通过 4.3 节的**删除授权四重守卫**。
+5. **阶段 5：交接判定与租约保护**：
+   - 若清理阶段出现底层删除超时、权限被拒、或在途操作在时限到达时仍未返回：
+     - 完成报告必须如实返回 `CleanupIncomplete(reason)`。
+     - **租约保持契约**：只要存在执行结果未明、无法取消的在途操作，**存活协调器绝不释放 ResourceScope 独占租约**！必须保持租约直至在途操作彻底终结，防止新进程并发介入踩踏。
+
+### 7.2 崩溃后的跨进程接管契约 (Crash Recovery & Handoff)
+
+当进程崩溃退出、文件锁被操作系统被动释放时，新进程接管必须遵循以下协议：
+
+1. **WAL 日志核对先行**：
+   - 新进程获取租约后，必须首先读取恢复日志，扫描是否存在前任留下的 `InDoubt` 在途记录，并按 5.2 节的归属准入规则进行清算。
+2. **委托宿主会话代际失效 (Session Generation Invalidation)**：
+   - 针对 Android VpnService 或 iOS 委托宿主：新进程启动时必须生成单调递增的 `SessionEpoch`，并向宿主系统服务发起会话重置指令。
+   - 宿主服务强制使所有旧会话的回调和配置失效，彻底阻断崩溃前残留的异步 VPN 请求在新进程运行期间回踩系统状态。
+
+---
+
+## 8. 快照即事实的单向版本化流转契约
+
+针对审查意见 T5、T6、S8，恢复全量快照作为唯一事实源，明确等待令牌与调度公平性：
+
+### 8.1 完整快照事实源与无遗漏订阅 (Addressing T5)
 
 为保证第二步（建立版本化路由需求接口）顺利实施，冻结以下接口语义：
 
-1. **来源身份与 Epoch 分配**：
-   - 每个需求来源拥有全局唯一的 `SourceId = (SourceType, Uuid)`。
-   - 每次注册分配严格单调递增的 `SourceEpoch`。重注册或重启必须递增 Epoch，任何 `epoch < current_epoch` 的迟到消息无条件丢弃。
-   - 来源撤销时记录 `Tombstone(SourceId, Epoch, FinalRev)`，彻底防范旧消息复活。
-   - 区分 `SourceUnavailable`（临时不可达，需求保持 stale 状态不删除）与 `Revoked`（显式撤销，需求被清除）。
-2. **无遗漏原子订阅窗口**：
-   - 订阅协议提供原子化的 `subscribe()` 接口，保证在建立订阅的瞬间获得最新的全量快照，后续增量更新无缝衔接，不存在订阅间隙漏消息的问题。
-3. **对外等待令牌与 Superseded 条件**：
-   - 查询接口 `wait_convergence(token: SubmissionToken, timeout: Duration)` 必须使用类型化令牌：
-     `SubmissionToken::Source { source_id, epoch, revision }` 或 `SubmissionToken::DomainAggregate(u64)`。
-   - **精确的 Superseded 条件**：仅当**该令牌所关心的来源**发布了更新版本，或者发生了直接影响该需求的冲突时才判定为 Superseded；无关来源的并发更新不会导致等待被误判作废。
+1. **快照是事实，通知是提示 (Snapshots as Truth, Notifications as Hints)**：
+   - **恢复总纲核心契约**：每个需求来源每次提交必须是其持有的**全量需求快照**，附带单调递增的 `(SourceEpoch, SourceRevision)`。
+   - 通知仅用于唤醒协调器（Event-driven trigger），不承载唯一增量数据。
+   - **丢通知与乱序自愈**：若通知队列溢出（Lagged）、丢失或乱序，协调器无需任何增量补丁逻辑，只需直接向来源拉取最新的全量快照，即可瞬间恢复一致性。低版本快照（`rev < current_rev`）直接被幂等丢弃。
+2. **原子无遗漏订阅窗口**：
+   - 订阅接口必须保证“原子订阅建立 + 获取当前全量快照”，使接收方在建立订阅的瞬间取得基线事实，后续变更通知无缝衔接。
+3. **来源身份与生命周期**：
+   - `SourceId = (SourceType, Uuid)` 全局唯一。
+   - 重新注册分配递增的 `SourceEpoch`。
+   - 撤销时记录 `Tombstone(SourceId, Epoch, FinalRev)`，防范旧消息复活。
+   - 区分 `SourceUnavailable`（临时不可达，需求保持 stale 状态不删除）与 `Revoked`（显式注销，需求退出）。
 
-### 8.2 有界延迟防抖与调度公平性 (Addressing S8)
+### 8.2 对外等待令牌与精确完成语义 (Addressing T6)
+
+统一异步状态查询接口 `wait_convergence(token: SourceSubmissionToken, timeout: Duration)`：
+
+1. **类型化提交令牌**：
+   - 第二步直接绑定核心的 `SourceSubmissionToken { source_id: SourceId, epoch: u64, revision: u64 }`。暂不暴露未定义汇总规则的聚合 Token。
+2. **互斥且确定的完成状态定义**：
+   - **`Accepted`**：需求已被协调器接收并排队，计划待执行。
+   - **`HostConfirmed`**：委托宿主（如 Android VpnService）已确认配置生效。
+   - **`Verified`**：原生后端已调用系统接口并完成读回验证，真实 FIB 中已确认条目。
+   - **`Superseded`**：**严格限定为所等待的特定来源发布了更高 revision 的快照**，导致当前 revision 自然作废。
+   - **`Conflicted`**：发生外部争抢或业务冲突，**独立返回此状态，绝不混淆为 Superseded**。
+   - **`Degraded`**：部分操作失败、日志异常或处于只读降级状态。
+   - **`Unsupported / Skipped`**：如在 No-TUN 模式下，需求被显式跳过。
+   - **`CleanupIncomplete`**：退出清理未能在时限内彻底完成。
+
+### 8.3 有界延迟防抖与调度公平性 (Addressing S8)
 
 为防止高频更新（如每 20ms 一次）导致防抖定时器无限顺延、甚至饿死稳定来源：
 
@@ -373,59 +434,65 @@ graph TD
    - 重试、观测自愈与退出屏障享有独立调度预算，不得被高频业务快照饿死。
    - 退出请求（Shutdown）立即打断防抖窗口，强制进入停止屏障。
 
-### 8.3 停止屏障协议与租约保护 (Addressing S4)
+---
 
-退出过程严禁因超时而无条件释放独占租约，导致旧写入者与新写入者并发冲突：
+## 9. 选路策略边界与 Provider 反馈防御
 
-```mermaid
-sequenceDiagram
-    participant User as 业务调用方
-    participant Coord as 域协调器
-    participant Executor as 执行引擎
-    participant OS as 宿主操作系统
-    
-    User->>Coord: shutdown(timeout)
-    Coord->>Coord: 1. 关停需求摄取 (拒收新快照)
-    Coord->>Executor: 2. 取消未下发的排队任务
-    Coord->>Executor: 3. 隔离/等待在途任务 (Fence/Drain)
-    alt 在途任务在超时内排空
-        loop 逆序遍历 Owned 集合
-            Executor->>OS: 4. 下发精确删除 (校验四重守卫)
-            OS-->>Executor: ACK / 成功
-        end
-        Coord->>Coord: 5. 安全释放 ResourceScope 独占租约
-        Coord-->>User: 返回 ShutdownReport::Success
-    else 在途任务超时未结束
-        Coord->>Coord: 5. 保持独占租约! 记录未决状态至 Journal
-        Coord-->>User: 返回 ShutdownReport::CleanupIncomplete(LeaseRetained)
-    end
-```
+针对审查意见 S6，消除 LAN 优先、冲突状态与外层绕行之间的表述矛盾：
 
-- **租约保持契约**：若在超时期限到达时，仍有无法取消且结果未明的底层系统调用或委托宿主请求在途，**协调器绝不能无条件释放独占租约**！必须保持租约直至在途操作彻底终结，防止新进程并发介入踩踏。
+### 9.1 策略允许优先 vs 意外抢占冲突 (Addressing S6)
 
-### 8.4 对外完成状态契约 (Completion State Definitions)
+必须严格区分三类运行状态，消除规划器自相矛盾：
 
-提供统一的异步状态查询结果：
+1. **`Installed` (本方路由已就绪)**：本方期望的路由已在内核正确安装。
+2. **`PolicyPermittedPrecedence` (策略允许的外部优先)**：
+   - 例如经配置认可的本地局域网物理直连路由（LAN Bypass），其优先级高于 EasyTier 路由是**符合设计预期的正常策略**，**绝不能被规划器误报为 `TrafficHijackedConflict`**。
+3. **`TrafficHijackedConflict` (意外抢占冲突)**：
+   - 只有在未经授权的外部路由以更高优先级覆盖了 EasyTier 期望管理的专属网段时，才判定为劫持冲突。
 
-- **`Accepted`**：需求已被接收并排队，计划待执行。
-- **`HostConfirmed`**：委托宿主（如 Android VpnService）已确认配置生效。
-- **`Verified`**：原生后端已调用系统接口并完成读回验证，真实 FIB 中已确认条目。
-- **`Superseded`**：所等待的特定来源版本被该来源的新版本替代。
-- **`Conflicted`**：检测到外部不可调和的路由冲突或排他租约冲突，已进入退避。
-- **`Degraded`**：部分操作失败、日志异常或处于只读降级状态。
-- **`Unsupported / Skipped`**：如在 No-TUN 模式下，需求被显式跳过。
-- **`CleanupIncomplete`**：退出清理未能在时限内彻底完成。
+### 9.2 外层传输防环的可验证包路径要求
+
+- **包路径不变量**：EasyTier 传输层报文（物理 UDP/TCP 连接、STUN 探测、P2P 穿透报文）必须直达物理上行网卡，**绝对不得路由进入 EasyTier 自身的 TUN 网卡**。
+- **机制适配而非绝对定理**：
+  - 承认 `socket_mark` 的局限性（如 [`easytier/src/socket/fake_tcp/mod.rs:440`](../easytier/src/socket/fake_tcp/mod.rs#L440) 中 FakeTCP 仅对 decoy socket 生效）。
+  - 外层绕行根据平台传输能力灵活适配（Linux 下结合 `SO_BINDTODEVICE` 物理网卡绑定、源地址绑定与 socket mark），不把单一标记宣称为绝对防环手段。
+
+### 9.3 Public IPv6 Provider 反馈回路防御契约
+
+为防止 [`public_ipv6_provider/linux.rs:338`](../easytier/src/instance/public_ipv6_provider/linux.rs#L338) 将 EasyTier 自身的 `::/0` 路由当成上游物理出口：
+
+1. **接口分类与排除**：Provider 模块在调用 `list_ipv6_route_messages` 扫描 WAN 接口时，必须依据**接口身份（排除所有已知 EasyTier TUN 接口）**，不得依赖不可靠的 magic protocol。
+2. **保留 NDP 同步需求**：保留 [`linux.rs:523`](../easytier/src/instance/public_ipv6_provider/linux.rs#L523) 中的 `collect_public_ipv6_tun_routes`，用于获取 EasyTier TUN 设备上的 public IPv6 路由以同步 NDP 代理。
 
 ---
 
-## 9. 扩展故障场景与恢复目录 (Failure Scenarios Catalog)
+## 10. 真实的四维平台能力矩阵与证据边界
 
-扩展为涵盖 10 类典型异常的处置规范：
+针对审查意见 T7，根据代码现状、真实 CI/测试环境与系统潜力，客观重构矩阵（当前 CI 中 Windows 与 macOS 仅执行构建，真实系统网络调用待第四步验证）：
 
-1. **场景 1：写入底层成功，但在日志确认前崩溃 (Crash Window)**
-   - **自愈机制**：新进程启动初始化时扫描系统路由表。发现条目存在但 Journal 中仅有 `Intent` 无 `Commit`：若具备确凿的 `InterfaceBinding` 证据且符合 Desired，补记 `Committed`；否则归类为 `UncertainExternal`，绝不盲目强删。
-2. **场景 2：底层操作超时但实际在内核中生效 (Addressing S1)**
-   - **自愈机制**：严格按 Action 处理。Add 超时读回存在但无法证明由本方创建时，标记为 `ExternalSatisfied`，不伪造 `Owned` 凭据；Delete 超时读回存在判定为失败，保持重试。
+| 平台分类 | 系统底层 API 潜力 | 当前代码库已实现 | 本次实施目标 (HostRouteManager) | 验证状态与证据边界说明 (Addressing T7) |
+| :--- | :--- | :--- | :--- | :--- |
+| **Linux** | **原生完全**：Netlink dump/replace/event, 多表, FIB rule, netns | **原生可用**：`NetlinkIfConfiger` 支持基本增删与 dump；但 NetNSGuard 存在多线程跨 await 调度隐患 | **原生高强度**：Netlink Socket 显式绑定 netns；实现精确 Replace、异步组播读回验证、专用表策略 | **部分验证**：主线 CI（Ubuntu）运行了基本网络测试；但 netns 显式绑定与多表策略待第四步专门验证 |
+| **Windows** | **原生完全**：IP Helper NetIO (`GetIpForwardTable2`, `DeleteIpForwardEntry2`, `NotifyRouteChange2`) | **原生部分**：`WindowsIfConfiger` 使用 LUID 增删；缺乏精确读回与异步变更订阅 | **原生高强度**：完善 `MIB_IPFORWARD_ROW2` 规范化（Metric 为 offset，必须提供 DestinationPrefix、NextHop 与 LUID/Index），利用 NotifyRouteChange2 监听变化，实现基于 Win32 API + 读回的高确认强度 | **静态核对完成，行为待验证**：当前 CI 仅执行 Windows 交叉构建，未在真实 Windows 环境下执行路由调用测试，第四步须补齐平台测试 |
+| **macOS** | **原生中等**：BSD Route Socket (`PF_ROUTE`) 支持结构化监听与 sysctl dump | **Shell CLI 包装**：`MacIfConfiger` 通过 `sh -c route -n` 执行命令，按进程退出状态码判定成功 | **架构目标明确**：在公共层确立纯函数规划与读回核对；首期交付带读回核对的 CLI 适配器，明确其无法原子 Replace 的局限，为结构化 route socket 预留明确接口 | **静态核对完成，行为待验证**：当前 CI 仅执行 macOS 构建，未执行真实网络测试，第四步须在真实 macOS 环境验证 |
+| **FreeBSD** | **原生中等**：BSD Route Socket, setfib 多 FIB 支持 | **Shell CLI 包装**：同 macOS，使用 `route` 命令 | **架构目标同 macOS**；为多 FIB 策略预留扩展能力 | **静态核对完成，行为待验证**：待第四步真实环境专项回归 |
+| **Android** | **委托支持**：`VpnService.Builder` 支持 IPv4/IPv6 地址与路由完整批次声明 | **委托部分**：`TauriVpnService.kt` 具备 `builder.addRoute`，支持 IPv6 地址，但前端仅下发 IPv4 | **委托闭环**：实现 `DelegatedHostRouteBackend`，支持全量快照声明式下发、IPv4/IPv6 对等支持、以会话代际确认 (`HostConfirmed`) 代替底层读回 | **部分验证**：Android IPv4 隧道建立已有实际运行；IPv6 路由下发与快速重建会话待第四步专项验证 |
+| **iOS** | **系统支持**：`NEPacketTunnelNetworkSettings` | **未实现 (占位 Stub)**：`tauri-plugin-vpnservice/ios/Sources/ExamplePlugin.swift` 仅为返回 `running=false` 的空壳 | **标记为未支持**：本轮不作生产承诺，明确归类为待开发后端 | **未支持 (Unsupported Stub)**；文档内严格如实标注 |
+| **OpenHarmony** (`ohrs`) | **系统支持**：`VpnExtensionAbility` 支持声明式路由配置 | **外部聚合**：`easytier-ohos-core/src/routing.rs` 实现了多实例需求聚合，但下游实际生效脱节 | **委托接入**：对接统一的 `RouteDemandsSnapshot` 导出接口，交由鸿蒙宿主执行 | **待第四步验证实际应用闭环** |
+| **macOS NE** (`macos-ne`) | **系统支持**：`NEPacketTunnelNetworkSettings` | **未实现** | **委托后端预留**：与 iOS 采用相同的委托模型 | **未支持** |
+| **WASI / 嵌入宿主** | **无原生路由能力** | 仅有事件字符串映射 (`event.rs:52`) | **显式跳过**：绑定 `NoTunRouteBackend`，不报虚假成功 | **静态核对完成**：已验证事件序列化代码 |
+| **No-TUN** | **不适用** | **逻辑脱节**：`ProxyCidrMonitor` 在 no-tun 下仍然空转并误发事件 | **显式支持**：绑定 `NoTunRouteBackend`，业务层透明，宿主层完全跳过底层操作，不空转轮询 | **逻辑已修正**：重构后彻底消除虚假事件 |
+
+---
+
+## 11. 扩展故障场景与恢复目录 (Failure Scenarios Catalog)
+
+针对审查意见 T1、T2、T4，扩充为涵盖 10 类典型异常的严密处置规范：
+
+1. **场景 1：写入底层成功，但在日志确认前崩溃 (Addressing T1/T2)**
+   - **自愈机制**：新进程启动初始化时扫描系统路由表。发现条目存在但 Journal 中仅有 `Intent` 无 `Commit`：严格判定为 `InDoubt`，标记为 `OutcomeUnknown` 或 `ExternalSatisfied`（若属性吻合），**绝不补写 `Committed`，绝不认领为 Owned**。
+2. **场景 2：底层操作超时但实际在内核中生效 (Addressing T1)**
+   - **自愈机制**：严格按 Action 处理。Add 超时读回存在但无唯一创建证明时，标记为 `ExternalSatisfied`，不创建 Owned；Delete 超时读回存在时，判定为未决/不确定，**严禁在无身份连续性证明下盲目重试删除**。
 3. **场景 3：外部管理工具强行清除路由**
    - **自愈机制**：系统路由被外部工具清空后，周期性核对（Reconcile）或 Netlink 异步删路由通知捕获该状态。检查 Desired 依然有效，重新生成 `Add` 操作以实现最终收敛。
 4. **场景 4：网卡高频抖动与代际错配 (Flapping)**
@@ -436,28 +503,27 @@ sequenceDiagram
    - **自愈机制**：保留上一次成功的 Observed 快照并标记为 `Stale`，**严禁将查询失败视为“系统路由全空”**，禁止发起无序全量重写。
 7. **场景 7：委托宿主（Android）用户权限弹窗延迟或拒绝**
    - **自愈机制**：委托后端向 Manager 报告 `PendingAuthorization`，在用户授权前挂起路由应用，不伪造成功，也不导致核心网络服务崩溃。
-8. **场景 8：日志文件损坏或磁盘只读**
-   - **自愈机制**：状态机进入安全只读降级状态 (`Degraded`)，拒绝下发新的破坏性修改，保留可诊断现场。
-9. **场景 9：来源快照乱序与重启 (Addressing S5)**
-   - **自愈机制**：依靠来源的 `SourceEpoch` 与 `SourceRev` 双单调保护，任何来自旧 `epoch` 或低于当前最大 `revision` 的迟到快照直接丢弃。
+8. **场景 8：日志文件损坏或磁盘只读 (Addressing T2)**
+   - **自愈机制**：状态机进入安全只读降级状态 (`Degraded`)，**全面停止常规增删改下发（包括 Add）**，保留现场供人工排查。
+9. **场景 9：来源快照乱序与重启 (Addressing T5)**
+   - **自愈机制**：依靠来源的 `SourceEpoch` 与 `SourceRev` 双单调保护，任何来自旧 `epoch` 或低于当前最大 `revision` 的迟到快照直接丢弃；快照即全量事实，无需差分拼接。
 10. **场景 10：业务配置极高频变化（事件风暴） (Addressing S8)**
-    - **自愈机制**：协调器依靠最大处理预算（Max Horizon）执行有界防抖，定期截断快照并调度规划，彻底规避饥饿。
+    - **自愈机制**：协调器依靠硬性最大处理上限（Max Horizon，如 200ms）执行有界防抖，定期截断快照并调度规划，彻底规避饥饿。
 
 ---
 
-## 10. 修订总结与第二步准入核对
+## 12. 修订总结与第二步准入核对
 
-### 10.1 审查意见修复对照
+### 12.1 审查意见修复对照
 
-- [x] **S1 (P1)**：统一所有入口的归属准入标准，消除凭“条目存在”补记归属的漏洞；按 Add/Delete/Replace 严格核对前态、目标后态与当前观察态；强化 `Replace` 前置状态核验，拦截外部并发篡改（第 5.2 节）。
-- [x] **S2 (P1)**：彻底解耦平台槽位键、操作匹配条件与需求等价性；明确同域不同网卡（`tunA` vs `tunB`）为业务选路冲突而非共享路由；引用计数由有效来源集合派生（第 4.2 节）。
-- [x] **S3 (P1)**：修复接口索引复用误删漏洞；重构删除授权四重守卫；原接口物理销毁时强绑定责任自动终结；复用无法区分时禁止删除（第 4.3 节）。
-- [x] **S4 (P1)**：重构停止屏障；在途任务超时未结束时**严禁无条件释放独占租约**，保持租约隔离防止新旧执行者并发冲突（第 8.3 节）。
-- [x] **S5 (P1)**：补齐第二步所需的版本化协议契约；定义 `SourceEpoch`、Tombstone 撤销保护、原子无遗漏订阅窗口及基于 `SubmissionToken` 的精确收敛等待（第 8.1 节）。
-- [x] **S6 (P2)**：消除 LAN 优先与冲突状态的矛盾，解耦策略允许优先与意外抢占冲突；将外层防环表述为可验证的物理包路径不变量，不把 `socket_mark` 当绝对定理（第 6.1、6.2 节）。
-- [x] **S7 (P2)**：修正迁移事实：阐明 Android `event.ts` 收到路由更新主动触发 VPN 重建的活跃控制链；核实 `feat/dns-policy` 无活跃 `dns.addresses()` 注入；纠正 `collect_public_ipv6_tun_routes` 引用行号（523行）；重构基于可追溯证据的平台矩阵，补齐 macOS NE 与 WASI（第 2.1、2.3、7 节）。
-- [x] **S8 (P2)**：建立有界延迟防抖契约，设定硬性最大等待上限（Max Horizon），保障多来源调度公平性，规避事件风暴下的规划饥饿（第 8.2 节）。
+- [x] **T1 (P1)**：彻底删除第 426 行凭 Binding 补记 Committed 的弱证据分支，统一所有正常与故障入口的归属准入标准；纠正 Delete 超时后盲目重试删除的漏洞；陈述共享表协作假设与保证边界（第 5.2 节）。
+- [x] **T2 (P1)**：完整恢复严格的 WAL (Write-Ahead Logging) 写入顺序契约（Intent 落盘 -> 底层执行 -> Commit 落盘）；确立持久化失败即停机的安全边界，禁止 Add 操作隐式豁免（第 6 节）。
+- [x] **T3 (P1)**：纠正 Linux 槽位键错误，移除 `oif` 作为独立冲突键的错误假设；解耦需求等价性、内核操作冲突与选路冲突；明确多表（不同 table 与互斥 rule）相同前缀的安全共存性（第 4.2 节）。
+- [x] **T4 (P1)**：彻底闭合停止协议；实例退出先撤销 Demand 再规划清理，遵守四重守卫；在途任务超时未结束时**保持独占租约不释放**；确立跨进程接管时的日志核对与委托宿主会话代际失效协议（第 7 节）。
+- [x] **T5 (P1)**：恢复全量快照作为唯一事实源，通知仅作为触发提示，杜绝增量遗漏与乱序失效；确立原子订阅窗口（第 8.1 节）。
+- [x] **T6 (P2)**：规范对外等待令牌为 `SourceSubmissionToken`；消除冲突状态与 Superseded 的冲突定义，将 Superseded 严格限定为新版本替代（第 8.2 节）。
+- [x] **T7 (P2)**：校准平台能力矩阵的证据边界，诚实指出当前 CI 仅覆盖 Windows/macOS 交叉构建，将其实际行为明确标注为待第四步真实环境验证；明确 macOS/FreeBSD 最终架构目标（第 10 节）。
 
-### 10.2 第二步（建立版本化路由需求接口）准入判定
+### 12.2 第二步（建立版本化路由需求接口）准入判定
 
-经本轮针对性修订，第一步中关于版本流转、归属判定、生命周期隔离和并发保护的全部理论与架构阻碍均已扫清。系统规范具备高度自洽性，可以作为第二步实施的正式准入基准。
+经本轮针对性修订，第一步中关于所有权归属、持久化屏障、停机协议、需求版本化及平台真实证据的全部阻塞问题均已彻底解决，形成了自洽、严密的技术规范，满足正式进入第二步实施的准入标准。
