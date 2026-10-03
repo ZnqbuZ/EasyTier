@@ -1,6 +1,6 @@
-# HostRouteManager 第一步：路由审计、规则计算与生命周期规范（第五轮修订版）
+# HostRouteManager 第一步：路由审计、规则计算与生命周期规范（第六轮修订版）
 
-状态：已根据第六轮审查意见（[`docs/host-route-manager-step1-review-6.md`](host-route-manager-step1-review-6.md)）与最新实施总纲（[`docs/host-route-manager-master-plan.md`](host-route-manager-master-plan.md)）完成修订。明确了精确删除参数匹配、接口重建与停机的失败可见性、重叠路由交接策略、No-TUN 旁路机制、原生/委托双分支抽象，以及基于当前真实源码树的复用分工。
+状态：已根据第七轮审查意见（[`docs/host-route-manager-step1-review-7.md`](host-route-manager-step1-review-7.md)）与最新实施总纲（[`docs/host-route-manager-master-plan.md`](host-route-manager-master-plan.md)）完成修订。明确了 Public IPv6 地址维护任务与默认路由的解耦、自动/手工全量代理对未迁移条目的动态重叠防御、同一目标路由合并时的既定 Metric 保留规则，以及公开 Trait 入口与各平台精确删除参数的真实边界。
 
 ---
 
@@ -15,7 +15,7 @@ HostRouteManager：汇总 → 纯函数计算期望路由 → 执行比对并应
           ↓
 ┌─────────────────────────────────┴─────────────────────────────────┐
 │ 原生平台分支 (NativeRouteBackend)   │ 委托宿主分支 (DelegatedRouteBackend) │
-│ 逐条增删、精确参数匹配、逐项记账     │ 全量配置下发、宿主确认后整批记账   │
+│ 逐条增删、各平台精确参数匹配、记账   │ 全量配置下发、宿主确认后整批记账   │
 └─────────────────────────────────┬─────────────────────────────────┘
                                   ↓
       宿主操作系统网络栈 (Linux / Windows / macOS / Android VPN)
@@ -52,10 +52,10 @@ HostRouteManager：汇总 → 纯函数计算期望路由 → 执行比对并应
 ### 2.2 现有系统写入点代码审计与缺陷分析
 
 1. **`easytier/src/instance/virtual_nic.rs`**：
-   - 内部包含 3 个由 `tasks: JoinSet` 托管的长期 updater 任务：
-     - `run_proxy_cidrs_route_updater`（[Line 1048](../easytier/src/instance/virtual_nic.rs#L1048)）：监听 `GlobalCtxEvent::ProxyCidrsUpdated`。
-     - `run_public_ipv6_route_updater`（[Line 1118](../easytier/src/instance/virtual_nic.rs#L1118)）：监听 `GlobalCtxEvent::PublicIpv6RoutesUpdated`。
-     - `run_public_ipv6_addr_updater`（[Line 1171](../easytier/src/instance/virtual_nic.rs#L1171)）：监听 `GlobalCtxEvent::PublicIpv6Changed`。
+   - 内部包含 3 个由 `tasks: JoinSet` 托管的长期任务：
+     - `run_proxy_cidrs_route_updater`（[Line 1048](../easytier/src/instance/virtual_nic.rs#L1048)）：监听 `GlobalCtxEvent::ProxyCidrsUpdated`，负责 peer proxy 路由。
+     - `run_public_ipv6_route_updater`（[Line 1118](../easytier/src/instance/virtual_nic.rs#L1118)）：监听 `GlobalCtxEvent::PublicIpv6RoutesUpdated`，负责对端 public IPv6 路由。
+     - `run_public_ipv6_addr_updater`（[Line 1171–1230](../easytier/src/instance/virtual_nic.rs#L1171-L1230)）：监听 `GlobalCtxEvent::PublicIpv6Changed`，**同时负责网卡 link_up、IPv6 本机公网地址的添加与撤销（`add_ipv6` / `remove_ipv6`），以及公网默认路由 `::/0` 的增删（`add_ipv6_route_with_cost(::, 0, Some(5))` / `remove_ipv6_route`）**。
    - **关键缺陷分析**：
      - **错误推进缓存**：以 `apply_route_changes`（[Line 997](../easytier/src/instance/virtual_nic.rs#L997)）为例，无论底层 `ifcfg.add_ipv4_route` 是否报错，均无条件执行 `cur_proxy_cidrs.insert(cidr)`。写入失败后内存缓存假定其已存在，导致永久失去重试机会。
      - **缺乏系统核对**：完全依赖内存 `cur_proxy_cidrs`，外部工具篡改或删除后无法感知与恢复。
@@ -63,7 +63,7 @@ HostRouteManager：汇总 → 纯函数计算期望路由 → 执行比对并应
 2. **`easytier/src/common/ifcfg/netlink.rs:366–388`（删除匹配参数缺失隐患）**：
    - 当前 Linux `remove_ipv4_route(name, address, cidr_prefix)` 实现为遍历系统路由，仅比对 `destination == address && dst_len == cidr_prefix && oif == ifidx`，匹配到第一条便下发 `RTM_DELROUTE` 删除。
    - **参数缺失风险**：完全未匹配 `table` 与 `metric/priority`。若同接口、同前缀下存在外部创建的其他优先级路由（如外部 metric=100，本方 metric=65535），该方法可能误删外部路由。
-   - **修订结论**：必须将“补齐后端删除匹配参数（目标、前缀、网卡、metric、table）”作为复用现有接口的前提条件。
+   - **修订结论**：必须将“补齐后端删除精确匹配能力”作为复用现有接口的前提条件，按各平台实际路由身份与创建时的有效参数进行精确定位。
 3. **`easytier/src/instance/dns_server/server_instance.rs`**：
    - `MagicDnsServerInstance::new`（[Line 385–388](../easytier/src/instance/dns_server/server_instance.rs#L385-L388)）在 `fake_ip` 不属于 `tun_inet` 时直接临时实例化 `IfConfiger {}` 写入 `/32` 路由，Windows 平台传入 `cost = Some(4)`。
    - **NetNS 作用域隐患**：该调用未持有 `NetNSGuard`，在多 netns 环境下可能在错误的命名空间执行。
@@ -85,8 +85,8 @@ HostRouteManager：汇总 → 纯函数计算期望路由 → 执行比对并应
 
 | 平台分类 | 系统底层 API / 工具 | 当前代码实现 | HostRouteManager 接入方式 | 验证状态 |
 | :--- | :--- | :--- | :--- | :--- |
-| **Linux** | Netlink (rtnetlink route RTM_NEWROUTE / RTM_DELROUTE) | `NetlinkIfConfiger` 支持基本增删与 dump；netns 支持 | 原生后端：复用 `NetlinkIfConfiger`，补齐删除参数匹配 | 常用功能经 CI / 本地测试已验证 |
-| **Windows** | IP Helper API (`CreateIpForwardEntry2`, `DeleteIpForwardEntry2`) | `WindowsIfConfiger` 基于 LUID 增删路由 | 原生后端：复用 `WindowsIfConfiger` 增删路由 | CI 具备构建验证；网络调用需真实环境 |
+| **Linux** | Netlink (rtnetlink route RTM_NEWROUTE / RTM_DELROUTE) | `NetlinkIfConfiger` 支持基本增删与 dump；netns 支持 | 原生后端：复用 `NetlinkIfConfiger`，补齐按 table/priority/oif/前缀精确删除 | 常用功能经 CI / 本地测试已验证 |
+| **Windows** | IP Helper API (`CreateIpForwardEntry2`, `DeleteIpForwardEntry2`) | `WindowsIfConfiger` 基于 LUID 增删路由 | 原生后端：复用 `WindowsIfConfiger` 增删路由，按 LUID 与 next-hop 定位 | CI 具备构建验证；网络调用需真实环境 |
 | **macOS** | BSD Route Socket / 系统 `route` 命令 | `MacIfConfiger`（`darwin.rs`）通过 `sh -c route -n` 执行 | 原生后端：复用 `MacIfConfiger` 执行命令 | CI 具备构建验证；网络调用需真实环境 |
 | **FreeBSD** | 系统 `route` 命令 | **共用 `darwin.rs` 的 `MacIfConfiger`**（代码库无独立 `FreebsdIfConfiger`） | 原生后端：复用 `MacIfConfiger` | CI 具备构建验证；网络调用需真实环境 |
 | **Android** | `VpnService.Builder` | `TauriVpnService.kt` 批次调用 `builder.addRoute` | 委托后端：直接传递计算后的全量期望路由集合重建会话 | 已有 IPv4 实际运行，IPv6 待联调 |
@@ -100,11 +100,11 @@ HostRouteManager：汇总 → 纯函数计算期望路由 → 执行比对并应
 
 ### 3.1 源码基线与信息读取入口
 
-为避免指代模糊，下表明确区分当前代码库真实存在的入口、旧 Step 2 可选取的纯计算部分，以及待新增的接线：
+下表明确区分当前代码库真实存在的公开入口、旧 Step 2 可选取的纯计算部分，以及待新增的接线：
 
 | 来源分类 | 当前主线已存在 (In Main Tree) | 旧 Step 2 可选取复用 (From Old Commits) | 待新增 / 完善 (To Be Added) |
 | :--- | :--- | :--- | :--- |
-| **Core Peer 路由** | `Route::list_proxy_cidrs_excluding`<br>`Route::list_proxy_cidrs_v6_excluding` | 无（旧通用订阅协议已废弃） | 增加一个局部的一致拉取或精简 watch 接口，无需整套总线 |
+| **Core Peer 路由** | 公开 Trait: `Route::list_proxy_cidrs`<br>`Route::list_proxy_cidrs_v6`（已自动排除本机） | 无（旧通用订阅协议已废弃） | 增加一个局部的一致拉取或精简 watch 接口，无需整套总线 |
 | **手工静态配置** | `runtime_config.snapshot().services.manual_routes` | 相同 | 直接读取快照 |
 | **Public IPv6** | `peers::public_ipv6` 服务中获取 lease 与 routes | 纯数据结构定义 | 提取 `lease: Option<Ipv6Inet>` 与 `routes: BTreeSet<Ipv6Inet>` |
 | **Host Magic DNS** | `server_instance.rs` 中的 `fake_ip: Ipv4Addr` 与启停状态 | 无 | Host 侧提供读取当前 fake IP 与子网状态的方法 |
@@ -144,9 +144,14 @@ pub struct RouteSpec {
 5. **Public IPv6 路由规则**：
    - 若处于活动租约期（拥有 `lease: Option<Ipv6Inet>`）：生成目标为 `::/0`、`metric = Some(5)` 的公网 IPv6 默认路由。
    - 对等节点 Public IPv6 路由：按实际通告的网段生成路由条目。
-6. **最终期望集合合并与去重策略**：
-   - 相同目标若带有不同 metric，属于明确的策略冲突，不能依赖 `BTreeSet` 默认行为盲目去重。
-   - **冲突决策**：同一目标网段若同时出现在多个来源，优先保留更具体的显式配置；若优先级相同且 metric 不同，记录告警并选择 metric 较小（优先级更高）者，确保输出集合中同一 destination 唯一。
+6. **同一目标网段的固定合并与冲突裁决规则**：
+   - **业务用途独立性边界**：`manual_routes` 的覆盖权仅严格作用于对端子网代理路由（Proxy CIDR），绝对不能扩展去覆盖 Magic DNS 或 Public IPv6。
+   - **用途特化优先（Specialized Purpose Precedence）**：
+     - 若某代理路由（来自 peer 广播或 manual_routes）与 Magic DNS 生成了完全相同的 `/32` 目标：Magic DNS 属于特化的域名解析路由，必须**优先保留 Magic DNS 的既定参数**（例如保留 Windows 平台特有的 `metric = Some(4)`，非 Windows 为 `None`），绝不能被代理路由的默认参数覆盖。
+     - 同理，Public IPv6 的 `::/0`（metric = Some(5)）属于特化公网出口路由，不能被无特化参数的默认项稀释。
+   - **Metric 语义澄清**：
+     - `None` 表示平台的默认 metric（例如 Windows 下当前后端默认为 9000，Linux 下为内核默认值），**绝不代表数值最小（0）**。在比对或解析时，必须以各平台实际生效的有效值进行评估，不能将 `None` 误当作高优先级数值。
+   - **未明冲突报错**：若同一来源内存在无法依据上述固定规则合理裁决的同目标冲突，记录警告并明确报告冲突，不建立复杂策略框架，也不依靠集合无序遍历随机胜出。
 
 ### 3.3 严格保留的配置语义与平台纠偏
 
@@ -174,7 +179,7 @@ pub struct RouteSpec {
 pub trait NativeRouteBackend: Send + Sync + 'static {
     /// 添加一条路由，必须传递完整标识参数
     async fn add_route(&self, route: &RouteSpec) -> Result<(), Error>;
-    /// 删除一条路由，必须按完整参数精确匹配定位，无法精确定位时返回错误
+    /// 删除一条路由，必须按平台身份和创建时有效参数精确匹配定位，无法精确定位时返回错误
     async fn remove_route(&self, route: &RouteSpec) -> Result<(), Error>;
 }
 
@@ -195,7 +200,7 @@ pub enum RouteBackend {
 
 1. **原生桌面分支 (`NativeRouteBackend`)**：
    - 持有 TUN 设备的网卡控制器或 `IfConfiger` 实例；
-   - **精确删除改造（必须前提）**：修改现有的 `remove_ipv4_route` / `remove_ipv6_route`，下发删除请求时必须匹配 `destination`、`prefix`、`ifindex`、`metric` 和 `table`。若未找到完全吻合的条目，返回错误，绝不随意删除同网段不同 metric 的条目。
+   - **精确删除改造（必须前提）**：修改现有的 `remove_ipv4_route` / `remove_ipv6_route`，按各平台实际路由身份和创建时的有效参数进行精确定位（如 Linux 按 destination、prefix、ifindex、table 及 priority/metric 精确匹配；Windows 按 LUID 和 next-hop 精确定位；macOS/FreeBSD 按其系统接口能力定位）。若在系统中无法精确定位完全吻合的条目，返回错误，绝不随意删除同网段不同 metric/属性的外部条目。无需将平台专有字段侵入公共 `RouteSpec`。
 2. **移动端委托分支 (`DelegatedRouteBackend`)**：
    - 实现 `apply_routes`，将全量集合一次性传递给 Android `VpnService.Builder` 重建会话；
    - 仅在宿主系统确认会话建立成功后，才整体更新 `applied_routes`；
@@ -269,13 +274,13 @@ Manager 维护内存记录 `installed_routes: BTreeSet<RouteSpec>`，记录**本
 | 目标能力 | 主线代码处理 | 旧 Step 2 提交选取 | 实施时新增/改写 |
 | :--- | :--- | :--- | :--- |
 | **纯计算函数** | 保留 `gateway/proxy/cidr_monitor.rs` 纯覆盖逻辑 | 选取 `projection.rs` 中的规范化逻辑与测试用例 | 合并为清晰的纯计算模块 |
-| **Peer 路由读取** | 保留 `Route::list_proxy_cidrs_excluding` | 废弃旧通用发布总线与提交 Token 框架 | 增加简单的快照拉取接口，保证串行化不倒退 |
-| **后端接口** | 保留 `IfConfiger` | 废弃复杂的只读影子诊断框架 (`route_shadow.rs`) | 补齐 `remove_route` 精确匹配参数；提供双分支 trait |
+| **Peer 路由读取** | 保留 `Route::list_proxy_cidrs`<br>`Route::list_proxy_cidrs_v6` | 废弃旧通用发布总线与提交 Token 框架 | 增加简单的快照拉取接口，保证串行化不倒退 |
+| **后端接口** | 保留 `IfConfiger` | 废弃复杂的只读影子诊断框架 (`route_shadow.rs`) | 补齐 `remove_route` 各平台精确匹配参数；提供双分支 trait |
 | **Manager 主体** | 无 | 参考 `route-dev` 骨架 | 实现单循环比对、记账与失败可见的 `stop()` |
 
-### 5.3 对应旧 Writer 的分阶段退出与重叠路由防御
+### 5.3 对应旧 Writer 的分阶段退出与动态重叠防御
 
-为防止系统发生路由双写冲突，各旧写入者按以下两个阶段严格退出：
+各旧写入者按以下两个阶段严格退出：
 
 ```text
 阶段一 (第二步实施)：最小闭环接管代理路由
@@ -284,24 +289,30 @@ Manager 维护内存记录 `installed_routes: BTreeSet<RouteSpec>`，记录**本
 │ 2. 停写旧链路：禁用 ProxyCidrMonitor 与                │
 │    VirtualNic::run_proxy_cidrs_route_updater            │
 │ 3. 启用闭环：由 HostRouteManager 唯一负责代理路由的增删   │
-│ 4. 排除/交接重叠：禁止 manual_routes 与未迁移项重叠，或 │
-│    重叠条目由旧 writer 清理后，新 Manager 才启动接管   │
+│ 4. 动态重叠防御：全量有效代理集合 (自动+手工) 动态排查重叠│
+│    重叠条目同批交接，或在阶段一阻止冲突条目进入新写入者 │
 └─────────────────────────────────────────────────────────┘
                             ↓
 阶段二 (第三步实施)：全面收敛并彻底删除旧模块
 ┌─────────────────────────────────────────────────────────┐
 │ 1. 接管范围：Public IPv6 路由/出口 + Magic DNS /32      │
 │             + macOS/FreeBSD 显式接口前缀                │
-│ 2. 停写旧链路：停止 VirtualNic 中 public_ipv6 的        │
-│    2 个 updater 任务；移除 Magic DNS 中的 IfConfiger 写入│
+│ 2. 停写旧链路：                                         │
+│    - 停止 VirtualNic::run_public_ipv6_route_updater     │
+│    - 从 run_public_ipv6_addr_updater 中仅移除默认路由   │
+│      ::/0 增删，保留其 IPv6 地址添加/删除与 link_up 职责 │
+│    - 移除 Magic DNS 中的 IfConfiger 写入                │
 │ 3. 彻底删除：删除 ProxyCidrMonitor 模块及其 feature 分支 │
 │ 4. 最终状态：全仓受管路由 100% 收敛至 HostRouteManager   │
 └─────────────────────────────────────────────────────────┘
 ```
 
 **重叠路由防御与交接铁律**：
-1. **同路由同批交接**：不同来源若映射到同一条实际系统路由（例如手工路由指定了 DNS fake IP 的 `/32` 或接口前缀），必须在同一批次一起交接相关写入者，严禁只按来源名称拆分写入权。
-2. **首期交接排除**：在阶段一中，若检测到手工路由与 DNS / 接口前缀网段重叠，系统明确拒绝该配置或维持旧链路，防止新旧 writer 相互踩踏删除。
+1. **同路由同批交接**：不同来源若映射到同一条实际系统路由（例如手工路由或自动 peer 路由包含了 DNS fake IP 的 `/32` 或接口前缀），必须在同一批次一起交接相关写入者，严禁只按来源名称拆分写入权。
+2. **首期交接排除与动态重叠防御**：在阶段一中，重叠防御不仅检查静态的 `manual_routes`，必须**检查计算后的有效代理集合（包含动态 OSPF peer 广播的代理路由）**。在启动时及运行期间 peer 路由或配置发生动态变化时持续检查。若检测到有效代理路由与尚未迁移的 Magic DNS `/32` 或接口前缀发生同一实际条目冲突：
+   - 系统在阶段一明确阻止该冲突范围进入新 Manager 写入，或维持旧链路；
+   - 严禁将重叠条目同时交给新旧两个 writer 下发，也不得在冲突时重新启动一个与新 Manager 同时写的旧链路；
+   - 判定冲突严格限定于同一实际目标 CIDR 或删除匹配范围冲突，不把无冲突的前缀包含关系当作双写。
 3. **干净切换原则**：切换到新 Manager 时优先采用干净实例启动；或由旧 writer 明确确认已完成旧条目清理后，新 Manager 方从空的 `installed_routes` 干净起步。**严禁自动认领未经核实的旧系统路由**。
 
 ---
@@ -316,6 +327,7 @@ Manager 维护内存记录 `installed_routes: BTreeSet<RouteSpec>`，记录**本
 - [ ] **显式空集禁用**：`manual_routes = Some([])` 时代理路由输出为空集，且**绝对不影响** DNS 与 Public IPv6 路由的生成。
 - [ ] **CIDR 规范化**：输入包含主机位的网段（如 `192.168.1.50/24`）被正确转换为 `192.168.1.0/24`。
 - [ ] **Magic DNS 边界与 Metric**：当 `fake_ip` 位于 TUN 子网内时不产生路由；位于子网外时准确产生 `/32` 主机路由（Windows 下正确附带 metric=4，非 Windows 为 None）；DNS 禁用时输出为空。
+- [ ] **同目标路由合并与 Metric 保留**：当手工路由或 peer 路由恰好包含与 Magic DNS 相同的 `fake_ip/32` 时，合并结果必须保留 Magic DNS 的既定参数（如 Windows 平台保留 `cost = Some(4)`，不退化为平台默认 9000），DNS 路由意图不被破坏。
 - [ ] **显式接口前缀**：macOS/FreeBSD 正确生成虚拟子网网段路由；Linux/Windows 不生成多余显式需求。
 - [ ] **冲突去重与裁决**：同一目标网段在不同来源出现时，能够依据明确策略裁决出唯一条目，不依赖集合遍历随机胜出。
 
@@ -340,5 +352,6 @@ Manager 维护内存记录 `installed_routes: BTreeSet<RouteSpec>`，记录**本
   - 删除失败的条目依然保留在 `installed_routes` 中；
   - `stop()` 明确返回 `Err(CleanupIncomplete { .. })`，剩余条目列表对外完全可见；
   - 进程允许退出，但不伪造“清理干净”的假成功。
-- [ ] **单写者互斥**：阶段一与阶段二迁移切换过程中，旧 updater 停写与新闭环生效具备严格的前后顺序，不存在针对同一路由的新旧双写窗口；重叠路由已做交接或前置排除。
+- [ ] **Public IPv6 地址与路由职责解耦**：租约获得、换地址、释放后，TUN 接口的 IPv6 地址添加、更新与删除继续由 `run_public_ipv6_addr_updater` 正常执行，而 `::/0` 默认路由仅由 Manager 写入与更新。
+- [ ] **动态重叠路由防御**：无论通过 `manual_routes` 还是动态 OSPF peer 广播通告了与 Magic DNS fake IP `/32` 或接口前缀相同的网段，系统均能识别冲突并阻止双写，确保阶段一未迁移的旧 writer 与新 Manager 不针对同一条目竞争。
 - [ ] **接口重建自愈**：网卡销毁后，旧接口记录保留至底层清理完毕或随网卡注销收回；网卡重建后新接口成功重新安装期望路由，不发生状态混淆。
