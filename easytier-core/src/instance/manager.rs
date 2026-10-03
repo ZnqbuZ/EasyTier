@@ -638,6 +638,7 @@ mod tests {
     };
 
     use super::*;
+    use crate::config::toml::ConfigLoader;
     struct TestFactory {
         drops: Arc<AtomicUsize>,
     }

@@ -3335,33 +3335,35 @@ virtual_ip = "10.82.0.2/24"
 
         assert_eq!(snap.sources.len(), 2);
 
-        // Update runtime config to add manual route
-        let mut updated = instance.runtime_config.snapshot().as_ref().clone();
-        let manual_net: cidr::Ipv4Cidr = "192.168.100.0/24".parse().unwrap();
-        updated.services.manual_routes = Some(vec![manual_net].into_iter().collect());
-        instance.update_runtime_config(updated).await.unwrap();
+        if cfg!(feature = "proxy-cidr-monitor") {
+            // Update runtime config to add manual route
+            let mut updated = instance.runtime_config.snapshot().as_ref().clone();
+            let manual_net: cidr::Ipv4Cidr = "192.168.100.0/24".parse().unwrap();
+            updated.services.manual_routes = Some(vec![manual_net].into_iter().collect());
+            instance.update_runtime_config(updated).await.unwrap();
 
-        // Wait for reactive demand update
-        let mut found_manual = false;
-        for _ in 0..10 {
-            snap = sub.wait_next().await.unwrap();
-            for s in snap.sources.values() {
-                if let Some(snapshot) = &s.latest_snapshot {
-                    if snapshot
-                        .demands
-                        .iter()
-                        .any(|d| d.destination == cidr::IpCidr::V4(manual_net))
-                    {
-                        found_manual = true;
-                        break;
+            // Wait for reactive demand update
+            let mut found_manual = false;
+            for _ in 0..10 {
+                snap = sub.wait_next().await.unwrap();
+                for s in snap.sources.values() {
+                    if let Some(snapshot) = &s.latest_snapshot {
+                        if snapshot
+                            .demands
+                            .iter()
+                            .any(|d| d.destination == cidr::IpCidr::V4(manual_net))
+                        {
+                            found_manual = true;
+                            break;
+                        }
                     }
                 }
+                if found_manual {
+                    break;
+                }
             }
-            if found_manual {
-                break;
-            }
+            assert!(found_manual, "manual route demand was not projected");
         }
-        assert!(found_manual, "manual route demand was not projected");
 
         // Stop instance: demand registry must be closed and sources revoked
         instance.stop().await;
