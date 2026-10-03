@@ -11,6 +11,7 @@ pub mod management;
 pub mod packet;
 pub mod peers;
 pub mod process_runtime;
+pub mod route_demand;
 pub mod rpc;
 pub mod socket;
 pub mod tunnel;
