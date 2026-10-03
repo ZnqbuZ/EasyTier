@@ -29,6 +29,7 @@ use event_journal::EventJournal;
 #[cfg(feature = "tun")]
 use magic_dns::MagicDnsRuntime;
 use tun_runtime::NativeTunRuntime;
+use crate::instance::route_demand_sources::HostRouteDemandSources;
 
 pub(crate) struct NativeInstanceRuntimeHost {
     global_ctx: ArcGlobalCtx,
@@ -36,6 +37,7 @@ pub(crate) struct NativeInstanceRuntimeHost {
     cancel: CancellationToken,
     event_journal: EventJournal,
     tun: NativeTunRuntime,
+    route_demand_sources: Arc<HostRouteDemandSources>,
 }
 
 impl NativeInstanceRuntimeHost {
@@ -43,12 +45,14 @@ impl NativeInstanceRuntimeHost {
         let cancel = CancellationToken::new();
         let tun = NativeTunRuntime::new(global_ctx.clone(), cancel.clone());
         let event_journal = EventJournal::new(&global_ctx);
+        let route_demand_sources = HostRouteDemandSources::new();
         Arc::new(Self {
             global_ctx,
             event_journal,
             operation: Arc::new(Mutex::new(())),
             cancel,
             tun,
+            route_demand_sources,
         })
     }
 
@@ -57,7 +61,9 @@ impl NativeInstanceRuntimeHost {
         packet_plane: Arc<CorePacketPlane>,
     ) -> anyhow::Result<Option<Arc<dyn DhcpIpv4Host>>> {
         self.event_journal.start(self.cancel.clone()).await;
+        self.update_route_demands();
         self.tun.prepare(packet_plane.clone()).await?;
+        self.update_route_demands();
         Ok(Some(
             self.tun.dhcp_host(self.operation.clone(), packet_plane),
         ))
@@ -66,8 +72,26 @@ impl NativeInstanceRuntimeHost {
     async fn shutdown_runtime(&self) {
         self.cancel.cancel();
         let _operation = self.operation.lock().await;
+        self.route_demand_sources.shutdown();
         self.event_journal.stop().await;
         self.tun.shutdown().await;
+    }
+
+    fn initialize_route_demands(&self, context: easytier_core::instance::HostRouteDemandContext) {
+        let _ = self.route_demand_sources.initialize(context);
+        self.update_route_demands();
+    }
+
+    pub(crate) fn update_route_demands(&self) {
+        let ipv4 = self.global_ctx.get_ipv4();
+        let ipv6 = self.global_ctx.get_ipv6();
+        let accept_dns = self.global_ctx.get_flags().accept_dns;
+        let fake_ip = crate::instance::dns_server::MAGIC_DNS_FAKE_IP
+            .parse()
+            .unwrap_or(std::net::Ipv4Addr::new(100, 100, 100, 101));
+        let _ = self
+            .route_demand_sources
+            .update_address_and_dns_facts(ipv4, ipv6, accept_dns, fake_ip);
     }
 
     fn request_runtime_shutdown(&self) {
@@ -111,6 +135,7 @@ impl NativeInstanceRuntimeHost {
         if patch.disable_relay_data.is_some() || patch.prefer_peer_relay.is_some() {
             self.global_ctx.set_flags(config.peer.flags.clone());
         }
+        self.update_route_demands();
     }
 
     pub(crate) fn subscribe_event(&self) -> crate::common::global_ctx::EventBusSubscriber {

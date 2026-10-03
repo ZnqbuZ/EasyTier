@@ -10,6 +10,10 @@ use super::NativeInstanceRuntimeHost;
 
 #[async_trait::async_trait]
 impl InstanceRuntimeHost for NativeInstanceRuntimeHost {
+    fn initialize_route_demands(&self, context: easytier_core::instance::HostRouteDemandContext) {
+        self.initialize_route_demands(context);
+    }
+
     async fn prepare(
         &self,
         packet_plane: Arc<CorePacketPlane>,
