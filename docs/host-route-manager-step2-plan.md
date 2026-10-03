@@ -1,540 +1,329 @@
-# HostRouteManager 第二步：版本化路由需求接口详细方案
+# HostRouteManager 第二步：版本化路由需求接口实施方案
 
-状态：已完成详细方案设计。基于《[实施总纲](host-route-manager-master-plan.md)》第二步要求与第一步冻结的行为契约（[`docs/host-route-manager-step1-audit-and-contract.md`](host-route-manager-step1-audit-and-contract.md)），建立分层清晰、无丢更新窗口、纯事件驱动、版本化且具备双轨阴影验证的路由需求接口体系。  
-依据：《[HostRouteManager 实施总纲](host-route-manager-master-plan.md)》第 109–116 行。  
-基线代码：本地 `main` 分支 `a017dc13`；涉及 DNS 需求部分核对 `feat/dns-policy` (`2569f35f`)。
+状态：经独立方案对照与源码审查修订，待实施。本文通过不代表实现已完成。
 
----
+依据：[实施总纲](host-route-manager-master-plan.md)、[第一步行为契约](host-route-manager-step1-audit-and-contract.md)、[第一步验收记录](host-route-manager-step1-review-5.md)。审查工作区基线为 `47bcda9e`；实施前重新确认分支和调用关系。
 
-## 1. 目标与架构定位
+## 1. 本步交付与边界
 
-### 1.1 第二步核心目标
+交付一个独立于旧 monitor、按来源保存完整事实的需求接口。Core 与 Host 生产者通过同一注册/发布/撤销协议表达需求；消费者随时取得完整状态，无需拼接事件历史。新链路只读接入实例生命周期，旧链路继续承担实际系统写入。
 
-根据实施总纲，第二步的核心任务是**建立版本化路由需求接口**，将散落在各处的路由生成逻辑收敛为规范的领域模型与快照发布总线：
-1. **Core 需求投影与 Host 注册协议**：实现 Core 层的需求解析与 Host 层的来源注册，发布自洽的全量快照，提供无丢更新窗口的原子订阅。
-2. **版本化与代际控制**：实现来源 `(SourceEpoch, SourceRevision)` 双单调版本控制、显式撤销语义、墓碑（Tombstone）防旧消息复活、来源重启与初始状态无缝拉取。
-3. **业务覆盖策略唯一收敛**：把业务覆盖逻辑（尤其是 `manual_routes` 针对 `None`、`Some([])`、`Some([...])` 的三态语义）收敛在 Core 唯一确定的位置。
-4. **彻底废除 1 秒轮询 (`sleep(1s)`)**：由 OSPF 路由变更与配置更新事件直接驱动需求投影，彻底消除历史遗留的 `ProxyCidrMonitor` 轮询时钟。
-5. **双轨制安全隔离 (Shadow Run)**：**本阶段严禁启用新的系统写入者**！新需求接口以只读/阴影形式运行，旧写入链路（`ProxyCidrMonitor` 与 `virtual_nic.rs` 等）继续承担实际系统写入，双轨并行比对以验证模型正确性。
+本步完成：
 
-### 1.2 Core vs Host 分层架构图
+1. 可移植需求模型、实例级来源注册表、只读订阅和提交令牌。
+2. 提交后可读的一致业务输入，事件驱动的 Core 投影，Host DNS/接口前缀来源适配。
+3. 来源重启、暂不可读、撤销、实例停止和任务异常的内存协议。
+4. 影子比对、确定性协议测试、真实生产者接线测试和 feature 构建验证。
 
-系统严格贯彻 Core（纯业务需求抽象，位于 `easytier-core`）与 Host（宿主系统控制，位于 `easytier`）的分层契约：
+本步不实现平台路由身份、跨实例需求合并、选路仲裁、Owned/Pending、持久化日志、系统后端或实际收敛等待；它们属于第三至第五步。GUI/OHOS 生产配置链切换、旧 monitor 删除属于第六至第八步。
+
+“事件驱动”约束新需求投影，不要求此时删除旧链路的 1 秒轮询，也不删除 OSPF 存活检测、租约到期等业务计时器。不得用旧 `ProxyCidrsUpdated` 事件唤醒新投影，否则仍依赖旧 monitor。
+
+## 2. 审查后的取舍
+
+| 原稿设计 | 本方案取舍及原因 |
+| --- | --- |
+| 全量快照、epoch/revision、tombstone、影子比对 | 保留，补齐权威写入点、异常生命周期和具体测试。 |
+| Core 意图携带表号、metric、网卡名；全部解析器放 Core | 删除系统字段；纯模型和注册协议放 Core，Host 事实由 Host 发布，平台策略留 Host。 |
+| Core 按 CIDR 聚合并判定 EgressMismatch/TableMismatch | 删除。相同 CIDR 不足以合并，不同表不必然冲突；第二步保留逐来源事实，第三步结合域、绑定与策略决定。 |
+| 在 `update_peer_info_last_update()` 广播 | 改为业务事实提交后发布。当前该方法在路由表重建前调用，会唤醒消费者读到旧状态。 |
+| ArcSwap、RwLock、broadcast 三处维护发布状态 | 采用短同步锁串行提交，`watch<Arc<RegistrySnapshot>>` 保存并通知完整视图，减少重复状态。 |
+| 第二步提供系统级 wait_convergence、移动端直接改用新输出 | 只实现需求登记和生命周期查询，不产生 HostConfirmed/Verified，不切换生产写入。 |
+| 随机并发、固定 10ms 延迟、即时新旧一致 | 用可控交错和虚拟时钟验证；比对先对齐输入版本或明确等待稳态。 |
+
+## 3. 架构与职责
 
 ```mermaid
 flowchart TD
-    subgraph CoreLayer ["Core 业务与需求抽象层 (easytier-core)"]
-        direction TB
-        
-        subgraph Resolvers ["业务需求解析器 (Demand Resolvers)"]
-            R_Proxy["ProxyCidrDemandResolver<br>• OSPF 路由事件驱动<br>• manual_routes 三态覆盖<br>• 彻底废除 1s 轮询"]
-            R_IPv6["PublicIpv6DemandResolver<br>• ::/0 出口 (metric=5)<br>• 对等节点公网 IPv6"]
-            R_DNS["MagicDnsDemandResolver<br>• fake_ip/32 虚拟 IP 需求"]
-            R_Prefix["InterfacePrefixDemandResolver<br>• macOS/FreeBSD 虚拟子网前缀"]
-        end
-
-        subgraph BusCore ["需求发布与聚合中枢 (DemandBus)"]
-            RegProt["来源注册/注销协议<br>SourceEpoch / Tombstone"]
-            SnapStore["各来源最新全量快照存储<br>SourceRevision 单调递增校验"]
-            Aggregator["全域快照聚合器<br>需求等价性判定 & 派生引用计数"]
-            AtomicSub["原子订阅与广播分发<br>Atomic Subscribe & Current Snapshot"]
-        end
-
-        Resolvers -->|发布全量快照| RegProt
-        RegProt --> SnapStore
-        SnapStore --> Aggregator
-        Aggregator --> AtomicSub
-    end
-
-    subgraph HostLayer ["Host 宿主控制与双轨验证层 (easytier)"]
-        direction TB
-        AtomicSub -->|无丢更新订阅流| SubIngest["需求摄取与有界防抖 Ingestion<br>Max Horizon 硬性上限截断"]
-        SubIngest --> ShadowMgr["双轨阴影核对器 (RouteShadowVerifier)<br>• 内存全量需求聚合<br>• 与旧链路输出实时一致性对比<br>• 仅打印诊断与遥测日志<br><b>【严禁调用底层系统写入 API】</b>"]
-    end
-
-    subgraph LegacyWriters ["旧写入链路 (本阶段完全保留，承担实际系统写入)"]
-        direction TB
-        OldMonitor["ProxyCidrMonitor (旧 1s 轮询)"] --> OldVNic["VirtualNic 路由更新任务"]
-        OldVNic --> SysCall["系统路由调用 (IfConfiger / Netlink)"]
-        OldDNS["MagicDnsServerInstance 独立写入"] --> SysCall
-    end
+    P[Peer Route 已提交投影] --> CP[Core 业务投影器]
+    C[配置完整快照与变更提示] --> CP
+    V[Public IPv6 完整业务状态] --> CP
+    CP --> R[实例级 DemandRegistry]
+    H[Host DNS / 接口地址事实] --> HP[Host 来源适配器]
+    HP --> R
+    R --> Q[CoreRouteDemands 只读门面]
+    Q --> S[Host 影子观察器 / 外部只读消费者]
+    Q -.后续步骤.-> M[HostRouteManager 域协调器]
+    L[旧 monitor / NIC / DNS / 移动配置链] --> OS[现有系统写入]
 ```
 
----
+- **`easytier_core::route_demand`**：平台无关模型、来源状态机、快照通道、令牌判定和纯投影函数；不依赖 PeerManager、Native NIC 或系统库。
+- **`easytier_core::instance::route_demands`**：连接业务输入并管理 Core 投影任务；暴露独立门面，不把新 API 塞进 packet-plane diff。
+- **Host 来源适配器**：读取 Host 已持有的 DNS/地址事实，通过受限句柄提交；Core 不反向读取 Host 内部结构。
+- **注册表不是域协调器。** 一个 Core 实例运行拥有一个注册表，容纳该实例 Core 与 Host 来源。后续域协调器订阅多个实例；本步不建立跨进程锁或按 CIDR 合并。
+- **接口不依赖 `proxy-cidr-monitor`。** No-TUN 也能发布业务需求，执行资格由后续 Host 能力决定，不能将无 TUN 解释为业务需求为空。
 
-## 2. 领域模型与类型契约
+## 4. 数据模型
 
-所有路由需求模型均作为不可变值对象，定义在 `easytier-core/src/route/` 模块下。
+以下固定语义而非提供可直接粘贴的完整代码；类型 derive、错误类型和可见性须经编译验证。
 
-### 2.1 来源标识与生命周期版本
+### 4.1 标识与版本
 
-```rust
-/// 需求来源类型枚举
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub enum SourceKind {
-    /// 对端子网代理与手工路由覆盖
-    ProxyCidr,
-    /// 公网 IPv6 默认出口路由 (::/0)
-    PublicIpv6Egress,
-    /// 公网 IPv6 对等节点路由
-    PublicIpv6Peer,
-    /// Magic DNS fake IP (/32) 虚拟路由
-    MagicDns,
-    /// 平台显式虚拟网卡直连子网前缀 (如 macOS/FreeBSD)
-    InterfacePrefix,
-    /// VPN Portal 客户端动态路由
-    VpnPortalClient,
-    /// 用户自定义扩展来源
-    Custom(u32),
-}
+| 类型 | 含义与分配者 |
+| --- | --- |
+| `InstanceRuntimeId` | 一次实例运行的 UUID，与配置中可复用的 instance UUID 分开。 |
+| `RegistryId` | 注册表此次运行的 UUID；跨注册表不比较 view revision。 |
+| `SourceId { kind, uuid }` | 来源的全局唯一标识。UUID 是来源 UUID，不是实例 UUID；同实例允许两个 DNS 来源。 |
+| `SourceEpoch(u64)` | 注册表为同一 SourceId 的每次重新注册分配，严格递增。 |
+| `SourceRevision(u64)` | 当前 epoch 的需求发布版本，由注册表分配，生产者不能自行填数。 |
+| `RegistryRevision(u64)` | 每次注册表可见状态改变递增，不冒充来源版本。 |
+| `SourceSubmissionToken` | 第一阶段约定的 `(source_id, epoch, revision)`，绑定一次被接受的需求发布。 |
 
-/// 全局唯一的来源标识
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct SourceId {
-    pub kind: SourceKind,
-    pub instance_id: uuid::Uuid,
-}
+同一运行中重启生产任务保留 SourceId、提升 epoch。整个实例/进程重建时分配新的 RegistryId、InstanceRuntimeId 和 SourceId，旧句柄/消息不能进入新注册表。本步不持久化来源序号，也不允许复用旧 SourceId 后将 epoch 重置。若未来需要持久来源身份，由第五步提供恢复后的单调分配器。
 
-/// 来源代际 Epoch：每次来源注册或重启时单调递增，代表一次独立的生命周期会话
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, Default)]
-pub struct SourceEpoch(pub u64);
+来源业务定位键（kind + 本实例逻辑 slot）由 supervisor 保有，以支持合法重启，不能用 CIDR 充当身份。所有计数使用 checked_add，溢出显式失败，不回绕。
 
-/// 来源版本 Revision：同一 Epoch 内每次快照更新严格单调递增
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, Default)]
-pub struct SourceRevision(pub u64);
+### 4.2 路由需求载荷
 
-/// 来源活跃状态
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum SourceStatus {
-    /// 正常活跃
-    Active,
-    /// 临时不可达（如通信暂时中断，需求保持 stale 状态不删除）
-    Unavailable,
-    /// 显式注销（记录注销墓碑，需求从聚合快照中移除）
-    Revoked {
-        tombstone_revision: SourceRevision,
-    },
-}
-```
+`RouteDemand` 至少包含：
 
-### 2.2 路由意图与全量需求快照
+- **规范化目标前缀**：支持 IPv4/IPv6，统一网络地址与前缀长度；非法输入报错，不静默忽略。
+- **业务用途**：PeerProxy、ManualOverrideProxy、PublicIpv6Default、PublicIpv6Peer、MagicDnsFakeIp、InterfaceSubnet；用途不是内核对象键。
+- **逻辑出口**：本实例的 EasyTier packet interface，关联 InstanceRuntimeId。A、B 的 TunDevice 不能被当成同一个出口。不得放入网卡名、ifindex、OS next-hop、table ID、平台 metric。
+- **必要依赖**：例如默认出口所依赖的本地 IPv6 租约/地址版本、Host 前缀所依赖的地址事实版本。使用类型化逻辑事实引用，不携带系统句柄。相同前缀的依赖变化也必须可见。
 
-```rust
-/// 路由业务用途
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub enum RoutePurpose {
-    PeerProxy,           // 对端广播的子网代理
-    ManualOverrideProxy, // 配置覆盖的静态子网代理
-    PublicIpv6Default,   // 公网 IPv6 出口默认路由
-    PublicIpv6Peer,      // 公网 IPv6 对等节点
-    MagicDnsFakeIp,      // Magic DNS 虚拟 IP
-    InterfaceSubnet,     // 虚拟网卡链路直连子网
-}
+平台兼容策略（旧 Public IPv6 cost=5、Windows DNS cost=4、默认 cost）保留在 Host 迁移映射，后续按用途与后端解析。本步不能凭 metric 数字承诺实际选路优先级。
 
-/// 出口网关提示
-#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub enum EgressHint {
-    TunDevice,                         // 默认 EasyTier 虚拟网卡
-    NamedInterface(String),            // 指定名称的网卡
-    NextHop(std::net::IpAddr),         // 指定下一跳 IP
-}
+`SourceSnapshot` 保存完整不可变 demand set、SourceId、epoch/revision 和 `ProjectionBasis`。Basis 记录输入版本供依赖核验、影子诊断；时间戳只作观测，不用于排序、判等或归属。
 
-/// 单条路由需求意图 (RouteIntent)
-#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct RouteIntent {
-    /// 目标网络前缀 (IPv4 或 IPv6 CIDR)
-    pub destination: cidr::IpCidr,
-    /// 业务用途
-    pub purpose: RoutePurpose,
-    /// 出口目标
-    pub egress_hint: EgressHint,
-    /// 推荐 Metric / 优先级 (若为 None 则采用平台默认策略)
-    pub metric_preference: Option<u32>,
-    /// 推荐路由表 (若为 None 则为默认路由表)
-    pub table_preference: Option<u32>,
-}
+输出和测试采用确定性排序。若用 BTreeSet，所有键必须实现一致的 Ord/Eq，不能只 derive Hash/Eq。不同用途或不同依赖的条目不得按 CIDR 覆盖。
 
-/// 单一来源提交的全量需求快照 (RouteDemandsSnapshot)
-/// 契约核心：快照是事实，通知是提示。每次提交必须是该来源期望存在的完整集合。
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct RouteDemandsSnapshot {
-    pub source_id: SourceId,
-    pub epoch: SourceEpoch,
-    pub revision: SourceRevision,
-    /// 该来源持有的全量路由需求项
-    pub demands: std::collections::BTreeSet<RouteIntent>,
-    /// 生成时间戳
-    pub timestamp: std::time::SystemTime,
-}
-```
+### 4.3 来源状态与完整视图
 
-### 2.3 需求等价性、合并与派生引用计数
+`RegistrySnapshot` 包含 RegistryId、RegistryRevision、逐来源 SourceRecord 和生命周期终止信息，不含 merged_demands 或路由引用计数。
 
-严格遵循第一步第 4.2 节的契约：**两个业务需求能够合并并共享引用的充要条件是具有完全相同的转发语义**。
+| 来源状态 | 事实与处理 |
+| --- | --- |
+| Initializing | 尚无有效结果，不冒充确认过的空需求。 |
+| Active | 有完整快照；Active + 空集合是明确空需求。 |
+| Unavailable | 保留最后有效快照并标记 stale，不撤销需求。 |
+| Revoked | epoch 已终止，需求不再活跃，保留 tombstone/high-water 拒绝旧提交。 |
 
-```rust
-/// 聚合后的单条合并路由需求
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct MergedRouteDemand {
-    /// 规范化后的路由需求项
-    pub intent: RouteIntent,
-    /// 拥有此需求的有效来源集合（引用计数严格等于 owners.len()）
-    pub owners: std::collections::HashSet<SourceId>,
-    /// 是否存在属性不一致的业务冲突（如相同前缀指定了不同出口）
-    pub conflict: Option<DemandConflictReason>,
-}
+重注册立即使旧 epoch 写句柄失效；旧有效需求作为带原始版本的 stale 基线保留，直至新 epoch 首次发布完整结果或显式撤销。不得仅因任务重启发空集合，也不能把旧基线伪装成新 epoch 已发布/已收敛。
 
-/// 业务冲突原因说明
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum DemandConflictReason {
-    EgressMismatch { hints: Vec<EgressHint> },
-    TableMismatch { tables: Vec<Option<u32>> },
-}
+健康改变推进 RegistryRevision，不凭空生成需求提交令牌。恢复相同需求仍须发布 Fresh 状态；需求及有效依赖不变时可复用当前 token，避免无关事件不断 Supersede 等待者。
 
-/// 全域聚合需求快照 (AggregatedDemandsSnapshot)
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct AggregatedDemandsSnapshot {
-    /// 单调递增的总线聚合版本
-    pub bus_version: u64,
-    /// 各来源最新快照视图
-    pub per_source: std::collections::BTreeMap<SourceId, RouteDemandsSnapshot>,
-    /// 合并后的需求集合 (以目标 CIDR 和作用域为索引)
-    pub merged_demands: std::collections::BTreeMap<cidr::IpCidr, MergedRouteDemand>,
-    /// 生成时刻
-    pub generated_at: std::time::Instant,
-}
-```
+## 5. 注册、发布、订阅与任务生命周期
 
----
+### 5.1 能力隔离与接口
 
-## 3. 业务需求解析器 (Business Demand Resolvers)
-
-业务解析器负责监听系统内具体的业务事件，并向 `DemandBus` 投影出类型化的 `RouteDemandsSnapshot`。
-
-### 3.1 `ProxyCidrDemandResolver` (代理网段业务需求解析器)
-
-#### 3.1.1 业务覆盖策略唯一确立 (Addressing Scope Contract)
-在第一步已冻结的契约基础上，消除所有前端或旁路的推导逻辑，将 `manual_routes` 针对 Proxy CIDRs 的三态覆盖规则完全统合在解析器内部：
-1. **`manual_routes = None` (自动跟随模式)**：
-   - 投影结果 = 对端 Peer 广播的全部合法代理网段 `list_proxy_cidrs()`。
-   - 需求属性：`purpose = RoutePurpose::PeerProxy`。
-2. **`manual_routes = Some([])` (显式空集，禁用对端代理模式)**：
-   - 用户明确要求“不安装任何来自对端的代理路由”。
-   - 投影结果 = **空集合 $\emptyset$**。
-   - **绝不回退为对端路由，彻底抑制对端代理路由的安装**。
-3. **`manual_routes = Some([A, B])` (静态覆盖模式)**：
-   - 投影结果 = 严格为用户指定的集合 `[A, B]`。
-   - 需求属性：`purpose = RoutePurpose::ManualOverrideProxy`。
-   - 对端路由被完全覆盖抑制。
-
-#### 3.1.2 零轮询、纯事件驱动机制 (Eliminating 1-Second Sleep)
-旧版 `ProxyCidrMonitor` 在循环中执行 `sleep(1s)` 严重浪费 CPU 且带来最大 1 秒的路由应用延迟。新解析器采用**双事件异步唤醒机制**：
-- **通道 1：OSPF 路由变更**：
-  在 `easytier-core/src/peers/route/mod.rs` 的 `PeerRoute` trait 中新增 `subscribe_route_updates(&self) -> tokio::sync::watch::Receiver<std::time::Instant>` 接口。当 `PeerRouteServiceImpl::update_peer_info_last_update` 被调用时触发广播。
-- **通道 2：配置热重载变更**：
-  监听 `CoreRuntimeConfigStore::subscribe_service_runtime_changes()`，当 `manual_routes` 被修改并调用 `replace()` 时触发。
-
-```rust
-// 纯事件驱动的反应式循环逻辑
-pub async fn run_event_driven_loop(
-    mut route_rx: tokio::sync::watch::Receiver<Instant>,
-    mut config_rx: tokio::sync::watch::Receiver<u64>,
-    peer_manager: Arc<PeerManagerCore>,
-    config_store: CoreRuntimeConfigStore,
-    bus: Arc<DemandBus>,
-    handle: SourceRegistrationHandle,
-) {
-    let mut last_route_time = *route_rx.borrow_and_update();
-    let mut last_config_version = *config_rx.borrow_and_update();
-
-    // 初始立即投影一次
-    project_and_publish(&peer_manager, &config_store, &bus, &handle).await;
-
-    loop {
-        tokio::select! {
-            // OSPF 路由事件唤醒
-            res = route_rx.changed() => {
-                if res.is_err() { break; }
-                let current_time = *route_rx.borrow_and_update();
-                if current_time == last_route_time { continue; }
-                last_route_time = current_time;
-                project_and_publish(&peer_manager, &config_store, &bus, &handle).await;
-            }
-            // 运行时配置热更新唤醒
-            res = config_rx.changed() => {
-                if res.is_err() { break; }
-                let current_version = *config_rx.borrow_and_update();
-                if current_version == last_config_version { continue; }
-                last_config_version = current_version;
-                project_and_publish(&peer_manager, &config_store, &bus, &handle).await;
-            }
-        }
-    }
-}
-```
-
-### 3.2 `PublicIpv6DemandResolver` (公网 IPv6 需求解析器)
-
-由 `CorePublicIpv6Runtime` 的租约和对等路由状态驱动：
-- **公网出口路由 (`::/0`)**：
-  - 条件：本节点成功向 Provider 申请到公网 IPv6 前缀租约（`lease.is_some()`）。
-  - 需求生成：
-    - `destination: IpCidr::V6("::/0")`
-    - `purpose: RoutePurpose::PublicIpv6Default`
-    - `egress_hint: EgressHint::TunDevice`
-    - `metric_preference: Some(5)`（保证公网 IPv6 流量默认优先走 EasyTier 出口，但不覆盖本地物理 IPv6 直连）
-  - 当租约失效时，快照中移除该条目。
-- **对等节点公网 IPv6 路由**：
-  - 条件：组网内其他 Peer 节点上报的公网 IPv6 地址前缀。
-  - 需求生成：
-    - `destination: IpCidr::V6(peer_inet)`
-    - `purpose: RoutePurpose::PublicIpv6Peer`
-    - `egress_hint: EgressHint::TunDevice`
-    - `metric_preference: None`
-
-### 3.3 `MagicDnsDemandResolver` (Magic DNS 需求解析器)
-
-由 Magic DNS 服务器状态驱动，彻底消除前端或 GUI 层的硬编码：
-- **条件判定**：
-  当分配的 Magic DNS 虚拟 IP（如 `7.7.7.7` 或 `100.100.100.101`）不在虚拟网卡分配的子网网段内时（`!tun_inet.contains(&fake_ip)`）。
-- **需求生成**：
-  - `destination: IpCidr::V4(Ipv4Cidr::new(fake_ip, 32))`
-  - `purpose: RoutePurpose::MagicDnsFakeIp`
-  - `egress_hint: EgressHint::TunDevice`
-  - `metric_preference: if cfg!(windows) { Some(4) } else { None }`
-- **退出生命周期**：
-  Magic DNS 实例停止时，调用 `revoke_source` 撤销该需求，由协调器完成清理，消除异常退出时的残留漏洞。
-
-### 3.4 `InterfacePrefixDemandResolver` (显式接口前缀需求解析器)
-
-针对 macOS 与 FreeBSD 等不自动派生子网路由的平台特性：
-- **触发时机**：TUN 网卡分配 IPv4 / IPv6 地址时（如 `10.144.144.1/24` 或 `fd00::1/64`）。
-- **需求生成**：
-  - 生成对应的网络前缀需求（如 `10.144.144.0/24` 和 `fd00::/64`）。
-  - `purpose: RoutePurpose::InterfaceSubnet`。
-  - `egress_hint: EgressHint::TunDevice`。
-- **价值**：将隐藏在 `VirtualNic` 中的操作系统级差异显式化为类型化需求，为后续步骤移除 NIC 内部直接写路由打平基础。
-
----
-
-## 4. 需求总线与订阅协议 (Demand Bus & Atomicity)
-
-`DemandBus` 是 Core 内部管理需求快照与订阅分发的核心枢纽。
-
-### 4.1 来源注册与注销协议
-
-```rust
-/// 来源注册成功返回的操作句柄
-pub struct SourceRegistrationHandle {
-    pub source_id: SourceId,
-    pub epoch: SourceEpoch,
-    bus: Arc<DemandBusInner>,
-}
-
-impl SourceRegistrationHandle {
-    /// 提交新版本全量快照，返回可供等待的提交令牌
-    pub async fn publish(&self, demands: BTreeSet<RouteIntent>) -> SourceSubmissionToken {
-        self.bus.publish_snapshot(self.source_id, self.epoch, demands).await
-    }
-
-    /// 显式注销该来源（写入墓碑，移除需求）
-    pub async fn revoke(self) -> SourceRevocationRecord {
-        self.bus.revoke_source(self.source_id, self.epoch).await
-    }
-}
-```
-
-#### 来源注销与墓碑防复活 (Tombstone Protection)
-当来源调用 `revoke()` 时：
-1. 总线记录墓碑：`Tombstones.insert(source_id, TombstoneRecord { epoch, final_rev })`；
-2. 该来源在 `sources` 表中的状态被置为 `Revoked`，其持有的所有路由需求从全域聚合快照中移除；
-3. **防旧消息复活屏障**：若网络或异步任务中存在残留的旧快照提交，总线检查发现 `epoch <= tombstone.epoch` 时，直接拒绝并丢弃，杜绝幽灵路由复活。
-
-### 4.2 原子订阅契约 (Atomic Subscribe & Current Snapshot)
-
-为杜绝“建立订阅”与“读取基线快照”之间的竞态窗口（此窗口会导致订阅者漏掉第一笔更新通知）：
-
-```rust
-impl DemandBus {
-    /// 原子建立订阅并获取当前聚合快照
-    /// 在内部读锁保护下原子完成：保证订阅者收到的第一条通知严格在 initial_snapshot 之后产生
-    pub fn subscribe(&self) -> (DemandSubscriber, Arc<AggregatedDemandsSnapshot>) {
-        let inner = self.inner.read();
-        let receiver = self.broadcast_tx.subscribe();
-        let snapshot = self.aggregated_snapshot.load_full();
-        
-        let subscriber = DemandSubscriber {
-            receiver,
-            last_seen_version: snapshot.bus_version,
-        };
-        (subscriber, snapshot)
-    }
-}
-```
-
-### 4.3 有界防抖机制 (Bounded Debounce & Fairness)
-
-在网络震荡或节点高频上线时，对端路由可能在短时间内以 10~20ms 的间隔连续波动。协调器订阅端引入**有界防抖**：
-- **防抖窗口 (Debounce Window)**：收到变更通知后等待 50ms。若期间有新通知到达，重置 50ms 窗口。
-- **硬性上限 (Max Processing Horizon)**：记录首次收到通知的绝对时间点。一旦流逝超过 200ms，**必须强行截断防抖**，立即读取当前最新快照启动处理！
-- **通知溢出自愈 (Lagged Recovery)**：若通知通道收到 `tokio::sync::broadcast::error::RecvError::Lagged`，订阅端无需报错或增量重放，直接调用 `bus.get_current_snapshot()` 重新对齐最新事实。
-
----
-
-## 5. 提交令牌与收敛等待契约 (Submission Token & Convergence)
-
-为解决配置更新后的异步等待与确定性判定，提供类型化提交令牌与状态机。
-
-### 5.1 类型化提交令牌
-
-```rust
-/// 提交令牌：唯一绑定某一次快照提交
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct SourceSubmissionToken {
-    pub source_id: SourceId,
-    pub epoch: SourceEpoch,
-    pub revision: SourceRevision,
-}
-
-/// 收敛完成状态枚举 (严格对齐第一步契约第 8.2 节)
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum ConvergenceStatus {
-    /// 需求已被需求总线接收并聚合完成，等待下发
-    Accepted,
-    /// 委托宿主 (如 Android VpnService) 已确认生效
-    HostConfirmed,
-    /// 原生后端已调用系统接口并完成读回验证 (FIB 确认)
-    Verified,
-    /// 本次提交已被同一来源更高版本作废 (生命周期终止)
-    Superseded {
-        superseded_by: SourceSubmissionToken,
-    },
-    /// 在等待期间，该来源被显式撤销注销
-    Revoked,
-    /// 发生无法自愈的业务冲突或选路争抢 (独立状态，绝不混淆为 Superseded)
-    Conflicted {
-        reason: DemandConflictReason,
-    },
-    /// 只读降级或持久化异常
-    Degraded(String),
-    /// No-TUN 模式下显式跳过
-    Unsupported,
-}
-
-/// 等待收敛查询结果
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ConvergenceResult {
-    pub token: SourceSubmissionToken,
-    pub status: ConvergenceStatus,
-    pub elapsed: std::time::Duration,
-}
-```
-
-### 5.2 状态转移与生命周期替代契约
-
-当调用 `wait_convergence(token, timeout)` 时，状态机按以下严密规则判定：
-
-```mermaid
-stateDiagram-v2
-    [*] --> Accepted: publish() 提交快照
-    
-    Accepted --> Superseded: 检测到更高 Epoch (来源重启)<br>或同 Epoch 更高 Revision
-    Accepted --> Revoked: 来源被显式 revoke()
-    Accepted --> Conflicted: 检测到业务选路冲突
-    
-    Accepted --> HostConfirmed: [Step 4] 委托宿主声明生效
-    Accepted --> Verified: [Step 4] 原生底层读回验证通过
-    
-    HostConfirmed --> Superseded: 后续新版本覆盖
-    Verified --> Superseded: 后续新版本覆盖
-    
-    HostConfirmed --> Revoked: 来源撤销
-    Verified --> Revoked: 来源撤销
-
-    Accepted --> [*]
-    Superseded --> [*]
-    Revoked --> [*]
-    Conflicted --> [*]
-```
-
-1. **`Superseded` 判定**：
-   - 条件 A：总线中该 `SourceId` 的当前 `epoch > token.epoch`（来源已重启/重新注册）；
-   - 条件 B：`epoch == token.epoch && current_revision > token.revision`（来源提交了更新的快照）；
-   - 满足任一条件立即返回 `Superseded`，释放等待通道。
-2. **`Revoked` 判定**：
-   - 来源处于 `Revoked` 状态，或墓碑中记录的注销版本包含当前 Token。立即返回 `Revoked`，杜绝悬挂等待至超时。
-3. **`Conflicted` 判定**：
-   - 独立返回冲突详情，严禁将其误报为被替代或成功。
-
----
-
-## 6. 代码与模块变更规划 (File & Module Layout)
-
-### 6.1 精确实体文件布局清单
+区分实例 owner/supervisor、受限来源发布句柄、只读 reader。Reader 不能注册/撤销，来源不能重注册自己或修改他人；身份字段不能公开供调用者伪造。
 
 ```text
-easytier-core/
-├── src/
-│   ├── route/                         # [NEW] 路由需求抽象与总线模块
-│   │   ├── mod.rs                     # 统一导出公共接口与类型
-│   │   ├── model.rs                   # SourceId, SourceEpoch, RouteIntent, RoutePurpose 等
-│   │   ├── snapshot.rs                # RouteDemandsSnapshot, AggregatedDemandsSnapshot 等
-│   │   ├── bus.rs                     # DemandBus, SourceRegistrationHandle, 原子订阅
-│   │   ├── token.rs                   # SourceSubmissionToken, ConvergenceStatus
-│   │   ├── adapters/                  # 需求解析器适配层
-│   │   │   ├── mod.rs
-│   │   │   ├── proxy_cidr.rs          # ProxyCidrDemandResolver (OSPF + manual_routes)
-│   │   │   ├── public_ipv6.rs         # PublicIpv6DemandResolver (::/0 + peer v6)
-│   │   │   ├── magic_dns.rs           # MagicDnsDemandResolver (fake_ip/32)
-│   │   │   └── interface_prefix.rs    # InterfacePrefixDemandResolver (虚拟子网前缀)
-│   │   └── tests/                     # 单元与契约测试
-│   │       ├── mod.rs
-│   │       ├── bus_tests.rs           # 订阅竞态、代际更替、撤销墓碑测试
-│   │       └── resolver_tests.rs      # manual_routes 三态、零轮询延迟测试
-│   ├── peers/
-│   │   └── route/
-│   │       ├── mod.rs                 # [MODIFIED] PeerRoute trait 增加 subscribe_route_updates
-│   │       └── peer_ospf_route.rs     # [MODIFIED] update_peer_info_last_update 触发通知
-│   └── instance/
-│       └── mod.rs                     # [MODIFIED] 集成 DemandBus 实例
-easytier/
-└── src/
-    └── instance/
-        ├── route_shadow.rs            # [NEW] 双轨阴影核对器 (只读比对，不写系统)
-        └── tests/
-            └── shadow_tests.rs        # [NEW] 双轨比对一致性验证测试
+InstanceOwner.register(kind, logical_slot) -> Result<SourcePublisher>
+InstanceOwner.restart(source_id) -> Result<SourcePublisher>
+InstanceOwner.close() -> Result<RevocationReceipt>
+
+SourcePublisher.publish(full_demands, basis) -> Result<PublishReceipt>
+SourcePublisher.mark_unavailable(reason) -> Result<()>
+SourcePublisher.revoke() -> Result<RevocationReceipt>
+
+ScopedPublisher.publish_batch(updates) -> Result<BatchReceipt>
+
+DemandReader.current() -> Arc<RegistrySnapshot>
+DemandReader.subscribe() -> (Subscription, Arc<RegistrySnapshot>)
+DemandReader.query_token(token) -> Result<SubmissionLifecycle>
+DemandReader.wait_obsolete(token, timeout) -> Result<ObsoleteOutcome>
 ```
 
-### 6.2 模块职责与依赖约束
-- `easytier-core::route` 绝不依赖任何系统平台库（如 netlink、win32 api 等），保持纯粹的跨平台与 WASI 兼容。
-- `DemandBus` 在 Core 实例创建时初始化，作为只读需求提供者供上层查询。
-- 依赖项：利用已有的 `tokio`, `cidr`, `uuid`, `arc-swap`, `serde`，无需引入外部重量级依赖。
+publish 先完成规范化和校验，再在短同步临界区校验作用域、epoch、关闭状态并提交。失败明确返回 StaleEpoch、Revoked、RegistryClosed、InvalidDemand 等错误，不返回貌似有效的 token。内存提交不需 async；不在锁内调用用户回调、系统 I/O 或 await。
 
----
+每个来源只有一个顺序计算/发布任务。禁止 A、B 两个异步投影按完成先后给陈旧内容分配更高 revision。输入获取在锁外，纯投影使用不可变输入。外部传输未来需要导入自带版本时另设校验入口，本步不开放任意版本写入。
 
-## 7. 测试与验证方案 (Test Plan)
+### 5.2 幂等、撤销、重启与批次
 
-针对实施总纲第二步的全部验收要求，设计 8 类完备的测试用例：
+- 规范化需求和语义依赖完全相同的重复 publish 返回当前 token，不增加来源 revision。仅诊断 Basis 更新可推进诊断视图，不制造新需求版本。
+- 新需求推进来源 revision 和 RegistryRevision。publish_batch 校验所有受本实例授权的来源后一次提交，返回逐来源回执；任何一项失败都不部分生效。
+- revoke 在同一临界区记录 tombstone、关闭写能力、移除活跃需求并发布新视图。并发 publish 要么先被接受再撤销，要么返回 Revoked，不能复活。
+- close 原子封闭实例的注册/提交入口并撤销所有来源；之后的 Host 回调也失败。订阅方先能读到关闭/撤销终态，再结束等待。
+- epoch 只由 owner 提升；旧 epoch 的高 revision 不能覆盖新 epoch。新 epoch 首次发布始终产生新 token，即使内容与 stale 基线相同。
+- tombstone/epoch high-water 在注册表存活期间保留，不加会丢防重放证据的 TTL。未来裁剪查询历史须明确 TokenExpired，不能将旧 token 重新视为有效。
 
-| 序号 | 测试用例名称 | 测试目标与验证步骤 | 期望结果 (Pass Criteria) |
-| :--- | :--- | :--- | :--- |
-| **T1** | **原子订阅与高并发竞态测试**<br>`test_bus_atomic_subscription_race` | 5 个并发线程以随机间隔向 `DemandBus` 提交快照。与此同时，10 个订阅者并发建立订阅。 | 每一个订阅者获取的 `(initial_snapshot, stream)` 必须无缝衔接；版本号单调递增，绝不出现初始快照遗漏通知或通知乱序倒退。 |
-| **T2** | **陈旧版本与乱序提交丢弃测试**<br>`test_bus_stale_revision_rejection` | 来源先后提交 Revision 1、Revision 3。然后模拟乱序网络延迟，再次提交 Revision 2。 | Revision 2 必须被总线幂等丢弃；总线中该来源的最新快照保持为 Revision 3；版本未发生回退。 |
-| **T3** | **来源重启与代际更替测试**<br>`test_source_restart_epoch_increment` | 来源以 Epoch 1 提交 Revision 1，异步调用 `wait_convergence` 等待。模拟来源重启，以 Epoch 2 注册并提交 Revision 1。 | 原 Epoch 1 的等待令牌立即返回 `Superseded`，不发生死锁或超时；总线快照无缝更新为 Epoch 2 内容。 |
-| **T4** | **显式撤销与墓碑防复活测试**<br>`test_source_revocation_and_tombstone` | 来源提交快照后调用 `revoke()`。随后人为注入滞后的旧快照提交。 | 等待令牌立即返回 `Revoked`；聚合快照中该来源需求立即清空；后续旧快照被墓碑机制安全拦截，绝不发生“幽灵复活”。 |
-| **T5** | **`manual_routes` 三态覆盖与多来源独立性测试**<br>`test_manual_routes_three_state_isolation` | 同一实例同时启用 Proxy CIDR、Magic DNS (`7.7.7.7`) 和 Public IPv6 (`::/0`)。分别设置：<br>1. `None`<br>2. `Some([])`<br>3. `Some([192.168.1.0/24])`。 | 1. 自动跟随对端路由；<br>2. 代理需求严格为 `[]`，对端代理被完全抑制；<br>3. 仅有 192.168.1.0/24；<br>**三种情况下，Magic DNS 与 IPv6 需求均不受任何干扰，始终独立存在**。 |
-| **T6** | **零轮询、事件驱动响应延迟测试**<br>`test_event_driven_latency_under_10ms` | 启动 `ProxyCidrDemandResolver`。向 `PeerRoute` 注入对端路由更新，或向 config store 更新配置。记录时间差。 | 解析器在 **10 毫秒以内**完成需求快照更新并发布到总线，端到端耗时远低于历史的 1000ms 轮询时钟。 |
-| **T7** | **双轨数据阴影比对测试**<br>`test_shadow_dual_track_equivalence` | 同时运行旧版 `ProxyCidrMonitor` 和新版 `ProxyCidrDemandResolver`。注入动态 peer 增删网络拓扑。 | 新解析器输出的需求集合与旧 monitor 计算出的路由目标完全等价，证明新投影模型的无缝替代性。 |
-| **T8** | **高频事件有界防抖与抗饥饿测试**<br>`test_bounded_debounce_max_horizon` | 以 10ms 间隔连续发送 30 次 OSPF 路由抖动事件（总时长 300ms）。 | 防抖机制在达到 200ms 的硬性上限 (Max Horizon) 时强制截断并分发快照，不会被高频事件无限顺延或导致 CPU 饥饿。 |
+### 5.3 一条权威快照发布路径
 
----
+注册表用短同步 Mutex 串行提交，维护 `watch::Sender<Arc<RegistrySnapshot>>`。注册、发布、健康改变、重启、撤销和关闭经过同一个提交函数：校验并构造不可变视图，推进版本，在串行化保护下 `send_replace`，然后释放锁。没有订阅者时也必须保留最新值。
 
-## 8. 准入与进入第三步的验收标准
+subscribe 在相同序列化边界建立 receiver、取得初始 Arc 并标记初始版本已读。只暴露封装后的 Subscription；内部 borrow_and_update 后立即 clone Arc、释放借用，不跨 await。current 与订阅初值读取同一权威视图，不另维护可能漂移的 ArcSwap 缓存。
 
-在完成第二步实施后，必须满足以下标准方可进入第三步（纯规划器和归属状态机）：
+允许合并中间版本，保证“完整初态 + 此后可取得最新完整事实”，不保证每次 publish 都发一条事件。每个订阅者独立过滤 `version <= last_seen`，不让旧 Arc 覆盖新视图。重新订阅、消费者重启、宿主重连先取当前全量。通道关闭不是 Active 空需求。
 
-- [ ] **接口与模型就绪**：`RouteDemandsSnapshot`、`SourceId`、`SourceEpoch`、`SourceRevision` 等核心模型在 `easytier-core` 中编译通过并通过单元测试。
-- [ ] **业务策略收敛唯一**：`manual_routes` 的三态覆盖逻辑已全部迁移至 `ProxyCidrDemandResolver`，移动端与前端已对接或对齐该抽象。
-- [ ] **彻底消除轮询**：`ProxyCidrDemandResolver` 实现了由 OSPF 路由与配置变更纯事件驱动，零 `sleep(1s)` 依赖。
-- [ ] **无新系统写入者**：第二步未引入任何向宿主操作系统路由表写入的操作，旧链路保持原样正常工作。
-- [ ] **测试全绿**：第七节规划的 8 项测试全部编写完毕并稳定通过。
+watch 不产生 broadcast Lagged。对旧 broadcast 输入或未来跨进程通知，溢出/重连仍需重取完整事实，不另造增量重放协议。版本化只读镜像拒绝旧视图；新 RegistryId 必须经显式重新绑定，不能被迟到包自动切换。
+
+### 5.4 任务异常与 Drop
+
+正常路径显式 stop/revoke。投影任务由实例 supervisor 持有并等待，启动失败和正常退出都封闭相应写能力；Host 与 Core 来源适用同一规则。
+
+任务 panic、输入通道意外关闭、暂时查询失败先标记 Unavailable 并保留最后需求，由 supervisor 决定重启。业务明确关闭才发布空需求或撤销。不得 `changed().is_err() => break` 后留下永久 Active 来源。
+
+可恢复故障使用带上限退避的重试/重订阅，恢复后立即读取完整初态，不等待下一次业务变化。主动关闭、能力不支持和临时故障分别处理；禁止因通道关闭而快速重建任务形成忙循环。
+
+Drop 不启动异步系统清理。实例 owner 异常丢弃可同步封闭内存注册表作为保险，正常生命周期仍显式停止；第三至第五步再将来源状态连接到系统清理责任。
+
+## 6. 业务输入与生产者接线
+
+### 6.1 Peer Route：事实提交后再通知
+
+实际 trait 为 [Route](../easytier-core/src/peers/route/mod.rs)，PeerRoute 是 OSPF 实现结构体，原稿的 trait 名称不正确。
+
+增加例如 subscribe_host_route_inputs 的只读接口，返回带单调 InputRevision 的不可变完整 PeerRouteInput。语义是可读事实先提交、通知后发布，不用 Instant 作为版本。
+
+当前 [update_route_table_and_cached_local_conn_bitmap](../easytier-core/src/peers/route/peer_ospf_route.rs#L2900) 先更新时间戳再重建表。不得把通知挂在旧时间戳更新处，也不能通知后让读者遍历正在原地改变的多张表。
+
+逐一核对路由同步、peer 可达性、本地配置、成本重算、过期清理、关闭/withdraw 和直接 update_route_table 入口。相关写入应串行化，或从同一构建输入生成不可变投影并在提交时校验版本，防止较旧构建晚完成覆盖新事实。本步新增业务事实，不重写 overlay 下一跳算法。
+
+DisabledRoute、测试实现和其他 Route 实现须明确能力：真实空输入与不支持/未就绪分开，不加默认永不通知的方法掩盖漏接线。
+
+### 6.2 Core Proxy CIDR
+
+输入是上述已提交 peer proxy 集合，以及 [CoreRuntimeConfigStore](../easytier-core/src/config/runtime.rs) 的完整配置和 service change 提示。
+
+- None：采用现有 list_proxy_cidrs 对应的集合，保留排除本机、可达性与前缀选择语义；不能改成无条件遍历 peer 广播字段。
+- Some([])：发布 Active 空需求。
+- Some([A, B])：只发布规范化 A、B，保留 ManualOverrideProxy 用途。
+
+将 [resolve_proxy_cidrs](../easytier-core/src/gateway/proxy/cidr_monitor.rs#L76) 的纯三态规则迁到 route_demand 的纯函数；旧 monitor 调用同一函数，但保持旧调度和写入。用独立预期值验证规则，不能仅以“新旧共用函数结果相同”证明正确。
+
+任务先订阅再取初态，随后串行响应变化。每轮捕获配置与 PeerRouteInput 的 Arc 并记录版本后纯计算；期间的新更新仍须未读或触发下一轮，不在结束时盲目 mark-seen。独立输入不伪称全局原子；有必须共同变化的业务依赖时，使用同一输入快照或显式版本屏障。
+
+配置变化和依赖变化须区分：仅无关配置字段变化不生成新需求版本；影响允许网段、逻辑出口或地址依赖的变化则不能被内容去重吞掉。输入事实已有版本但内容读取未与版本同步时，先修复其读取协议，不能靠投影器不断重试来掩盖不一致。
+
+当前 manual_routes 与旧 proxy writer 为 IPv4 路径；模型支持双栈，Public IPv6 来源实际覆盖 IPv6。本步不静默新增 IPv6 peer proxy 自动安装语义。list_proxy_cidrs_v6 的后续接入须另记配置/能力决策，不能从类型支持推导功能已开启。
+
+### 6.3 Core Public IPv6
+
+权威输入来自 [PublicIpv6Service::reconcile_runtime_from_snapshot](../easytier-core/src/peers/public_ipv6/service.rs#L204)，通过 [CorePublicIpv6Runtime](../easytier-core/src/peers/public_ipv6/mod.rs#L144) 暴露。当前 lease/routes 分别通过回调和事件发布，不能以增量事件作为新事实源。
+
+在现有 reconcile 路径生成完整不可变状态：本地有效地址/租约及逻辑版本、可达 peer public IPv6 路由；一次提交二者，初次订阅也可读取。旧事件保留给兼容消费者，不能反向用旧事件驱动新权威状态。
+
+单个 PublicIpv6 来源完整发布：本地有效地址存在时的 `::/0` 默认出口需求及地址依赖；peer public IPv6 需求，保留实际前缀长度和过滤。地址消失、auto 关闭、peer 不可达时更新全量。provider_enabled/发布前缀不等于本机获得 lease。
+
+`::/0` 在 lease A 换 B 时依赖版本必须改变，不能因 CIDR 相同抑制发布。实际地址安装就绪和 cost=5 解析留 Host/后续步骤。
+
+### 6.4 Host DNS 与接口前缀
+
+| 来源 | 事实与接线 | 本步输出与边界 |
+| --- | --- | --- |
+| Magic DNS | [runtime_host/magic_dns.rs](../easytier/src/instance/runtime_host/magic_dns.rs)、[server_instance.rs](../easytier/src/instance/dns_server/server_instance.rs) 的配置、fake IP、逻辑接口/地址版本 | 用实际 fake IP 及子网判定产生 /32；启用、换地址、停止均更新；Windows cost=4 留 Host 策略。 |
+| 显式接口前缀 | [virtual_nic.rs](../easytier/src/instance/virtual_nic.rs)、[tun_desktop.rs](../easytier/src/instance/runtime_host/tun_desktop.rs)、[tun_mobile.rs](../easytier/src/instance/runtime_host/tun_mobile.rs) 的地址事实和生命周期 | macOS/FreeBSD 显式前缀来源；Linux/Windows 地址派生路由只作地址事实，不冒充显式 Owned 需求。 |
+
+具体适配器位于 Host；Core 只提供类型和协议。需求在“业务决定需要该路由”的边界发布，不以旧 add_route 成功为前提，否则会将安装失败伪装成没有需求。启动失败保留真实需求/Unavailable，服务决定放弃才显式撤销。
+
+DHCP、地址更新、TUN 重建的需求与逻辑绑定事实共享捕获版本。DNS 与前缀需一起更新时使用受限 publish_batch，或要求匹配同一地址版本；不能发布半批后宣称配置整体完成。
+
+旧 NIC/DNS 系统调用继续拥有原执行权；新增来源只发布内存事实。第二步的 revoke 不会清理真实路由。
+
+### 6.5 VPN Portal、移动端及其他宿主
+
+- 主线 [vpn_portal/runtime.rs](../easytier-core/src/gateway/vpn_portal/runtime.rs) 经 attached peer 管理客户端。历史分支曾直接拼接 client CIDR，不能因此臆造主线独立 VpnPortalClient 来源。跟踪 attached-peer 到 PeerRouteInput，用集成测试证明现有需求无遗漏/重复；发现独立需求时须列出真实写入点再补来源。
+- [mobile_vpn.ts](../easytier-gui/src/composables/mobile_vpn.ts) 与 [OHOS routing.rs](../easytier-contrib/easytier-ohrs/crates/easytier-ohos-core/src/routing.rs) 仍有独立并集/简化逻辑。本步提供共享只读 DTO/门面及桥接契约测试，生产 VPN 配置继续走旧链路；union 到 override 的实际切换留第六步。
+- 新来源使用实际配置，不将 GUI DNS 常量复制为新的权威。某宿主 DNS/地址事实不可得时明确适配未就绪，不能报 Active 空或全来源影子通过。桥接测试至少注入实际形状的 Host 输入，记录未接通的生产链路。
+- WASI/嵌入宿主可读可移植需求，不以 native 权限或旧 monitor feature 限制读取。wire DTO 不含 Instant 或 OS 句柄。
+
+## 7. 实例装配与提交结果
+
+### 7.1 独立门面和 Host 上下文
+
+新增 CoreInstance::route_demands() 返回只读 CoreRouteDemands。Core 内部保有自身来源发布能力。经 InstanceRuntimeHost 的独立初始化钩子传递 HostRouteDemandContext（reader + 本实例 Host 来源注册权限）；可新增带默认空实现的钩子，无能力宿主不能伪造已支持。
+
+在 [instance/lifecycle.rs](../easytier-core/src/instance/lifecycle.rs) 的 Host prepare 之前交接上下文，避免漏掉首次地址/DNS需求。启动失败和 stop 走同一内存关闭协议。新门面不得向消费者暴露 PeerManager 内部或 IfConfiger。
+
+### 7.2 本步只确认需求协议
+
+publish 回执含 token 与 RegistryRevision，表示需求登记成功，不表示系统已安装或域协调器已规划。
+
+本步 SubmissionLifecycle 支持 Current（Fresh/Stale）、Superseded、Revoked，以及 UnknownToken/ForeignRegistry/RegistryClosed 查询错误。wait_obsolete 等待替代或撤销，不冒充 wait_convergence；timeout 是独立结果，取消等待不撤销需求。
+
+判定规则：
+
+1. 验证 token 曾被此注册表接受；未知/未来版本报错。
+2. token 所属 epoch 已显式撤销则 Revoked；之后重注册不改写这段历史。
+3. 否则更高 epoch 或同 epoch 更高需求 revision 为 Superseded。新 epoch 未首次发布时也可按 epoch 表达替代，不伪造 superseded_by token。
+4. 其余 Current，Unavailable 仍可查询 stale，不等于撤销/成功。
+
+查询/等待采用订阅加完整初态，避免先查询再挂 waiter 的窗口。已返回结果不追溯改变，新的查询反映当前生命周期。真正 wait_convergence 及 HostConfirmed/Verified/Conflicted 要等第三至第五步取得规划与执行证据后提供，本步不写空实现。
+
+## 8. 调度与影子验证
+
+### 8.1 合并唤醒而不牺牲进展
+
+优先用 watch 合并通知、语义去重，不给每次发布强加 50ms 延迟。昂贵投影/影子输出确需防抖时增加局部调度，设置最大等待预算；50ms/200ms 只是可测试初值，不是性能承诺。
+
+持续事件不能无限延长首个 pending 的期限。来源撤销、关闭和健康改变直接提交，不等防抖。单来源顺序投影不阻塞其他来源登记。系统操作的公平调度仍在第五步实现。
+
+### 8.2 影子观察器只有读权限
+
+观察器只接 reader 和只读旧业务输出，不注入 IfConfiger/backend 或旧控制事件发送权限。没有写路由、发旧控制事件或重建 VPN 的路径；关闭影子诊断不影响事实源。
+
+记录至少含 SourceId、用途、逻辑出口、Basis、采样版本和差异类别：
+
+- ComparableMatch/Mismatch：同一输入或确认稳态下可比。
+- PendingAlignment/NotComparable：旧 1 秒 monitor 与新投影版本不齐，或旧接口无版本依据；不报确定错误。
+- ExpectedCompatibilityDifference：移动 union 与新 override、旧 DNS 常量等已冻结差异，必须列具体场景，不能全局忽略。
+- SourceUnavailable：事实缺失，不能凭两个空集合相同判通过。
+
+测试优先用同一冻结输入驱动新旧业务投影。运行时无法对齐只作诊断。比较业务需求，不比较旧 cur_proxy_cidrs 成功缓存或真实 FIB；旧缓存可能在系统写失败后仍推进。日志按来源/版本限流。
+
+## 9. 文件与提交顺序
+
+使用 route_demand 目录，避免与 overlay peers::route 混淆。
+
+| 批次 | 新增/修改位置 | 独立产物 |
+| --- | --- | --- |
+| A：模型协议 | `easytier-core/src/route_demand/{mod,model,registry,subscription,token,projection}.rs`、`src/lib.rs` | 类型、注册状态机、完整订阅、令牌查询、基础测试。 |
+| B：可读输入 | `peers/route/{mod,peer_ospf_route}.rs`、按需 `config/runtime.rs`、`peers/public_ipv6/{mod,service}.rs` | 状态提交后通知，完整 Peer/PublicIpv6 投影及更新入口测试。 |
+| C：Core 装配 | `instance/route_demands.rs`、`instance/{mod,lifecycle}.rs`、`gateway/proxy/cidr_monitor.rs` | 门面、supervisor、纯规则复用；旧 monitor 继续工作。 |
+| D：Host 来源 | `easytier/src/instance/route_demand_sources.rs`、`runtime_host.rs` 及其 implementation/magic_dns/tun_desktop/tun_mobile 子模块，必要的 NIC/DNS 接线 | Host context、DNS/前缀来源、失败/重建/停止测试；无新增系统写。 |
+| E：只读观察 | `easytier/src/instance/route_shadow.rs`、Core 只读 DTO，GUI/OHOS/WASI 桥接测试 | 有版本依据的诊断、能力与兼容差异清单；生产消费者不切换。 |
+| F：验收 | 各模块及 instance 测试、feature/target 检查 | 测试覆盖映射、运行结果、后续切换清单。 |
+
+按大小拆分文件，不机械生成空模块。route_demand 纯模型/协议不依赖 instance/gateway/peers；实例层装配，避免移动纯函数产生依赖环。每批保持可构建。
+
+## 10. 测试与验收矩阵
+
+使用屏障、oneshot、受控假输入与虚拟时钟制造指定交错。真实 timeout 只防挂死，不以 10ms 以内完成判正确。
+
+| 类别 | 反例 | 通过条件 |
+| --- | --- | --- |
+| 原子订阅 | 提交分别在订阅前、取初态期间、订阅后；并发多来源 | 初态或后续全量必含更新，允许跳版，不倒退、不丢最终状态。 |
+| 无订阅者/慢消费者 | 无 receiver 时发布，再首次订阅；消费者落后几十版 | 获得最新完整值，发布不依赖 receiver 存在。 |
+| 错误和幂等 | 非法 CIDR、重复需求、旧 epoch handle、close 后 publish | 错误不返 token；幂等不增业务版本；无部分提交。 |
+| 顺序投影 | 读取输入后暂停，再改变输入；首次通知窗口 | 无需下次业务变化也到最新状态；旧计算不覆盖已发布的新计算。 |
+| 实际 OSPF 接线 | rebuild 前暂停；同步、失联、过期、成本/配置更新 | 新事实可读后才通知；不等旧 monitor tick。 |
+| 生命周期 | publish/revoke 竞态、旧 epoch 迟到、重启低 rev 新 epoch | 无复活；旧 token 正确终止；新句柄有效。 |
+| 初始化/异常 | Initializing、Active 空、Unavailable、恢复、panic、通道关闭 | 各状态可区分；故障保留最后需求，不永久假 Active。 |
+| 恢复进展 | 输入临时失败后恢复但没有新业务事件；关闭通道反复重订阅 | 有界退避后重取全量并恢复，不忙循环、不永久 stale。 |
+| 等待/查询 | 查询后立即撤销或重启、取消等待、未来 token | 无等待窗口；取消不撤销；未知 token 不假成功。 |
+| 三态和独立来源 | None/空/非空、本机代理排除、DNS/IPv6/前缀共存 | manual_routes 只影响 Proxy 来源。 |
+| 不误合并 | 两实例同 CIDR 不同出口、同实例两个 DNS 来源 | 保留来源与出口，不以 CIDR 覆盖或擅自判冲突。 |
+| Public IPv6 | lease 有/无、同 ::/0 换 lease、auto 关闭、peer 撤回 | 全量及依赖版本正确，不取半批 lease/routes。 |
+| Host 生命周期 | 旧路由写失败、DNS 启停、DHCP、同名 TUN 重建、批次失败 | 需求不以旧写成功为前提；依赖可追踪；无半批。 |
+| Portal/移动映射 | attached peer 上下线、union 差异、宿主事实缺失 | 无遗漏/重复；差异有依据，未知能力不伪装通过。 |
+| 影子无副作用 | 只读 fake、A 停止 B 继续、旧采样落后 | 不写系统或旧控制事件、不停 B、不误报时间差。 |
+| 调度进展 | 持续事件、慢消费者、停止/健康变化 | 有界推进、撤销不被饿死，以虚拟时间验证。 |
+
+按改动运行针对性测试，再执行构建矩阵；实施时按实际测试名称调整过滤：
+
+```bash
+cargo test -p easytier-core route_demand
+cargo test -p easytier-core gateway::proxy::cidr_monitor
+cargo test -p easytier-core peers::route
+cargo test -p easytier-core peers::public_ipv6
+cargo test -p easytier route_demand
+cargo check -p easytier-core --no-default-features
+cargo check -p easytier --features full
+cargo check -p easytier-core --lib --target wasm32-wasip1 --features management-rpc,proxy-smoltcp-stack,ring-crypto,wasi-crypto-offload
+```
+
+另测关闭 proxy-cidr-monitor 时新接口仍可用，以及开启时旧链路兼容。Native 来源用 fake Host/纯投影验证，不改开发机路由。可用平台补构建；未执行目标如实记录，构建通过不是路由行为验证。
+
+## 11. 进入第三步的门槛
+
+- [ ] 新模型/协议不携带系统表号、接口索引、平台 metric，不依赖旧 monitor 开关。
+- [ ] 活跃来源都有完整初态、可靠触发、Unavailable 和撤销路径；Peer/PublicIpv6 在事实提交后通知。
+- [ ] Host 来源与真实生命周期接通；移动/其他宿主的未就绪能力、兼容差异、第六步切换清单明确。
+- [ ] 新读接口独立可用，保留来源/实例/依赖，同 CIDR 不被错误折叠。
+- [ ] epoch/revision/tombstone、实例关闭、令牌等待的确定性交错测试通过。
+- [ ] 只读影子和测试可解释差异，没有新的系统路由/VPN 写入路径。
+- [ ] Core 最小 feature、旧 monitor 开关组合、WASI 等受影响目标已验证或明确阻塞，不以 dummy 算支持。
+
+完成后将条款映射到实现/测试位置并记录运行结果。第三步再消费逐来源事实，实现结合域、绑定与平台能力的纯规划器和归属状态机。
