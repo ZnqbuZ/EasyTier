@@ -34,6 +34,14 @@ pub enum NextHopPolicy {
     LeastCost,
 }
 
+/// Fully committed and immutable peer route input snapshot for route demand projection.
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+pub struct PeerRouteInput {
+    pub revision: u64,
+    pub proxy_cidrs: BTreeSet<Ipv4Cidr>,
+    pub proxy_cidrs_v6: BTreeSet<Ipv6Cidr>,
+}
+
 pub type ForeignNetworkRouteInfoMap =
     DashMap<ForeignNetworkRouteInfoKey, ForeignNetworkRouteInfoEntry>;
 
@@ -108,6 +116,12 @@ pub trait Route {
 
     async fn list_public_ipv6_routes(&self) -> BTreeSet<Ipv6Inet> {
         BTreeSet::new()
+    }
+
+    fn subscribe_host_route_inputs(&self) -> tokio::sync::watch::Receiver<Arc<PeerRouteInput>> {
+        let initial = Arc::new(PeerRouteInput::default());
+        let (_, rx) = tokio::sync::watch::channel(initial);
+        rx
     }
 
     async fn get_my_public_ipv6_addr(&self) -> Option<Ipv6Inet> {
@@ -234,5 +248,20 @@ impl Route for DisabledRoute {
 
     fn get_peer_groups(&self, _peer_id: PeerId) -> Arc<Vec<String>> {
         panic!("mock route")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_disabled_route_provides_empty_input() {
+        let disabled = DisabledRoute;
+        let mut rx = disabled.subscribe_host_route_inputs();
+        let init = rx.borrow_and_update().clone();
+        assert_eq!(init.revision, 0);
+        assert!(init.proxy_cidrs.is_empty());
+        assert!(init.proxy_cidrs_v6.is_empty());
     }
 }

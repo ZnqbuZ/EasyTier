@@ -207,6 +207,8 @@ impl PublicIpv6Service {
             my_addr = None;
         }
 
+        self.runtime.update_public_ipv6_snapshot(my_addr, routes.clone());
+
         let mut cached_my_addr = self.my_addr_cache.lock().unwrap();
         if *cached_my_addr != my_addr {
             let old = *cached_my_addr;

@@ -129,6 +129,15 @@ impl PublicIpv6Host for () {
     }
 }
 
+/// Fully committed immutable snapshot of public IPv6 state for route demand projection.
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+pub struct PublicIpv6Snapshot {
+    pub revision: u64,
+    pub lease: Option<Ipv6Inet>,
+    pub lease_version: u64,
+    pub routes: std::collections::BTreeSet<Ipv6Inet>,
+}
+
 #[async_trait::async_trait]
 #[auto_impl::auto_impl(Arc)]
 pub(crate) trait PublicIpv6Runtime: Send + Sync {
@@ -139,6 +148,12 @@ pub(crate) trait PublicIpv6Runtime: Send + Sync {
     async fn collect_reserved_public_ipv6_addrs(&self, prefix: Ipv6Cidr) -> HashSet<Ipv6Addr>;
     fn public_ipv6_lease_changed(&self, old: Option<Ipv6Inet>, new: Option<Ipv6Inet>);
     fn public_ipv6_routes_changed(&self, added: Vec<Ipv6Inet>, removed: Vec<Ipv6Inet>);
+    fn update_public_ipv6_snapshot(
+        &self,
+        _lease: Option<Ipv6Inet>,
+        _routes: std::collections::BTreeSet<Ipv6Inet>,
+    ) {
+    }
 }
 
 pub struct CorePublicIpv6Runtime {
@@ -147,6 +162,9 @@ pub struct CorePublicIpv6Runtime {
     events: Arc<dyn CoreEventSink>,
     provider_prefix: std::sync::Mutex<Option<Ipv6Cidr>>,
     lease: std::sync::Mutex<Option<Ipv6Inet>>,
+    public_ipv6_tx: tokio::sync::watch::Sender<Arc<PublicIpv6Snapshot>>,
+    lease_version_counter: std::sync::atomic::AtomicU64,
+    snapshot_revision_counter: std::sync::atomic::AtomicU64,
 }
 
 impl CorePublicIpv6Runtime {
@@ -155,13 +173,26 @@ impl CorePublicIpv6Runtime {
         host: Arc<dyn PublicIpv6Host>,
         events: Arc<dyn CoreEventSink>,
     ) -> Arc<Self> {
+        let initial_snapshot = Arc::new(PublicIpv6Snapshot::default());
+        let (public_ipv6_tx, _) = tokio::sync::watch::channel(initial_snapshot);
         Arc::new(Self {
             config,
             host,
             events,
             provider_prefix: std::sync::Mutex::new(None),
             lease: std::sync::Mutex::new(None),
+            public_ipv6_tx,
+            lease_version_counter: std::sync::atomic::AtomicU64::new(0),
+            snapshot_revision_counter: std::sync::atomic::AtomicU64::new(0),
         })
+    }
+
+    pub fn subscribe_snapshot(&self) -> tokio::sync::watch::Receiver<Arc<PublicIpv6Snapshot>> {
+        self.public_ipv6_tx.subscribe()
+    }
+
+    pub fn snapshot(&self) -> Arc<PublicIpv6Snapshot> {
+        self.public_ipv6_tx.borrow().clone()
     }
 
     pub fn set_provider_prefix(&self, prefix: Option<Ipv6Cidr>) -> bool {
@@ -240,6 +271,39 @@ impl PublicIpv6Runtime for CorePublicIpv6Runtime {
     fn public_ipv6_routes_changed(&self, added: Vec<Ipv6Inet>, removed: Vec<Ipv6Inet>) {
         self.events
             .emit(CoreEvent::PublicIpv6RoutesChanged { added, removed });
+    }
+
+    fn update_public_ipv6_snapshot(
+        &self,
+        lease: Option<Ipv6Inet>,
+        routes: std::collections::BTreeSet<Ipv6Inet>,
+    ) {
+        let current = self.public_ipv6_tx.borrow().clone();
+        let lease_changed = current.lease != lease;
+        let routes_changed = current.routes != routes;
+        if !lease_changed && !routes_changed && current.revision > 0 {
+            return;
+        }
+
+        let lease_version = if lease_changed {
+            self.lease_version_counter
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                + 1
+        } else {
+            current.lease_version
+        };
+        let revision = self
+            .snapshot_revision_counter
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            + 1;
+
+        let next = Arc::new(PublicIpv6Snapshot {
+            revision,
+            lease,
+            lease_version,
+            routes,
+        });
+        self.public_ipv6_tx.send_replace(next);
     }
 }
 
@@ -734,5 +798,48 @@ mod tests {
             PublicIpv6ProviderResolution::Pending(message)
                 if message.contains("detected prefix")
         ));
+    }
+
+    #[tokio::test]
+    async fn test_public_ipv6_snapshot_subscription() {
+        use std::collections::BTreeSet;
+        use std::str::FromStr;
+        use crate::config::peers::PeerRuntimeSnapshot;
+
+        let store = CoreRuntimeConfigStore::new(
+            CoreRuntimeConfig::default(),
+            Arc::new(PeerRuntimeSnapshot::default()),
+        );
+        let runtime = CorePublicIpv6Runtime::new(store, Arc::new(()), Arc::new(()));
+        let mut rx = runtime.subscribe_snapshot();
+
+        // Initial snapshot
+        let init = rx.borrow_and_update().clone();
+        assert_eq!(init.revision, 0);
+        assert_eq!(init.lease, None);
+        assert!(init.routes.is_empty());
+
+        // Update lease A
+        let lease_a = Ipv6Inet::from_str("2001:db8::1/64").unwrap();
+        let mut routes = BTreeSet::new();
+        routes.insert(Ipv6Inet::from_str("2001:db8:2::/64").unwrap());
+        runtime.update_public_ipv6_snapshot(Some(lease_a), routes.clone());
+
+        rx.changed().await.unwrap();
+        let snap1 = rx.borrow_and_update().clone();
+        assert_eq!(snap1.revision, 1);
+        assert_eq!(snap1.lease, Some(lease_a));
+        assert_eq!(snap1.lease_version, 1);
+        assert_eq!(snap1.routes, routes);
+
+        // Update lease B (same prefix routes) -> lease_version increments!
+        let lease_b = Ipv6Inet::from_str("2001:db8::2/64").unwrap();
+        runtime.update_public_ipv6_snapshot(Some(lease_b), routes.clone());
+
+        rx.changed().await.unwrap();
+        let snap2 = rx.borrow_and_update().clone();
+        assert_eq!(snap2.revision, 2);
+        assert_eq!(snap2.lease, Some(lease_b));
+        assert_eq!(snap2.lease_version, 2);
     }
 }

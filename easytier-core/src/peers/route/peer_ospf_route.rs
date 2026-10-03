@@ -70,7 +70,7 @@ use crate::{
 };
 
 use super::{
-    DefaultRouteCostCalculator, ForeignNetworkRouteInfoMap, NextHopPolicy, Route,
+    DefaultRouteCostCalculator, ForeignNetworkRouteInfoMap, NextHopPolicy, PeerRouteInput, Route,
     RouteCostCalculator, RouteCostCalculatorInterface, RouteInterfaceBox,
     graph_algo::dijkstra_with_first_hop,
     route_peer_wire::{
@@ -2380,6 +2380,9 @@ struct PeerRouteServiceImpl {
     last_update_my_foreign_network: AtomicCell<Option<Instant>>,
 
     peer_info_last_update: AtomicCell<Instant>,
+
+    peer_route_input_tx: tokio::sync::watch::Sender<Arc<PeerRouteInput>>,
+    peer_route_input_revision: AtomicU64,
 }
 
 impl Debug for PeerRouteServiceImpl {
@@ -2454,6 +2457,9 @@ impl PeerRouteServiceImpl {
             last_update_my_foreign_network: AtomicCell::new(None),
 
             peer_info_last_update: AtomicCell::new(Instant::now()),
+
+            peer_route_input_tx: tokio::sync::watch::channel(Arc::new(PeerRouteInput::default())).0,
+            peer_route_input_revision: AtomicU64::new(0),
         }
     }
 
@@ -2482,6 +2488,30 @@ impl PeerRouteServiceImpl {
         self.public_ipv6_service()
             .map(|service| service.handle_route_change())
             .unwrap_or(false)
+    }
+
+    pub fn subscribe_host_route_inputs(&self) -> tokio::sync::watch::Receiver<Arc<PeerRouteInput>> {
+        self.peer_route_input_tx.subscribe()
+    }
+
+    pub fn publish_peer_route_input_if_changed(&self) {
+        let proxy_cidrs = self.route_table.list_proxy_cidrs_excluding(self.my_peer_id);
+        let proxy_cidrs_v6 = self.route_table.list_proxy_cidrs_v6_excluding(self.my_peer_id);
+        let current = self.peer_route_input_tx.borrow().clone();
+        if current.proxy_cidrs == proxy_cidrs
+            && current.proxy_cidrs_v6 == proxy_cidrs_v6
+            && current.revision > 0
+        {
+            return;
+        }
+
+        let next_rev = self.peer_route_input_revision.fetch_add(1, Ordering::SeqCst) + 1;
+        let next_input = Arc::new(PeerRouteInput {
+            revision: next_rev,
+            proxy_cidrs,
+            proxy_cidrs_v6,
+        });
+        self.peer_route_input_tx.send_replace(next_input);
     }
 
     fn get_or_create_session(&self, dst_peer_id: PeerId) -> Arc<SyncRouteSession> {
@@ -2847,6 +2877,8 @@ impl PeerRouteServiceImpl {
             .as_mut()
             .unwrap()
             .end_update();
+
+        self.publish_peer_route_input_if_changed();
     }
 
     fn update_foreign_network_owner_map(&self) {
@@ -2966,6 +2998,9 @@ impl PeerRouteServiceImpl {
         {
             *locked = conn_bitmap;
         }
+        drop(locked);
+
+        self.publish_peer_route_input_if_changed();
     }
 
     fn collect_missing_peer_ids(
@@ -4610,11 +4645,16 @@ impl Route for PeerRoute {
     async fn open(&self, interface: RouteInterfaceBox) -> Result<u8, ()> {
         *self.service_impl.interface.lock().await = Some(interface);
         self.start().await;
+        self.service_impl.publish_peer_route_input_if_changed();
         Ok(1)
     }
 
     async fn close(&self) {
         self.stop().await;
+    }
+
+    fn subscribe_host_route_inputs(&self) -> tokio::sync::watch::Receiver<Arc<PeerRouteInput>> {
+        self.service_impl.subscribe_host_route_inputs()
     }
 
     async fn get_next_hop(&self, dst_peer_id: PeerId) -> Option<PeerId> {
