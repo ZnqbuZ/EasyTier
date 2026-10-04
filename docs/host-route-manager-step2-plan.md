@@ -1,42 +1,31 @@
-# HostRouteManager 第二步实施方案：最小 Manager 闭环（第六轮修订版）
+# HostRouteManager 第二步实施方案：架构收缩与最小闭环（第七轮修订版）
 
-状态：已根据第四次审查意见（[`docs/host-route-manager-step2-review-4.md`](host-route-manager-step2-review-4.md)）完成针对性修订。严格遵循最新实施总纲（[`docs/host-route-manager-master-plan.md`](host-route-manager-master-plan.md)）与第一步规范（[`docs/host-route-manager-step1-audit-and-contract.md`](host-route-manager-step1-audit-and-contract.md)）。  
+状态：已根据第六轮架构收缩审查（[`docs/host-route-manager-step2-review-6.md`](host-route-manager-step2-review-6.md)）完成全面重构与简化。遵循实施总纲（[`docs/host-route-manager-master-plan.md`](host-route-manager-master-plan.md)）与第一步规范（[`docs/host-route-manager-step1-audit-and-contract.md`](host-route-manager-step1-audit-and-contract.md)）。  
 基线代码：`refactor/route` 分支；参考分支：`refactor/route-dev` (`8abfb51e`)。
 
 ---
 
-## 1. 目标与范围及平台启用边界
+## 1. 目标与范围及平台边界
 
 ### 1.1 核心目标
-本阶段交付一个**小型的、实用的 HostRouteManager 闭环**：
+本阶段交付一个**小巧、精简、可工作的 HostRouteManager 闭环**：
 1. **范围聚焦**：接管 **IPv4 自动子网代理路由（Peer Proxy CIDR）** 与 **手工静态代理路由（`manual_routes`）**。
-2. **直连事实与闭环操作**：直接从 Core 路由表权威快照与配置拉取事实，由 Host 完成纯函数策略计算，通过薄后端接口应用变更，维护携带实际创建参数与接口代际的精确记录（`InstalledRoute`），保存未决操作（`PendingOperation`），支持带退避的失败重试与带超时的显式停机清理。
-3. **平滑交接与防双写**：统一定义单一生产后端模式选择（`RouteBackendMode`）；在启用的平台上停用旧 updater 系统写权限；尚未迁移的 Public IPv6、Magic DNS 及接口前缀在第二步暂不接入，但在阶段一通过生命周期时序与显式确认完成重叠范围的动态交接与防御，杜绝新旧双写。
-4. **性能与精简约束**：彻底不引入旧版版本化需求框架（无 Registry / Token / Epoch / 生产影子框架）；满足稳态零多余写入、快照与连接复用、消除用户态逐条 dump 等可测量的性能指标。
+2. **单一路由模型**：以统一的完整 `Route` 结构表达期望集与成功创建集，接口与 Metric 均作为路由属性。
+3. **标准错误与结果类型**：统一为一个 `RouteError`（区分 `Failed` 与 `Unknown`），系统操作结果使用标准 `Result<Option<Route>, RouteError>`。
+4. **编译期后端选择**：沿用仓库现有的 `cfg` 编译期平台选择，删除动态 `Box<dyn Backend>` 运行时分发与临时包装。
+5. **guarden 资源收束**：复用项目已有 `guarden = "0.3"` 管理清理任务与设备资源生命周期，删除自定义的冻结协调状态机。
+6. **写入权平滑交接**：Linux 原生环境完全接管并停用旧 updater；未迁移平台保持原有旧链路；Magic DNS 与接口前缀通过生命周期确认杜绝双写。
 
-### 1.2 跨平台启用状态与单一控制开关 (`RouteBackendMode`)
+### 1.2 平台范围与生产接管策略
 
-为彻底杜绝“配置声明与生产链路不一致导致的漏写或双写”，采用**单一生产后端控制开关**统一决策：
+本阶段不建立长期的公共模式枚举，采用装配处/编译期的确定性选择：
 
-```rust
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum RouteBackendMode {
-    /// 启用全新 HostRouteManager，完全接管系统路由写入
-    NativeManager,
-    /// 维持现有旧版路由写入链路 (VirtualNic updater / mobile_vpn)
-    Legacy,
-    /// 旁路模式，不向系统写入任何路由
-    NoTun,
-}
-```
-
-| 平台分类 | 第二步默认模式 | 真实后端 / 宿主接线文件 | 旧 Writer 退出时机 | 第二步验收范围 |
+| 平台分类 | 第二步接管状态 | 真实后端文件 | 旧 Writer 退出时机 | 第二步验收范围 |
 | :--- | :--- | :--- | :--- | :--- |
-| **Linux** | **`NativeManager`** | `easytier/src/instance/route/backend/netlink.rs`<br>衔接 `NetlinkIfConfiger` | 启动时 `NativeManager` 生效，跳过创建 `VirtualNic::run_proxy_cidrs_route_updater` | 隔离 netns 下真实 Netlink 系统调用测试；覆盖增删、精确匹配、长连接与退避 |
-| **Windows** | **`Legacy`**<br>(测试可显式切 `NativeManager`) | `easytier/src/instance/route/backend/windows.rs`<br>衔接 `WindowsIfConfiger` | 默认维持旧链路；显式切换 `NativeManager` 时停用旧 updater | 隔离环境 Win32 API 增删与默认 Metric (9000) 映射测试 |
-| **macOS / FreeBSD** | **`Legacy`**<br>(测试可显式切 `NativeManager`) | `easytier/src/instance/route/backend/darwin.rs`<br>衔接 `MacIfConfiger` | 默认维持旧链路；显式切换 `NativeManager` 时停用旧 updater | CLI 命令执行与状态码检查测试；显式接口前缀暂留旧链路 |
-| **Android / 移动委托** | **`Legacy`** | `easytier/src/instance/route/backend/delegated.rs`<br>（适配 `VpnService.Builder` 接口模型） | **生产维持旧链路**：移动端 VPN 需同时携带 DNS 与子网配置，在第二步不切换生产 `mobile_vpn.ts` | 委托后端全量应用契约测试、会话代际确认与会话重置测试 |
-| **No-TUN** | **`NoTun`** | `RouteBackend::NoTun` | 停用旧 monitor 路由事件 | 验证正常计算期望，但完全跳过执行分支，已安装记录严格为空 |
+| **Linux** | **完全原生接管** | `easytier/src/instance/route/backend/netlink.rs` | 实例化 `HostRouteManager`，跳过创建 `VirtualNic::run_proxy_cidrs_route_updater` | 隔离 netns 下真实 Netlink 系统调用；增删、精确匹配、长连接与退避验证 |
+| **Windows / macOS** | **维持原链路** | 暂留后续步骤迁移 | 维持现有 `VirtualNic` 路由更新器 | 保持编译通过与现有功能完整，不提前声称接管 |
+| **Android / 移动端** | **维持原链路** | 暂留后续步骤迁移 | 维持现有 `mobile_vpn.ts` 前端并集拼装 | 生产保持旧链路，不预建未接入的动态代理分支 |
+| **No-TUN** | **明确旁路** | 在装配处通过 `Option<Backend>` 或空分支旁路 | 停用旧 monitor 路由事件 | 正常执行策略计算，跳过系统写入，已安装集合严格为空 |
 
 ---
 
@@ -44,27 +33,26 @@ pub enum RouteBackendMode {
 
 ### 2.1 源码分工与依赖单向性约束
 
-严格遵守 `easytier → easytier-core` 的单向依赖规则，**Core 绝不引用 Host 类型，也不感知 Host 管理器**：
+严格遵守 `easytier → easytier-core` 的单向依赖规则，**Core 绝不引用 Host 类型**：
 - **`easytier-core`（纯业务事实、不可变快照与规范化）**：
-  - 在 `PeerRouteServiceImpl::update_route_table` 提交边界计算并缓存不可变快照 `Arc<BTreeSet<Ipv4Cidr>>`。
-  - 通过 `CorePacketPlane` 导出只读快照及 Core 自有的 `watch` 订阅接口：`subscribe_proxy_cidrs()` 与 `list_proxy_cidrs_snapshot()`，独立于 `proxy-cidr-monitor` feature 开关。
+  - 在 `PeerRouteServiceImpl::update_route_table` 提交边界维护不可变快照 `Arc<BTreeSet<Ipv4Cidr>>`。
+  - 通过 `CorePacketPlane` 导出只读快照与变更通知能力，独立于 `proxy-cidr-monitor` feature 开关。
   - 导出配置 `CoreRuntimeConfigStore` 的快照与订阅接口。
   - 导出纯算法函数：
     - `normalize_v4_cidr(addr: Ipv4Addr, prefix: u8) -> Result<Ipv4Cidr, cidr::errors::NetworkParseError>`（CIDR 主机位规范化）。
-    - 现有的 `resolve_proxy_cidrs(peer_routes: BTreeSet<Ipv4Cidr>, config: ProxyCidrConfigSnapshot) -> BTreeSet<Ipv4Cidr>`（拥有所有权的手工覆盖计算）。
+    - 现有的 `resolve_proxy_cidrs(peer_routes: BTreeSet<Ipv4Cidr>, config: ProxyCidrConfigSnapshot) -> BTreeSet<Ipv4Cidr>`。
 - **`easytier`（宿主策略、生命周期与系统控制）**：
-  - 定义 `RouteSpec`、`InstalledRoute`、`PendingOperation`、`InterfaceBinding` 记录结构与结果枚举。
-  - 实现 Host 侧策略函数 `calculate_desired_proxy_routes`：过滤未迁移来源重叠、解析平台默认参数（Linux 65535, Windows 9000）、生成 `RouteSpec`。
-  - 实现 `RouteBackend` 及其原生/委托实现（包含长连接 Netlink、Win32 API 等）。
-  - 实现 `HostRouteManager` 协调循环、未决操作追踪、多代际记录与生命周期。
-  - 接线宿主生命周期组件：`NativeInstanceRuntimeHost`、`tun_desktop.rs`、`tun_common.rs`。
-  - 改造 Magic DNS 真实清理路径：独立返回路由删除结果 `DnsCleanOutcome`，传递至 `DnsRunner` 与 `MagicDnsRuntime::stop()`。
+  - 定义统一的 `Route` 结构与 `RouteError` 枚举。
+  - 实现 Host 侧策略计算 `calculate_desired_routes`：解析默认接口与默认 Metric（Linux 65535, Windows 9000），过滤未迁移冲突，输出 `BTreeSet<Route>`。
+  - 实现具体平台后端（Linux Netlink 长连接、消除 dump）。
+  - 实现 `HostRouteManager` 协调循环、失败退避与基于 `guarden` 的清理。
+  - 改造 Magic DNS 清理：解耦系统配置恢复与路由删除，独立返回路由清理结果 `DnsCleanOutcome`。
 
 ```text
 easytier-core/
   └── src/
         ├── instance/
-        │     └── packet_plane.rs           [修改] 独立于旧 monitor 导出 list_proxy_cidrs_snapshot 与 watch 订阅
+        │     └── packet_plane.rs           [修改] 独立于旧 monitor 导出 list_proxy_cidrs_snapshot 与变更通知
         ├── peers/route/
         │     ├── peer_ospf_route.rs        [修改] 在 update_route_table 提交边界维护 Arc<BTreeSet<Ipv4Cidr>> 快照
         │     └── projection.rs             [纯算法] normalize_v4_cidr (纯网络前缀清除，无 Host 依赖)
@@ -78,61 +66,30 @@ easytier/
         └── instance/
               ├── route/
               │     ├── mod.rs              [新增] 模块入口
-              │     ├── model.rs            [新增] RouteSpec, InstalledRoute, PendingOperation, InterfaceBinding, 结果枚举
-              │     ├── policy.rs           [新增] Host 侧策略计算 (未迁移冲突过滤与参数补全，输出 RouteSpec)
-              │     ├── backend.rs          [新增] RouteBackend 抽象与 MockBackend
+              │     ├── model.rs            [新增] 统一 Route 结构, RouteError
+              │     ├── policy.rs           [新增] Host 侧策略计算 (接口/Metric 解析与冲突过滤)
+              │     ├── backend.rs          [新增] RouteBackend trait 及编译期平台类型别名
               │     ├── backend/
-              │     │     ├── netlink.rs    [新增] Linux 专属实现 (长连接 netns 绑定、req/ACK 匹配、消除 dump)
-              │     │     ├── windows.rs    [新增] Windows 专属实现 (Win32 API、默认 Metric 9000)
-              │     │     ├── darwin.rs     [新增] macOS/FreeBSD 专属实现
-              │     │     └── delegated.rs  [新增] 移动端委托后端 (真实会话所有者契约)
-              │     └── manager.rs          [新增] HostRouteManager 核心闭环、未决操作记录与多代际绑定
+              │     │     └── netlink.rs    [新增] Linux 专属实现 (长连接 netns 绑定、req/ACK 匹配、消除 dump)
+              │     └── manager.rs          [新增] HostRouteManager 核心闭环与 guarden 清理
               ├── dns_server/
               │     ├── server_instance.rs  [修改] clean_env() 解耦系统配置并独立返回 DnsCleanOutcome
               │     └── runner.rs           [修改] 传递 clean_env() 结果至外部
-              ├── runtime_host.rs           [修改] 管理器实例生命周期管理 (持留 Handle 并在 shutdown 协调停止)
+              ├── runtime_host.rs           [修改] 管理器实例生命周期挂载与停机协调
               ├── runtime_host/
               │     ├── implementation.rs   [修改] 转发宿主运行时接口
               │     ├── magic_dns.rs        [修改] stop() 向上返回 DnsCleanOutcome
-              │     ├── tun_desktop.rs      [修改] 静态 TUN 与 DHCP 换卡通过命令通道交接 bind/unbind
-              │     └── tun_common.rs       [修改] TunNicState::stop 与 drain 协调解绑与旧网卡销毁确认
-              └── virtual_nic.rs            [修改] 按 RouteBackendMode 决策是否启动 run_proxy_cidrs_route_updater
+              │     └── tun_desktop.rs      [修改] 网卡就绪与重建时触发 Manager 换绑与刷新
+              └── virtual_nic.rs            [修改] Linux 下跳过创建 run_proxy_cidrs_route_updater
 ```
-
-### 2.2 `refactor/route-dev` 移植决策
-
-经核对 `refactor/route-dev` (`8abfb51e`) 分支中 `easytier/src/nic/route/manager.rs`：
-- **移植并改进**：
-  1. `RouteSpec` 概念：移植并精简为包含 `destination: IpCidr` 与 `metric: Option<i32>`，补充基于 `Ipv4Inet::network()` 的安全构造方法。
-  2. 单循环顺序处理思路：移植其简洁的循环骨架，填充为真正的比对、执行、记账、未决操作追踪与退避闭环。
-- **坚决舍弃**：
-  1. **舍弃 `nic.nic_ctx.downcast_ref::<Nic>()`**：切断通过 Any 锁住 NIC 的旧设计，改为构造时显式注入 `RouteBackend`。
-  2. **舍弃 `RouteCommand::SyncSource` 通道机制**：舍弃多通道代际状态机，采用拉取模型与单通知唤醒。
-  3. **不重新引入 `route_demand` 与 `route_shadow`**：坚决不引入版本化需求注册表与生产影子框架。
 
 ---
 
 ## 3. 结构与接口定义
 
-### 3.1 核心数据结构与安全构造
+### 3.1 统一路由模型 (`Route`)
 
-```rust
-// easytier-core/src/peers/route/projection.rs
-use std::net::Ipv4Addr;
-use cidr::{Ipv4Cidr, Ipv4Inet};
-
-/// 安全的纯 IPv4 CIDR 规范化函数：清除主机位，非法前缀显式返回错误，严禁 panic
-pub fn normalize_v4_cidr(addr: Ipv4Addr, prefix: u8) -> Result<Ipv4Cidr, cidr::errors::NetworkParseError> {
-    let inet = Ipv4Inet::new(addr, prefix)?;
-    Ok(inet.network())
-}
-
-// 现有 Core 中 resolve_proxy_cidrs 的真实函数签名 (easytier-core/src/gateway/proxy/cidr_monitor.rs:76)
-// pub(crate) fn resolve_proxy_cidrs(
-//     peer_routes: BTreeSet<Ipv4Cidr>,
-//     config: ProxyCidrConfigSnapshot,
-// ) -> BTreeSet<Ipv4Cidr>;
-```
+合并旧方案中重复的 `RouteSpec` 与 `InstalledRoute`，使用一种完整的 `Route` 结构表达生效参数：
 
 ```rust
 // easytier/src/instance/route/model.rs
@@ -140,326 +97,233 @@ use std::net::Ipv4Addr;
 use cidr::{IpCidr, Ipv4Cidr, Ipv4Inet};
 
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
-pub struct RouteSpec {
+pub struct Route {
+    /// 目标网络 CIDR
     pub destination: IpCidr,
-    pub metric: Option<i32>,
+    /// 指定出口网卡名称 (执行前若未指定则解析为实例默认 TUN 网卡)
+    pub interface: String,
+    /// 有效 Metric 跃点数 (执行前若未指定则解析为平台默认值，Linux 为 65535)
+    pub metric: u32,
 }
 
-impl RouteSpec {
-    /// 安全的 IPv4 构造函数：利用 Ipv4Inet 清除主机位，非法前缀显式返回错误
-    pub fn try_new_v4(addr: Ipv4Addr, prefix: u8, metric: Option<i32>) -> Result<Self, cidr::errors::NetworkParseError> {
+impl Route {
+    /// 安全的 IPv4 构造函数：利用 Ipv4Inet 清除主机位，非法前缀显式返回错误，杜绝 panic
+    pub fn try_new_v4(addr: Ipv4Addr, prefix: u8, interface: String, metric: u32) -> Result<Self, cidr::errors::NetworkParseError> {
         let inet = Ipv4Inet::new(addr, prefix)?;
         Ok(Self {
             destination: IpCidr::V4(inet.network()),
+            interface,
             metric,
         })
     }
 
-    /// 从已规范化的 Ipv4Cidr 直接构造，避免重复规范化开销
-    pub fn from_v4_cidr(cidr: Ipv4Cidr, metric: Option<i32>) -> Self {
+    /// 从已规范化的 Ipv4Cidr 构造
+    pub fn from_v4_cidr(cidr: Ipv4Cidr, interface: String, metric: u32) -> Self {
         Self {
             destination: IpCidr::V4(cidr),
+            interface,
             metric,
         }
     }
 }
-
-/// 实际创建记录：保存底层创建时的真实通用属性与接口代际，支持精确删除
-/// 平台专属字段（如 Linux routing table）严格保存在后端内部，不向通用宿主身份扩散
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct InstalledRoute {
-    pub spec: RouteSpec,
-    pub binding: InterfaceBinding,
-    pub actual_metric: u32,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Hash)]
-pub struct InterfaceBinding {
-    pub ifname: String,
-    pub ifindex: u32,
-    pub generation: u64,
-}
 ```
 
-### 3.2 操作结果与未决操作记录 (`PendingOperation`)
+**模型与行为约束（A1 闭合）**：
+- **完整参数表达**：无论是期望集合（`desired`）还是成功安装集合（`installed`），均使用 `Route`。
+- **解析在先、匹配在前**：输入中的缺省接口和默认 Metric 在进入执行前由策略函数完成补全；用户显式指定的接口不得被隐式替换为默认 TUN。不同接口的同 CIDR 视为不同路由。
+- **删除以创建记录为准**：系统调用成功后将实际创建参数存入 `installed: BTreeSet<Route>`；删除时严格使用该记录，绝不重新根据当前变化了的默认值猜测接口与 Metric。
+- **所有权表达权限**：仅仅系统中存在相同前缀或字段齐全，不赋予本方删除权；只有记录在 `installed` 中的路由才允许被本方清理。
 
-为解决“添加产生副作用但确认丢失导致停机漏删”的问题，定义明确的结构化结果，并引入显式的未决操作记录：
+### 3.2 标准错误类型 (`RouteError`) 与后端接口
+
+删除自定义的 `Outcome` 枚举，统一使用标准 `thiserror` 错误与 `Result<Option<T>, RouteError>`：
 
 ```rust
 // easytier/src/instance/route/model.rs
 
-pub enum AddRouteOutcome {
-    /// 成功在系统中创建了路由，并返回实际生效的底层安装记录
-    Created(InstalledRoute),
-    /// 系统中已存在相同条目（非本方创建，不予认领，不入账，记录诊断警告）
-    AlreadyPresent,
-    /// 确定性的系统调用失败（如权限不足、参数非法），记录错误并按退避重试
+#[derive(thiserror::Error, Debug)]
+pub enum RouteError {
+    #[error("route operation failed deterministically: {0}")]
     Failed(anyhow::Error),
-    /// 结果不明（如超时、Netlink 套接字异常中断），记录未决操作，严禁盲目重试
-    OutcomeUnknown(anyhow::Error),
-}
-
-pub enum RemoveRouteOutcome {
-    /// 成功从系统中删除了目标路由
-    Removed,
-    /// 系统中已经不存在目标路由（已达目标状态，正常销毁账目）
-    AlreadyAbsent,
-    /// 确定性的删除失败（如正在使用、系统错误），保留账目并按退避重试
-    Failed(anyhow::Error),
-    /// 结果不明，保留账目并记录未决操作，严禁盲目重试
-    OutcomeUnknown(anyhow::Error),
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum PendingOperationKind {
-    Add(RouteSpec),
-    Remove(InstalledRoute),
-}
-
-/// 未决操作记录：记录因网络/套接字中断而结果不明的操作
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct PendingOperation {
-    pub kind: PendingOperationKind,
-    pub binding: InterfaceBinding,
-    pub error: String,
-    pub recorded_at: std::time::Instant,
+    #[error("route operation outcome is unknown: {0}")]
+    Unknown(anyhow::Error),
 }
 ```
-
-**未决操作处理约束（S1 / T4 闭合）**：
-1. **不因需求撤销而丢弃**：若某条路由添加返回 `OutcomeUnknown`，随后外部需求撤销，该条目的 `PendingOperation` **必须保留**，绝不能因不在 desired 中就直接丢弃。
-2. **不冒充认领**：未决添加不能视为 `Created`，也不能仅凭系统中存在同名前缀就草率认领。
-3. **阻塞交接与停机可见性**：
-   - 存在对应网段的未决操作时，严禁向 DNS 或外部 writer 发放预留交接确认，保持阻塞；
-   - 严禁盲目重复下发添加或擅自调用删除；
-   - 在 `stop(deadline)` 时，若存在未决操作，**必须作为未完成项返回**，绝不返回清理完成。
-
-### 3.3 后端接口抽象 (`RouteBackend`)
 
 ```rust
 // easytier/src/instance/route/backend.rs
 use super::model::*;
 
 #[async_trait::async_trait]
-pub trait NativeRouteBackend: Send + Sync + 'static {
+pub trait RouteBackend: Send + Sync + 'static {
     /// 添加一条路由
-    async fn add_route(&self, route: &RouteSpec, binding: &InterfaceBinding) -> AddRouteOutcome;
+    /// - Ok(Some(actual_route)): 本方成功创建，返回实际生效参数 (记入 installed)
+    /// - Ok(None): 系统中已存在相同条目，非本方创建，不予认领 (不入账，记录警告)
+    /// - Err(RouteError::Failed(err)): 确定性失败，按指数退避重试
+    /// - Err(RouteError::Unknown(err)): 结果不明 (如超时、套接字中断)，记入未决责任，严禁盲目重发
+    async fn add(&mut self, route: &Route) -> Result<Option<Route>, RouteError>;
+
     /// 精确删除一条由本方创建的路由
-    async fn remove_route(&self, record: &InstalledRoute) -> RemoveRouteOutcome;
+    /// - Ok(Some(())): 成功从系统中删除 (移出 installed)
+    /// - Ok(None): 系统中精确目标已不存在，目标状态已达成 (移出 installed)
+    /// - Err(RouteError::Failed(err)): 确定性失败，保留账目并按退避重试
+    /// - Err(RouteError::Unknown(err)): 结果不明，保留账目并报警，严禁盲目重发
+    async fn remove(&mut self, route: &Route) -> Result<Option<()>, RouteError>;
 }
+```
 
-#[async_trait::async_trait]
-pub trait DelegatedRouteBackend: Send + Sync + 'static {
-    /// 移动端全量路由应用契约：由真实会话所有者组装完整 VPN 配置（保留 DNS、接口前缀等非代理需求），
-    /// 仅将旧代理路由子集替换为最新的 desired 集合，并等待宿主明确确认
-    async fn apply_routes(&self, routes: &std::collections::BTreeSet<RouteSpec>) -> Result<(), anyhow::Error>;
-    /// 重置移动端会话（会话失效或注销时清空 applied 状态，不跨实例共享）
-    async fn reset_session(&self) -> Result<(), anyhow::Error>;
-}
+### 3.3 编译期平台选择与 Linux Netlink 实现
 
-pub enum RouteBackend {
-    Native(Box<dyn NativeRouteBackend>),
-    Delegated(Box<dyn DelegatedRouteBackend>),
-    NoTun,
-}
+沿用仓库已有 `common/ifcfg/mod.rs` 模式，通过编译期条件选择具体类型别名，删除生产运行时的 `Box<dyn Backend>` 动态分发（A3 闭合）：
+
+```rust
+// easytier/src/instance/route/backend.rs
+
+#[cfg(target_os = "linux")]
+pub type PlatformRouteBackend = netlink::NetlinkRouteBackend;
+
+#[cfg(target_os = "windows")]
+pub type PlatformRouteBackend = windows::WindowsRouteBackend;
+
+#[cfg(target_os = "macos")]
+pub type PlatformRouteBackend = darwin::DarwinRouteBackend;
+
+#[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
+pub type PlatformRouteBackend = stub::StubRouteBackend;
 ```
 
 #### Linux Netlink 后端细节要求
 `easytier/src/instance/route/backend/netlink.rs` 的实现必须满足：
-1. **连接与 NetNS 绑定**：创建时在目标 NetNS 中打开长连接 Netlink 套接字并绑定，生命周期内持续复用，消除每请求创建与关闭 socket 的系统开销。
-2. **请求 / ACK 匹配**：为每次请求分配单调递增的序列号（`nlmsg_seq`），收包循环严格匹配对应的 `NLMSG_ERROR` ACK，正确处理乱序或插队响应，坚决不假设一发一收。
-3. **消除 Dump**：直接构造带 `RTA_DST`、`RTA_OIF`、`RTA_PRIORITY`、`rtm_table` 的单发 `RTM_DELROUTE` 报文下发，单条删除请求数量恒定为 1，杜绝用户态全表扫描。
+1. **连接与 NetNS 绑定**：创建时在目标 NetNS 中打开长连接 Netlink 套接字并绑定，生命周期内持续复用，消除每请求临时创建 socket 的开销。
+2. **请求 / ACK 匹配**：为每次请求分配单调递增的序列号（`nlmsg_seq`），收包循环严格匹配对应的 `NLMSG_ERROR` ACK，正确处理乱序或插队响应。
+3. **消除 Dump**：直接构造带 `RTA_DST`、`RTA_OIF`、`RTA_PRIORITY`、`rtm_table` 的单发 `RTM_DELROUTE` 报文下发，单条删除请求数量恒定为 1，杜绝用户态全表 dump 扫描。
 4. **异步安全**：将阻塞底层网络 I/O 放入 `tokio::task::spawn_blocking` 中执行，不阻塞 Tokio 异步调度器线程；NetNS 绑定固定在专用执行环境中，绝不跨越 `await`。
 
-### 3.4 Manager 结构与内部控制命令
+### 3.4 Manager 结构与句柄定义
 
-为消除解绑时的循环等待死锁，并在接口交接中提供明确的所有权和执行屏障，Manager 引入内部控制命令：
+Manager 直接持有编译期确定的具体后端类型（支持泛型以方便单元测试替换）：
 
 ```rust
 // easytier/src/instance/route/manager.rs
+use std::collections::{BTreeMap, BTreeSet};
+use super::model::*;
+use super::backend::PlatformRouteBackend;
 
 pub enum ManagerCommand {
-    /// 绑定新接口：更新 binding，重置 installed，并将 execution_dirty 置为 true 强制下发期望路由
-    BindInterface {
-        binding: InterfaceBinding,
-        backend: Box<dyn NativeRouteBackend>,
-        ack: tokio::sync::oneshot::Sender<()>,
-    },
-    /// 接口解绑：停止该接口的一切新 I/O，归档至 retired，冻结等待宿主决策，回复 ACK
-    UnbindInterface {
-        ack: tokio::sync::oneshot::Sender<()>,
-    },
-    /// 宿主确认底层设备已物理销毁（内核已级联删除路由）：直接注销对应代际的旧记录
-    ConfirmInterfaceDestroyed {
-        generation: u64,
-        ack: tokio::sync::oneshot::Sender<()>,
-    },
-    /// 宿主明确保留旧网卡设备：授权 Manager 启动针对该 retired 后端的精确 remove_route 清理
-    CleanupRetiredInterface {
-        generation: u64,
-        ack: tokio::sync::oneshot::Sender<Result<(), anyhow::Error>>,
-    },
-    /// 显式停机：携带统一 deadline
+    /// 触发刷新：外部通知有新快照或配置变更到达，协调循环被唤醒后统一拉取
+    Refresh,
+    /// 显式停机：携带统一超时时间
     Stop {
         deadline: std::time::Instant,
         ack: tokio::sync::oneshot::Sender<Result<(), CleanupIncomplete>>,
     },
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum RetiredBindingState {
-    /// 已解绑，已停止所有 I/O，全局冻结等待宿主决策 (所有执行入口严禁触碰)
-    FrozenAwaitingDecision,
-    /// 宿主明确保留设备并交回控制，已授权 Manager 执行精确清理
-    CleaningActive,
-}
-
-pub struct RetiredBindingContext {
-    pub binding: InterfaceBinding,
-    pub backend: Box<dyn NativeRouteBackend>,
-    pub installed: std::collections::BTreeMap<RouteSpec, InstalledRoute>,
-    pub pending: std::collections::BTreeMap<RouteSpec, PendingOperation>,
-    pub state: RetiredBindingState,
-}
-
-pub struct HostRouteManager {
-    backend: RouteBackend,
-    /// 当前活跃绑定的已安装路由记录 (spec -> InstalledRoute)
-    installed_routes: std::collections::BTreeMap<RouteSpec, InstalledRoute>,
-    /// 待清理的旧绑定及其专属后端、残留记录、未决操作与状态
-    retired_bindings: Vec<RetiredBindingContext>,
-    /// 未决操作记录表 (记录 OutcomeUnknown 项)
-    pending_operations: std::collections::BTreeMap<RouteSpec, PendingOperation>,
-    /// 失败重试退避追踪表 (限制事件风暴下的反复重试)
-    retry_tracker: std::collections::BTreeMap<RouteSpec, RetryState>,
-    /// 当前网卡绑定上下文
-    current_binding: Option<InterfaceBinding>,
-    /// 纯业务期望路由投影缓存 (仅当 Core 输入快照变化时重算)
-    desired_routes_cache: Option<Arc<Vec<RouteSpec>>>,
-    /// 上一轮输入快照指针与路由相关配置
-    last_peer_cidrs: Option<Arc<std::collections::BTreeSet<cidr::Ipv4Cidr>>>,
-    last_manual_routes: Option<Option<std::collections::BTreeSet<cidr::Ipv4Cidr>>>,
-    /// 执行差异标记：当新接口绑定、期望集变化、重试到期或被请求清理时置为 true
-    execution_dirty: bool,
+pub struct HostRouteManager<B = PlatformRouteBackend> {
+    backend: B,
+    /// 本方成功安装的有效路由集合
+    installed_routes: BTreeSet<Route>,
+    /// 操作结果不明的未决路由责任表 (严禁当成普通失败重试，停机时作为未完成项报告)
+    unknown_routes: BTreeSet<Route>,
+    /// 失败重试退避追踪表
+    retry_tracker: BTreeMap<Route, RetryState>,
+    /// 当前生效的网卡名称
+    current_interface: Option<String>,
+    /// 缓存的业务期望路由集合
+    desired_routes_cache: Option<BTreeSet<Route>>,
     /// 命令接收通道
     cmd_rx: tokio::sync::mpsc::Receiver<ManagerCommand>,
-    /// 停机令牌
+    /// 停机取消令牌
     cancel_token: tokio_util::sync::CancellationToken,
 }
 
 #[derive(Clone)]
 pub struct RouteManagerHandle {
     cmd_tx: tokio::sync::mpsc::Sender<ManagerCommand>,
-    join_handle: Arc<tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>>,
+    join_handle: std::sync::Arc<tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>>,
     cancel_token: tokio_util::sync::CancellationToken,
 }
 
 impl RouteManagerHandle {
-    /// 接口创建/重建时更新绑定 (等待 Manager 确认切换并置 dirty)
-    pub async fn bind_interface(&self, binding: InterfaceBinding, backend: Box<dyn NativeRouteBackend>) -> anyhow::Result<()> { ... }
-    /// 接口注销/失效时解绑 (等待 Manager 确认旧条目已冻结归档，且当前在途 I/O 结算完毕)
-    pub async fn unbind_interface(&self) -> anyhow::Result<()> { ... }
-    /// 宿主销毁网卡后调用确认 (注销对应 generation，无冗余调用)
-    pub async fn confirm_interface_destroyed(&self, generation: u64) -> anyhow::Result<()> { ... }
-    /// 宿主保留网卡时授权清理 (由 Manager 执行精确清理)
-    pub async fn cleanup_retired_interface(&self, generation: u64) -> anyhow::Result<()> { ... }
-    /// 显式停机：借用 Handle，整个等待严格受 deadline 约束；超时返回未完成信息，原持有者继续保留 Handle 与 JoinHandle
+    /// 发送刷新唤醒 (通知到达时合并触发，不逐条排队)
+    pub fn notify_refresh(&self) {
+        let _ = self.cmd_tx.try_send(ManagerCommand::Refresh);
+    }
+
+    /// 显式停机：借用 Handle，整个等待严格受 deadline 约束；超时返回未完成信息，原持有者继续保留 Handle
     pub async fn stop(&self, deadline: std::time::Instant) -> Result<(), CleanupIncomplete> { ... }
 }
 ```
 
 ---
 
-## 4. 输入接线与无冗余调度
+## 4. 输入拉取与无冗余调度
 
-### 4.1 输入接线映射表
+### 4.1 权威输入拉取与唤醒机制（A6 闭合）
 
-Manager 绝不通过虚假消息总线通信，而是直接绑定各组件的权威只读入口：
+Manager 采用**事件驱动拉取**模型，通知只负责唤醒，不逐条重放事件：
 
 | 来源分类 | 读取入口 (Read API) | 快照提交点 (Commit Point) | 通知方式 (Wakeup) |
 | :--- | :--- | :--- | :--- |
-| **Core Peer 路由** | `CorePacketPlane::list_proxy_cidrs_snapshot() -> Arc<BTreeSet<Ipv4Cidr>>` | OSPF 路由表更新处 (`PeerRouteServiceImpl::update_route_table`) 提交 `ArcSwap` | Core 自有的 `watch::Receiver<Arc<BTreeSet<Ipv4Cidr>>>` 触发唤醒 |
-| **手工静态配置** | `CoreRuntimeConfigStore::snapshot().services.manual_routes` | 配置变更原子提交处 | 订阅 `subscribe_service_runtime_changes()` 唤醒 |
-| **Host 未迁移事实** | `UnmigratedRouteTracker::snapshot()` | DHCP lease 变更、TUN IP 变更、DNS 启停提交处 | 提交处内部触发 Manager 唤醒通知 |
+| **Core Peer 路由** | `CorePacketPlane::list_proxy_cidrs_snapshot() -> Arc<BTreeSet<Ipv4Cidr>>` | OSPF 路由更新处 (`PeerRouteServiceImpl::update_route_table`) 提交 `ArcSwap` | Core 自有通知触发 `handle.notify_refresh()` |
+| **手工静态配置** | `CoreRuntimeConfigStore::snapshot().services.manual_routes` | 配置变更原子提交处 | 订阅变更触发 `handle.notify_refresh()` |
+| **Host 未迁移事实** | `UnmigratedRouteTracker::snapshot()` | DHCP lease 变更、TUN IP 变更、DNS 启停提交处 | 提交处内部触发 `handle.notify_refresh()` |
 
 ### 4.2 订阅与初态读取顺序
 
 为杜绝启动初始化期间的事件丢失，严格执行**先订阅、后读初态**（`subscribe -> read_initial`）原则：
-1. 先建立 `CorePacketPlane` 的 proxy cidrs `watch` 订阅与 `CoreRuntimeConfigStore` 服务订阅。
+1. 先建立 Core 路由变更监听与配置订阅。
 2. 立即拉取各来源的初始快照，装配初态。
-3. 启动协调循环。在订阅与初态读取之间到达的任何并发更新，均会通过已注册的通道准确唤醒。
+3. 启动协调循环。在订阅与初态读取之间到达的任何并发更新，均会通过已注册的通知准确合并唤醒。
 
-### 4.3 稳态零多余计算与执行跳过机制（T3 闭合）
+### 4.3 稳态零多余计算与执行跳过
 
-方案严格区分**业务期望投影计算**与**系统差异协调执行**：
-
-1. **业务期望投影计算与快照缓存 (`desired_routes_cache`)**：
-   - 比较 `Arc::ptr_eq(&last_peer_cidrs, &current_peer_cidrs)`；
-   - 比较 `current_config.services.manual_routes == last_manual_routes`（**忽略与路由无关的其他服务配置变更**，如 Socks5/DHCP 配置变动不引发重算）；
-   - 比较未迁移事实快照。
-   - 若三者均未改变，**直接复用 `desired_routes_cache: Arc<Vec<RouteSpec>>`**，0 次策略计算，0 次内存分配！
-2. **系统差异协调执行标记 (`execution_dirty`)**：
-   - `execution_dirty` 独立于业务输入快照。以下情况**必须置为 `true`**：
-     - **新网卡绑定**：收到 `BindInterface` 命令时，设置 `execution_dirty = true`；
-     - **业务期望集发生实质变更**（计算出新的 `desired_routes`）；
-     - **重试定时器到期**（存在到期的失败项需重新尝试）；
-     - **旧绑定被授权清理**（收到 `CleanupRetiredInterface` 命令）。
-3. **快速跳过执行条件**：
-   协调循环仅在同时满足以下条件时跳过执行差异并休眠：
-   - `!execution_dirty`；
-   - 当前网卡已绑定且已完成协调（`installed_routes` 与 `desired_routes_cache` 一致）；
-   - 无到期的重试项；
-   - `retired_bindings` 中无处于 `CleaningActive` 的待处理项。
-   **当同配置、同地址的新网卡绑定时**，虽然输入快照未变，但 `execution_dirty == true` 强制执行一次协调：复用缓存的 `desired_routes`，计算 `to_add = desired - installed`（全量下发至新网卡），保证新网卡立即安装全部期望路由！
+1. **输入快照与路由相关配置比较**：
+   协调循环被唤醒后，首先比对：
+   - `Arc::ptr_eq(&last_peer_cidrs, &current_peer_cidrs)`；
+   - `current_config.services.manual_routes == last_manual_routes`（**忽略与路由无关的其他服务配置变更**，如 Socks5/DHCP 配置变动不引发重算）；
+   - 未迁移事实快照。
+   若输入未变且当前网卡名称未变，直接复用 `desired_routes_cache`，**0 堆分配，0 策略重算**。
+2. **差异跳过机制**：
+   比对 `desired_routes_cache` 与 `installed_routes`：若二者集合完全相等且无到期的失败重试项，**直接跳过系统调用并休眠**，稳态系统调用数为 0。
+3. **网卡替换强制重算**：
+   当网卡发生替换（`current_interface` 变化）时，即使 Core 输入快照未变，差异比对会立即发现 `installed_routes` 为空，从而直接下发期望路由，杜绝同配置换卡漏装路由的问题。
+4. **低频保底与独立重试**：
+   废除 1 秒忙碌轮询，设 30 秒低频保底核对；失败重试由退避计时器在到达最早 `next_retry` 时精准唤醒。
 
 ---
 
-## 5. 执行闭环设计与生命周期
+## 5. 执行闭环与 guarden 清理
 
-### 5.1 协调循环核心算法（解绑交接与执行顺序）
+### 5.1 协调循环核心算法
 
 ```text
        ┌────────────────────────────────────────────────────────┐
-       │ 唤醒源: 命令通道 (cmd) OR watch 通知 OR 重试/保底定时器 │
+       │ 唤醒源: ManagerCommand (Refresh/Stop) OR 重试/保底定时器 │
        └──────────────────────────┬─────────────────────────────┘
                                   ↓
        ┌────────────────────────────────────────────────────────┐
-       │ 1. 批量处理当前到达的所有命令:                          │
-       │    - Bind: 设置 current_binding, 清空 installed,       │
-       │            置 execution_dirty = true, 回复 ack          │
-       │    - Unbind: 停止当前 I/O, 归档至 retired (Frozen),     │
-       │              回复 ack (承诺绝不自主对旧网卡发起 I/O)    │
-       │    - ConfirmDestroy: 注销指定 generation 的旧记录       │
-       │    - CleanupRetired: 置对应 retired 为 CleaningActive,  │
-       │                      置 execution_dirty = true         │
-       │    - Stop: 进入全局限时停机流程                         │
+       │ 1. 检查取消令牌与命令 (若收到 Stop 命令进入停机清理流程) │
+       │ 2. 拉取最新权威输入:                                   │
+       │    - 比较快照与路由配置 (未变则复用 desired_routes_cache)│
+       │ 3. 策略计算生成 desired_routes (过滤未迁移冲突, 解析参数)│
+       │ 4. 计算差异:                                           │
+       │    to_remove = installed - desired                     │
+       │    to_add    = desired - installed                     │
+       │    若差异为空且无到期重试项 -> 稳态直接休眠             │
        └──────────────────────────┬─────────────────────────────┘
                                   ↓
        ┌────────────────────────────────────────────────────────┐
-       │ 2. 处理已授权清理的 retired_bindings (CleaningActive):  │
-       │    - 遍历对应 retired 后端执行 remove_route            │
-       │    - 成功或确认不存在 -> 移出记录                      │
-       │    - 失败 -> 记录退避；结果不明 -> 记入 pending_ops     │
-       │    - (Frozen 状态的旧绑定在此处完全跳过，严禁触碰)      │
-       └──────────────────────────┬─────────────────────────────┘
-                                  ↓
-       ┌────────────────────────────────────────────────────────┐
-       │ 3. 检查当前网卡绑定 current_binding:                   │
-       │    - 若为 None: 暂停安装新路由，继续监听并休眠           │
-       │    - 若为 Some: 检查输入快照并按需更新 desired_routes    │
-       └──────────────────────────┬─────────────────────────────┘
-                                  ↓
-       ┌────────────────────────────────────────────────────────┐
-       │ 4. 若 !execution_dirty: 直接休眠 (稳态零多余操作)       │
-       │ 5. 计算差异: to_remove = installed - desired           │
-       │             to_add    = desired - installed           │
-       │ 6. 逐项有界执行 (每 16 项检查一次取消与代际失效):       │
-       │    a. 执行 to_remove: 成功 -> 移除记录                 │
-       │    b. 执行 to_add:    成功 -> 插入 InstalledRoute      │
-       │                       已存在 -> 不入账，记录警告       │
-       │                       确定失败 -> 启动指数退避         │
-       │                       结果不明 -> 记入 pending_ops     │
-       │ 7. 本轮差异处理完毕，重置 execution_dirty = false       │
+       │ 5. 逐项有界执行 (每 16 项检查一次取消与输入失效):       │
+       │    a. 执行 to_remove:                                  │
+       │       - Ok(Some(())) / Ok(None) -> 移出 installed      │
+       │       - Err(Failed)  -> 记录指数退避                   │
+       │       - Err(Unknown) -> 记入 unknown_routes            │
+       │    b. 执行 to_add:                                     │
+       │       - Ok(Some(route)) -> 插入 installed              │
+       │       - Ok(None)        -> 外部存在不入账，记录警告     │
+       │       - Err(Failed)     -> 记录指数退避                │
+       │       - Err(Unknown)    -> 记入 unknown_routes         │
        └────────────────────────────────────────────────────────┘
 ```
 
@@ -470,92 +334,80 @@ Manager 绝不通过虚假消息总线通信，而是直接绑定各组件的权
    退避序列：100ms, 200ms, 400ms, 800ms, 1.6s, 最高封顶 5s。
    在下一轮循环计算差异时，**尚未到达 `next_retry` 的失败项不被选入当轮执行队列**。当输入变化使该条目不再需要时，重试状态自动释放。这彻底防止了因无关配置变化或频繁 OSPF 广播导致同一个底层错误被高频重试（防事件风暴）。
 2. **中途失效丢弃过时计划**：
-   在遍历执行 `to_remove` 和 `to_add` 时，每处理 16 项（或每个耗时操作后）检查一次 `cancel_token`、网卡代际与输入版本。若检测到网卡已失效或新输入涌入，**立即终止执行余下过时条目**，将已成功的操作正确记账后，立即进入下一轮最新全量比对。
+   在遍历执行 `to_remove` 和 `to_add` 时，每处理 16 项检查一次取消令牌与输入版本。若检测到网卡失效或新输入涌入，**立即终止执行余下过时条目**，将已成功的操作正确记账后，立即进入下一轮最新全量比对。
 3. **替换依赖顺序保证**：
    若同一个槽位（相同目标 CIDR）需要替换（例如 metric 变更），必须**先执行并确认删除成功，才允许尝试添加**。删除若失败，严禁盲目执行添加。
 
-### 5.3 接口重建与全局冻结约束（T2 / U1 闭合）
+### 5.3 基于 `guarden` 的资源收束与设备清理（A4 闭合）
 
-为彻底杜绝“Manager 在 Host 关闭旧接口后并发发送删除指令导致 ifindex 踩踏”的问题，交接时序与冻结状态遵循以下全局通用约束：
+废除上一轮复杂的自定义冻结协调协议（`FrozenAwaitingDecision`、`CleaningActive`、`ConfirmInterfaceDestroyed` 等），复用仓库现有的 `guarden = "0.3"` 统一管理清理任务与设备资源的所有权：
 
-1. **全局禁止 I/O 约束 (`FrozenAwaitingDecision`)**：
-   处于 `FrozenAwaitingDecision` 状态的旧绑定，**受到全局禁止 I/O 的硬性约束**。该约束对 Manager 的**全部执行入口**（包括正常差异循环、失败退避重试、Stop 停机清理、DNS 冲突交接及任何核对操作）普遍生效：
-   - 任何入口**均严禁对 Frozen 绑定发起系统调用（`remove_route` / `add_route`）**！
-   - 只有匹配绑定的 `CleanupRetiredInterface` 命令才能将其转为 `CleaningActive` 并重新授权 I/O；Stop 和 DNS 请求本身**不是这项授权**。
-2. **解绑冻结与无 I/O 承诺 (`UnbindInterface`)**：
-   - Host 触发网卡重建或切换时，调用 `handle.unbind_interface().await`；
-   - Manager 收到命令后，停止对当前绑定的所有新 I/O，等待当前单项在途操作完成并记账；
-   - 将当前绑定及其记录、未决操作打包为 `RetiredBindingContext`，**其状态标记为 `FrozenAwaitingDecision`**；
-   - Manager 向 Host 发送 ACK。
-3. **Host 处理网卡底层与分支确认**：
-   - **分支 1（销毁网卡，最常见的 TUN 重建路径）**：
-     Host 安全关闭/注销底层 TUN 设备（内核自动级联删除其所有路由）。Host 调用 `handle.confirm_interface_destroyed(gen).await`。Manager 收到后，确认设备已物理销毁，直接从 `retired_bindings` 注销丢弃对应代际的所有记录。从 ACK 到销毁确认之间，**旧后端调用数严格为 0**！
-   - **分支 2（保留网卡，仅逻辑解绑/换 IP）**：
-     Host 保留设备，调用 `handle.cleanup_retired_interface(gen).await` 交回控制。Manager 将其状态转为 `CleaningActive`，并置 `execution_dirty = true`，安全启动精确清理。
+1. **资源所有权与清理分离**：
+   当网卡失效、重建或实例退出时：
+   - Manager 停止对对应接口发起新的添加操作。
+   - 清理上下文接管相关已安装记录（`installed: BTreeSet<Route>`）、未决责任（`unknown_routes`）以及**底层设备所需资源的所有权**。
+2. **guarden 任务承接与超时容忍**：
+   通过 `guarden::guard!` 创建异步清理守卫：
+   ```rust
+   let (completion_tx, completion_rx) = tokio::sync::oneshot::channel();
+   let cleanup_guard = guarden::guard! {
+       [mut backend, installed, unknown, completion_tx = Some(completion_tx)] {
+           async move {
+               let mut all_ok = true;
+               for route in installed {
+                   if let Err(e) = backend.remove(&route).await {
+                       all_ok = false;
+                       tracing::error!(?route, ?e, "failed to remove route during cleanup");
+                   }
+               }
+               if let Some(tx) = completion_tx {
+                   let _ = tx.send(all_ok);
+               }
+           }
+       }
+   };
+   ```
+3. **显式触发与顺序保证**：
+   - **正常路径**：宿主或 Manager 显式触发清理任务，并在 `deadline` 内等待 `completion_rx`。
+   - **超时路径**：若等待超时，调用方结束等待并报告 `CleanupIncomplete`。**由于 `guarden` 持有后端与底层资源的完整所有权**，清理任务在后台继续平稳调度并结算未决操作，绝不因等待超时粗暴丢弃资源或在内核留下未决状态。
+   - **网卡销毁场景**：若宿主关闭底层 TUN 设备（内核自动级联删除其全部路由），宿主释放设备所有权并丢弃对应记录，清理任务不再发起无意义的系统调用，0 次多余系统交互。
 
-### 5.4 停机流程与超时保证 (`stop(deadline)`)（T1 / U1 闭合）
+### 5.4 停机流程与超时保证 (`stop(deadline)`)
 
 ```rust
 pub struct CleanupIncomplete {
-    pub uncleaned_active: Vec<InstalledRoute>,
-    pub uncleaned_retired: Vec<InstalledRoute>,
-    pub pending_unknown: Vec<PendingOperation>,
-    pub in_flight_operation: Option<RouteSpec>,
+    pub uncleaned_routes: Vec<Route>,
+    pub unknown_routes: Vec<Route>,
     pub reason: String,
 }
 ```
 
-停机调用 `handle.stop(deadline)` 时严格执行以下步骤，**确保整个等待过程全程受 deadline 严格约束，且绝不违背 Frozen 规则**：
-
-1. **立即打断调度**：
-   在 `handle.stop()` 入口处，**立即触发 `cancel_token.cancel()`**，拒绝接收新添加请求。
-2. **外层调用限时约束**：
-   `RouteManagerHandle::stop(&self, deadline: Instant)` 的**整个调用被 `tokio::time::timeout_at(deadline, ...)` 包裹**：
-   - 发送 `ManagerCommand::Stop { deadline, ack }` 并等待 ACK；
-   - 若发送命令等待超时、或 Manager 处理超时，外层 `timeout_at` 准时在 `deadline` 到达时返回 `Err(CleanupIncomplete { reason: "Deadline exceeded during stop", .. })`；
-   - **绝不通过 task abort 取消 Manager**：Manager 任务在后台继续平稳运行，等待在途系统调用正常返回并记账；
-   - **宿主保持持有 Handle**：因 `stop(&self)` 采用借用，Host 在收到 `CleanupIncomplete` 后依然持有 `RouteManagerHandle`，可继续通过 `join_handle` 观察后台在途任务的最终退出，绝不提前启动相竞争的新 writer。
-3. **Manager 内部限时执行与句柄独占**：
-   - **在途操作限时等待**：若当前存在正在 `spawn_blocking` 中执行的在途操作，Manager 必须避免按值消费导致丢弃接收端。Manager 持留 pinned future 的可变借用（`&mut in_flight_fut`），使用 `tokio::time::timeout_at(deadline, &mut in_flight_fut).await` 进行限时等待：
-     - 若在途操作在 deadline 前完成，将其结果如实记入账目或 `pending_operations`；
-     - 若超时未完，`in_flight_fut` 未被丢弃，Manager 在后台继续独占持有该句柄以接收最终结果，并在返回的 `CleanupIncomplete` 中将 `in_flight_operation` 设为 `Some(spec)`。
-   - **清理循环与 Frozen 遵守**：
-     - 对当前活跃绑定的 `installed_routes` 依次调用 `remove_route`，每项操作使用借用受 `timeout_at(deadline)` 保护；
-     - 对 `retired_bindings` 中处于 `CleaningActive` 状态的旧绑定，依次调用对应后端的 `remove_route`；
-     - **对 `retired_bindings` 中处于 `FrozenAwaitingDecision` 状态的旧绑定：严格禁止调用任何 `remove_route`！**
-       Manager 在 `deadline` 内仅等待 Host 发来 `ConfirmInterfaceDestroyed` 或 `CleanupRetiredInterface`：
-       - 若收到 `ConfirmInterfaceDestroyed`：直接注销记录；
-       - 若收到 `CleanupRetiredInterface`：转为 `CleaningActive` 并执行 `remove_route`；
-       - 若 `deadline` 到期仍处于 `FrozenAwaitingDecision`，将其记录在 `CleanupIncomplete.uncleaned_retired` 中如实上报，绝不擅自删除！
-   - 仅当全部已安装记录清空、`pending_operations` 为空且无在途操作时，返回 `Ok(())`；否则返回包含未完成项的 `CleanupIncomplete`。
+停机调用 `handle.stop(deadline)` 时严格执行以下步骤：
+1. **立即打断调度**：入口处立即触发 `cancel_token.cancel()`，拒绝接收新操作。
+2. **全流程限时等待**：
+   `RouteManagerHandle::stop(&self, deadline: Instant)` 整体受 `tokio::time::timeout_at(deadline, ...)` 包裹：
+   - 发送 `ManagerCommand::Stop` 并等待清理完成通知。
+   - 若发送或清理等待超时，准时在 `deadline` 到达时返回 `Err(CleanupIncomplete { .. })`。
+   - 宿主通过借用 `&self` 依然持有 `RouteManagerHandle`，可继续通过 `join_handle` 观察后台清理任务平稳退出，绝不提前启动竞争 writer。
+3. **结果真实透明**：
+   仅当 `installed_routes` 全部成功删除且 `unknown_routes` 为空时返回 `Ok(())`；存在删除失败或未决操作时返回 `CleanupIncomplete`，绝不虚报成功。
 
 ---
 
 ## 6. 写入权交接与动态冲突防御
 
-### 6.1 写入权控制与开关时序
+### 6.1 写入权控制
 
-在启动 Host 时，依据 `RouteBackendMode` 统一决策写入权：
+依据装配处的平台决策统一控制写入权：
+- **Linux 生产环境**：启用 `HostRouteManager`，宿主在创建网卡时跳过启动 `VirtualNic::run_proxy_cidrs_route_updater`，全仓代理路由仅由单一 Manager 写入。
+- **Windows / macOS / 移动端**：第二步维持原有旧链路运行，不启动新 Manager。
 
-```text
-Host 启动 / 初始化
-   │
-   ├─► 若 RouteBackendMode::NativeManager (Linux 生产默认 / 测试):
-   │     ├─► 1. 禁用 ProxyCidrMonitor 的外部路由派发
-   │     ├─► 2. VirtualNic 跳过创建 run_proxy_cidrs_route_updater
-   │     └─► 3. 启动 HostRouteManager 协调循环，接管路由写入
-   │
-   └─► 若 RouteBackendMode::Legacy (Windows / macOS / 移动端生产默认):
-         ├─► 1. 正常启动 VirtualNic::run_proxy_cidrs_route_updater (或 mobile_vpn)
-         └─► 2. 不启动 HostRouteManager，由旧链路安全维持运行
-```
-
-### 6.2 动态全量代理的重叠冲突防御与交接时序（T4 / U1 闭合）
+### 6.2 动态全量代理的重叠冲突防御与交接时序
 
 在第二步中，Magic DNS（`fake_ip/32`）与 macOS/FreeBSD 接口前缀依然由旧代码写入。
 
-**DNS 清理路径真实解耦与错误分离改造**：
-在 `easytier/src/instance/dns_server/server_instance.rs` 中，**将路由删除与系统 DNS 配置恢复彻底解耦，并分离报告结果**：
+**DNS 清理路径真实解耦与错误分离**：
+在 `easytier/src/instance/dns_server/server_instance.rs` 中，**将路由删除与系统 DNS 配置恢复彻底解耦，独立返回路由清理结果**：
 
 ```rust
 // dns_server/server_instance.rs
@@ -597,8 +449,7 @@ impl MagicDnsServerInstance {
     }
 }
 ```
-- 修改 `dns_server/runner.rs`：`DnsRunner` 退出时向外部传递 `DnsCleanOutcome`。
-- 修改 `runtime_host/magic_dns.rs`：`MagicDnsRuntime::stop(&mut self) -> Result<DnsCleanOutcome, anyhow::Error>`，向上抛出真实结构化结果。
+- `MagicDnsRuntime::stop()` 向上返回 `DnsCleanOutcome`。
 
 **未迁移上下文动态追踪 (`UnmigratedRouteTracker`)**：
 - 动态事实：`dns_status: UnmigratedWriterStatus`（包含 `Active`、`Inactive`、`CleaningFailed(Error)`）、`magic_dns_ip: Option<Ipv4Addr>`、`tun_cidr: Option<Ipv4Cidr>`。
@@ -607,23 +458,19 @@ impl MagicDnsServerInstance {
 **生命周期交接顺序（预留冲突范围 $\to$ 等待原 writer 清理确认 $\to$ 启动接手 writer）**：
 1. **场景 A：Manager 已安装代理路由 $P$，随后外部事实变化导致未迁移 DNS 也需要 $P$**：
    - **预留范围**：Host 更新 `UnmigratedRouteTracker`，将 $P$ 标记为待接手预留状态。
-   - **触发清理**：Manager 协调循环被唤醒，策略函数将 $P$ 从 desired 中剔除：
-     - **未决/在途检查**：若 $P$ 存在于 `pending_operations` 中，或正在在途添加，Manager **绝不发放预留确认，保持阻塞**！在途操作必须先结算，若添加成功则触发删除，若结果不明则持续阻塞。
-     - **已安装/旧绑定检查**：
-       - 若 $P$ 存在于当前活跃绑定的 `installed_routes` 中：调用当前后端的 `remove_route(P)`，成功后发放确认；
-       - 若 $P$ 存在于处于 `CleaningActive` 的 `retired_bindings` 中：调用该旧后端的 `remove_route(P)`，成功后发放确认；
-       - **若 $P$ 存在于处于 `FrozenAwaitingDecision` 的 `retired_bindings` 中：严禁自主发起删除！保持预留阻塞**，直到 Host 发送该代际的 `ConfirmInterfaceDestroyed`（冲突解除直接放行）或 `CleanupRetiredInterface`（授权删除成功后放行）。
-     - **完全无冲突**：只有当 $P$ 在本方记录（`installed`、`pending`、`in_flight`、`retired`）中均完全不存在时，才发放预留确认。
+   - **触发清理**：Manager 策略函数将 $P$ 从 desired 中剔除：
+     - 若 $P$ 存在于 `unknown_routes` 中：Manager 绝不发放预留确认，保持阻塞！
+     - 若 $P$ 存在于 `installed_routes` 中：调用 `remove(&route)` 删除，成功后发放确认。
+     - 若 $P$ 本方未安装且无未决操作：立即发放确认。
    - **启动旧 Writer**：DNS 模块收到确认后，方可调用底层系统接口写入 $P$。
-   - **失败防御**：若 Manager 删除 $P$ 失败，Tracker 绝不发放确认，DNS 模块中止写入并报错，绝不产生双写踩踏。
+   - **失败防御**：若 Manager 删除失败，Tracker 绝不发放确认，DNS 模块中止写入并报错，绝不产生双写踩踏。
 2. **场景 B：反向交接（未迁移 DNS 停止，将 $P$ 释放给 Manager）**：
    - DNS 模块退出并调用解耦后的 `clean_env()` 删除 $P$。
    - `MagicDnsRuntime::stop()` 向上返回 `DnsCleanOutcome`，**Tracker 严格依据 `route_cleaned` 判断**：
-     - 若 `route_cleaned.is_ok()`：路由已从系统内核完全清除！无论 `system_config_cleaned` 是否失败，Tracker 均将 `dns_status` 置为 `Inactive`，释放预留范围并唤醒 Manager。Manager 策略函数解除抑制，将 $P$ 纳入 desired 并下发安装。若 `system_config_cleaned` 存在错误，仅记录诊断日志。
-     - 若 `route_cleaned.is_err()`：路由仍残留于内核！Tracker 将状态置为 `CleaningFailed`，**继续保留排除范围**！Manager 绝不安装 $P$，防止在系统仍残留旧路由时引发冲突。
+     - 若 `route_cleaned.is_ok()`：路由已从系统内核完全清除！无论 `system_config_cleaned` 是否失败，Tracker 均将 `dns_status` 置为 `Inactive`，释放预留范围并通知 Manager。Manager 策略函数解除抑制，将 $P$ 纳入 desired 并下发安装。若 `system_config_cleaned` 失败仅记录诊断日志。
+     - 若 `route_cleaned.is_err()`：尚未确认路由已清理，**继续保留排除范围并报告错误**！Manager 绝不安装 $P$，防止在系统仍残留旧路由时引发冲突。
 3. **场景 C：macOS / FreeBSD 显式接口前缀与 TUN 重建**：
    - macOS/FreeBSD 接口直连路由在 TUN 创建时由系统/旧脚本写入；`UnmigratedRouteTracker` 记录 `tun_cidr`，Manager 策略函数自动排除与 `tun_cidr` 相同的代理路由。
-   - 换卡时，旧 TUN 必须先完成停止与解绑确认，旧责任注销或清理完毕后，才允许向新 TUN 下发新路由。
 
 ---
 
@@ -633,10 +480,10 @@ impl MagicDnsServerInstance {
 
 ### 7.1 稳态零多余操作与零堆分配
 - **机理说明**：
-  现有 `cidr_monitor.rs:165–176` 每 1 秒轮询检查一次更新时间戳与配置指针；当检测到变化时，调用 `collect_proxy_cidr_diff_from_snapshot` 执行 `collect()` 构建新的 `BTreeSet`。
-  新方案彻底废除 1 秒定时轮询，改为 Core 快照提交驱动的 `watch` 通知。协调循环利用快照指针（`Arc::ptr_eq`）快速拦截，稳态下不拉取路由表、不创建集合、不执行 diff 比对。
+  现有 `cidr_monitor.rs:165–176` 每 1 秒轮询检查一次更新时间戳与配置指针；当检测到变化时调用 `collect()` 构建新的 `BTreeSet`。
+  新方案彻底废除 1 秒定时轮询，由变更驱动通知唤醒。协调循环利用不可变快照指针（`Arc::ptr_eq`）快速拦截，稳态下不拉取路由表、不创建集合、不执行 diff 比对。
 - **测量方法**：
-  - 测试手段：MockBackend 统计底层调用计数，结合内存分配跟踪器（如全局 allocator 探针）。
+  - 测试手段：MockBackend 统计底层调用计数，结合内存分配跟踪器。
   - 验收基准：在 60 秒稳态运行期间，底层路由调用次数严格为 0；协调循环迭代的堆分配次数为 0。
 
 ### 7.2 平台连接复用
@@ -644,7 +491,7 @@ impl MagicDnsServerInstance {
   现有实现针对每个路由操作临时建立 Netlink socket。新方案在 Linux 原生后端的单次网卡绑定生命周期内持久持有单个 Netlink socket 实例，跨迭代持续复用。
 - **测量方法**：
   - 测试手段：使用 `strace -c -e socket,bind,close` 追踪单次网卡生命周期内的路由操作系统调用。
-  - 验收基准：在持续增删 100 次路由场景下，Netlink 相关套接字的创建次数严格等于后端单次绑定的 1 次（允许在网卡重绑或致命连接恢复时重新建连）。
+  - 验收基准：在持续增删 100 次路由场景下，Netlink 相关套接字的创建次数严格等于后端单次绑定的 1 次。
 
 ### 7.3 消除用户态逐条 Dump
 - **机理说明**：
@@ -660,11 +507,11 @@ impl MagicDnsServerInstance {
 分批实施划分为 5 个独立可编译、可测试的批次：
 
 ```text
-Batch 1: 纯计算与轻量模型 (Core 快照与算法 + Host 策略、模型与未决操作)
+Batch 1: 纯计算与统一模型 (Core 快照与算法 + Host 策略与统一 Route 模型)
    ↓
 Batch 2: 精确删除改造与平台后端 (Netlink 消除 dump、长连接、Mock 后端)
    ↓
-Batch 3: HostRouteManager 核心闭环 (命令通道、全局冻结约束、dirty 机制、借用 stop)
+Batch 3: HostRouteManager 核心闭环 (统一 RouteError、结果映射、失败退避、guarden 清理)
    ↓
 Batch 4: Host 真实生命周期接线与交接 (runtime_host 挂载、DNS 错误解耦、旧 updater 屏蔽)
    ↓
@@ -673,47 +520,47 @@ Batch 5: 隔离环境原生测试与基准度量 (netns 真实系统调用、零
 
 ### 8.1 分批实施详细任务
 
-#### Batch 1：纯计算与轻量模型
+#### Batch 1：纯计算与统一模型
 - **代码落点**：
-  - `easytier-core/src/peers/route/peer_ospf_route.rs`：在 `PeerRouteServiceImpl::update_route_table` 维护 `Arc<BTreeSet<Ipv4Cidr>>` 快照并导出 `watch`。
-  - `easytier-core/src/instance/packet_plane.rs`：导出 `list_proxy_cidrs_snapshot` 与 `subscribe_proxy_cidrs`。
+  - `easytier-core/src/peers/route/peer_ospf_route.rs`：在 `PeerRouteServiceImpl::update_route_table` 维护 `Arc<BTreeSet<Ipv4Cidr>>` 快照并导出变更通知。
+  - `easytier-core/src/instance/packet_plane.rs`：导出 `list_proxy_cidrs_snapshot`。
   - `easytier-core/src/peers/route/projection.rs`：纯函数 `normalize_v4_cidr`（基于 `Ipv4Inet::network()`）。
-  - `easytier/src/instance/route/model.rs`：`RouteSpec`、`InstalledRoute`、`PendingOperation`、`InterfaceBinding` 及结果枚举。
-  - `easytier/src/instance/route/policy.rs`：Host 策略计算 `calculate_desired_proxy_routes`。
+  - `easytier/src/instance/route/model.rs`：统一 `Route` 结构与 `RouteError` 枚举。
+  - `easytier/src/instance/route/policy.rs`：Host 策略计算 `calculate_desired_routes`。
 - **验证**：
-  - 单元测试：主机位非零安全规范化（`10.0.0.1/24` $\to$ `10.0.0.0/24`，无 panic）、`/0` 与 `/32` 边界测试、非法前缀（> 32 返回错误）测试、`manual_routes` 三态测试、未迁移 DNS `/32` 碰撞排除测试。
+  - 单元测试：主机位非零安全规范化（`10.0.0.1/24` $\to$ `10.0.0.0/24`，无 panic）、`/0` 与 `/32` 边界测试、非法前缀测试、`manual_routes` 三态测试、未迁移 DNS `/32` 碰撞排除测试。
 
 #### Batch 2：精确删除改造与平台后端
 - **代码落点**：
   - `easytier/src/common/ifcfg/netlink.rs`：改造 `remove_ipv4_route`，消除全量 dump，直接匹配 destination, oif, priority, table 发送 `RTM_DELROUTE`。
-  - `easytier/src/instance/route/backend.rs`：`NativeRouteBackend`、`DelegatedRouteBackend`、`MockRouteBackend`。
+  - `easytier/src/instance/route/backend.rs`：`RouteBackend` trait、编译期平台别名与 `MockRouteBackend`。
 - **验证**：
   - 单元测试：同接口、同前缀但不同 metric 的精确删除测试（验证外部 metric 路由不被误删）；Mock 后端记录核对测试。
 
 #### Batch 3：HostRouteManager 核心闭环
 - **代码落点**：
-  - `easytier/src/instance/route/manager.rs`：实现 `HostRouteManager` 协调循环、命令通道（Bind/Unbind/ConfirmDestroy/CleanupRetired/Stop）、快照指针比对、`execution_dirty` 机制、未决操作追踪、失败指数退避、中途失效检查、多代际记录跟踪与 `stop(deadline)`。
+  - `easytier/src/instance/route/manager.rs`：实现 `HostRouteManager` 协调循环、快照比对跳过、失败指数退避、中途失效检查、基于 `guarden` 的清理与 `stop(deadline)`。
 - **验证**：
   - 基于 `MockRouteBackend` 的闭环测试：
     - 首启全量添加；
     - 输入未变稳态 0 调用与 0 堆分配；
-    - **T3 验证**：输入和地址完全不变，仅替换 TUN 网卡，验证触发 `execution_dirty` 在新接口安装全部期望路由；测试先有输入后由 DHCP 首次建卡；
-    - **T2 / U1 验证**：取得 unbind ACK 后暂不发销毁确认，分别触发 Stop 和 DNS 冲突请求：验证在两个场景中旧后端调用数均严格为 0，Stop 返回未完成，DNS 保持阻塞；销毁确认到达后验证安全注销；
-    - **T1 验证**：分别注入 Stop 前的慢 add、Stop 后的慢 remove 以及命令确认延迟，验证均严格在 `deadline` 到期时返回 `CleanupIncomplete`；在途 future 借用等待超时不被丢弃，底层阻塞释放后结果被 Manager 正确接收并记账；
-    - **T4 验证**：添加注入 `OutcomeUnknown`，随后 DNS 请求同一网段，验证预留确认被严格阻塞；
-    - No-TUN 旁路测试（执行分支跳过，已安装记录保持为空）。
+    - 换网卡触发全量安装；
+    - 失败单项指数退避测试；
+    - 操作结果返回 `RouteError::Unknown` 时准确记入 `unknown_routes`，随后 stop 返回 `CleanupIncomplete`，不误报成功；
+    - Stop 限时等待超时测试，验证超时后由 guarden 任务在后台继续持有资源并安全退出；
+    - No-TUN 旁路测试（已安装记录保持为空）。
 
 #### Batch 4：Host 真实生命周期接线与交接
 - **代码落点**：
   - `easytier/src/instance/dns_server/server_instance.rs` & `runner.rs` & `runtime_host/magic_dns.rs`：解耦系统配置与路由清理，返回 `DnsCleanOutcome` 并向上抛出。
-  - `easytier/src/instance/runtime_host.rs` & `tun_desktop.rs` / `tun_common.rs` / `implementation.rs`：接入 `RouteManagerHandle`，在网卡就绪时（包括 DHCP 延迟建卡与静态卡）调用 `bind_interface`，在关闭时调用 `stop(deadline)`。
-  - `easytier/src/instance/virtual_nic.rs`：按 `RouteBackendMode` 停用 `run_proxy_cidrs_route_updater`。
+  - `easytier/src/instance/runtime_host.rs` & `tun_desktop.rs` / `tun_common.rs` / `implementation.rs`：接入 `RouteManagerHandle`，在网卡就绪与重建时触发换绑与刷新，关闭时调用 `stop(deadline)`。
+  - `easytier/src/instance/virtual_nic.rs`：Linux 下跳过创建 `run_proxy_cidrs_route_updater`。
 - **验证**：
   - 集成测试：启动集成测试节点，动态推送 `manual_routes`，验证真实 Manager 接管生效且旧 updater 不重复写入；
-  - **T4 / 校正 2 集成验证**：
-    1. 在 Linux (`system_config=None`) 且实际安装了 DNS /32 时，停止服务验证执行路由删除；
-    2. 模拟 `system_config.close()` 失败但 `remove_ipv4_route` 成功：验证路由排除范围成功释放给 Manager，不被系统配置错误阻塞；
-    3. 模拟 `remove_ipv4_route` 失败但 `system_config.close()` 成功：验证 Tracker 准确将路由标为 `CleaningFailed`，保留排除范围，杜绝双写。
+  - DNS 交接集成验证：
+    1. 在 Linux (`system_config=None`) 且安装了 DNS /32 时，停止服务验证执行路由删除；
+    2. 模拟 `system_config.close()` 失败但 `remove_ipv4_route` 成功：验证路由排除范围成功释放给 Manager；
+    3. 模拟 `remove_ipv4_route` 失败但 `system_config.close()` 成功：验证 Tracker 保留排除范围，杜绝双写。
 
 #### Batch 5：隔离环境原生测试与基准度量
 - **代码落点**：
@@ -733,14 +580,14 @@ Batch 5: 隔离环境原生测试与基准度量 (netns 真实系统调用、零
 
 在宣布第二步完成并进入第三步前，必须逐项核对满足以下门槛：
 
-- [ ] **计算正确且无 Panic**：CIDR 主机位非零（如 `10.0.0.1/24`）通过 `Ipv4Inet::network()` 安全规范化；自动代理、手工覆盖与显式空集均准确计算。
-- [ ] **依赖方向合规**：`easytier-core` 绝无引用 `easytier` 类型，所有构建目标独立可编译；Core 快照与 watch 独立于 Host。
-- [ ] **精确删除与身份完整**：已安装记录保存实际创建参数与接口代际；同接口同前缀下不同 metric 的外部路由不被误删。
+- [ ] **统一模型与计算正确**：以单一 `Route` 模型表达期望与安装路由；CIDR 主机位非零（如 `10.0.0.1/24`）安全规范化，无 panic；自动代理、手工覆盖均准确计算。
+- [ ] **依赖方向合规**：`easytier-core` 绝无引用 `easytier` 类型，所有构建目标独立可编译。
+- [ ] **精确删除与身份完整**：已安装记录保存实际创建参数；同接口同前缀下不同 metric 的外部路由不被误删。
 - [ ] **稳态零多余操作**：在网络拓扑与配置稳定的状态下，快照指针比对快速拦截，协调循环不产生多余的底层系统调用和堆内存分配；无关服务配置变动不引发路由重算。
-- [ ] **换网卡不丢路由 (T3)**：输入和地址不变仅替换网卡时，`execution_dirty` 机制确保在新网卡上准确下发全部期望路由。
-- [ ] **全局冻结与解绑安全 (T2 / U1)**：解绑后至销毁确认前，`FrozenAwaitingDecision` 全局禁止 I/O，Stop 和 DNS 交接绝不旁路调用旧后端，旧后端系统调用严格为 0；彻底消除在网卡销毁后发起旧删除的竞态。
-- [ ] **停机超时全程覆盖与在途独占 (T1)**：`stop(deadline)` 全程受 deadline 约束，在途句柄使用借用等待超时不丢弃，超时按时返回 `CleanupIncomplete`；Host 持续持有 Handle 跟踪后台在途操作，绝不虚报成功。
-- [ ] **交接防误放行与 DNS 真实删除 (T4 / 校正 2)**：未决操作存在时严格阻塞交接；Linux 等无 `system_config` 环境下 DNS 停止仍如实执行路由删除；系统配置恢复错误与路由清理错误分离，路由删除失败保留排除范围，杜绝双写。
+- [ ] **换网卡不丢路由**：网卡替换时差异比对生效，在新网卡上准确下发全部期望路由。
+- [ ] **guarden 资源收束与设备清理**：退出或换网卡时由 guarden 任务持有资源所有权平稳结算，超时不破坏操作系统状态，设备不被提前释放。
+- [ ] **停机超时全程覆盖**：`stop(deadline)` 全程受 deadline 约束，超时按时返回 `CleanupIncomplete`；Host 持续持有 Handle 跟踪后台在途操作，绝不虚报成功。
+- [ ] **交接防误放行与 DNS 真实删除**：未决操作存在时严格阻塞交接；Linux 等无 `system_config` 环境下 DNS 停止仍如实执行路由删除；系统配置恢复错误与路由清理错误分离，路由删除失败保留排除范围，杜绝双写。
 - [ ] **无全表 Dump**：Linux 下删除路由直接构造 `RTM_DELROUTE`，基准测试验证 0 次 `RTM_GETROUTE` dump。
-- [ ] **失败退避与未决记账**：添加/删除失败如实记账并不误报成功；失败项执行指数退避；结果不明记录为未决操作，停机时作为未完成项上报。
-- [ ] **生产控制一致**：在第二步启用的平台（Linux 原生）完全由 HostRouteManager 接管且旧 updater 停写；未迁移平台（Windows、macOS、移动端）由统一开关安全保持旧链路，不发生漏写或双写。
+- [ ] **失败退避与结果明确**：标准 `RouteError` 区分确定失败与未知结果；失败项执行指数退避；结果不明记录为未决责任，停机时作为未完成项上报。
+- [ ] **生产控制一致**：在第二步启用的平台（Linux 原生）完全由 HostRouteManager 接管且旧 updater 停写；未迁移平台保持原有旧链路，不发生漏写或双写。
