@@ -1,6 +1,6 @@
-# HostRouteManager 第二步实施方案：架构收缩与最小闭环（第八轮修订版）
+# HostRouteManager 第二步实施方案：架构收缩与最小闭环（第九轮修订版）
 
-状态：已根据第七轮复审审查（[`docs/host-route-manager-step2-review-7.md`](host-route-manager-step2-review-7.md)）完成全面修订。遵循实施总纲（[`docs/host-route-manager-master-plan.md`](host-route-manager-master-plan.md)）与第一步规范（[`docs/host-route-manager-step1-audit-and-contract.md`](host-route-manager-step1-audit-and-contract.md)）。  
+状态：已根据第八轮复审审查（[`docs/host-route-manager-step2-review-8.md`](host-route-manager-step2-review-8.md)）完成全面修订。遵循实施总纲（[`docs/host-route-manager-master-plan.md`](host-route-manager-master-plan.md)）与第一步规范（[`docs/host-route-manager-step1-audit-and-contract.md`](host-route-manager-step1-audit-and-contract.md)）。  
 基线代码：`refactor/route` 分支；参考分支：`refactor/route-dev` (`8abfb51e`)。
 
 ---
@@ -12,8 +12,8 @@
 1. **范围聚焦**：接管 **IPv4 自动子网代理路由（Peer Proxy CIDR）** 与 **手工静态代理路由（`manual_routes`）**。
 2. **单一路由模型与设备身份**：以包含确切网络设备身份（`DeviceId { ifname, ifindex }`）的统一 `Route` 结构表达期望集与成功创建集，接口与 Metric 均作为路由属性。同名网卡重建按 `ifindex` 变更精确识别并重新安装，显式指定其他接口的路由安全隔离。
 3. **标准错误与结果类型**：统一为一个 `RouteError`（区分 `Failed` 与 `Unknown`），系统操作结果使用标准 `Result<Option<Route>, RouteError>`。
-4. **原生异步与确定性编译门控**：后端 trait 使用原生 `async fn` 静态分发，消除每次调用装箱 future 的开销；仅在实际接管的 `all(target_os = "linux", feature = "linux-netlink")` 条件下编译新模块与管理器，不声明当前阶段不存在的平台别名或 Stub 类型。
-5. **guarden 真实设备所有权收束**：复用项目已有 `guarden = "0.3"` 管理清理任务与设备资源生命周期，守卫接管真实设备保活句柄（`device_keepalive`），单线程协调循环收束在途操作后再移交清理，杜绝等待超时导致设备提前释放；清理流程完整处理 `unknown_routes`，跳过盲目重试，如实返回 `CleanupIncomplete`。
+4. **原生异步与明确 Send 契约**：后端 trait 声明返回带 `Send` 约束的 opaque future，兼顾静态分发的零装箱开销与 Tokio / guarden 跨线程调度的线程安全性；仅在实际接管的 `all(target_os = "linux", feature = "linux-netlink")` 条件下编译新模块与管理器，不声明当前阶段不存在的平台别名或 Stub 类型。
+5. **真实设备所有权保活与可靠命令投递**：通过 `TunDeviceHandle` 强引用持有底层网卡（`Arc<VirtualNic>` / `Arc<NicCtx>`），生命周期换绑命令 `bind_tun_device` 采用 `send().await` 可靠入队，队列满时背压等待，杜绝静默丢失；guarden 清理守卫接管真实设备所有权并在 `async move` 异步块末尾显式释放，确保设备资源在正常运行、收束在途操作与清理全过程绝对存活，杜绝调用方等待超时导致设备被提前释放。
 6. **写入权平滑交接**：Linux 原生环境完全接管并停用旧 updater；未迁移平台保持原有旧链路；Magic DNS 与接口前缀通过生命周期确认杜绝双写。
 
 ### 1.2 平台范围与生产接管策略
@@ -41,10 +41,10 @@
     - `normalize_v4_cidr(addr: Ipv4Addr, prefix: u8) -> Result<Ipv4Cidr, cidr::errors::NetworkParseError>`（CIDR 主机位规范化）。
     - 现有的 `resolve_proxy_cidrs(peer_routes: BTreeSet<Ipv4Cidr>, config: ProxyCidrConfigSnapshot) -> BTreeSet<Ipv4Cidr>`。
 - **`easytier`（宿主策略、生命周期与系统控制）**：
-  - 定义包含网络设备身份（`DeviceId { ifname, ifindex }`）的统一 `Route` 结构与 `RouteError` 枚举。
+  - 定义包含网络设备身份（`DeviceId { ifname, ifindex }`）的统一 `Route` 结构与 `RouteError` 枚举；定义真实持有底层设备强引用所有权的 `TunDeviceHandle`。
   - 实现 Host 侧策略计算 `calculate_desired_routes`：解析默认接口设备身份与默认 Metric（Linux 65535），过滤未迁移冲突，输出 `BTreeSet<Route>`。
-  - 实现具体平台后端（Linux Netlink 长连接、请求/ACK 匹配、消除 dump），原生 `async fn` 零装箱。
-  - 实现 `HostRouteManager` 协调循环、失败退避与基于 `guarden` 且持有 `device_keepalive` 的清理。
+  - 实现具体平台后端（Linux Netlink 长连接、请求/ACK 匹配、消除 dump），提供带 `Send` 约束的 `RouteBackend` trait 静态分发。
+  - 实现 `HostRouteManager` 协调循环、失败退避、生命周期可靠投递与基于 `guarden` 且持有真实设备所有权的清理。
   - 改造 Magic DNS 清理：解耦系统配置恢复与路由删除，独立返回路由清理结果 `DnsCleanOutcome`。
 
 ```text
@@ -67,10 +67,10 @@ easytier/
               │     ├── mod.rs              [新增] 模块入口
               │     ├── model.rs            [新增] DeviceId, 统一 Route 结构, RouteError
               │     ├── policy.rs           [新增] Host 侧策略计算 (接口/Metric 解析与冲突过滤)
-              │     ├── backend.rs          [新增] RouteBackend trait (原生 async fn) 及 Linux 编译期别名
+              │     ├── backend.rs          [新增] RouteBackend trait (静态分发 impl Future + Send) 及 Linux 编译期别名
               │     ├── backend/
               │     │     └── netlink.rs    [新增] Linux 专属实现 (长连接 netns 绑定、req/ACK 匹配、消除 dump)
-              │     └── manager.rs          [新增] HostRouteManager 核心闭环与 guarden 清理 (持有 device_keepalive)
+              │     └── manager.rs          [新增] HostRouteManager 核心闭环与 guarden 清理 (持有 TunDeviceHandle 真实设备所有权)
               ├── dns_server/
               │     ├── server_instance.rs  [修改] clean_env() 解耦系统配置并独立返回 DnsCleanOutcome
               │     └── runner.rs           [修改] 传递 clean_env() 结果至外部
@@ -78,7 +78,7 @@ easytier/
               ├── runtime_host/
               │     ├── implementation.rs   [修改] 转发宿主运行时接口
               │     ├── magic_dns.rs        [修改] stop() 向上返回 DnsCleanOutcome
-              │     └── tun_desktop.rs      [修改] 网卡就绪与重建时传递 DeviceId 触发 Manager 换绑与刷新
+              │     └── tun_desktop.rs      [修改] 网卡就绪与重建时构造 TunDeviceHandle 触发 Manager 可靠换绑与刷新
               └── virtual_nic.rs            [修改] 仅在 not(all(target_os = "linux", feature = "linux-netlink")) 下创建 run_proxy_cidrs_route_updater
 ```
 
@@ -86,13 +86,15 @@ easytier/
 
 ## 3. 结构与接口定义
 
-### 3.1 统一路由模型 (`Route`) 与设备身份 (`DeviceId`)
+### 3.1 统一路由模型 (`Route`)、设备身份 (`DeviceId`) 与设备句柄 (`TunDeviceHandle`)
 
-合并旧方案中重复的 `RouteSpec` 与 `InstalledRoute`，使用一种完整的 `Route` 结构表达生效参数；引入确切设备身份 `DeviceId` 避免将网卡名称误作为生命周期标识（R1 闭合）：
+合并旧方案中重复的 `RouteSpec` 与 `InstalledRoute`，使用一种完整的 `Route` 结构表达生效参数；引入确切设备身份 `DeviceId` 避免将网卡名称误作为生命周期标识；引入 `TunDeviceHandle` 强引用持有真实底层设备资源（R1 闭合）：
 
 ```rust
 // easytier/src/instance/route/model.rs
 use std::net::Ipv4Addr;
+use std::sync::Arc;
+use std::any::Any;
 use cidr::{IpCidr, Ipv4Cidr, Ipv4Inet};
 
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
@@ -109,6 +111,21 @@ impl DeviceId {
             ifname: ifname.into(),
             ifindex,
         }
+    }
+}
+
+/// 真实持有底层设备所有权的保活句柄 (R1 闭合)
+#[derive(Clone)]
+pub struct TunDeviceHandle {
+    /// 确切网络设备身份 (包含 ifname 与 ifindex)
+    pub id: DeviceId,
+    /// 强引用持有底层网卡设备/上下文 (如 Arc<dyn Any + Send + Sync>，直接持有底层 VirtualNic / NicCtx)
+    pub device: Arc<dyn Any + Send + Sync>,
+}
+
+impl TunDeviceHandle {
+    pub fn new(id: DeviceId, device: Arc<dyn Any + Send + Sync>) -> Self {
+        Self { id, device }
     }
 }
 
@@ -146,13 +163,14 @@ impl Route {
 
 **模型与行为约束（A1 / R1 闭合）**：
 - **设备身份与生命周期分离**：网络接口名称（如 `"tun0"`）仅为用户可见字符串，不构成单次设备生命周期的唯一身份。Linux 内核在网卡销毁与重建时会重新分配递增的 `ifindex`。将 `DeviceId { ifname, ifindex }` 存入 `Route`，使得同名网卡重建（`tun0` $\to$ `tun0`）能被 Manager 的集合比对精准感知并触发重装。
+- **真实设备所有权与生命周期绑定**：`TunDeviceHandle` 将内核设备身份 `DeviceId` 与底层网络设备的生命周期强引用（`Arc<dyn Any + Send + Sync>`）绑定。Manager 持有 `TunDeviceHandle` 即可对真实设备实施强引用保活，杜绝虚拟通知器无法维持底层网卡存活的缺陷。
 - **删除严格依据创建时解析的设备身份**：删除时直接使用 `route.interface.ifindex` 发送精确 Netlink 报文，绝不重新通过网卡名称猜测或二次解析，杜绝将旧网卡路由错删到新网卡上。
 - **多接口隔离与显式接口保护**：当实例默认 TUN 网卡重建或退出时，只有绑定到该 TUN `ifindex` 的路由记录会被重装或级联清理；用户通过 `manual_routes` 显式绑定到其他外部接口（如 `eth0`，对应不同的 `ifindex`）的路由不受任何影响，绝不因默认 TUN 的释放而被误删或丢弃。
 - **所有权表达权限**：仅仅系统中存在相同前缀或字段齐全，不赋予本方删除权；只有记录在 `installed` 中的路由才允许被本方清理。
 
-### 3.2 标准错误类型 (`RouteError`) 与原生后端接口
+### 3.2 标准错误类型 (`RouteError`) 与带 `Send` 约束的后端接口
 
-删除自定义的 `Outcome` 枚举，统一使用标准 `thiserror` 错误与 `Result<Option<T>, RouteError>`。trait 方法采用原生 `async fn` 声明，消除泛型分发下的 `Box<dyn Future>` 装箱分配开销：
+删除自定义的 `Outcome` 枚举，统一使用标准 `thiserror` 错误与 `Result<Option<T>, RouteError>`。trait 方法采用声明返回 `impl std::future::Future<Output = ...> + Send` 的 opaque future，消除泛型分发下的 `Box<dyn Future>` 装箱分配开销，同时向 Tokio 调度器与 guarden 显式承诺线程安全性（R3 闭合）：
 
 ```rust
 // easytier/src/instance/route/model.rs
@@ -176,16 +194,25 @@ pub trait RouteBackend: Send + 'static {
     /// - Ok(None): 系统中已存在相同条目，非本方创建，不予认领 (不入账，记录警告)
     /// - Err(RouteError::Failed(err)): 确定性失败，按指数退避重试
     /// - Err(RouteError::Unknown(err)): 结果不明 (如超时、套接字中断)，记入未决责任，严禁盲目重发
-    async fn add(&mut self, route: &Route) -> Result<Option<Route>, RouteError>;
+    fn add(
+        &mut self,
+        route: &Route,
+    ) -> impl std::future::Future<Output = Result<Option<Route>, RouteError>> + Send;
 
     /// 精确删除一条由本方创建的路由
     /// - Ok(Some(())): 成功从系统中删除 (移出 installed)
     /// - Ok(None): 系统中精确目标已不存在，目标状态已达成 (移出 installed)
     /// - Err(RouteError::Failed(err)): 确定性失败，保留账目并按退避重试
     /// - Err(RouteError::Unknown(err)): 结果不明，保留账目并报警，严禁盲目重发
-    async fn remove(&mut self, route: &Route) -> Result<Option<()>, RouteError>;
+    fn remove(
+        &mut self,
+        route: &Route,
+    ) -> impl std::future::Future<Output = Result<Option<()>, RouteError>> + Send;
 }
 ```
+
+**后端 Future 的 Send 约束说明（R3 闭合）**：
+裸 `async fn` 在 Rust trait 中脱糖后默认不声明返回 future 的 `Send` 约束，导致泛型 `HostRouteManager<B: RouteBackend>` 在放入 `tokio::spawn` 或供 `guarden` 默认 Tokio 调度器执行时报 `future cannot be sent between threads safely` 编译错误。通过在 trait 签名中显式约束 `-> impl std::future::Future<Output = ...> + Send`，既保持了静态分发与 0 堆装箱（无需 `Box<dyn Future>`），又严格满足多线程执行器的调度要求。具体实现端（如 `NetlinkRouteBackend` 和 `MockRouteBackend`）仍可直接使用原生 `async fn` 编写，编译器会自动证明其 future 满足 `Send`。
 
 ### 3.3 严格编译期平台选择与 Linux Netlink 实现
 
@@ -225,8 +252,8 @@ use super::backend::PlatformRouteBackend;
 pub enum ManagerCommand {
     /// 触发刷新：外部通知有新快照或配置变更到达，协调循环被唤醒后统一拉取
     Refresh,
-    /// 换绑默认 TUN 设备：携带新的设备身份 (即使名称相同，ifindex 也会改变)
-    BindTunDevice(DeviceId),
+    /// 可靠换绑默认 TUN 设备：携带新的设备句柄 (包含 DeviceId 与真实底层设备 Arc 强引用)
+    BindTunDevice(TunDeviceHandle),
     /// 显式停机：携带统一超时时间
     Stop {
         deadline: std::time::Instant,
@@ -242,14 +269,20 @@ pub struct HostRouteManager<B = PlatformRouteBackend> {
     unknown_routes: BTreeSet<Route>,
     /// 失败重试退避追踪表
     retry_tracker: BTreeMap<Route, RetryState>,
-    /// 当前生效的默认 TUN 设备身份 (包含 ifname 与 ifindex)
-    current_tun_device: Option<DeviceId>,
+    /// 当前生效的默认 TUN 设备句柄 (持有 DeviceId 与真实设备强引用所有权)
+    current_tun_device: Option<TunDeviceHandle>,
     /// 缓存的业务期望路由集合
     desired_routes_cache: Option<BTreeSet<Route>>,
     /// 命令接收通道
     cmd_rx: tokio::sync::mpsc::Receiver<ManagerCommand>,
     /// 停机取消令牌
     cancel_token: tokio_util::sync::CancellationToken,
+}
+
+#[derive(thiserror::Error, Debug)]
+pub enum DeviceBindError {
+    #[error("manager terminated while binding tun device")]
+    ManagerTerminated(TunDeviceHandle),
 }
 
 #[derive(Clone)]
@@ -267,9 +300,17 @@ impl RouteManagerHandle {
         let _ = self.cmd_tx.try_send(ManagerCommand::Refresh);
     }
 
-    /// 通知换绑默认 TUN 设备 (即使名称未变，ifindex 变化也会被精准识别)
-    pub fn bind_tun_device(&self, device: DeviceId) {
-        let _ = self.cmd_tx.try_send(ManagerCommand::BindTunDevice(device));
+    /// 可靠通知换绑默认 TUN 设备 (R2 闭合)
+    /// 采用 send().await 可靠入队，当协调循环正忙于系统调用或队列已满时通过背压等待，杜绝静默丢失；
+    /// 若 Manager 通道已关闭 (停机终止)，将未装配的设备句柄完整返回给调用方，保留资源所有权。
+    pub async fn bind_tun_device(&self, device: TunDeviceHandle) -> Result<(), DeviceBindError> {
+        self.cmd_tx
+            .send(ManagerCommand::BindTunDevice(device))
+            .await
+            .map_err(|e| match e.0 {
+                ManagerCommand::BindTunDevice(dev) => DeviceBindError::ManagerTerminated(dev),
+                _ => unreachable!(),
+            })
     }
 
     /// 显式停机：借用 Handle，整个等待严格受 deadline 约束；超时返回未完成信息，原持有者继续保留 Handle
@@ -313,15 +354,19 @@ Manager 采用**事件驱动拉取**模型，通知只负责唤醒，不逐条�
    - `Arc::ptr_eq(&last_peer_cidrs, &current_peer_cidrs)`；
    - `current_config.services.manual_routes == last_manual_routes`（**忽略与路由无关的其他服务配置变更**，如 Socks5/DHCP 配置变动不引发重算）；
    - 未迁移事实快照；
-   - 当前生效的默认 TUN 设备身份未变（`current_tun_device == last_tun_device`，不仅比对 `ifname`，更严格比对内核 `ifindex`）。
+   - 当前生效的默认 TUN 设备身份未变（`current_tun_device.as_ref().map(|d| &d.id) == last_tun_device.as_ref().map(|d| &d.id)`，不仅比对 `ifname`，更严格比对内核 `ifindex`）。
    若输入未变且网卡身份未变，直接复用 `desired_routes_cache`，**0 堆分配，0 策略重算**。
 2. **差异跳过机制**：
    比对 `desired_routes_cache` 与 `installed_routes`：若二者集合完全相等且无到期的失败重试项，**直接跳过系统调用并休眠**，稳态系统调用数为 0。
-3. **设备替换强制重算与局部记录交接（R1 闭合）**：
-   当收到 `BindTunDevice(new_device)` 或检测到默认 TUN 设备变更（即使名称同为 `"tun0"`，新旧 `ifindex` 不同）：
-   - **精确隔离与范围收割**：仅针对旧设备 `old_device.ifindex` 的路由记录进行重装或清理；用户显式指定绑定到其他外部设备（如 `eth0`，对应不同的 `ifindex`）的路由记录继续完整保留在 `installed_routes` 中，绝不误伤其他接口。
-   - **强制触发差异执行**：由于 `desired_routes` 中默认路由的目标接口已解析为 `new_device.ifindex`，与 `installed_routes` 中旧设备的 `old_device.ifindex` 产生明确差异。
-   - **重装保障**：旧条目被移出（若使用内核级联销毁捷径，则由 Host 确认关闭旧设备后同步清空旧 `ifindex` 记录），新条目被完整下发至新设备，彻底杜绝同名网卡重建漏装路由的问题。
+3. **设备替换强制重算与局部记录交接（R1 / R2 闭合）**：
+   当通过可靠调用收到 `BindTunDevice(new_device)` 或检测到默认 TUN 设备变更（即使名称同为 `"tun0"`，新旧 `ifindex` 不同）：
+   - **在途操作收束**：Manager 协调循环由于单线程顺序执行，必定先等待上一个在途底层系统调用执行完成并记账后，才处理换绑命令。
+   - **旧设备清理与交接**：若此前持有 `old_device`：
+     - 若旧设备 `ifindex` 与新设备不同，针对 `old_device.id.ifindex` 的路由记录进行精确清理；在此期间 `old_device` 依然被 Manager 持有，底层设备不被提前释放。
+     - 清理完成后，旧设备的 `TunDeviceHandle` 被安全 drop 释放。
+   - **接入新设备**：将 `self.current_tun_device = Some(new_device)` 存入 Manager。
+   - **精确隔离与范围收割**：仅针对默认 TUN 设备 `ifindex` 的路由记录进行重装或清理；用户显式指定绑定到其他外部设备（如 `eth0`，对应不同的 `ifindex`）的路由记录继续完整保留在 `installed_routes` 中，绝不误伤其他接口。
+   - **强制触发差异执行**：由于 `desired_routes` 中默认路由的目标接口已解析为 `new_device.id.ifindex`，与 `installed_routes` 中旧设备的 `old_device.id.ifindex` 产生明确差异。新条目被完整下发至新设备，彻底杜绝同名网卡重建漏装路由的问题。
 4. **低频保底与独立重试**：
    废除 1 秒忙碌轮询，设 30 秒低频保底核对；失败重试由退避计时器在到达最早 `next_retry` 时精准唤醒。
 
@@ -366,41 +411,39 @@ Manager 采用**事件驱动拉取**模型，通知只负责唤醒，不逐条�
    对执行失败的路由条目（无论添加还是删除），记录其 `RetryState { attempt: u32, next_retry: Instant }`。
    退避序列：100ms, 200ms, 400ms, 800ms, 1.6s, 最高封顶 5s。
    在下一轮循环计算差异时，**尚未到达 `next_retry` 的失败项不被选入当轮执行队列**。当输入变化使该条目不再需要时，重试状态自动释放。这彻底防止了因无关配置变化或频繁 OSPF 广播导致同一个底层错误被高频重试（防事件风暴）。
-2. **在途操作收束保证（R2 闭合）**：
-   Manager 协调循环是单线程顺序执行的，每次调用 `backend.add(&route).await` 或 `backend.remove(&route).await` 均同步等待底层系统调用返回。当收到外部 `ManagerCommand::Stop`、`BindTunDevice` 或取消信号时，**循环必定先等待当前正在执行的底层调用返回并记账**（记入 `installed_routes` 或 `unknown_routes`），然后才进入停机清理或换绑。绝不存在脱离记账的在途操作，杜绝迟到结果落到重建后的新网卡上。
+2. **在途操作收束保证（R1 / R2 闭合）**：
+   Manager 协调循环是单线程顺序执行的，每次调用 `backend.add(&route).await` 或 `backend.remove(&route).await` 均同步等待底层系统调用返回。当收到外部 `ManagerCommand::Stop`、`BindTunDevice` 或取消信号时，**循环必定先等待当前正在执行的底层调用返回并记账**（记入 `installed_routes` 或 `unknown_routes`），然后才进入停机清理或换绑。期间底层设备始终由 `current_tun_device: Option<TunDeviceHandle>` 强引用持有，绝不存在脱离记账或脱离设备保活的在途操作，杜绝迟到结果落到重建后的新网卡上。
 3. **中途失效丢弃过时计划**：
    在遍历执行 `to_remove` 和 `to_add` 时，每处理 16 项检查一次取消令牌与输入版本。若检测到网卡失效或新输入涌入，**立即终止执行余下过时条目**，将已成功的操作正确记账后，立即进入下一轮最新全量比对。
 4. **替换依赖顺序保证**：
    若同一个槽位（相同目标 CIDR）需要替换（例如 metric 变更），必须**先执行并确认删除成功，才允许尝试添加**。删除若失败，严禁盲目执行添加。
 
-### 5.3 基于 `guarden` 的资源收束与设备清理（R2 / R3 闭合）
+### 5.3 基于 `guarden` 的资源收束与真实设备所有权保活（R1 / R2 / R3 闭合）
 
-废除上一轮复杂的自定义冻结协调协议（`FrozenAwaitingDecision`、`CleaningActive`、`ConfirmInterfaceDestroyed` 等），复用仓库现有的 `guarden = "0.3"` 统一管理清理任务与设备资源的所有权：
+复用仓库现有的 `guarden = "0.3"` 统一管理清理任务与设备资源的所有权，彻底消除虚假的虚拟保活与提前释放风险：
 
-#### 1. 真实 Host 设备持有接线
-在 `easytier/src/instance/runtime_host/tun_desktop.rs` 与 `tun_common.rs` 中明确资源持有关系：
-```rust
-// runtime_host/tun_common.rs
-struct NicCtxContainer {
-    nic_ctx: Option<Box<dyn Any + Send>>, // 持有底层 TUN 文件描述符与虚拟网卡
-    device_keepalive: Arc<Notify>,        // 设备保活凭证 (只要清理未完成，不得释放)
-    magic_dns: MagicDnsRuntime,
-}
-```
-- **保活凭证保护**：`HostRouteManager` 或其清理守卫持有 `device_keepalive`。即使调用方等待超时或触发 `TunNicState::stop()`，只要清理任务尚未完成，`device_keepalive` 就不会被 drop，底层的 `nic_ctx` 和 TUN 接口保持存活，防止内核先销毁设备导致 Netlink 删除请求报错。
-- **单线程自然收束**：Manager 在接收到 `Stop` 命令后，首先完成当前在途的单次操作并更新账目，确保账目完整后才构造清理守卫。
+#### 1. 真实 Host 设备持有接线与所有权移交（R1 闭合）
+在 `easytier/src/instance/runtime_host/tun_desktop.rs` 与 `tun_common.rs` 中建立真实设备资源强引用关系：
+- **真实强引用句柄**：废除原方案中仅包含 `Arc<Notify>` 的虚拟保活设计，由 `TunDeviceHandle` 直接持有网卡上下文的强引用 `Arc<dyn Any + Send + Sync>`（在 Host 侧即为 `Arc<VirtualNic>` 或 `Arc<NicCtx>`）。
+- **可靠移交**：当网卡就绪或重建时，Host 构造 `TunDeviceHandle::new(DeviceId::new(&name, ifindex), Arc::new(nic_ctx))`，通过 `manager_handle.bind_tun_device(handle).await` 可靠移交给 Manager。
+- **设备资源三阶段全覆盖生命周期保证**：
+  1. **正常运行阶段**：Manager 的 `current_tun_device: Option<TunDeviceHandle>` 强引用持有底层网卡。
+  2. **等待在途操作阶段**：收到 `Stop` 或换绑信号时，Manager 顺序等待当前底层调用返回并记账；在此期间 `current_tun_device` 保持持有，底层设备绝对存活。
+  3. **清理阶段**：Manager 构造 `cleanup_guard` 时，通过 `current_tun_device.take()` 接管真实设备所有权。在 `guarden::guard!` 的 `async move` 异步体末尾显式执行 `drop(device)`。由于 Rust 闭包捕获规则，末尾的 `drop(device)` 强制编译器将 `device` 移入返回的 future 中，使得真实设备强引用存活至清理 future 完全执行结束。即便调用方 `stop(deadline)` 超时退出且 Host 丢弃原持有路径，设备也绝不会被提前释放。
+  4. **换绑阶段**：当换绑发生时，旧设备在其路由全部清理完毕后才 drop 释放，新设备按相同规则安全接入。
 
 #### 2. guarden 清理守卫构造与 Unknown 安全排除
-通过 `guarden::guard!` 创建异步清理守卫，**严格跳过 `unknown_routes`，严禁盲目向内核重复发送未知状态的操作，并完整收集结果**：
+通过 `guarden::guard!` 创建异步清理守卫，**严格跳过 `unknown_routes`，严禁盲目向内核重复发送未知状态的操作，显式保活底层设备并完整收集结果**：
 
 ```rust
 let (completion_tx, completion_rx) = tokio::sync::oneshot::channel();
+let device = current_tun_device.take(); // 取出真实设备句柄
 let mut cleanup_guard = guarden::guard! {
     [
         mut backend,
         installed = installed_routes,
         unknown = unknown_routes,
-        device_keepalive,
+        device, // 捕获真实设备所有权
         completion_tx = Some(completion_tx)
     ]
     async move {
@@ -446,7 +489,12 @@ let mut cleanup_guard = guarden::guard! {
         if let Some(tx) = completion_tx {
             let _ = tx.send(final_outcome.clone());
         }
-        // 守卫结束：此处才真正释放 device_keepalive 与 backend，允许底层网卡安全释放
+
+        // 4. 显式释放设备句柄 (R1 闭合关键点)：
+        // 在 async move 异步块末尾显式使用 drop(device)，强制 Rust 编译器将 device 捕获进返回的 future 中，
+        // 确保真实设备强引用存活至清理 future 真正执行完毕，杜绝调用方超时导致底层设备被提前释放
+        drop(device);
+
         final_outcome
     }
 };
@@ -458,7 +506,7 @@ let mut cleanup_guard = guarden::guard! {
 - **超时与分离机制**：
   - 调用方 `handle.stop(deadline)` 整体受 `deadline` 约束。若在超时前收到 `completion_rx`，如实返回 `Result<(), CleanupIncomplete>`。
   - 若调用方到达 `deadline` 超时，调用方结束等待并返回 `Err(CleanupIncomplete { .. reason: "timeout waiting for cleanup" })`。
-  - **关键保障**：调用方超时绝不打断后台任务。后台 `DetachableTask` 继续由 Manager 调度执行并持有 `device_keepalive`，防止设备被提前释放。清理完成后更新 `cleanup_result`，外部可通过 `handle.query_cleanup_result()` 随时获取真实终态。
+  - **关键保障**：调用方超时绝不打断后台任务。后台 `DetachableTask` 继续由 Manager 调度执行并持有 `device`（`TunDeviceHandle`），防止底层设备被提前释放。清理完成后更新 `cleanup_result`，外部可通过 `handle.query_cleanup_result()` 随时获取真实终态。
 - **自有 TUN 级联销毁捷径约束**：
   若 Host 选择通过直接关闭自有 TUN 文件描述符让内核自动级联删除接口路由：
   - 必须先停止 Manager 协调循环并收束在途操作；
@@ -487,7 +535,7 @@ pub struct CleanupIncomplete {
    `RouteManagerHandle::stop(&self, deadline: Instant)` 整体受 `tokio::time::timeout_at(deadline, ...)` 包裹：
    - 发送 `ManagerCommand::Stop` 并等待清理完成通知。
    - 若发送或清理等待超时，准时在 `deadline` 到达时返回 `Err(CleanupIncomplete { .. reason: "deadline exceeded while waiting for route cleanup" })`。
-   - 宿主通过借用 `&self` 依然持有 `RouteManagerHandle`，后台清理任务继续安全持有设备保活凭证执行到底。
+   - 宿主通过借用 `&self` 依然持有 `RouteManagerHandle`，后台清理任务继续安全持有底层设备句柄（`TunDeviceHandle`）执行到底。
 3. **真实结果透明判定（R3 闭合）**：
    - 仅当 `uncleaned_routes` 为空**且 `unknown_routes` 为空**时返回 `Ok(())`；
    - 若存在任何删除失败条目或未决条目，绝不虚报成功，严格返回 `CleanupIncomplete`；
@@ -608,13 +656,13 @@ impl MagicDnsServerInstance {
 分批实施划分为 5 个独立可编译、可测试的批次：
 
 ```text
-Batch 1: 纯计算与统一模型 (Core 快照与算法 + Host 策略与统一 Route 模型 + DeviceId)
+Batch 1: 纯计算与统一模型 (Core 快照与算法 + Host 策略与统一 Route 模型 + DeviceId + TunDeviceHandle)
    ↓
-Batch 2: 精确删除改造与平台后端 (Netlink 消除 dump、长连接、原生 async fn、Mock 后端)
+Batch 2: 精确删除改造与平台后端 (Netlink 消除 dump、长连接、impl Future + Send 静态分发、Mock 后端)
    ↓
-Batch 3: HostRouteManager 核心闭环 (统一 RouteError、收束在途操作、跳过 unknown、guarden 清理)
+Batch 3: HostRouteManager 核心闭环 (统一 RouteError、收束在途操作、可靠 bind_tun_device、跳过 unknown、guarden 清理)
    ↓
-Batch 4: Host 真实生命周期接线与交接 (DeviceId 换绑、device_keepalive 保活、DNS 解耦、旧 updater 屏蔽)
+Batch 4: Host 真实生命周期接线与交接 (TunDeviceHandle 换绑、真实设备所有权保活、DNS 解耦、旧 updater 屏蔽)
    ↓
 Batch 5: 隔离环境原生测试与基准度量 (netns 真实系统调用、零 dump、零写度量)
 ```
@@ -626,7 +674,7 @@ Batch 5: 隔离环境原生测试与基准度量 (netns 真实系统调用、零
   - `easytier-core/src/peers/route/peer_ospf_route.rs`：在 `PeerRouteServiceImpl::update_route_table` 维护 `Arc<BTreeSet<Ipv4Cidr>>` 快照并导出变更通知。
   - `easytier-core/src/instance/packet_plane.rs`：导出 `list_proxy_cidrs_snapshot`。
   - `easytier-core/src/peers/route/projection.rs`：纯函数 `normalize_v4_cidr`（基于 `Ipv4Inet::network()`）。
-  - `easytier/src/instance/route/model.rs`：`DeviceId`、统一 `Route` 结构与 `RouteError` 枚举。
+  - `easytier/src/instance/route/model.rs`：`DeviceId`、`TunDeviceHandle`（强引用持有底层网卡 `Arc<dyn Any + Send + Sync>` 资源）、统一 `Route` 结构与 `RouteError` 枚举。
   - `easytier/src/instance/route/policy.rs`：Host 策略计算 `calculate_desired_routes`（解析 `DeviceId`、默认 Metric 与过滤未迁移冲突）。
 - **验证**：
   - 单元测试：主机位非零安全规范化（`10.0.0.1/24` $\to$ `10.0.0.0/24`，无 panic）、`/0` 与 `/32` 边界测试、非法前缀测试、`manual_routes` 三态测试、未迁移 DNS `/32` 碰撞排除测试。
@@ -634,32 +682,35 @@ Batch 5: 隔离环境原生测试与基准度量 (netns 真实系统调用、零
 #### Batch 2：精确删除改造与平台后端
 - **代码落点**：
   - `easytier/src/common/ifcfg/netlink.rs`：改造 `remove_ipv4_route`，消除全量 dump，直接匹配 destination, oif (`route.interface.ifindex`), priority, table 发送 `RTM_DELROUTE`。
-  - `easytier/src/instance/route/backend.rs`：`RouteBackend` trait（采用原生 `async fn` 零装箱）、严格门控别名 `PlatformRouteBackend`（仅限 `all(target_os = "linux", feature = "linux-netlink")`）与 `MockRouteBackend`。
+  - `easytier/src/instance/route/backend.rs`：`RouteBackend` trait（采用声明返回 `impl Future<Output = ...> + Send` 静态分发，兼顾零装箱与线程安全）、严格门控别名 `PlatformRouteBackend`（仅限 `all(target_os = "linux", feature = "linux-netlink")`）与 `MockRouteBackend`。
 - **验证**：
-  - 单元测试：同接口、同前缀但不同 metric 的精确删除测试（验证外部 metric 路由不被误删）；Mock 后端记录核对测试；静态分发原生 async 调用验证。
+  - 单元测试：同接口、同前缀但不同 metric 的精确删除测试（验证外部 metric 路由不被误删）；Mock 后端记录核对测试；静态分发原生 async 调用与 Send 泛型约束编译验证。
 
 #### Batch 3：HostRouteManager 核心闭环
 - **代码落点**：
-  - `easytier/src/instance/route/manager.rs`：实现 `HostRouteManager` 协调循环、快照与 `DeviceId` 比对跳过、串行在途操作收束、diff 与清理均跳过 `unknown_routes`、基于 `guarden` 且持有 `device_keepalive` 的清理与 `stop(deadline)`。
+  - `easytier/src/instance/route/manager.rs`：实现 `HostRouteManager` 协调循环、快照与设备身份比对跳过、串行在途操作收束、可靠命令 `bind_tun_device`（`send().await` 背压防丢与失败返回所有权）、diff 与清理均跳过 `unknown_routes`、基于 `guarden` 且在清理 future 末尾显式 `drop(device)` 的真实设备保活清理与 `stop(deadline)`。
 - **验证**：
   - 基于 `MockRouteBackend` 的闭环测试：
     - 首启全量添加；
     - 输入未变稳态 0 调用与 0 堆分配；
     - **同名网卡重建重装**：重建模似 TUN（`tun0` $\to$ `tun0`，`ifindex` 变更），验证自动触发全量重装；
+    - **可靠换绑投递与通道关闭测试**：在 Manager 执行系统调用阻塞时发送高频 Refresh 填满队列，发起 `bind_tun_device`，验证 `send().await` 背压等待且命令不丢失；验证 Manager 停机通道关闭时返回 `DeviceBindError::ManagerTerminated(device)` 保持设备所有权；
+    - **真实设备保活与清理防提前释放测试**：使用带 Drop 计数/通道通知的可观察虚拟设备，在 `backend.remove` 暂停时触发 guard，验证设备未被释放；模拟调用方 stop 超时且 Host 丢弃原句柄，验证设备仍未释放；直到后台清理 future 执行完毕后设备才真正释放；
     - **显式外部接口保护**：默认 TUN 重建或退出时，验证绑定到其他外部接口（如 `eth0`）的路由记录完整保留，不被误删或丢弃；
     - **在途操作收束**：模拟单次 ADD 阻塞在底层，触发退出并使调用方等待超时，验证在途操作被单线程循环正常收束记账，旧操作绝不落到重建后的网卡上；
     - **未决隔离与真实报告**：操作结果返回 `RouteError::Unknown` 时准确记入 `unknown_routes`；后续 diff 循环与清理循环均自动跳过该条目（不盲发重试）；stop 最终返回 `CleanupIncomplete`，绝不误报成功；
-    - **Stop 限时超时与后台保活**：调用方 stop 超时后按时返回，后台 guarden 任务继续持有 `device_keepalive` 和 backend 安全运行直至结束，设备不被提前释放；外部可通过 `query_cleanup_result` 获得最终完成结果；
+    - **Stop 限时超时与后台保活**：调用方 stop 超时后按时返回，后台 guarden 任务继续持有底层设备（`TunDeviceHandle`）和 backend 安全运行直至结束，设备不被提前释放；外部可通过 `query_cleanup_result` 获得最终完成结果；
     - No-TUN 旁路测试（已安装记录保持为空）。
 
 #### Batch 4：Host 真实生命周期接线与交接
 - **代码落点**：
   - `easytier/src/instance/dns_server/server_instance.rs` & `runner.rs` & `runtime_host/magic_dns.rs`：解耦系统配置与路由清理，返回 `DnsCleanOutcome` 并向上抛出。
-  - `easytier/src/instance/runtime_host/tun_desktop.rs` & `tun_common.rs` & `implementation.rs`：传递 `DeviceId` 与 `device_keepalive`，网卡就绪与重建时触发 `bind_tun_device`，停机时调用 `stop(deadline)`。
+  - `easytier/src/instance/runtime_host/tun_desktop.rs` & `tun_common.rs` & `implementation.rs`：构造持有底层网卡（`Arc<VirtualNic>` / `Arc<NicCtx>`）的 `TunDeviceHandle`，网卡就绪与重建时可靠调用 `bind_tun_device`，停机时调用 `stop(deadline)`。
   - `easytier/src/instance/virtual_nic.rs`：仅在 `not(all(target_os = "linux", feature = "linux-netlink"))` 下启动 `run_proxy_cidrs_route_updater`。
 - **验证**：
   - 跨平台与特性组合编译验证：验证 Linux（开启/未开启 netlink）、Windows、macOS（含 `macos-ne`）、FreeBSD 均能顺利编译，未迁移平台维持原有旧链路；
-  - 集成测试：启动集成测试节点，动态推送 `manual_routes`，验证真实 Manager 接管生效且旧 updater 不重复写入；
+  - 真实设备接线集成测试：启动真实节点，覆盖真实 `VirtualNic` / `NicCtx` 装配、同名网卡重建可靠换绑与停机超时后台保活；
+  - 动态配置集成测试：动态推送 `manual_routes`，验证真实 Manager 接管生效且旧 updater 不重复写入；
   - DNS 交接集成验证：
     1. 在 Linux (`system_config=None`) 且安装了 DNS /32 时，停止服务验证执行路由删除；
     2. 模拟 `system_config.close()` 失败但 `remove_ipv4_route` 成功：验证路由排除范围成功释放给 Manager；
@@ -683,12 +734,12 @@ Batch 5: 隔离环境原生测试与基准度量 (netns 真实系统调用、零
 
 在宣布第二步完成并进入第三步前，必须逐项核对满足以下门槛：
 
-- [ ] **统一模型与确切设备身份**：以包含 `DeviceId { ifname, ifindex }` 的单一 `Route` 模型表达期望与安装路由；CIDR 主机位非零（如 `10.0.0.1/24`）安全规范化，无 panic；自动代理、手工覆盖均准确计算。
-- [ ] **同名网卡重建重装与多接口隔离**：同名网卡销毁后重建（`tun0` $\to$ `tun0`），Manager 依据 `ifindex` 变更精确触发重新安装；默认 TUN 销毁或换绑时，显式绑定到其他外部接口（如 `eth0`）的路由记录完整保留，不被误删。
+- [ ] **统一模型与真实设备所有权**：以包含 `DeviceId { ifname, ifindex }` 的单一 `Route` 模型表达期望与安装路由；`TunDeviceHandle` 强引用持有底层真实网卡资源；CIDR 主机位非零（如 `10.0.0.1/24`）安全规范化，无 panic；自动代理、手工覆盖均准确计算。
+- [ ] **同名网卡重建重装与可靠换绑**：同名网卡销毁后重建（`tun0` $\to$ `tun0`），Manager 依据 `ifindex` 变更精确触发重新安装；`bind_tun_device` 采用 `send().await` 可靠入队，队列满时背压等待，杜绝静默丢失；若通道关闭能将未使用的设备所有权返回调用方；默认 TUN 销毁或换绑时，显式绑定到其他外部接口（如 `eth0`）的路由记录完整保留，不被误删。
 - [ ] **依赖方向与严格编译门控**：`easytier-core` 绝无引用 `easytier` 类型；`PlatformRouteBackend` 仅在 `all(target_os = "linux", feature = "linux-netlink")` 下声明，不预建未实现的平台别名或 Stub 类型；全平台及特性组合均独立可编译。
-- [ ] **原生异步后端与精确删除**：`RouteBackend` 采用原生 `async fn` 零装箱静态分发；Linux 精确删除直接按 `ifindex`、目标、metric 与 table 发送单发 `RTM_DELROUTE`，0 次全表 dump。
+- [ ] **带 Send 约束的静态分发后端与精确删除**：`RouteBackend` trait 声明返回 `impl Future<Output = ...> + Send`，兼顾零装箱静态分发与 Tokio / guarden 线程安全性；Linux 精确删除直接按 `ifindex`、目标、metric 与 table 发送单发 `RTM_DELROUTE`，0 次全表 dump。
 - [ ] **稳态零多余操作**：在网络拓扑与配置稳定的状态下，快照指针与设备身份比对快速拦截，协调循环不产生多余的底层系统调用和堆内存分配；无关服务配置变动不引发路由重算。
-- [ ] **在途操作收束与 guarden 设备保活**：单线程协调循环在停机或换绑前先等待当前在途操作返回并记账；guarden 清理守卫持有 `device_keepalive`，调用方等待超时不提前释放底层设备资源，迟到结果安全结算。
+- [ ] **在途操作收束与 guarden 真实设备保活**：单线程协调循环在停机或换绑前先等待当前在途操作返回并记账；guarden 清理守卫接管真实设备所有权并在 `async move` 异步块末尾显式释放，调用方等待超时不提前释放底层设备资源，设备覆盖正常运行、等待在途和清理全周期。
 - [ ] **未决隔离与真实清理结果**：`unknown_routes` 在 diff 和清理中均被跳过，严禁盲发重发；清理流程收集失败与未决条目；存在未决条目或删除失败时，`stop(deadline)` 如实返回 `CleanupIncomplete`，绝不虚报成功。
 - [ ] **交接防误放行与 DNS 真实删除**：未决操作存在时严格阻塞交接；Linux 等无 `system_config` 环境下 DNS 停止仍如实执行路由删除；系统配置恢复错误与路由清理错误分离，路由删除失败保留排除范围，杜绝双写。
 - [ ] **生产控制一致**：在第二步启用的平台（Linux + linux-netlink）完全由 HostRouteManager 接管且旧 updater 停写；未迁移平台保持原有旧链路，不发生漏写或双写。

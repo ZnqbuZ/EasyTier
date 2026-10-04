@@ -112,13 +112,14 @@ HostRouteManager：汇总 → 纯函数计算期望路由 → 执行比对并应
 
 ### 3.2 纯函数计算流程与规则
 
-期望路由的计算是纯函数，无副作用，输入业务事实，输出最终期望的 `BTreeSet<RouteSpec>`：
+期望路由的计算是纯函数，无副作用，输入业务事实，输出最终期望的 `BTreeSet<Route>`：
 
 ```rust
-#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
-pub struct RouteSpec {
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
+pub struct Route {
     pub destination: IpCidr,
-    pub metric: Option<i32>,
+    pub interface: DeviceId,
+    pub metric: u32,
 }
 ```
 
@@ -177,9 +178,15 @@ pub struct RouteSpec {
 ```rust
 pub trait RouteBackend: Send + 'static {
     /// 添加一条路由，成功创建返回生效 Route (记入 installed)
-    async fn add(&mut self, route: &Route) -> Result<Option<Route>, RouteError>;
+    fn add(
+        &mut self,
+        route: &Route,
+    ) -> impl std::future::Future<Output = Result<Option<Route>, RouteError>> + Send;
     /// 精确删除一条由本方创建的路由
-    async fn remove(&mut self, route: &Route) -> Result<Option<()>, RouteError>;
+    fn remove(
+        &mut self,
+        route: &Route,
+    ) -> impl std::future::Future<Output = Result<Option<()>, RouteError>> + Send;
 }
 
 // 编译期平台选择：仅在 Linux netlink 下启用 PlatformRouteBackend = netlink::NetlinkRouteBackend
@@ -188,7 +195,7 @@ pub trait RouteBackend: Send + 'static {
 
 1. **原生桌面分支 (`NativeRouteBackend`)**：
    - 持有 TUN 设备的网卡控制器或 `IfConfiger` 实例；
-   - **精确删除改造（必须前提）**：修改现有的 `remove_ipv4_route` / `remove_ipv6_route`，按各平台实际路由身份和创建时的有效参数进行精确定位（如 Linux 按 destination、prefix、ifindex、table 及 priority/metric 精确匹配；Windows 按 LUID 和 next-hop 精确定位；macOS/FreeBSD 按其系统接口能力定位）。若在系统中无法精确定位完全吻合的条目，返回错误，绝不随意删除同网段不同 metric/属性的外部条目。无需将平台专有字段侵入公共 `RouteSpec`。
+   - **精确删除改造（必须前提）**：修改现有的 `remove_ipv4_route` / `remove_ipv6_route`，按各平台实际路由身份和创建时的有效参数进行精确定位（如 Linux 按 destination、prefix、ifindex、table 及 priority/metric 精确匹配；Windows 按 LUID 和 next-hop 精确定位；macOS/FreeBSD 按其系统接口能力定位）。若在系统中无法精确定位完全吻合的条目，返回错误，绝不随意删除同网段不同 metric/属性的外部条目。无需将平台专有字段侵入公共 `Route`。
 2. **移动端委托分支 (`DelegatedRouteBackend`)**：
    - 实现 `apply_routes`，将全量集合一次性传递给 Android `VpnService.Builder` 重建会话；
    - 仅在宿主系统确认会话建立成功后，才整体更新 `applied_routes`；
@@ -199,7 +206,7 @@ pub trait RouteBackend: Send + 'static {
 
 ### 4.2 协调循环与记账逻辑
 
-Manager 维护内存记录 `installed_routes: BTreeSet<RouteSpec>`，记录**本次运行已明确成功安装但尚未成功删除的路由条目**。
+Manager 维护内存记录 `installed_routes: BTreeSet<Route>`，记录**本次运行已明确成功安装但尚未成功删除的路由条目**。
 
 ```text
 原生平台循环：
@@ -250,7 +257,7 @@ Manager 维护内存记录 `installed_routes: BTreeSet<RouteSpec>`，记录**本
 
 - **保留**：
   - 其小型 `RouteManager` 骨架及单循环顺序消费思路；
-  - 直观简洁的 `RouteSpec { destination, metric }` 概念。
+  - 直观简洁的 `Route { destination, interface, metric }` 统一模型概念。
 - **改写**：
   - **切断 NIC 内部耦合**：删除 `nic.downcast_ref::<Nic>()` 这种通过 Any 寻找控制器的脆弱做法，改为在创建 `HostRouteManager` 时显式注入薄抽象 `RouteBackend`。
   - **实现真实的 `sync()` 闭环**：`route-dev` 中的 `async fn sync(&self) {}` 是完全空白的空函数。将其替换为第 4.2 节所述的期望集合与已安装记录的比对、增删、失败保留及重试闭环。
