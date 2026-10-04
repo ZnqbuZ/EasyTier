@@ -1,6 +1,6 @@
-# HostRouteManager 第二步实施方案：架构收缩与最小闭环（第十轮修订版）
+# HostRouteManager 第二步实施方案：架构收缩与最小闭环（第十一轮修订版）
 
-状态：已根据第九轮复审审查（[`docs/host-route-manager-step2-review-9.md`](host-route-manager-step2-review-9.md)）完成全面修订。遵循实施总纲（[`docs/host-route-manager-master-plan.md`](host-route-manager-master-plan.md)）与第一步规范（[`docs/host-route-manager-step1-audit-and-contract.md`](host-route-manager-step1-audit-and-contract.md)）。  
+状态：已根据第十轮复审审查（[`docs/host-route-manager-step2-review-10.md`](host-route-manager-step2-review-10.md)）完成全面修订。遵循实施总纲（[`docs/host-route-manager-master-plan.md`](host-route-manager-master-plan.md)）与第一步规范（[`docs/host-route-manager-step1-audit-and-contract.md`](host-route-manager-step1-audit-and-contract.md)）。  
 基线代码：`refactor/route` 分支；参考分支：`refactor/route-dev` (`8abfb51e`)。
 
 ---
@@ -13,7 +13,7 @@
 2. **单一路由模型与设备身份**：以包含确切网络设备身份（`DeviceId { ifname, ifindex }`）的统一 `Route` 结构表达期望集与成功创建集，接口与 Metric 均作为路由属性。同名网卡重建按 `ifindex` 变更精确识别并重新安装，显式指定其他接口的路由安全隔离。
 3. **标准错误与结果类型**：统一为一个 `RouteError`（区分 `Failed` 与 `Unknown`），系统操作结果使用标准 `Result<Option<Route>, RouteError>`。
 4. **原生异步与明确 Send 契约**：后端 trait 声明返回带 `Send` 约束的 opaque future，兼顾静态分发的零装箱开销与 Tokio / guarden 跨线程调度的线程安全性；仅在实际接管的 `all(target_os = "linux", feature = "linux-netlink")` 条件下编译新模块与管理器，不声明当前阶段不存在的平台别名或 Stub 类型。
-5. **真实设备文件描述符保活与解绑/换绑闭环**：通过 `TunDeviceHandle` 直接持有底层网卡设备文件描述符的强引用（Linux 下为 `Arc<OwnedFd>`，独立于转发任务），杜绝依赖不持有设备的 `VirtualNic` 或持有转发锁的 `NicCtx`；建立明确的解绑与绑定路径（`旧设备 → unbind_tun_device → 无设备 → bind_tun_device → 新设备`），guarden 清理守卫在 `async move` 异步块内先 `drop(device)` 释放内核设备后再发送确认 ACK，确保 Host 收到完成通知时旧同名设备已完全注销，调用方等待超时不提前释放底层设备。
+5. **真实设备文件描述符保活与解绑/换绑闭环**：通过 `TunDeviceHandle` 直接持有底层网卡设备文件描述符的强引用（Linux 下为 `Arc<OwnedFd>`，独立于转发任务）；建立确定的关闭与解绑顺序（Host 先停止并 join 确认旧转发任务退出，释放原始 fd 与 receiver 锁；Manager 持有保活描述符完成路由精确删除后 `drop(device)` 关闭全系统最后一个描述符，触发内核注销非持久 TUN 设备，再向 Host 发送确认 ACK）；deadline 统一覆盖命令入队与等待 ACK 全过程；解绑到无设备与全局停机清理严格分离，确保 Host 收到完成通知时旧同名设备已在内核中完全销毁，调用方超时不提前释放底层资源。
 6. **写入权平滑交接**：Linux 原生环境完全接管并停用旧 updater；未迁移平台保持原有旧链路；Magic DNS 与接口前缀通过生命周期确认杜绝双写。
 
 ### 1.2 平台范围与生产接管策略
@@ -334,19 +334,41 @@ impl RouteManagerHandle {
 
     /// 可靠通知解绑默认 TUN 设备 (R2 闭合)
     /// 请求解除当前生效的默认 TUN 设备，等待 Manager 清理其对应路由并释放设备描述符；
-    /// 成功返回 Ok(())，解绑失败或等待超时返回 Err(CleanupIncomplete)；
-    /// Manager 本身不退出，继续维持运行并管理其他接口路由。
+    /// deadline 统一限制命令入队与等待 ACK 全过程：
+    /// - 发送入队超时：说明协调循环繁忙且命令队列已满，请求尚未成功入队，返回 Err(CleanupIncomplete) 指明未入队，Manager 未开始解绑；
+    /// - 入队成功但等待 ACK 超时：说明请求已进入 Manager 处理队列，返回 Err(CleanupIncomplete) 指明等待超时，Manager 在后台继续持有资源并处理，不提前释放设备；
+    /// 成功返回 Ok(())；Manager 本身不退出，继续维持运行并管理其他接口路由。
     pub async fn unbind_tun_device(&self, deadline: std::time::Instant) -> Result<(), CleanupIncomplete> {
+        let deadline_instant: tokio::time::Instant = deadline.into();
         let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
-        self.cmd_tx
-            .send(ManagerCommand::UnbindTunDevice { deadline, ack: ack_tx })
-            .await
-            .map_err(|_| CleanupIncomplete {
-                uncleaned_routes: Vec::new(),
-                unknown_routes: Vec::new(),
-                reason: "manager terminated while requesting unbind".to_string(),
-            })?;
-        match tokio::time::timeout_at(deadline.into(), ack_rx).await {
+
+        // 1. 发送入队：严格受 deadline 约束，杜绝队列满时无超时阻塞
+        let send_res = tokio::time::timeout_at(
+            deadline_instant,
+            self.cmd_tx.send(ManagerCommand::UnbindTunDevice { deadline, ack: ack_tx }),
+        )
+        .await;
+
+        match send_res {
+            Err(_) => {
+                return Err(CleanupIncomplete {
+                    uncleaned_routes: Vec::new(),
+                    unknown_routes: Vec::new(),
+                    reason: "deadline exceeded while queueing unbind command (request not enqueued)".to_string(),
+                });
+            }
+            Ok(Err(_)) => {
+                return Err(CleanupIncomplete {
+                    uncleaned_routes: Vec::new(),
+                    unknown_routes: Vec::new(),
+                    reason: "manager terminated while queueing unbind".to_string(),
+                });
+            }
+            Ok(Ok(())) => {}
+        }
+
+        // 2. 等待 ACK：受同一 deadline 约束；若超时 Manager 继续在后台持有资源安全处理
+        match tokio::time::timeout_at(deadline_instant, ack_rx).await {
             Ok(Ok(outcome)) => outcome,
             Ok(Err(_)) => Err(CleanupIncomplete {
                 uncleaned_routes: Vec::new(),
@@ -356,15 +378,47 @@ impl RouteManagerHandle {
             Err(_) => Err(CleanupIncomplete {
                 uncleaned_routes: Vec::new(),
                 unknown_routes: Vec::new(),
-                reason: "deadline exceeded while waiting for tun unbind".to_string(),
+                reason: "deadline exceeded while waiting for manager unbind ACK (manager continuing in background)".to_string(),
             }),
         }
     }
 
-    /// 显式停机：借用 Handle，整个等待严格受 deadline 约束；超时返回未完成信息，原持有者继续保留 Handle
+    /// 显式停机：借用 Handle，整个等待严格受 deadline 约束 (覆盖发送与清理等待全过程)；超时返回未完成信息，原持有者继续保留 Handle
     pub async fn stop(&self, deadline: std::time::Instant) -> Result<(), CleanupIncomplete> {
-        // 详见 5.4 节
-        ...
+        let deadline_instant: tokio::time::Instant = deadline.into();
+        self.cancel_token.cancel();
+        let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+
+        // 发送入队：受统一 deadline 约束
+        let send_res = tokio::time::timeout_at(
+            deadline_instant,
+            self.cmd_tx.send(ManagerCommand::Stop { deadline, ack: ack_tx }),
+        )
+        .await;
+
+        match send_res {
+            Err(_) => {
+                return Err(CleanupIncomplete {
+                    uncleaned_routes: Vec::new(),
+                    unknown_routes: Vec::new(),
+                    reason: "deadline exceeded while queueing stop command".to_string(),
+                });
+            }
+            Ok(Err(_)) => {
+                return self.query_cleanup_result().await.unwrap_or(Ok(()));
+            }
+            Ok(Ok(())) => {}
+        }
+
+        match tokio::time::timeout_at(deadline_instant, ack_rx).await {
+            Ok(Ok(outcome)) => outcome,
+            Ok(Err(_)) => self.query_cleanup_result().await.unwrap_or(Ok(())),
+            Err(_) => Err(CleanupIncomplete {
+                uncleaned_routes: Vec::new(),
+                unknown_routes: Vec::new(),
+                reason: "deadline exceeded while waiting for stop cleanup ACK (manager continuing in background)".to_string(),
+            }),
+        }
     }
 
     /// 查询最终清理结果 (在 stop 超时后可随时异步获取后台完成状态)
@@ -406,10 +460,15 @@ Manager 采用**事件驱动拉取**模型，通知只负责唤醒，不逐条�
    若输入未变且网卡身份未变，直接复用 `desired_routes_cache`，**0 堆分配，0 策略重算**。
 2. **差异跳过机制**：
    比对 `desired_routes_cache` 与 `installed_routes`：若二者集合完全相等且无到期的失败重试项，**直接跳过系统调用并休眠**，稳态系统调用数为 0。
-3. **设备解绑、替换与空状态过渡（R1 / R2 闭合）**：
+3. **设备解绑、替换与空状态过渡（R1 / R2 / R3 闭合）**：
    明确支持 `旧设备 → unbind_tun_device → 无设备 (None) → bind_tun_device → 新设备` 的生命周期路径：
-   - **解绑到空状态（`UnbindTunDevice`）**：
-     当收到解绑命令时，Manager 顺序收束当前在途底层系统调用；通过 `self.current_tun_device.take()` 将默认网卡置为 `None`，并使 `desired_routes` 排除默认 TUN 路由；针对旧网卡 `old_device.id.ifindex` 路由执行精确删除；**在清理 future 内先 `drop(device)` 释放内核文件描述符，确认内核接口销毁后再向 Host 发送确认 ACK**。Host 收到确认后方可安全确认旧网卡已在内核中完全销毁。解绑超时或失败返回 `CleanupIncomplete`，Host 不得判定为已释放。
+   - **解绑到空状态（`UnbindTunDevice`）与确定关闭顺序**：
+     1. Host 侧发起解绑前，**先停止旧转发任务并等待任务退出**（`JoinSet::shutdown().await` 或 join 等待任务销毁，确认其原始 fd 与 `peer_packet_receiver` 锁已完全释放），同时释放 Host 自身持有的保活副本；此时 Linux 内核非持久 TUN 设备因 Manager 独立持有的 `TunDeviceHandle`（`Arc<OwnedFd>`）继续保活，绝无 `ENODEV`；
+     2. Host 调用 `manager.unbind_tun_device(deadline).await`（受统一 deadline 约束入队与等待 ACK 全过程）；
+     3. Manager 顺序收束当前在途底层系统调用；通过 `self.current_tun_device.take()` 将默认网卡置为 `None`，并使 `desired_routes` 排除默认 TUN 路由；仅针对旧网卡 `old_device.id.ifindex` 路由执行精确删除；
+     4. 路由精确删除完成后，Manager **显式执行 `drop(old_device)`**。此时 Host 转发任务已退出，Manager 的描述符是全系统对该非持久 TUN 设备的**最后一个打开描述符**，彻底关闭它将触发 Linux 内核注销并销毁该接口；
+     5. Manager 向 Host 发送确认 ACK。Host 收到 ACK 确认旧非持久网卡已在内核中完全销毁，随后执行 `self.nic.drain()`（因任务已退出故即刻完成）进入无设备状态或安全重建同名新设备；
+     6. 若解绑超时（入队超时或等待 ACK 超时）或删除失败，返回 `Err(CleanupIncomplete)`，Host 保持未决状态，绝不盲目判定为已释放或重建同名设备。
    - **无设备稳态**：
      若 Host 进入无设备状态（如 DHCP 续租失败 `next == None`），Manager 维持 `current_tun_device = None` 运行，跳过默认 TUN 路由安装，继续正常管理外部接口路由。
    - **新设备绑定（`BindTunDevice`）**：
@@ -467,103 +526,200 @@ Manager 采用**事件驱动拉取**模型，通知只负责唤醒，不逐条�
 4. **替换依赖顺序保证**：
    若同一个槽位（相同目标 CIDR）需要替换（例如 metric 变更），必须**先执行并确认删除成功，才允许尝试添加**。删除若失败，严禁盲目执行添加。
 
-### 5.3 基于 `guarden` 的资源收束与真实设备所有权保活（R1 / R2 / R3 闭合）
+### 5.3 基于独立描述符保活、局部解绑与 guarden 停机清理（R1 / R2 / R3 闭合）
 
-复用仓库现有的 `guarden = "0.3"` 统一管理清理任务与设备资源的所有权，彻底消除虚假的虚拟保活与提前释放风险：
+复用仓库现有的 `guarden = "0.3"` 统一管理停机任务与设备资源的所有权，彻底区分局部解绑与全局停机，消除虚假保活与提前释放风险：
 
-#### 1. 真实 Host 设备持有接线与关闭顺序（R1 闭合）
+#### 1. 真实 Host 设备持有接线、dup 描述符语义与确定关闭顺序（R1 闭合）
 在 `easytier/src/instance/runtime_host/tun_desktop.rs` 与 `tun_common.rs` 中建立确定的资源持有与关闭顺序：
-- **真实设备文件描述符强引用**：
-  在 Linux 原生环境下，Linux 内核网络接口（如 `tun0`）的存在完全取决于内核中指向 `/dev/net/tun` 的文件描述符。网卡创建时（`VirtualNic::create_dev`），Host 从创建好的底层设备中克隆一份独立的内核文件描述符（`dev.as_fd().try_clone_to_owned()?`），封装为 `Arc<OwnedFd>` 注入 `TunDeviceHandle`。
-- **与转发任务生命周期彻底解耦**：
-  - 转发任务归属于 `NicCtx` 的 `JoinSet`，其中发送任务在 `virtual_nic.rs:910` 长期锁定 `peer_packet_receiver`。
-  - 当网卡需要停止或执行 `drain()` 时，Host 终止 `NicCtx` 的转发任务，发送任务退出立即释放 `peer_packet_receiver` 的互斥锁，确保 `drain()` 或后续设备能无阻塞接管数据包接收。
-  - 与此同时，由于 `TunDeviceHandle` 独立持有 `Arc<OwnedFd>`，内核中的 `tun0` 网络接口（以及内核分配的递增 `ifindex`）依然存活！Netlink 路由精确删除可以顺利执行，绝不发生 `ENODEV`。
-- **设备资源全生命周期与解绑换卡顺序（R2 闭合）**：
-  1. **正常运行**：Manager 的 `current_tun_device: Option<TunDeviceHandle>` 强引用持有设备描述符。
-  2. **等待在途操作**：收到解绑、换绑或停机请求时，Manager 先顺序等待当前正在执行的单次底层调用返回并记账；期间设备描述符持续存活。
-  3. **解绑与清理顺序（先释放资源后发确认 ACK）**：
-     - Manager 接管旧设备句柄 `device`，将 `current_tun_device` 置为 `None`；
-     - 逐条精确删除属于该设备的路由；
-     - **在发送完成通知前显式执行 `drop(device)`**：彻底关闭 Manager 持有的最后一个 `OwnedFd`，触发内核注销销毁该接口；
-     - **确认资源已释放后才发送 `ack`**：Host 收到完成通知时，旧设备在系统内核中已绝对销毁；若解绑超时或失败，返回 `CleanupIncomplete`，Host 绝不误报旧设备已释放。
-  4. **Host 排水与新设备接入**：Host 收到解绑成功后执行 `self.nic.drain()`；若有新设备，创建全新网卡（同名 `tun0` 无内核冲突）、克隆新描述符并通过 `bind_tun_device` 可靠接入。
+- **内核描述符与 dup(2) 语义**：
+  在 Linux 原生环境下，非持久 TUN 设备（如 `tun0`）在内核网络协议栈中的存在完全取决于内核中指向 `/dev/net/tun` 的 open file description。网卡创建时（`VirtualNic::create_dev`），Host 从创建好的底层设备中克隆一份独立的内核文件描述符（`dev.as_fd().try_clone_to_owned()?`），封装为 `Arc<OwnedFd>` 注入 `TunDeviceHandle` 交付 Manager。  
+  **关键内核语义**：`dup(2)` 产生的新描述符与原始描述符指向**同一个 open file description**。仅当指向该 open file description 的**所有文件描述符均已关闭**时，Linux 内核才会注销并销毁该非持久 TUN 网络接口（参见 [Linux dup(2)](https://man7.org/linux/man-pages/man2/dup.2.html) 与 [Linux TUN/TAP 文档](https://docs.kernel.org/networking/tuntap.html)）。
+- **杜绝循环等待与任务退出确认**：
+  - 转发任务归属于 `NicCtx` 的 Tokio `JoinSet`，其中发送任务在 `virtual_nic.rs:910` 长期锁定 `peer_packet_receiver`。
+  - 不能简单发出取消信号或 Drop `JoinSet` 就假定任务已退出：`JoinSet` 的 Drop 虽会中止任务，但不等待底层 future 真正销毁；原始 fd 与 `peer_packet_receiver` 锁的释放必须等待任务真正退出。
+  - 若 Host 先等待 Manager 解绑成功才执行 `nic.drain()`，则在 Manager 执行清理并 `drop(device)` 时，转发任务仍持有原始 fd，Manager 的 ACK 承诺“内核中已销毁”并不成立；若 Manager 等待设备实际销毁再发 ACK 则会导致死锁。
+- **确定的 3 步关闭与解绑顺序（统一全文）**：
+  1. **Host 停止旧转发任务并等待完全退出**：
+     Host 发起换卡或解绑时，首先调用 `old_nic_ctx.tasks.shutdown().await`（或等待全部任务 join 退出），确认转发任务完全退出、原始描述符关闭且 `peer_packet_receiver` 锁彻底释放；随后释放 Host 持有的保活引用（`drop(old_nic_ctx)`）。  
+     此时，由于 Manager 独立持有 `TunDeviceHandle`（`Arc<OwnedFd>`），内核中的非持久 TUN 接口及递增 `ifindex` 依然存活，路由依然有效，后续 Netlink 精确删除绝无 `ENODEV`。
+  2. **Host 发送解绑请求，Manager 局部清理并释放最后描述符**：
+     Host 调用 `manager.unbind_tun_device(deadline).await`（受统一 deadline 约束入队与等待 ACK）。  
+     Manager 顺序收束在途操作，取出 `old_device = self.current_tun_device.take()`；  
+     Manager 仅精确删除属于 `old_device.id.ifindex` 的路由记录；  
+     删除完成后，Manager **显式执行 `drop(old_device)`**。由于 Host 侧所有持有者均已在此前确认释放，此时 Manager 的 drop 是全系统对该非持久 TUN 设备的**最后一个打开描述符**，彻底关闭它将触发 Linux 内核注销并销毁该接口；  
+     Manager 发送完成 ACK。
+  3. **Host 接收完成确认与安全状态转换**：
+     Host 收到 ACK，确认旧非持久 TUN 设备在内核中已绝对销毁，且所有路由与转发任务已彻底清理；  
+     Host 执行 `self.nic.drain()`（此时 packet receiver 锁早已释放，drain 即刻完成），安全进入无设备状态（如 DHCP lease 释放）或创建同名全新设备（无内核接口名称冲突或 `EEXIST`），克隆新描述符调用 `bind_tun_device`。
+- **设备销毁保证的边界声明**：
+  上述设备注销保证**严格限于本实例拥有的非持久 TUN 设备，并以所有持有者（Host 转发任务与 Manager 描述符）确实完全释放为前提**；不能由单次 `Arc::drop` 盲目推导，持久 TUN 设备（`TUNSETPERSIST`）不受文件描述符关闭而自动销毁。
 
-#### 2. guarden 清理守卫构造与 Unknown 安全排除
-通过 `guarden::guard!` 创建异步清理守卫，**严格跳过 `unknown_routes`，严禁盲目向内核重复发送未知状态的操作，显式保活底层设备并完整收集结果**：
+#### 2. 局部设备解绑分支 (`UnbindTunDevice`)：借用 Backend、局部收割、保留其他路由与继续事件循环（R3 闭合）
+解绑命令只针对旧默认设备进行局部清理，**Manager 绝不退出主事件循环，不转移 `backend` 的所有权，且绝不误删其他外部接口（如 `eth0`）的路由**：
 
 ```rust
-let (completion_tx, completion_rx) = tokio::sync::oneshot::channel();
-let device = current_tun_device.take(); // 取出真实设备句柄
-let mut cleanup_guard = guarden::guard! {
-    [
-        mut backend,
-        installed = installed_routes,
-        unknown = unknown_routes,
-        device, // 捕获真实设备所有权
-        completion_tx = Some(completion_tx)
-    ]
-    async move {
-        let mut uncleaned_routes = Vec::new();
-        let mut unknown_routes_during_cleanup = Vec::new();
+// 在 HostRouteManager 主事件循环中处理 UnbindTunDevice 分支
+ManagerCommand::UnbindTunDevice { deadline, ack } => {
+    // 1. 等待正在执行的单次在途底层系统调用返回并记账
+    self.flush_in_flight().await;
 
-        // 1. 逐条精确删除本方创建的有效路由
-        for route in installed {
-            // 严禁对已知结果不明的条目盲目重发删除！
-            if unknown.contains(&route) {
-                continue;
-            }
-            match backend.remove(&route).await {
-                Ok(Some(())) | Ok(None) => {
-                    // 成功移出系统或系统中已无该精确条目
-                }
-                Err(RouteError::Failed(err)) => {
-                    tracing::error!(?route, ?err, "failed to remove route during cleanup");
-                    uncleaned_routes.push(route);
-                }
-                Err(RouteError::Unknown(err)) => {
-                    tracing::error!(?route, ?err, "unknown result during route cleanup");
-                    unknown_routes_during_cleanup.push(route);
-                }
-            }
+    // 2. 取出当前默认 TUN 设备句柄
+    let old_device = self.current_tun_device.take();
+
+    match old_device {
+        None => {
+            // 当前本就处于无设备状态，直接回复成功
+            let _ = ack.send(Ok(()));
         }
+        Some(dev) => {
+            // 3. 精确分区：仅筛选属于旧默认网卡 (dev.id.ifindex) 的路由记录
+            // 绑定到外部接口 (如 eth0) 的路由继续保留在 installed_routes 中，绝不误伤！
+            let dev_ifindex = dev.id.ifindex;
+            let (device_routes, retained_routes): (BTreeSet<Route>, BTreeSet<Route>) =
+                std::mem::take(&mut self.installed_routes)
+                    .into_iter()
+                    .partition(|r| r.interface.ifindex == dev_ifindex);
+            self.installed_routes = retained_routes;
 
-        // 2. 汇总未决责任 (此前积累的 unknown 与清理期间新增的 unknown)
-        let mut all_unknown: Vec<Route> = unknown.into_iter().collect();
-        all_unknown.extend(unknown_routes_during_cleanup);
+            // 4. 局部清理执行：直接借用 &mut self.backend，不消费 backend 所有权
+            let mut uncleaned_routes = Vec::new();
+            let mut dev_unknown_routes = Vec::new();
 
-        // 3. 计算最终真实结果：仅当无失败且无未决项时才返回 Ok(())
-        let final_outcome = if uncleaned_routes.is_empty() && all_unknown.is_empty() {
-            Ok(())
-        } else {
-            Err(CleanupIncomplete {
-                uncleaned_routes,
-                unknown_routes: all_unknown,
-                reason: "route cleanup incomplete: encountered failed deletions or undetermined route states".to_string(),
-            })
-        };
+            for route in device_routes {
+                // 若此条目此前已处于 unknown 状态，严禁盲发重发删除
+                if self.unknown_routes.contains(&route) {
+                    dev_unknown_routes.push(route);
+                    continue;
+                }
+                match self.backend.remove(&route).await {
+                    Ok(Some(())) | Ok(None) => {
+                        // 成功从内核移出
+                    }
+                    Err(RouteError::Failed(err)) => {
+                        tracing::error!(?route, ?err, "failed to remove route during tun unbind");
+                        // 失败条目保留在 self.installed_routes 中，责任不丢失
+                        self.installed_routes.insert(route.clone());
+                        uncleaned_routes.push(route);
+                    }
+                    Err(RouteError::Unknown(err)) => {
+                        tracing::error!(?route, ?err, "unknown result during tun unbind");
+                        // 未决条目记入 self.unknown_routes 隔离，责任不丢失
+                        self.unknown_routes.insert(route.clone());
+                        dev_unknown_routes.push(route);
+                    }
+                }
+            }
 
-        // 4. 先显式释放设备描述符，后发送确认通知 (R1 / R2 闭合关键点)：
-        // 必须在向 completion_tx 发送结果前 drop(device)，确保底层的 OwnedFd 完全关闭且内核接口已开始销毁；
-        // 这样 Host 在收到 ACK 唤醒并准备重建同名设备时，旧设备在系统内核中已绝对释放，杜绝名称冲突与残留
-        drop(device);
+            // 5. 显式释放全系统最后一个描述符，触发内核注销非持久 TUN 设备 (R1 闭合)
+            drop(dev);
 
-        if let Some(tx) = completion_tx {
-            let _ = tx.send(final_outcome.clone());
+            // 6. 计算局部解绑结果并发送 ACK
+            let outcome = if uncleaned_routes.is_empty() && dev_unknown_routes.is_empty() {
+                Ok(())
+            } else {
+                Err(CleanupIncomplete {
+                    uncleaned_routes,
+                    unknown_routes: dev_unknown_routes,
+                    reason: "tun unbind incomplete: encountered failed deletions or undetermined states on device".to_string(),
+                })
+            };
+
+            // 若调用方已超时断开 (ack_rx dropped)，结果已正确保留在 self.installed_routes 与 self.unknown_routes 中
+            let _ = ack.send(outcome);
         }
-
-        final_outcome
     }
-};
+    // 7. 解绑完成后，Manager 维持 current_tun_device = None，继续运行在主循环中！
+    // 后端 backend 可用，外部接口路由完好，后续可随时响应 BindTunDevice 绑定新设备
+}
 ```
 
-#### 3. 守卫触发与任务跟踪模型
-- **任务触发**：调用 `let cleanup_task = cleanup_guard.trigger();`，返回 `guarden::task::DetachableTask`。
-- **任务驱动与结果保存**：Manager 主任务直接执行 `let outcome = cleanup_task.await;`。Manager 任务的 `JoinHandle` 持续追踪该清理过程，直到清理真正完成才退出；同时将 `outcome` 写入 `handle.cleanup_result`。
-- **超时与分离机制**：
-  - 调用方 `handle.stop(deadline)` 或 `handle.unbind_tun_device(deadline)` 整体受 `deadline` 约束。若在超时前收到 `completion_rx`，如实返回 `Result<(), CleanupIncomplete>`。
-  - 若调用方到达 `deadline` 超时，调用方结束等待并返回 `Err(CleanupIncomplete { .. reason: "timeout waiting for cleanup" })`。
-  - **关键保障**：调用方超时绝不打断后台任务。后台 `DetachableTask` 继续由 Manager 调度执行并持有 `device`（`TunDeviceHandle`），防止底层设备被提前释放。清理完成后更新 `cleanup_result`，外部可通过 `handle.query_cleanup_result()` 随时获取真实终态。
+#### 3. 全局停机清理守卫 (`Stop`)：接管全部资源、guarden 异步保活与终止退出（R3 闭合）
+与局部解绑不同，全局停机命令用于整个服务实例退出时的彻底清理，**接管 Manager 的全部资源并在 `guarden::guard!` 内执行终态清理后退出任务**：
+
+```rust
+// 在 HostRouteManager 主事件循环中处理 Stop 分支
+ManagerCommand::Stop { deadline, ack } => {
+    // 1. 等待在途系统调用返回并记账
+    self.flush_in_flight().await;
+
+    // 2. 消耗全部资源所有权，退出主事件循环
+    let backend = self.backend;
+    let installed = std::mem::take(&mut self.installed_routes);
+    let unknown = std::mem::take(&mut self.unknown_routes);
+    let device = self.current_tun_device.take();
+
+    // 3. 通过 guarden::guard! 构造异步清理守卫，确保调度打断或异常时清理不被半途丢弃
+    let (completion_tx, completion_rx) = tokio::sync::oneshot::channel();
+    let mut cleanup_guard = guarden::guard! {
+        [
+            mut backend,
+            installed,
+            unknown,
+            device,
+            completion_tx = Some(completion_tx)
+        ]
+        async move {
+            let mut uncleaned_routes = Vec::new();
+            let mut unknown_routes_during_cleanup = Vec::new();
+
+            // 逐条精确删除所有已安装路由 (跳过 unknown_routes，严禁盲发重发)
+            for route in installed {
+                if unknown.contains(&route) {
+                    continue;
+                }
+                match backend.remove(&route).await {
+                    Ok(Some(())) | Ok(None) => {}
+                    Err(RouteError::Failed(err)) => {
+                        tracing::error!(?route, ?err, "failed to remove route during global stop");
+                        uncleaned_routes.push(route);
+                    }
+                    Err(RouteError::Unknown(err)) => {
+                        tracing::error!(?route, ?err, "unknown result during global stop");
+                        unknown_routes_during_cleanup.push(route);
+                    }
+                }
+            }
+
+            let mut all_unknown: Vec<Route> = unknown.into_iter().collect();
+            all_unknown.extend(unknown_routes_during_cleanup);
+
+            let final_outcome = if uncleaned_routes.is_empty() && all_unknown.is_empty() {
+                Ok(())
+            } else {
+                Err(CleanupIncomplete {
+                    uncleaned_routes,
+                    unknown_routes: all_unknown,
+                    reason: "route cleanup incomplete: encountered failed deletions or undetermined route states".to_string(),
+                })
+            };
+
+            // 释放可能存留的设备描述符
+            drop(device);
+
+            if let Some(tx) = completion_tx {
+                let _ = tx.send(final_outcome.clone());
+            }
+
+            final_outcome
+        }
+    };
+
+    // 4. 驱动守卫执行直至终态，记录结果并终止 Manager 任务
+    let cleanup_task = cleanup_guard.trigger();
+    let outcome = cleanup_task.await;
+    *self.cleanup_result.lock().await = Some(outcome.clone());
+    let _ = ack.send(outcome);
+    break; // 彻底退出协调循环
+}
+```
+
+#### 4. 任务跟踪、超时机制与后台资源保活（R2 闭合）
+- **统一 deadline 约束**：
+  - `handle.unbind_tun_device(deadline)` 与 `handle.stop(deadline)` 均由外部调用方传入绝对 `deadline`。
+  - **命令入队阶段**：采用 `tokio::time::timeout_at(deadline.into(), cmd_tx.send(...))`。若此时 Manager 正卡在 Netlink 系统调用且通道已满，调用在 `deadline` 到达时准时返回 `Err(CleanupIncomplete { reason: "deadline exceeded while queueing ..." })`。调用方明确获知请求未入队，Manager 未开始解绑或停机。
+  - **ACK 等待阶段**：入队成功后，对 `ack_rx` 同样以该 `deadline` 执行 `timeout_at`。若底层删除较慢导致超时返回，Manager 此时已接管请求并在后台继续持有资源（`old_device` 或 `backend`）顺序执行，绝不因为调用方超时而提前释放描述符导致内核设备提前销毁。
+  - **结果追溯**：对于 `stop`，后台任务完成后将最终真实结果写入 `handle.cleanup_result`，外部可通过 `handle.query_cleanup_result().await` 随时查询最终状态。
 - **自有 TUN 级联销毁捷径约束**：
   若 Host 选择通过直接关闭自有 TUN 文件描述符让内核自动级联删除接口路由：
   - 必须先停止 Manager 协调循环并收束在途操作；
@@ -588,17 +744,19 @@ pub struct CleanupIncomplete {
 
 #### 1. 默认设备解绑流程 (`unbind_tun_device(deadline)`)
 用于网卡重建前夕或 DHCP 释放（`next == None`）时的设备解绑（`旧设备 → 无设备`）：
-1. **可靠请求与状态收束**：向 Manager 发送 `ManagerCommand::UnbindTunDevice`。Manager 优先等待在途系统调用完成并记账。
-2. **空状态过渡与局部清理**：Manager 将 `current_tun_device` 置为 `None`，更新 desired 路由排除默认 TUN 路由；针对旧设备 `ifindex` 路由执行精确删除；**先 `drop(device)` 释放内核文件描述符，后发送完成通知**。
-3. **超时与未完成保护**：若解绑在 `deadline` 前未完成，返回 `Err(CleanupIncomplete)`，Host 保持未决状态，绝不继续同名创建。
-4. **服务持续性**：解绑成功后 Manager 保持存活，继续维护外部接口（如 `eth0`）路由。
+1. **停止转发任务**：Host 首先停止旧转发任务并等待任务实际退出（`JoinSet::shutdown().await`），确认原始 fd 与 `peer_packet_receiver` 锁完全释放，并释放 Host 持有的保活句柄。
+2. **限时入队与状态收束**：向 Manager 发送 `ManagerCommand::UnbindTunDevice`（发送受 `deadline` 约束）。Manager 优先等待在途系统调用完成并记账。
+3. **空状态过渡与局部清理**：Manager 将 `current_tun_device` 置为 `None`，更新 desired 路由排除默认 TUN 路由；仅针对旧设备 `ifindex` 路由执行精确删除；保留外部接口路由，不退出主循环。
+4. **释放最后描述符与回复 ACK**：删除完成后显式 `drop(old_device)`，关闭全系统最后一个打开描述符触发内核注销非持久 TUN 接口，随后发送 ACK。
+5. **超时与未完成保护**：若入队超时或等待 ACK 超时，返回 `Err(CleanupIncomplete)`，Host 保持未决状态，绝不盲目判定为已释放或重建同名设备；Manager 在入队成功后于后台继续处理。
+6. **Host 排水与状态转换**：Host 收到 ACK 确认设备注销后，执行 `self.nic.drain()` 进入无设备状态或安全创建全新同名设备。
 
 #### 2. 全局停机流程 (`stop(deadline)`)
 用于整个服务实例退出时的彻底清理：
-1. **立即打断调度**：触发 `cancel_token.cancel()`，拒绝接收新操作。
-2. **全流程限时等待**：发送 `ManagerCommand::Stop` 并限时等待全量已安装路由清理。
-3. **资源彻底释放**：同样在发送完成通知前执行 `drop(device)` 与 backend 释放。
-4. **真实结果透明判定（R3 闭合）**：仅当无失败且无未决项时返回 `Ok(())`；调用方超时返回 `CleanupIncomplete`，后台任务继续持有资源安全运行直至终态。
+1. **立即打断调度**：触发 `cancel_token.cancel()`，拒绝接收新业务操作。
+2. **全流程限时入队与清理等待**：发送 `ManagerCommand::Stop` 并限时等待全量已安装路由清理（发送与 ACK 等待统一受 `deadline` 约束）。
+3. **guarden 资源彻底释放**：Manager 退出循环，在 `guarden::guard!` 异步块内精确删除全量已安装路由（跳过 unknown），执行 `drop(device)` 与 backend 释放。
+4. **真实结果透明判定（R3 闭合）**：仅当无失败且无未决项时返回 `Ok(())`；调用方超时返回 `CleanupIncomplete`，后台任务继续持有资源安全运行直至终态，可随时通过 `query_cleanup_result` 查询。
 
 ---
 
@@ -747,7 +905,7 @@ Batch 5: 隔离环境原生测试与基准度量 (netns 真实系统调用、零
 
 #### Batch 3：HostRouteManager 核心闭环
 - **代码落点**：
-  - `easytier/src/instance/route/manager.rs`：实现 `HostRouteManager` 协调循环、快照与设备身份比对跳过、串行在途操作收束、可靠命令 `bind_tun_device` 与解绑 `unbind_tun_device`（先 `drop(device)` 后发 ACK）、diff 与清理均跳过 `unknown_routes`、基于 `guarden` 的设备保活清理与 `stop(deadline)`。
+  - `easytier/src/instance/route/manager.rs`：实现 `HostRouteManager` 协调循环、快照与设备身份比对跳过、串行在途操作收束、可靠命令 `bind_tun_device` 与解绑 `unbind_tun_device`（覆盖入队与等待 ACK 全过程的统一 deadline、借用 backend 执行局部清理、清理完成后显式 `drop(device)` 释放最后描述符后发 ACK）、diff 与清理均跳过 `unknown_routes`、基于 `guarden` 的设备保活清理与 `stop(deadline)`。
 - **验证**：
   - 基于 `MockRouteBackend` 的闭环测试：
     - 首启全量添加；
@@ -755,8 +913,10 @@ Batch 5: 隔离环境原生测试与基准度量 (netns 真实系统调用、零
     - **设备解绑与无设备稳态测试**：验证 `unbind_tun_device` 正确将 Manager 置为无设备状态（`current_tun_device = None`）并清理对应路由；验证在发送完成 ACK 前设备描述符已关闭；验证 Manager 在无设备下保持运行并不丢弃其他接口路由；
     - **同名网卡先解绑后重建测试**：模拟同名重建（`tun0` $\to$ `tun0`），验证必须在旧设备完全释放后才接入新设备；
     - **独立设备描述符保活与解耦验证**：使用真实底层设备接线，先终止转发任务（释放 `peer_packet_receiver` 锁），路由删除仍处于等待中；确认设备文件描述符尚未释放；直到路由清理完成并 drop 后设备才释放，后续关闭能顺畅释放旧 packet receiver，不阻碍 drain 或下一块设备接管；
+    - **延迟旧转发任务退出验证 (R1 闭合)**：延迟旧转发任务退出（保持原始描述符未关闭），验证 Host 绝不提前宣告设备销毁或创建同名设备；任务退出后顺利完成解绑与同名重建；
+    - **解绑 Deadline 覆盖入队与 ACK 验证 (R2 闭合)**：保持 backend 系统调用未返回，填满命令队列，调用 `unbind_tun_device`；验证其在 deadline 到达时立即超时返回（指出请求未入队），绝不在 send 上无超时挂死；另验证已成功入队但仅 ACK 超时场景下，Manager 在后台继续安全执行并不提前释放资源；
+    - **局部解绑与外部接口隔离测试 (R3 闭合)**：同时存在默认 TUN 和其他接口（如 `eth0`）的本方路由时执行 `unbind_tun_device`：验证仅清理前者路由，Manager 不退出；随后外部接口路由仍能正常刷新维护，新 TUN 仍能正常调用 `bind_tun_device` 绑定；局部清理失败或产生 unknown 时，未完成条目妥善保留在 Manager 状态中，绝不丢失；
     - **可靠换绑投递与通道关闭测试**：在 Manager 执行系统调用阻塞时发送高频 Refresh 填满队列，发起 `bind_tun_device`，验证 `send().await` 背压等待且命令不丢失；验证 Manager 停机通道关闭时返回 `DeviceBindError::ManagerTerminated(device)` 保持设备所有权；
-    - **显式外部接口保护**：默认 TUN 重建或退出时，验证绑定到其他外部接口（如 `eth0`）的路由记录完整保留，不被误删或丢弃；
     - **在途操作收束**：模拟单次 ADD 阻塞在底层，触发退出并使调用方等待超时，验证在途操作被单线程循环正常收束记账，旧操作绝不落到重建后的网卡上；
     - **未决隔离与真实报告**：操作结果返回 `RouteError::Unknown` 时准确记入 `unknown_routes`；后续 diff 循环与清理循环均自动跳过该条目（不盲发重试）；stop 最终返回 `CleanupIncomplete`，绝不误报成功；
     - **Stop 限时超时与后台保活**：调用方 stop 超时后按时返回，后台 guarden 任务继续持有底层设备（`TunDeviceHandle`）和 backend 安全运行直至结束，设备不被提前释放；外部可通过 `query_cleanup_result` 获得最终完成结果；
@@ -765,7 +925,12 @@ Batch 5: 隔离环境原生测试与基准度量 (netns 真实系统调用、零
 #### Batch 4：Host 真实生命周期接线与交接
 - **代码落点**：
   - `easytier/src/instance/dns_server/server_instance.rs` & `runner.rs` & `runtime_host/magic_dns.rs`：解耦系统配置与路由清理，返回 `DnsCleanOutcome` 并向上抛出。
-  - `easytier/src/instance/runtime_host/tun_desktop.rs` & `tun_common.rs` & `implementation.rs`：在 `NativeDhcpIpv4Host::apply` 中先调用 `unbind_tun_device(deadline).await?` 解绑并执行 `nic.drain()`；若 `next` 为 None 保持无设备，若 `next` 为 Some，创建新网卡克隆 `OwnedFd` 构造 `TunDeviceHandle` 并可靠调用 `bind_tun_device`；停机时调用 `stop(deadline)`。
+  - `easytier/src/instance/runtime_host/tun_desktop.rs` & `tun_common.rs` & `implementation.rs`：在 `NativeDhcpIpv4Host::apply` 中实现确定的关闭与解绑顺序：
+    1. 首先停止旧转发任务并等待任务实际退出（`tasks.shutdown().await`），确认原始 fd 与 receiver 锁完全释放；
+    2. 释放 Host 持有的保活引用（`drop(old_nic_ctx)`）；
+    3. 调用 `unbind_tun_device(deadline).await?` 限时解绑（入队与等待 ACK 均受 deadline 约束），等待 Manager 清理路由并释放全系统最后描述符（触发内核注销非持久 TUN 接口）；
+    4. 执行 `self.nic.drain()` 进入干净状态；
+    5. 若 `next` 为 None 保持无设备稳态；若 `next` 为 Some，创建全新网卡克隆 `OwnedFd` 构造 `TunDeviceHandle` 并可靠调用 `bind_tun_device`；停机时调用 `stop(deadline)`。
   - `easytier/src/instance/virtual_nic.rs`：仅在 `not(all(target_os = "linux", feature = "linux-netlink"))` 下启动 `run_proxy_cidrs_route_updater`。
 - **验证**：
   - 跨平台与特性组合编译验证：验证 Linux（开启/未开启 netlink）、Windows、macOS（含 `macos-ne`）、FreeBSD 均能顺利编译，未迁移平台维持原有旧链路；
@@ -795,7 +960,7 @@ Batch 5: 隔离环境原生测试与基准度量 (netns 真实系统调用、零
 在宣布第二步完成并进入第三步前，必须逐项核对满足以下门槛：
 
 - [ ] **统一模型与真实设备描述符所有权**：以包含 `DeviceId { ifname, ifindex }` 的单一 `Route` 模型表达期望与安装路由；`TunDeviceHandle` 独立持有底层真实设备文件描述符（`Arc<OwnedFd>`），与用户态转发任务彻底解耦，实现 `Debug`；CIDR 主机位非零（如 `10.0.0.1/24`）安全规范化，无 panic；自动代理、手工覆盖均准确计算。
-- [ ] **完整解绑与同名网卡重建重装**：建立 `旧设备 → unbind_tun_device → 无设备 → bind_tun_device → 新设备` 闭环；同名网卡重建时旧设备先解绑释放，新设备后接入；解绑与清理时先 `drop(device)` 释放内核设备描述符后再发送完成通知；默认 TUN 销毁或换绑时，显式绑定到其他外部接口（如 `eth0`）的路由记录完整保留，不被误删。
+- [ ] **完整解绑与同名网卡重建重装**：建立 `旧设备 → unbind_tun_device → 无设备 → bind_tun_device → 新设备` 闭环；确立唯一确定的关闭与解绑顺序（Host 先停止并等待旧转发任务退出释放原始 fd 与 receiver 锁；Manager 持有保活描述符完成路由精确删除后 `drop(old_device)` 关闭全系统最后一个描述符，触发内核注销非持久 TUN 接口后再发 ACK；保证严格以所有持有者释放为前提）；解绑 deadline 统一覆盖命令入队与等待 ACK 全过程（防止队列满挂死）；局部解绑仅针对默认 TUN 路由，借用 backend 并在完成后留在主循环，显式绑定到其他外部接口（如 `eth0`）的路由记录完整保留且责任不丢失。
 - [ ] **依赖方向与严格编译门控**：`easytier-core` 绝无引用 `easytier` 类型；`PlatformRouteBackend` 仅在 `all(target_os = "linux", feature = "linux-netlink")` 下声明，不预建未实现的平台别名或 Stub 类型；全平台及特性组合均独立可编译。
 - [ ] **带 Send 约束的静态分发后端与精确删除**：`RouteBackend` trait 声明返回 `impl Future<Output = ...> + Send`，兼顾零装箱静态分发与 Tokio / guarden 线程安全性；Linux 精确删除直接按 `ifindex`、目标、metric 与 table 发送单发 `RTM_DELROUTE`，0 次全表 dump。
 - [ ] **稳态零多余操作**：在网络拓扑与配置稳定的状态下，快照指针与设备身份比对快速拦截，协调循环不产生多余的底层系统调用和堆内存分配；无关服务配置变动不引发路由重算。
