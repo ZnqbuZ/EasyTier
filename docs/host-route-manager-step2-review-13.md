@@ -1,5 +1,7 @@
 # HostRouteManager 第二步方案：第十三轮复审
 
+> **此轮通过结论已撤回。** 后续职责审查确认：路由 Manager 不应持有或延长 TUN 设备生命周期；此前要求的 TunDeviceHandle、复制 fd 保活及设备销毁 ACK 是错误的设计前提。刷新统一采用 watch，删除 Refresh 命令路径。原结论仅保留为审查历史，不再作为实施依据；以 step2 文档开头的职责修正为准。
+
 审查对象：`4cafe6da` 基线上的工作区修订；[`host-route-manager-step2-plan.md`](host-route-manager-step2-plan.md) 内容哈希为 `478cc96914b55b56b5b872e6d73a4f5ecc851eeb`。本文行号对应此版本。
 
 **结论：上一轮两项问题已关闭，本轮未发现新的阻断项，可以进入第二步实现。无需为本次审查再整体修订方案。**
