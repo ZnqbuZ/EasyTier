@@ -1,6 +1,6 @@
-# HostRouteManager 第二步实施方案：最小 Manager 闭环（第五轮修订版）
+# HostRouteManager 第二步实施方案：最小 Manager 闭环（第六轮修订版）
 
-状态：已根据第三次审查意见（[`docs/host-route-manager-step2-review-3.md`](host-route-manager-step2-review-3.md)）完成深度修订。严格遵循最新实施总纲（[`docs/host-route-manager-master-plan.md`](host-route-manager-master-plan.md)）与第一步规范（[`docs/host-route-manager-step1-audit-and-contract.md`](host-route-manager-step1-audit-and-contract.md)）。  
+状态：已根据第四次审查意见（[`docs/host-route-manager-step2-review-4.md`](host-route-manager-step2-review-4.md)）完成针对性修订。严格遵循最新实施总纲（[`docs/host-route-manager-master-plan.md`](host-route-manager-master-plan.md)）与第一步规范（[`docs/host-route-manager-step1-audit-and-contract.md`](host-route-manager-step1-audit-and-contract.md)）。  
 基线代码：`refactor/route` 分支；参考分支：`refactor/route-dev` (`8abfb51e`)。
 
 ---
@@ -58,7 +58,7 @@ pub enum RouteBackendMode {
   - 实现 `RouteBackend` 及其原生/委托实现（包含长连接 Netlink、Win32 API 等）。
   - 实现 `HostRouteManager` 协调循环、未决操作追踪、多代际记录与生命周期。
   - 接线宿主生命周期组件：`NativeInstanceRuntimeHost`、`tun_desktop.rs`、`tun_common.rs`。
-  - 改造 Magic DNS 真实清理路径：解耦系统 DNS 配置恢复与路由删除，`clean_env()` 返回结构化结果，传递至 `DnsRunner` 与 `MagicDnsRuntime::stop()`。
+  - 改造 Magic DNS 真实清理路径：独立返回路由删除结果 `DnsCleanOutcome`，传递至 `DnsRunner` 与 `MagicDnsRuntime::stop()`。
 
 ```text
 easytier-core/
@@ -88,12 +88,12 @@ easytier/
               │     │     └── delegated.rs  [新增] 移动端委托后端 (真实会话所有者契约)
               │     └── manager.rs          [新增] HostRouteManager 核心闭环、未决操作记录与多代际绑定
               ├── dns_server/
-              │     ├── server_instance.rs  [修改] clean_env() 解耦系统配置并真实返回路由删除结果 Result<(), Error>
-              │     └── runner.rs           [修改] 传递 clean_env() 路由清理结果至外部
+              │     ├── server_instance.rs  [修改] clean_env() 解耦系统配置并独立返回 DnsCleanOutcome
+              │     └── runner.rs           [修改] 传递 clean_env() 结果至外部
               ├── runtime_host.rs           [修改] 管理器实例生命周期管理 (持留 Handle 并在 shutdown 协调停止)
               ├── runtime_host/
               │     ├── implementation.rs   [修改] 转发宿主运行时接口
-              │     ├── magic_dns.rs        [修改] stop() 向上返回真实路由清理结果
+              │     ├── magic_dns.rs        [修改] stop() 向上返回 DnsCleanOutcome
               │     ├── tun_desktop.rs      [修改] 静态 TUN 与 DHCP 换卡通过命令通道交接 bind/unbind
               │     └── tun_common.rs       [修改] TunNicState::stop 与 drain 协调解绑与旧网卡销毁确认
               └── virtual_nic.rs            [修改] 按 RouteBackendMode 决策是否启动 run_proxy_cidrs_route_updater
@@ -308,9 +308,9 @@ pub enum ManagerCommand {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RetiredBindingState {
-    /// 已解绑，已停止所有 I/O，冻结等待宿主决策 (严禁自主发起 remove_route)
+    /// 已解绑，已停止所有 I/O，全局冻结等待宿主决策 (所有执行入口严禁触碰)
     FrozenAwaitingDecision,
-    /// 宿主明确保留设备并交回控制，正在执行精确清理
+    /// 宿主明确保留设备并交回控制，已授权 Manager 执行精确清理
     CleaningActive,
 }
 
@@ -474,23 +474,26 @@ Manager 绝不通过虚假消息总线通信，而是直接绑定各组件的权
 3. **替换依赖顺序保证**：
    若同一个槽位（相同目标 CIDR）需要替换（例如 metric 变更），必须**先执行并确认删除成功，才允许尝试添加**。删除若失败，严禁盲目执行添加。
 
-### 5.3 接口重建与解绑交接屏障（T2 闭合）
+### 5.3 接口重建与全局冻结约束（T2 / U1 闭合）
 
-为彻底杜绝“Manager 在 Host 关闭旧接口后并发发送删除指令导致 ifindex 踩踏”的问题，交接时序严格遵守以下契约：
+为彻底杜绝“Manager 在 Host 关闭旧接口后并发发送删除指令导致 ifindex 踩踏”的问题，交接时序与冻结状态遵循以下全局通用约束：
 
-1. **解绑冻结与无 I/O 承诺 (`UnbindInterface`)**：
+1. **全局禁止 I/O 约束 (`FrozenAwaitingDecision`)**：
+   处于 `FrozenAwaitingDecision` 状态的旧绑定，**受到全局禁止 I/O 的硬性约束**。该约束对 Manager 的**全部执行入口**（包括正常差异循环、失败退避重试、Stop 停机清理、DNS 冲突交接及任何核对操作）普遍生效：
+   - 任何入口**均严禁对 Frozen 绑定发起系统调用（`remove_route` / `add_route`）**！
+   - 只有匹配绑定的 `CleanupRetiredInterface` 命令才能将其转为 `CleaningActive` 并重新授权 I/O；Stop 和 DNS 请求本身**不是这项授权**。
+2. **解绑冻结与无 I/O 承诺 (`UnbindInterface`)**：
    - Host 触发网卡重建或切换时，调用 `handle.unbind_interface().await`；
    - Manager 收到命令后，停止对当前绑定的所有新 I/O，等待当前单项在途操作完成并记账；
    - 将当前绑定及其记录、未决操作打包为 `RetiredBindingContext`，**其状态标记为 `FrozenAwaitingDecision`**；
    - Manager 向 Host 发送 ACK。
-   - **关键保证**：在收到 Host 明确指令之前，Manager **绝不主动对该 retired 绑定发起任何系统调用**！
-2. **Host 处理网卡底层与分支确认**：
+3. **Host 处理网卡底层与分支确认**：
    - **分支 1（销毁网卡，最常见的 TUN 重建路径）**：
      Host 安全关闭/注销底层 TUN 设备（内核自动级联删除其所有路由）。Host 调用 `handle.confirm_interface_destroyed(gen).await`。Manager 收到后，确认设备已物理销毁，直接从 `retired_bindings` 注销丢弃对应代际的所有记录。从 ACK 到销毁确认之间，**旧后端调用数严格为 0**！
    - **分支 2（保留网卡，仅逻辑解绑/换 IP）**：
      Host 保留设备，调用 `handle.cleanup_retired_interface(gen).await` 交回控制。Manager 将其状态转为 `CleaningActive`，并置 `execution_dirty = true`，安全启动精确清理。
 
-### 5.4 停机流程与超时保证 (`stop(deadline)`)（T1 闭合）
+### 5.4 停机流程与超时保证 (`stop(deadline)`)（T1 / U1 闭合）
 
 ```rust
 pub struct CleanupIncomplete {
@@ -502,7 +505,7 @@ pub struct CleanupIncomplete {
 }
 ```
 
-停机调用 `handle.stop(deadline)` 时严格执行以下步骤，**确保整个等待过程全程受 deadline 严格约束**：
+停机调用 `handle.stop(deadline)` 时严格执行以下步骤，**确保整个等待过程全程受 deadline 严格约束，且绝不违背 Frozen 规则**：
 
 1. **立即打断调度**：
    在 `handle.stop()` 入口处，**立即触发 `cancel_token.cancel()`**，拒绝接收新添加请求。
@@ -513,9 +516,17 @@ pub struct CleanupIncomplete {
    - **绝不通过 task abort 取消 Manager**：Manager 任务在后台继续平稳运行，等待在途系统调用正常返回并记账；
    - **宿主保持持有 Handle**：因 `stop(&self)` 采用借用，Host 在收到 `CleanupIncomplete` 后依然持有 `RouteManagerHandle`，可继续通过 `join_handle` 观察后台在途任务的最终退出，绝不提前启动相竞争的新 writer。
 3. **Manager 内部限时执行与句柄独占**：
-   - Manager 处理 Stop 命令时，若当前存在正在 `spawn_blocking` 中执行的在途操作，使用 `tokio::time::timeout_at(deadline, in_flight_rx)` 等待其完成；
-   - 若在途操作超时未完，Manager 独占其结果接收句柄，将其记录为 `in_flight_operation`，立即向 ACK 发送 `CleanupIncomplete`；
-   - 若在途操作及时完成，Manager 进入清理循环，对 `installed_routes` 与 `retired_bindings` 依次调用 `remove_route`，每项操作均受 `timeout_at(deadline)` 保护；
+   - **在途操作限时等待**：若当前存在正在 `spawn_blocking` 中执行的在途操作，Manager 必须避免按值消费导致丢弃接收端。Manager 持留 pinned future 的可变借用（`&mut in_flight_fut`），使用 `tokio::time::timeout_at(deadline, &mut in_flight_fut).await` 进行限时等待：
+     - 若在途操作在 deadline 前完成，将其结果如实记入账目或 `pending_operations`；
+     - 若超时未完，`in_flight_fut` 未被丢弃，Manager 在后台继续独占持有该句柄以接收最终结果，并在返回的 `CleanupIncomplete` 中将 `in_flight_operation` 设为 `Some(spec)`。
+   - **清理循环与 Frozen 遵守**：
+     - 对当前活跃绑定的 `installed_routes` 依次调用 `remove_route`，每项操作使用借用受 `timeout_at(deadline)` 保护；
+     - 对 `retired_bindings` 中处于 `CleaningActive` 状态的旧绑定，依次调用对应后端的 `remove_route`；
+     - **对 `retired_bindings` 中处于 `FrozenAwaitingDecision` 状态的旧绑定：严格禁止调用任何 `remove_route`！**
+       Manager 在 `deadline` 内仅等待 Host 发来 `ConfirmInterfaceDestroyed` 或 `CleanupRetiredInterface`：
+       - 若收到 `ConfirmInterfaceDestroyed`：直接注销记录；
+       - 若收到 `CleanupRetiredInterface`：转为 `CleaningActive` 并执行 `remove_route`；
+       - 若 `deadline` 到期仍处于 `FrozenAwaitingDecision`，将其记录在 `CleanupIncomplete.uncleaned_retired` 中如实上报，绝不擅自删除！
    - 仅当全部已安装记录清空、`pending_operations` 为空且无在途操作时，返回 `Ok(())`；否则返回包含未完成项的 `CleanupIncomplete`。
 
 ---
@@ -539,50 +550,55 @@ Host 启动 / 初始化
          └─► 2. 不启动 HostRouteManager，由旧链路安全维持运行
 ```
 
-### 6.2 动态全量代理的重叠冲突防御与交接时序（T4 闭合）
+### 6.2 动态全量代理的重叠冲突防御与交接时序（T4 / U1 闭合）
 
 在第二步中，Magic DNS（`fake_ip/32`）与 macOS/FreeBSD 接口前缀依然由旧代码写入。
 
-**DNS 清理路径真实解耦改造**：
-在 `easytier/src/instance/dns_server/server_instance.rs` 中，**将路由删除与系统 DNS 配置恢复彻底解耦，绝不将路由删除放在 `if let Some(configer)` 条件内**：
+**DNS 清理路径真实解耦与错误分离改造**：
+在 `easytier/src/instance/dns_server/server_instance.rs` 中，**将路由删除与系统 DNS 配置恢复彻底解耦，并分离报告结果**：
 
 ```rust
 // dns_server/server_instance.rs
-pub async fn clean_env(&self) -> Result<(), anyhow::Error> {
-    let mut first_error = None;
 
-    // 1. 系统 DNS 配置恢复 (独立执行，即便为 None 或失败也不跳过路由删除)
-    if let Some(configer) = &self.data.system_config {
-        if let Err(e) = configer.close() {
-            tracing::error!("Failed to close system config: {:?}", e);
-            first_error = Some(e);
+#[derive(Debug)]
+pub struct DnsCleanOutcome {
+    /// 路由删除结果 (用于判定内核中是否已清除主机路由)
+    pub route_cleaned: Result<(), anyhow::Error>,
+    /// 系统配置恢复结果 (如 resolv.conf，用于诊断，不阻塞路由交接)
+    pub system_config_cleaned: Result<(), anyhow::Error>,
+}
+
+impl MagicDnsServerInstance {
+    pub async fn clean_env(&self) -> DnsCleanOutcome {
+        // 1. 系统 DNS 配置恢复 (独立执行，即便为 None 或失败也不影响路由删除)
+        let system_config_cleaned = if let Some(configer) = &self.data.system_config {
+            configer.close()
+        } else {
+            Ok(())
+        };
+
+        // 2. 路由清理：依据是否实际添加了主机路由独立执行，Linux (system_config=None) 正常执行！
+        let route_cleaned = if !self.tun_inet.contains(&self.data.fake_ip)
+            && let Some(tun_dev_name) = &self.data.tun_dev
+        {
+            let ifcfg = IfConfiger {};
+            ifcfg.remove_ipv4_route(tun_dev_name, self.data.fake_ip, 32).await
+                .map_err(Into::into)
+        } else {
+            Ok(())
+        };
+
+        self.packet_filter.close().await;
+
+        DnsCleanOutcome {
+            route_cleaned,
+            system_config_cleaned,
         }
-    }
-
-    // 2. 路由清理：依据是否实际添加了主机路由独立执行，Linux (system_config=None) 正常执行！
-    if !self.tun_inet.contains(&self.data.fake_ip)
-        && let Some(tun_dev_name) = &self.data.tun_dev
-    {
-        let ifcfg = IfConfiger {};
-        if let Err(e) = ifcfg.remove_ipv4_route(tun_dev_name, self.data.fake_ip, 32).await {
-            tracing::error!("Failed to remove DNS ipv4 route: {:?}", e);
-            if first_error.is_none() {
-                first_error = Some(e.into());
-            }
-        }
-    }
-
-    self.packet_filter.close().await;
-
-    if let Some(err) = first_error {
-        Err(err)
-    } else {
-        Ok(())
     }
 }
 ```
-- 修改 `dns_server/runner.rs`：`DnsRunner` 退出时向外部传递 `clean_env()` 的执行结果。
-- 修改 `runtime_host/magic_dns.rs`：`MagicDnsRuntime::stop(&mut self) -> Result<(), anyhow::Error>`，向上抛出真实清理结果。
+- 修改 `dns_server/runner.rs`：`DnsRunner` 退出时向外部传递 `DnsCleanOutcome`。
+- 修改 `runtime_host/magic_dns.rs`：`MagicDnsRuntime::stop(&mut self) -> Result<DnsCleanOutcome, anyhow::Error>`，向上抛出真实结构化结果。
 
 **未迁移上下文动态追踪 (`UnmigratedRouteTracker`)**：
 - 动态事实：`dns_status: UnmigratedWriterStatus`（包含 `Active`、`Inactive`、`CleaningFailed(Error)`）、`magic_dns_ip: Option<Ipv4Addr>`、`tun_cidr: Option<Ipv4Cidr>`。
@@ -593,15 +609,18 @@ pub async fn clean_env(&self) -> Result<(), anyhow::Error> {
    - **预留范围**：Host 更新 `UnmigratedRouteTracker`，将 $P$ 标记为待接手预留状态。
    - **触发清理**：Manager 协调循环被唤醒，策略函数将 $P$ 从 desired 中剔除：
      - **未决/在途检查**：若 $P$ 存在于 `pending_operations` 中，或正在在途添加，Manager **绝不发放预留确认，保持阻塞**！在途操作必须先结算，若添加成功则触发删除，若结果不明则持续阻塞。
-     - **已安装检查**：若 $P$ 存在于 `installed_routes`（或未清理的 `retired_bindings`）中，Manager 调用 `remove_route(P)`，成功后方发放确认。
+     - **已安装/旧绑定检查**：
+       - 若 $P$ 存在于当前活跃绑定的 `installed_routes` 中：调用当前后端的 `remove_route(P)`，成功后发放确认；
+       - 若 $P$ 存在于处于 `CleaningActive` 的 `retired_bindings` 中：调用该旧后端的 `remove_route(P)`，成功后发放确认；
+       - **若 $P$ 存在于处于 `FrozenAwaitingDecision` 的 `retired_bindings` 中：严禁自主发起删除！保持预留阻塞**，直到 Host 发送该代际的 `ConfirmInterfaceDestroyed`（冲突解除直接放行）或 `CleanupRetiredInterface`（授权删除成功后放行）。
      - **完全无冲突**：只有当 $P$ 在本方记录（`installed`、`pending`、`in_flight`、`retired`）中均完全不存在时，才发放预留确认。
    - **启动旧 Writer**：DNS 模块收到确认后，方可调用底层系统接口写入 $P$。
    - **失败防御**：若 Manager 删除 $P$ 失败，Tracker 绝不发放确认，DNS 模块中止写入并报错，绝不产生双写踩踏。
 2. **场景 B：反向交接（未迁移 DNS 停止，将 $P$ 释放给 Manager）**：
    - DNS 模块退出并调用解耦后的 `clean_env()` 删除 $P$。
-   - `MagicDnsRuntime::stop()` 向上返回真实删除结果：
-     - 若删除成功：Tracker 将状态置为 `Inactive`，释放预留范围并唤醒 Manager。Manager 策略函数解除抑制，将 $P$ 纳入 desired 并下发安装。
-     - 若删除失败：Tracker 将状态置为 `CleaningFailed`，**继续保留排除范围**！Manager 绝不安装 $P$，防止在系统仍残留旧路由时引发冲突。
+   - `MagicDnsRuntime::stop()` 向上返回 `DnsCleanOutcome`，**Tracker 严格依据 `route_cleaned` 判断**：
+     - 若 `route_cleaned.is_ok()`：路由已从系统内核完全清除！无论 `system_config_cleaned` 是否失败，Tracker 均将 `dns_status` 置为 `Inactive`，释放预留范围并唤醒 Manager。Manager 策略函数解除抑制，将 $P$ 纳入 desired 并下发安装。若 `system_config_cleaned` 存在错误，仅记录诊断日志。
+     - 若 `route_cleaned.is_err()`：路由仍残留于内核！Tracker 将状态置为 `CleaningFailed`，**继续保留排除范围**！Manager 绝不安装 $P$，防止在系统仍残留旧路由时引发冲突。
 3. **场景 C：macOS / FreeBSD 显式接口前缀与 TUN 重建**：
    - macOS/FreeBSD 接口直连路由在 TUN 创建时由系统/旧脚本写入；`UnmigratedRouteTracker` 记录 `tun_cidr`，Manager 策略函数自动排除与 `tun_cidr` 相同的代理路由。
    - 换卡时，旧 TUN 必须先完成停止与解绑确认，旧责任注销或清理完毕后，才允许向新 TUN 下发新路由。
@@ -645,9 +664,9 @@ Batch 1: 纯计算与轻量模型 (Core 快照与算法 + Host 策略、模型�
    ↓
 Batch 2: 精确删除改造与平台后端 (Netlink 消除 dump、长连接、Mock 后端)
    ↓
-Batch 3: HostRouteManager 核心闭环 (命令通道、执行屏障、dirty 机制、stop deadline)
+Batch 3: HostRouteManager 核心闭环 (命令通道、全局冻结约束、dirty 机制、借用 stop)
    ↓
-Batch 4: Host 真实生命周期接线与交接 (runtime_host 挂载、DNS 确认闭合、旧 updater 屏蔽)
+Batch 4: Host 真实生命周期接线与交接 (runtime_host 挂载、DNS 错误解耦、旧 updater 屏蔽)
    ↓
 Batch 5: 隔离环境原生测试与基准度量 (netns 真实系统调用、零 dump、零写度量)
 ```
@@ -679,19 +698,22 @@ Batch 5: 隔离环境原生测试与基准度量 (netns 真实系统调用、零
     - 首启全量添加；
     - 输入未变稳态 0 调用与 0 堆分配；
     - **T3 验证**：输入和地址完全不变，仅替换 TUN 网卡，验证触发 `execution_dirty` 在新接口安装全部期望路由；测试先有输入后由 DHCP 首次建卡；
-    - **T2 验证**：用屏障控制 ACK、设备关闭与销毁确认的先后，验证从 unbind ACK 到销毁确认之间，旧后端调用次数严格为 0；
-    - **T1 验证**：分别注入 Stop 前的慢 add、Stop 后的慢 remove 以及命令确认延迟，验证均严格在 `deadline` 到期时返回 `CleanupIncomplete`；随后释放底层阻塞，验证结果被 Manager 正确接收并记账；
+    - **T2 / U1 验证**：取得 unbind ACK 后暂不发销毁确认，分别触发 Stop 和 DNS 冲突请求：验证在两个场景中旧后端调用数均严格为 0，Stop 返回未完成，DNS 保持阻塞；销毁确认到达后验证安全注销；
+    - **T1 验证**：分别注入 Stop 前的慢 add、Stop 后的慢 remove 以及命令确认延迟，验证均严格在 `deadline` 到期时返回 `CleanupIncomplete`；在途 future 借用等待超时不被丢弃，底层阻塞释放后结果被 Manager 正确接收并记账；
     - **T4 验证**：添加注入 `OutcomeUnknown`，随后 DNS 请求同一网段，验证预留确认被严格阻塞；
     - No-TUN 旁路测试（执行分支跳过，已安装记录保持为空）。
 
 #### Batch 4：Host 真实生命周期接线与交接
 - **代码落点**：
-  - `easytier/src/instance/dns_server/server_instance.rs` & `runner.rs` & `runtime_host/magic_dns.rs`：解耦系统配置与路由清理，`clean_env()` 返回结构化结果并向上抛出。
+  - `easytier/src/instance/dns_server/server_instance.rs` & `runner.rs` & `runtime_host/magic_dns.rs`：解耦系统配置与路由清理，返回 `DnsCleanOutcome` 并向上抛出。
   - `easytier/src/instance/runtime_host.rs` & `tun_desktop.rs` / `tun_common.rs` / `implementation.rs`：接入 `RouteManagerHandle`，在网卡就绪时（包括 DHCP 延迟建卡与静态卡）调用 `bind_interface`，在关闭时调用 `stop(deadline)`。
   - `easytier/src/instance/virtual_nic.rs`：按 `RouteBackendMode` 停用 `run_proxy_cidrs_route_updater`。
 - **验证**：
   - 集成测试：启动集成测试节点，动态推送 `manual_routes`，验证真实 Manager 接管生效且旧 updater 不重复写入；
-  - **T4 集成验证**：在 Linux (`system_config=None`) 且实际安装了 DNS /32 时，停止服务验证执行路由删除；若注入删除失败，验证 Tracker 保留排除范围，Manager 不接手，杜绝双写。
+  - **T4 / 校正 2 集成验证**：
+    1. 在 Linux (`system_config=None`) 且实际安装了 DNS /32 时，停止服务验证执行路由删除；
+    2. 模拟 `system_config.close()` 失败但 `remove_ipv4_route` 成功：验证路由排除范围成功释放给 Manager，不被系统配置错误阻塞；
+    3. 模拟 `remove_ipv4_route` 失败但 `system_config.close()` 成功：验证 Tracker 准确将路由标为 `CleaningFailed`，保留排除范围，杜绝双写。
 
 #### Batch 5：隔离环境原生测试与基准度量
 - **代码落点**：
@@ -716,9 +738,9 @@ Batch 5: 隔离环境原生测试与基准度量 (netns 真实系统调用、零
 - [ ] **精确删除与身份完整**：已安装记录保存实际创建参数与接口代际；同接口同前缀下不同 metric 的外部路由不被误删。
 - [ ] **稳态零多余操作**：在网络拓扑与配置稳定的状态下，快照指针比对快速拦截，协调循环不产生多余的底层系统调用和堆内存分配；无关服务配置变动不引发路由重算。
 - [ ] **换网卡不丢路由 (T3)**：输入和地址不变仅替换网卡时，`execution_dirty` 机制确保在新网卡上准确下发全部期望路由。
-- [ ] **解绑安全与无竞态 (T2)**：收到 unbind ACK 到销毁确认之间，旧后端系统调用严格为 0；彻底消除在网卡销毁后发起旧删除的竞态。
-- [ ] **停机超时全程覆盖与持续追踪 (T1)**：`stop(deadline)` 全程受 deadline 约束，超时按时返回 `CleanupIncomplete`；Host 持续持有 Handle 跟踪后台在途操作，绝不虚报成功。
-- [ ] **交接防误放行与 DNS 真实删除 (T4)**：未决操作存在时严格阻塞交接；Linux 等无 `system_config` 环境下 DNS 停止仍如实执行路由删除，删除失败保留排除范围，杜绝双写。
+- [ ] **全局冻结与解绑安全 (T2 / U1)**：解绑后至销毁确认前，`FrozenAwaitingDecision` 全局禁止 I/O，Stop 和 DNS 交接绝不旁路调用旧后端，旧后端系统调用严格为 0；彻底消除在网卡销毁后发起旧删除的竞态。
+- [ ] **停机超时全程覆盖与在途独占 (T1)**：`stop(deadline)` 全程受 deadline 约束，在途句柄使用借用等待超时不丢弃，超时按时返回 `CleanupIncomplete`；Host 持续持有 Handle 跟踪后台在途操作，绝不虚报成功。
+- [ ] **交接防误放行与 DNS 真实删除 (T4 / 校正 2)**：未决操作存在时严格阻塞交接；Linux 等无 `system_config` 环境下 DNS 停止仍如实执行路由删除；系统配置恢复错误与路由清理错误分离，路由删除失败保留排除范围，杜绝双写。
 - [ ] **无全表 Dump**：Linux 下删除路由直接构造 `RTM_DELROUTE`，基准测试验证 0 次 `RTM_GETROUTE` dump。
 - [ ] **失败退避与未决记账**：添加/删除失败如实记账并不误报成功；失败项执行指数退避；结果不明记录为未决操作，停机时作为未完成项上报。
 - [ ] **生产控制一致**：在第二步启用的平台（Linux 原生）完全由 HostRouteManager 接管且旧 updater 停写；未迁移平台（Windows、macOS、移动端）由统一开关安全保持旧链路，不发生漏写或双写。
