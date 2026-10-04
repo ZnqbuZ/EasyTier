@@ -172,30 +172,18 @@ pub struct RouteSpec {
 
 ### 4.1 系统接口复用：原生与委托双分支抽象
 
-为避免用虚假方法冒充成功，后端抽象明确划分为两个独立分支：
+为避免用虚假方法冒充成功，并消除运行时动态装箱分发开销，后端接口按真实执行方式组织（按 review-6/7 架构收缩，使用单一 `Route` 模型与编译期静态分发，删除生产路径的 `Box<dyn ...>`）：
 
 ```rust
-#[async_trait::async_trait]
-pub trait NativeRouteBackend: Send + Sync + 'static {
-    /// 添加一条路由，必须传递完整标识参数
-    async fn add_route(&self, route: &RouteSpec) -> Result<(), Error>;
-    /// 删除一条路由，必须按平台身份和创建时有效参数精确匹配定位，无法精确定位时返回错误
-    async fn remove_route(&self, route: &RouteSpec) -> Result<(), Error>;
+pub trait RouteBackend: Send + 'static {
+    /// 添加一条路由，成功创建返回生效 Route (记入 installed)
+    async fn add(&mut self, route: &Route) -> Result<Option<Route>, RouteError>;
+    /// 精确删除一条由本方创建的路由
+    async fn remove(&mut self, route: &Route) -> Result<Option<()>, RouteError>;
 }
 
-#[async_trait::async_trait]
-pub trait DelegatedRouteBackend: Send + Sync + 'static {
-    /// 移动端整批下发完整期望集合
-    async fn apply_routes(&self, routes: &BTreeSet<RouteSpec>) -> Result<(), Error>;
-    /// 关闭/重置移动端 VPN 会话
-    async fn reset_session(&self) -> Result<(), Error>;
-}
-
-pub enum RouteBackend {
-    Native(Box<dyn NativeRouteBackend>),
-    Delegated(Box<dyn DelegatedRouteBackend>),
-    NoTun, // 明确的 No-TUN 旁路
-}
+// 编译期平台选择：仅在 Linux netlink 下启用 PlatformRouteBackend = netlink::NetlinkRouteBackend
+// 移动端委托分支保持独立（暂留后续步骤迁移），No-TUN 在装配处旁路
 ```
 
 1. **原生桌面分支 (`NativeRouteBackend`)**：

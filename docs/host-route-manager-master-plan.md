@@ -34,11 +34,12 @@ EasyTier 只实现自己的路由业务规则和管理闭环。通用状态订�
 
 ```rust
 // 职责示意；类型和方法均按实际需要保持 crate 内可见。
-struct HostRouteManager {
+// （注：按 review-6/7 收缩，RouteSpec 与 InstalledRoute 已统一为包含 DeviceId 的单一 Route 模型，运行时统一使用编译期后端静态分发）
+struct HostRouteManager<B = PlatformRouteBackend> {
     inputs: RouteInputs,                         // 现有业务的读取入口
-    backend: RouteBackend,                       // 原生 / 委托 / No-TUN
-    desired: Vec<RouteSpec>,                     // 排序后的计算结果缓存
-    installed: BTreeMap<RouteSpec, InstalledRoute>, // 本次绑定的成功安装记录
+    backend: B,                                  // 原生 (编译期平台绑定) / 委托 / Mock
+    desired: BTreeSet<Route>,                    // 计算结果缓存 (统一 Route 模型)
+    installed: BTreeSet<Route>,                  // 本次绑定的成功安装记录 (统一 Route 模型)
 }
 ```
 
@@ -106,18 +107,18 @@ installed 初始采用有序映射，方便逐项成功后的插入、移除以�
 保持原生和委托两种真实执行方式，不给不支持的方法提供空成功。下面是职责接口示意，step2 再确定具体 Rust 类型；不要求对所有内部函数建立 trait。
 
 ```text
-NativeRouteBackend（绑定一个确定的接口生命周期和网络作用域）
-    add(RouteSpec)          -> Created(InstalledRoute) | AlreadyPresent | Error
-    remove(InstalledRoute)  -> Removed | AlreadyAbsent | Error
+NativeRouteBackend（绑定确定的接口生命周期和网络作用域，采用原生 async fn 静态分发）
+    add(&Route)    -> Result<Option<Route>, RouteError>  // Ok(Some): 本方成功创建; Ok(None): 已存在外部条目; Err: 确定失败或结果不明
+    remove(&Route) -> Result<Option<()>, RouteError>     // Ok(Some): 成功删除; Ok(None): 系统已无此条目; Err: 确定失败或结果不明
 
 DelegatedRouteBackend（绑定一个 VPN 宿主会话）
     apply(sorted_routes)    -> 宿主确认成功 | Error
     reset_session()         -> 宿主确认关闭 | Error
 
-RouteBackend = Native | Delegated | NoTun
+RouteBackend = Native (静态分发) | Delegated | NoTun
 ```
 
-InstalledRoute 是后端返回的本次成功创建记录，带创建时有效参数和对应绑定。可以是 backend.rs 内的私有平台结构；它不是 SourceSubmissionToken，不支持注册、历史查询或通用等待协议。删除使用这份记录，不重新根据新接口或已变化的默认值猜测原来的系统条目。后端允许等价条目并存时，独立增删可批量执行；同一系统槽位的参数替换必须按后端约束排序，不能在必要的旧条目删除失败后继续冒充替换成功。
+（按 review-6/7 架构收缩：原 `RouteSpec` 与 `InstalledRoute` 已统一为包含确切 `DeviceId { ifname, ifindex }` 的单一 `Route` 结构，创建与删除均使用该记录，不根据新接口猜测条目；操作结果统一为标准 `Result<Option<T>, RouteError>`，区分确定性失败与结果不明。）
 
 AlreadyPresent 不产生本方安装记录；对等价外部条目是否满足需求可单独记录诊断，但不能凭存在授权删除。只有能确认精确目标不存在时才返回 AlreadyAbsent。确定失败可以重试，结果不明确须先核实或报告阻塞，不能冒充失败不断重发。委托端确认只表示宿主应用成功，不宣称系统读回验证。
 
