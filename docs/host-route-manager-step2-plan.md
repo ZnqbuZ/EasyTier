@@ -1,6 +1,6 @@
-# HostRouteManager 第二步实施方案：架构收缩与最小闭环（第十二轮修订版）
+# HostRouteManager 第二步实施方案：架构收缩与最小闭环（第十三轮修订版）
 
-状态：已根据第十一轮复审审查（[`docs/host-route-manager-step2-review-11.md`](host-route-manager-step2-review-11.md)）完成全面修订。遵循实施总纲（[`docs/host-route-manager-master-plan.md`](host-route-manager-master-plan.md)）与第一步规范（[`docs/host-route-manager-step1-audit-and-contract.md`](host-route-manager-step1-audit-and-contract.md)）。  
+状态：已根据第十二轮复审审查（[`docs/host-route-manager-step2-review-12.md`](host-route-manager-step2-review-12.md)）完成全面修订。遵循实施总纲（[`docs/host-route-manager-master-plan.md`](host-route-manager-master-plan.md)）与第一步规范（[`docs/host-route-manager-step1-audit-and-contract.md`](host-route-manager-step1-audit-and-contract.md)）。  
 基线代码：`refactor/route` 分支；参考分支：`refactor/route-dev` (`8abfb51e`)。
 
 ---
@@ -290,8 +290,12 @@ pub struct HostRouteManager<B = PlatformRouteBackend> {
     retry_tracker: BTreeMap<Route, RetryState>,
     /// 当前生效的默认 TUN 设备句柄 (持有 DeviceId 与独立内核文件描述符强引用)
     current_tun_device: Option<TunDeviceHandle>,
-    /// 最近一次解绑清理结果 (保留局部终态，供重复解绑或超时后查询，杜绝虚报成功)
+    /// 当前设备绑定生命周期内最近一次解绑清理结果 (绑定新设备或开始新解绑时重置为 None；保留同一设备的局部终态，供重复解绑或超时后查询，杜绝虚报成功)
     last_unbind_result: Option<Result<(), CleanupIncomplete>>,
+    /// 共享当前设备解绑结果 (供 Handle 查询，生命周期限定在当前绑定周期内)
+    unbind_result: Arc<Mutex<Option<Result<(), CleanupIncomplete>>>>,
+    /// 共享停机清理最终结果 (供 Handle 查询)
+    cleanup_result: Arc<Mutex<Option<Result<(), CleanupIncomplete>>>>,
     /// 缓存的业务期望路由集合
     desired_routes_cache: Option<BTreeSet<Route>>,
     /// 命令接收通道
@@ -309,7 +313,7 @@ pub enum DeviceBindError {
 #[derive(Clone)]
 pub struct RouteManagerHandle {
     cmd_tx: tokio::sync::mpsc::Sender<ManagerCommand>,
-    /// 记录最近一次设备解绑清理的最终结果 (供超时后的调用方或外部观察者查询)
+    /// 记录当前设备解绑清理的最终结果 (限定在当前设备绑定生命周期内；绑定新设备或开始新解绑时失效重置，供超时后的调用方或外部观察者查询)
     unbind_result: Arc<Mutex<Option<Result<(), CleanupIncomplete>>>>,
     /// 记录停机清理的最终确定结果 (供超时后的调用方或外部观察者查询)
     cleanup_result: Arc<Mutex<Option<Result<(), CleanupIncomplete>>>>,
@@ -323,10 +327,18 @@ impl RouteManagerHandle {
         let _ = self.cmd_tx.try_send(ManagerCommand::Refresh);
     }
 
-    /// 可靠通知绑定默认 TUN 设备 (R2 闭合)
+    /// 可靠通知绑定默认 TUN 设备 (R1 / R2 闭合)
     /// 采用 send().await 可靠入队，当协调循环正忙于系统调用或队列已满时通过背压等待，杜绝静默丢失；
+    /// 绑定新设备时立即使上一设备的解绑缓存失效，确保解绑结果生命周期严格限定在当前设备绑定范围内；
     /// 若 Manager 通道已关闭 (停机终止)，将未装配的设备句柄完整返回给调用方，保留资源所有权。
     pub async fn bind_tun_device(&self, device: TunDeviceHandle) -> Result<(), DeviceBindError> {
+        // 使上一设备的解绑缓存失效
+        if let Ok(mut guard) = self.unbind_result.try_lock() {
+            *guard = None;
+        } else {
+            *self.unbind_result.lock().await = None;
+        }
+
         self.cmd_tx
             .send(ManagerCommand::BindTunDevice(device))
             .await
@@ -336,12 +348,13 @@ impl RouteManagerHandle {
             })
     }
 
-    /// 可靠通知解绑默认 TUN 设备 (R2 闭合)
+    /// 可靠通知解绑默认 TUN 设备 (R1 / R2 闭合)
     /// 请求解除当前生效的默认 TUN 设备，等待 Manager 清理其对应路由并释放设备描述符；
-    /// deadline 统一限制命令入队与等待 ACK 全过程：
-    /// - 发送入队超时：说明协调循环繁忙且命令队列已满，请求尚未成功入队，返回 Err(CleanupIncomplete) 指明未入队，Manager 未开始解绑；
-    /// - 入队成功但等待 ACK 超时：说明请求已进入 Manager 处理队列，返回 Err(CleanupIncomplete) 指明等待超时，Manager 在后台继续持有资源并处理，不提前释放设备；
-    /// - 通道关闭或异常：仅当 query_unbind_result() 存在确定的 Some(Ok(())) 时才返回成功，无结果必须如实返回失败；
+    /// deadline 统一限制命令入队、等待 ACK 与回退查询全过程，严禁无界等待锁：
+    /// - 发送入队超时：说明协调循环繁忙且命令队列已满，deadline 已耗尽，直接返回 Err(CleanupIncomplete)，Manager 未开始解绑；
+    /// - 发送入队失败：Manager 已停机退出，命令未被处理且无法证明缓存属于本次解绑，直接返回失败，严禁猜成功；
+    /// - 入队成功但等待 ACK 超时：说明请求已进入 Manager 处理队列，deadline 已耗尽，直接返回 Err(CleanupIncomplete)，Manager 在后台继续持有资源并处理，不提前释放设备；
+    /// - ACK 通道关闭：仅在受同一 deadline 约束下检查属于本次操作的确切终态，无确定成功结果严格返回失败，绝不虚报成功；
     /// 成功返回 Ok(())；Manager 本身不退出，继续维持运行并管理其他接口路由。
     pub async fn unbind_tun_device(&self, deadline: std::time::Instant) -> Result<(), CleanupIncomplete> {
         let deadline_instant: tokio::time::Instant = deadline.into();
@@ -356,6 +369,7 @@ impl RouteManagerHandle {
 
         match send_res {
             Err(_) => {
+                // 入队已超时，deadline 耗尽，直接返回未入队超时，严禁等待锁
                 return Err(CleanupIncomplete {
                     uncleaned_routes: Vec::new(),
                     unknown_routes: Vec::new(),
@@ -363,15 +377,12 @@ impl RouteManagerHandle {
                 });
             }
             Ok(Err(_)) => {
-                // 通道已关闭说明 Manager 已经停机或退出；检查是否已有最近一次解绑结果，绝不盲目判 Ok
-                return match self.query_unbind_result().await {
-                    Some(res) => res,
-                    None => Err(CleanupIncomplete {
-                        uncleaned_routes: Vec::new(),
-                        unknown_routes: Vec::new(),
-                        reason: "manager terminated while queueing unbind without recorded result".to_string(),
-                    }),
-                };
+                // 通道已关闭说明 Manager 已经停机退出；解绑请求未入队处理，无法证明缓存属于本次操作，严禁盲目猜成功
+                return Err(CleanupIncomplete {
+                    uncleaned_routes: Vec::new(),
+                    unknown_routes: Vec::new(),
+                    reason: "manager terminated while queueing unbind (request not processed)".to_string(),
+                });
             }
             Ok(Ok(())) => {}
         }
@@ -380,25 +391,40 @@ impl RouteManagerHandle {
         match tokio::time::timeout_at(deadline_instant, ack_rx).await {
             Ok(Ok(outcome)) => outcome,
             Ok(Err(_)) => {
-                // ACK 通道关闭，回退查询记录的确定结果，若无确定成功结果严格返回失败，绝不虚报成功
-                match self.query_unbind_result().await {
+                // ACK 通道在 deadline 到达前关闭，说明 Manager 异常退出未能完成 ACK 握手；
+                // 此时 deadline 尚未耗尽，受同一 deadline 约束尝试获取属于本次的结果；严禁无界等待锁
+                let outcome = if let Ok(guard) = self.unbind_result.try_lock() {
+                    guard.clone()
+                } else {
+                    tokio::time::timeout_at(deadline_instant, async {
+                        self.unbind_result.lock().await.clone()
+                    })
+                    .await
+                    .unwrap_or(None)
+                };
+
+                match outcome {
                     Some(res) => res,
                     None => Err(CleanupIncomplete {
                         uncleaned_routes: Vec::new(),
                         unknown_routes: Vec::new(),
-                        reason: "manager unbind ack channel closed before recording completion".to_string(),
+                        reason: "manager unbind ack channel closed before completing unbind".to_string(),
                     }),
                 }
             }
-            Err(_) => Err(CleanupIncomplete {
-                uncleaned_routes: Vec::new(),
-                unknown_routes: Vec::new(),
-                reason: "deadline exceeded while waiting for manager unbind ACK (manager continuing in background)".to_string(),
-            }),
+            Err(_) => {
+                // ACK 等待超时：deadline 已耗尽，直接返回超时，Manager 在后台继续执行，绝不在锁上挂死
+                Err(CleanupIncomplete {
+                    uncleaned_routes: Vec::new(),
+                    unknown_routes: Vec::new(),
+                    reason: "deadline exceeded while waiting for manager unbind ACK (manager continuing in background)".to_string(),
+                })
+            }
         }
     }
 
-    /// 显式停机：借用 Handle，整个等待严格受 deadline 约束 (覆盖发送与清理等待全过程)；超时返回未完成信息，原持有者继续保留 Handle
+    /// 显式停机：借用 Handle，整个等待严格受 deadline 约束 (覆盖发送、清理等待与回退查询全过程)；
+    /// deadline 已过时直接返回未完成或仅做不等待的 try_lock 查询，绝不脱离 deadline 无界等待锁；超时返回未完成信息，原持有者继续保留 Handle
     pub async fn stop(&self, deadline: std::time::Instant) -> Result<(), CleanupIncomplete> {
         let deadline_instant: tokio::time::Instant = deadline.into();
         self.cancel_token.cancel();
@@ -413,9 +439,10 @@ impl RouteManagerHandle {
 
         match send_res {
             Err(_) => {
-                // 入队超时：cancel_token 已触发，Manager 会在当前在途系统调用返回后进入停机清理；
-                // 调用方在 deadline 内未能完成入队等待，检查是否已有确定结果，无结果则报告超时
-                return match self.query_cleanup_result().await {
+                // 入队超时：deadline 已到达耗尽，严禁进行无界锁等待！
+                // 仅非阻塞检查是否已有确定的清理终态；无确定结果直接报告超时
+                let recorded = self.cleanup_result.try_lock().ok().and_then(|g| g.clone());
+                return match recorded {
                     Some(res) => res,
                     None => Err(CleanupIncomplete {
                         uncleaned_routes: Vec::new(),
@@ -425,8 +452,19 @@ impl RouteManagerHandle {
                 };
             }
             Ok(Err(_)) => {
-                // 发送失败（通道已关闭），说明 Manager 已经退出或已进入停机；检查是否已发布确定结果，无结果必须报失败 (R1 闭合)
-                return match self.query_cleanup_result().await {
+                // 发送失败（通道已关闭），说明 Manager 已经退出或已进入停机；
+                // deadline 尚未耗尽，受同一 deadline 约束尝试获取终态，杜绝脱离 deadline 等待锁
+                let outcome = if let Ok(guard) = self.cleanup_result.try_lock() {
+                    guard.clone()
+                } else {
+                    tokio::time::timeout_at(deadline_instant, async {
+                        self.cleanup_result.lock().await.clone()
+                    })
+                    .await
+                    .unwrap_or(None)
+                };
+
+                return match outcome {
                     Some(res) => res,
                     None => Err(CleanupIncomplete {
                         uncleaned_routes: Vec::new(),
@@ -441,8 +479,18 @@ impl RouteManagerHandle {
         match tokio::time::timeout_at(deadline_instant, ack_rx).await {
             Ok(Ok(outcome)) => outcome,
             Ok(Err(_)) => {
-                // ACK 通道关闭，回退查询记录的确定结果；仅当已记录 Some(Ok(())) 时才能成功，无结果必须返回失败 (严禁 unwrap_or(Ok(())))
-                match self.query_cleanup_result().await {
+                // ACK 通道在 deadline 到达前关闭，受同一 deadline 约束回退获取已发布的确定结果；仅当已记录确定结果才可返回，无结果必须返回失败
+                let outcome = if let Ok(guard) = self.cleanup_result.try_lock() {
+                    guard.clone()
+                } else {
+                    tokio::time::timeout_at(deadline_instant, async {
+                        self.cleanup_result.lock().await.clone()
+                    })
+                    .await
+                    .unwrap_or(None)
+                };
+
+                match outcome {
                     Some(res) => res,
                     None => Err(CleanupIncomplete {
                         uncleaned_routes: Vec::new(),
@@ -451,20 +499,27 @@ impl RouteManagerHandle {
                     }),
                 }
             }
-            Err(_) => Err(CleanupIncomplete {
-                uncleaned_routes: Vec::new(),
-                unknown_routes: Vec::new(),
-                reason: "deadline exceeded while waiting for stop cleanup ACK (manager continuing in background)".to_string(),
-            }),
+            Err(_) => {
+                // ACK 等待超时：deadline 已到达耗尽，严禁进行无界锁等待！仅非阻塞检查是否已有确定的清理结果
+                let recorded = self.cleanup_result.try_lock().ok().and_then(|g| g.clone());
+                match recorded {
+                    Some(res) => res,
+                    None => Err(CleanupIncomplete {
+                        uncleaned_routes: Vec::new(),
+                        unknown_routes: Vec::new(),
+                        reason: "deadline exceeded while waiting for stop cleanup ACK (manager continuing in background)".to_string(),
+                    }),
+                }
+            }
         }
     }
 
-    /// 查询最近一次设备解绑清理结果 (在 unbind 超时后可随时异步获取后台完成状态)
+    /// 查询当前设备解绑清理结果 (独立的公开查询 API，在 unbind 超时后可随时异步获取后台完成状态)
     pub async fn query_unbind_result(&self) -> Option<Result<(), CleanupIncomplete>> {
         self.unbind_result.lock().await.clone()
     }
 
-    /// 查询最终停机清理结果 (在 stop 超时后可随时异步获取后台完成状态)
+    /// 查询最终停机清理结果 (独立的公开查询 API，在 stop 超时后可随时异步获取后台完成状态)
     pub async fn query_cleanup_result(&self) -> Option<Result<(), CleanupIncomplete>> {
         self.cleanup_result.lock().await.clone()
     }
@@ -515,7 +570,7 @@ Manager 采用**事件驱动拉取**模型，通知只负责唤醒，不逐条�
    - **无设备稳态**：
      若 Host 进入无设备状态（如 DHCP 续租失败 `next == None`），Manager 维持 `current_tun_device = None` 运行，跳过默认 TUN 路由安装，继续正常管理外部接口路由。
    - **新设备绑定（`BindTunDevice`）**：
-     Host 在同名新设备创建就绪后，构造新 `TunDeviceHandle` 并可靠调用 `bind_tun_device`。Manager 设置 `current_tun_device = Some(new_device)`，将默认路由解析为 `new_device.id.ifindex` 并下发安装，彻底解决同名设备重建前旧设备未完全释放导致名称冲突或路由漏装的问题。
+     Host 在同名新设备创建就绪后，构造新 `TunDeviceHandle` 并可靠调用 `bind_tun_device`。绑定新设备时立即使上一设备的解绑缓存与终态失效（`unbind_result = None`, `last_unbind_result = None`），将解绑结果生命周期严格限定在当前设备绑定范围内，杜绝跨设备误判成功；Manager 设置 `current_tun_device = Some(new_device)`，将默认路由解析为 `new_device.id.ifindex` 并下发安装，彻底解决同名设备重建前旧设备未完全释放导致名称冲突或路由漏装的问题。
    - **精确隔离与范围收割**：解绑与换绑均仅针对默认 TUN 设备 `ifindex` 的路由记录进行清理；用户显式指定绑定到其他外部设备（如 `eth0`，对应不同的 `ifindex`）的路由记录继续完整保留在 `installed_routes` 中，绝不误伤其他接口。
 4. **低频保底与独立重试**：
    废除 1 秒忙碌轮询，设 30 秒低频保底核对；失败重试由退避计时器在到达最早 `next_retry` 时精准唤醒。
@@ -602,6 +657,25 @@ Manager 采用**事件驱动拉取**模型，通知只负责唤醒，不逐条�
 解绑命令只针对旧默认设备进行局部清理，**Manager 绝不退出主事件循环，不转移 `backend` 的所有权，且绝不误删其他外部接口（如 `eth0`）的路由**：
 
 ```rust
+// 在 HostRouteManager 主事件循环中处理 BindTunDevice 分支
+ManagerCommand::BindTunDevice(device) => {
+    // 1. 等待在途底层系统调用返回并记账
+    self.flush_in_flight().await;
+
+    // 2. 绑定新设备时立即使上一设备的解绑缓存与终态失效 (R1 闭合)
+    // 确保解绑缓存严格限定在当前设备绑定生命周期内，杜绝旧设备成功或失败影响新设备
+    self.last_unbind_result = None;
+    if let Ok(mut guard) = self.unbind_result.try_lock() {
+        *guard = None;
+    } else {
+        *self.unbind_result.lock().await = None;
+    }
+
+    // 3. 设置当前生效设备并触发期望路由重算与安装
+    self.current_tun_device = Some(device);
+    self.desired_routes_cache = None;
+}
+
 // 在 HostRouteManager 主事件循环中处理 UnbindTunDevice 分支
 ManagerCommand::UnbindTunDevice { deadline, ack } => {
     // 1. 等待正在执行的单次在途底层系统调用返回并记账 (事件循环串行天然保证，无新队列框架)
@@ -612,16 +686,24 @@ ManagerCommand::UnbindTunDevice { deadline, ack } => {
 
     match old_device {
         None => {
-            // 当前处于无设备状态：检查上一次解绑是否留有未完成的失败/未决结果 (R2 闭合)
+            // 当前处于无设备状态：检查当前绑定生命周期内上一次解绑是否留有未完成的失败/未决结果 (R1 / R2 闭合)
             // 若上一次解绑存在未完成错误，重复调用如实返回该失败，绝不因无设备改报成功！
             let outcome = match &self.last_unbind_result {
                 Some(Err(incomplete)) => Err(incomplete.clone()),
                 Some(Ok(())) => Ok(()),
-                None => Ok(()), // 从未绑定过设备的初始无设备稳态
+                None => Ok(()), // 从未绑定过设备或新设备已绑定的初始无设备稳态
             };
             let _ = ack.send(outcome);
         }
         Some(dev) => {
+            // 开始新一轮解绑时清除历史终态，解绑进行中不得暴露旧设备的终态 (R1 闭合)
+            self.last_unbind_result = None;
+            if let Ok(mut guard) = self.unbind_result.try_lock() {
+                *guard = None;
+            } else {
+                *self.unbind_result.lock().await = None;
+            }
+
             let dev_ifindex = dev.id.ifindex;
 
             // 3. 精确分区：
@@ -687,9 +769,13 @@ ManagerCommand::UnbindTunDevice { deadline, ack } => {
                 })
             };
 
-            // 记录最近一次解绑结果，并更新 Handle 共享结果供超时调用方查询
+            // 记录当前设备解绑结果，并更新 Handle 共享结果供超时调用方查询 (限定在当前设备生命周期)
             self.last_unbind_result = Some(outcome.clone());
-            *self.unbind_result.lock().await = Some(outcome.clone());
+            if let Ok(mut guard) = self.unbind_result.try_lock() {
+                *guard = Some(outcome.clone());
+            } else {
+                *self.unbind_result.lock().await = Some(outcome.clone());
+            }
 
             let _ = ack.send(outcome);
         }
@@ -778,13 +864,13 @@ ManagerCommand::Stop { deadline, ack } => {
 
 #### 4. 任务跟踪、超时机制与后台资源保活（R1 / R2 闭合）
 - **统一 deadline 约束与两阶段语义**：
-  - `handle.unbind_tun_device(deadline)` 与 `handle.stop(deadline)` 均由外部调用方传入绝对 `deadline`，同时限制入队与等待 ACK 全过程。
-  - **解绑命令入队超时**：说明协调循环正忙且通道已满，解绑请求尚未成功入队，返回 `Err(CleanupIncomplete { reason: "deadline exceeded while queueing unbind command (request not enqueued)" })`，调用方明确获知 Manager 未开始解绑。
-  - **停机命令入队超时**：因 `stop()` 调用前已先触发 `self.cancel_token.cancel()`，Manager 会在当前在途底层调用返回后进入统一停机清理并发布结果；入队超时仅说明调用方在 deadline 内未能建立 ACK 握手等待，返回超时，后台继续安全执行。
-  - **ACK 等待阶段超时**：入队成功后，对 `ack_rx` 同样以该 `deadline` 执行 `timeout_at`。若底层删除较慢导致超时返回，Manager 此时已接管请求并在后台继续持有资源（`old_device` 或 `backend`）顺序执行，绝不因为调用方超时而提前释放描述符导致内核设备提前销毁。
-  - **结果追溯与防虚报保证**：
-    - 对于 `stop`，后台完成后将确定结果写入 `handle.cleanup_result`；调用方无论在通道关闭或超时后，回退查询只有在取得已保存的 `Some(Ok(()))` 时才允许返回成功；若无结果或异常关闭严格返回 `CleanupIncomplete`，**严禁 `unwrap_or(Ok(()))` 掩盖未完成状态**。
-    - 对于 `unbind_tun_device`，完成结果写入 `handle.unbind_result`；若解绑存在未完成项，记录保留在 Manager 状态中，重复调用或超时后查询一致报告该未完成结果，绝不因 `current_tun_device` 为 `None` 虚报成功。
+  - `handle.unbind_tun_device(deadline)` 与 `handle.stop(deadline)` 均由外部调用方传入绝对 `deadline`，同时限制入队、等待 ACK 与回退查询全过程，严禁无界等待锁。
+  - **解绑命令入队超时**：说明协调循环正忙且通道已满，deadline 已耗尽，返回 `Err(CleanupIncomplete { reason: "deadline exceeded while queueing unbind command (request not enqueued)" })`，调用方明确获知 Manager 未开始解绑，绝不在锁上超时挂死。
+  - **停机命令入队超时**：因 `stop()` 调用前已先触发 `self.cancel_token.cancel()`，Manager 会在当前在途底层调用返回后进入统一停机清理并发布结果；deadline 已耗尽，仅非阻塞 `try_lock()` 检查是否已有终态，绝不进行无界 `lock().await`，返回超时并由后台继续安全执行。
+  - **ACK 等待阶段超时**：入队成功后，对 `ack_rx` 同样以该 `deadline` 执行 `timeout_at`。若底层删除较慢导致超时返回，deadline 已经到达，同样仅非阻塞检查结果或直接返回超时，绝不在锁上脱离 deadline；Manager 此时已接管请求并在后台继续持有资源（`old_device` 或 `backend`）顺序执行，绝不因为调用方超时而提前释放描述符导致内核设备提前销毁。
+  - **结果追溯与生命周期范围隔离保证 (R1 / R2 闭合)**：
+    - 对于 `stop`，后台完成后将确定结果写入 `handle.cleanup_result`；调用方无论在通道关闭或超时后，回退获取终态严格受同一 `deadline` 约束或仅做非阻塞 `try_lock()`；且只有在取得已保存的 `Some(Ok(()))` 时才允许返回成功；若无结果或异常关闭严格返回 `CleanupIncomplete`，**严禁 `unwrap_or(Ok(()))` 掩盖未完成状态**。
+    - 对于 `unbind_tun_device`，完成结果写入 `handle.unbind_result`；解绑缓存严格限定在当前设备绑定生命周期内：绑定新设备或开始新解绑时立即重置失效，解绑进行中或异常关闭若无确切归属本次操作的终态，直接返回 `CleanupIncomplete`，绝不猜成功；同一设备若解绑存在未完成项，记录保留在 Manager 状态中，重复调用或超时后查询一致报告该未完成结果，绝不因 `current_tun_device` 为 `None` 虚报成功。
 - **自有 TUN 级联销毁捷径约束**：
   若 Host 选择通过直接关闭自有 TUN 文件描述符让内核自动级联删除接口路由：
   - 必须先停止 Manager 协调循环并收束在途操作；
@@ -813,15 +899,15 @@ pub struct CleanupIncomplete {
 2. **限时入队与状态收束**：向 Manager 发送 `ManagerCommand::UnbindTunDevice`（发送受 `deadline` 约束）。Manager 优先等待在途系统调用完成并记账。
 3. **空状态过渡与局部清理**：Manager 将 `current_tun_device` 置为 `None`，更新 desired 路由排除默认 TUN 路由；按旧设备独立筛选 `unknown_routes`（涵盖未决 ADD），仅针对旧设备 `ifindex` 路由执行精确删除；保留外部接口路由，不退出主循环。
 4. **释放最后描述符与回复 ACK**：删除完成后显式 `drop(old_device)`，关闭全系统最后一个打开描述符触发内核注销非持久 TUN 接口，随后发送 ACK 并保存结果。
-5. **超时与未完成保护**：若入队超时或等待 ACK 超时，返回 `Err(CleanupIncomplete)`，Host 保持未决状态，绝不盲目判定为已释放或重建同名设备；Manager 在入队成功后于后台继续处理；若前次解绑未完成，重复解绑一致报告错误，绝不虚报成功。
+5. **超时与未完成保护**：若入队超时或等待 ACK 超时，返回 `Err(CleanupIncomplete)`，Host 保持未决状态，绝不盲目判定为已释放或重建同名设备；Manager 在入队成功后于后台继续处理；若前次解绑未完成，重复解绑一致报告错误，绝不虚报成功；解绑结果生命周期限定在当前设备绑定生命周期内，绑定新设备或开始新解绑即刻失效重置。
 6. **Host 排水与状态转换**：Host 收到 ACK 确认设备注销后，执行 `self.nic.drain()` 进入无设备状态或安全创建全新同名设备。
 
 #### 2. 全局停机流程 (`stop(deadline)`)
 用于整个服务实例退出时的彻底清理：
 1. **立即打断调度**：触发 `cancel_token.cancel()`，拒绝接收新业务操作。
-2. **全流程限时入队与清理等待**：发送 `ManagerCommand::Stop` 并限时等待全量已安装路由清理（发送与 ACK 等待统一受 `deadline` 约束）。
+2. **全流程限时入队与清理等待**：发送 `ManagerCommand::Stop` 并限时等待全量已安装路由清理（发送与 ACK 等待统一受 `deadline` 约束，严禁在 deadline 超时后无界等待锁）。
 3. **guarden 资源彻底释放**：Manager 退出循环，在 `guarden::guard!` 异步块内精确删除全量已安装路由（跳过 unknown），执行 `drop(device)` 与 backend 释放。
-4. **真实结果透明判定（R1 闭合）**：仅当取得已记录的 `Some(Ok(()))` 时返回 `Ok(())`；通道关闭或无结果时严格返回 `CleanupIncomplete`，严禁 `unwrap_or(Ok(()))`；后台任务继续持有资源安全运行直至终态，可随时通过 `query_cleanup_result` 查询。
+4. **真实结果透明判定（R1 闭合）**：仅当取得已记录的 `Some(Ok(()))` 时返回 `Ok(())`；通道关闭或无结果时严格返回 `CleanupIncomplete`，严禁 `unwrap_or(Ok(()))`；deadline 到达后严格按时返回，绝不脱离 deadline 无界等待结果锁；后台任务继续持有资源安全运行直至终态，可随时通过独立的公开查询 API `query_cleanup_result` 查询。
 
 ---
 
@@ -983,6 +1069,8 @@ Batch 5: 隔离环境原生测试与基准度量 (netns 真实系统调用、零
     - **局部解绑未决 ADD 覆盖验证 (Review 11 R2 闭合)**：在 `installed_routes` 为空、但 `unknown_routes` 存在旧 TUN 设备上添加结果不明的路由时，执行 `unbind_tun_device`，验证该未决条目被独立筛选并计入未完成责任，返回 `CleanupIncomplete`，绝不虚报成功，且不把其他接口（如 `eth0`）的 Unknown 混入结果；
     - **重复解绑防绕过与终态查询验证 (Review 11 R2 闭合)**：验证删除失败后再次调用 `unbind_tun_device`，因检测到最近一次解绑失败，重复调用一致返回错误，绝不因 `current_tun_device == None` 改报成功；验证第一次解绑 ACK 等待超时后后台最终失败，调用方后续通过 `query_unbind_result()` 依然能如实获取最终失败结果，保持记录与返回结果的一致性；
     - **Stop 通道关闭与回退判定验证 (Review 11 R1 闭合)**：验证 Stop 发送端或 ACK 通道关闭、且 `cleanup_result` 尚为 `None` 时，绝不返回 `Ok(())`，严格返回 `CleanupIncomplete`；已有最终错误时原样返回错误；已有最终成功时重复调用 `stop` 正确成功；验证 `cancel_token` 被取消后，Manager 走与 Stop 相同的清理及结果发布路径，结果如实发布至 `cleanup_result`；
+    - **解绑结果生命周期隔离与防串味验证 (Review 12 R1 闭合)**：设备 A 成功解绑后，绑定新设备 B；人为暂停设备 B 的路由删除操作，调用 `query_unbind_result()` 验证结果严格为 `None`，绝不得返回设备 A 的成功 `Some(Ok(()))`；随后分别让设备 B 正常完成删除与模拟 ACK 通道异常关闭，验证查询与回退结果确切归属于设备 B，若无当前操作结果严格返回未完成；同一设备未完成解绑的重复调用仍保持一致报告该未完成终态；
+    - **Deadline 到达防无界等待锁验证 (Review 12 R2 闭合)**：在测试任务中暂时持有 `cleanup_result` 或 `unbind_result` 锁，分别制造命令入队超时（队列占满）与通道关闭场景；调用 `stop(deadline)` 与 `unbind_tun_device(deadline)`，确认方法严格在 `deadline` 到达时即刻返回 `CleanupIncomplete`，绝不在锁上超时挂死，后台任务继续执行；通道提前关闭时，回退锁等待同样严格受 `deadline` 约束超时退出；
     - **局部解绑与外部接口隔离测试 (R3 闭合)**：同时存在默认 TUN 和其他接口（如 `eth0`）的本方路由时执行 `unbind_tun_device`：验证仅清理前者路由，Manager 不退出；随后外部接口路由仍能正常刷新维护，新 TUN 仍能正常调用 `bind_tun_device` 绑定；局部清理失败或产生 unknown 时，未完成条目妥善保留在 Manager 状态中，绝不丢失；
     - **可靠换绑投递与通道关闭测试**：在 Manager 执行系统调用阻塞时发送高频 Refresh 填满队列，发起 `bind_tun_device`，验证 `send().await` 背压等待且命令不丢失；验证 Manager 停机通道关闭时返回 `DeviceBindError::ManagerTerminated(device)` 保持设备所有权；
     - **在途操作收束**：模拟单次 ADD 阻塞在底层，触发退出并使调用方等待超时，验证在途操作被单线程循环正常收束记账，旧操作绝不落到重建后的网卡上；
