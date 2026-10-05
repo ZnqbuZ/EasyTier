@@ -74,6 +74,14 @@ impl CorePacketPlane {
         )
     }
 
+    pub fn list_proxy_cidrs_snapshot(&self) -> Arc<BTreeSet<cidr::Ipv4Cidr>> {
+        self.peer_manager.list_proxy_cidrs_snapshot()
+    }
+
+    pub fn runtime_config(&self) -> &CoreRuntimeConfigStore {
+        &self.runtime_config
+    }
+
     pub async fn public_ipv6_routes(&self) -> BTreeSet<cidr::Ipv6Inet> {
         self.peer_manager.list_public_ipv6_routes().await
     }

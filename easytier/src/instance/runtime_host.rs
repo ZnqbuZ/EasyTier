@@ -30,12 +30,30 @@ use event_journal::EventJournal;
 use magic_dns::MagicDnsRuntime;
 use tun_runtime::NativeTunRuntime;
 
+#[cfg(all(target_os = "linux", feature = "linux-netlink"))]
+use std::time::Duration;
+
+#[cfg(all(target_os = "linux", feature = "linux-netlink"))]
+use anyhow::Context as _;
+#[cfg(all(target_os = "linux", feature = "linux-netlink"))]
+use tokio::task::JoinHandle;
+
+#[cfg(all(target_os = "linux", feature = "linux-netlink"))]
+use crate::instance::route::{
+    DnsRouteProvider, HostRouteManager, PlatformRouteBackend, ProviderEntry, RouteType,
+    stop_manager,
+};
+
 pub(crate) struct NativeInstanceRuntimeHost {
     global_ctx: ArcGlobalCtx,
     operation: Arc<Mutex<()>>,
     cancel: CancellationToken,
     event_journal: EventJournal,
     tun: NativeTunRuntime,
+    #[cfg(all(target_os = "linux", feature = "linux-netlink"))]
+    route_task: Mutex<Option<JoinHandle<Result<(), crate::instance::route::CleanupIncomplete>>>>,
+    #[cfg(all(target_os = "linux", feature = "linux-netlink"))]
+    route_cancel: CancellationToken,
 }
 
 impl NativeInstanceRuntimeHost {
@@ -49,6 +67,10 @@ impl NativeInstanceRuntimeHost {
             operation: Arc::new(Mutex::new(())),
             cancel,
             tun,
+            #[cfg(all(target_os = "linux", feature = "linux-netlink"))]
+            route_task: Mutex::new(None),
+            #[cfg(all(target_os = "linux", feature = "linux-netlink"))]
+            route_cancel: CancellationToken::new(),
         })
     }
 
@@ -58,6 +80,37 @@ impl NativeInstanceRuntimeHost {
     ) -> anyhow::Result<Option<Arc<dyn DhcpIpv4Host>>> {
         self.event_journal.start(self.cancel.clone()).await;
         self.tun.prepare(packet_plane.clone()).await?;
+
+        #[cfg(all(target_os = "linux", feature = "linux-netlink"))]
+        if !self.global_ctx.get_flags().no_tun {
+            let cancel_token = self.route_cancel.clone();
+            let providers = vec![
+                ProviderEntry::new(RouteType::PeerAuto, Box::new(packet_plane.clone())),
+                ProviderEntry::new(
+                    RouteType::Manual,
+                    Box::new(packet_plane.runtime_config().clone()),
+                ),
+                ProviderEntry::new(
+                    RouteType::ServiceExtra,
+                    Box::new(DnsRouteProvider::new(self.global_ctx.clone())),
+                ),
+            ];
+
+            let backend = PlatformRouteBackend::new()
+                .context("failed to initialize platform netlink route backend")?;
+            let default_metric = 65535;
+            let manager = HostRouteManager::new(
+                self.global_ctx.clone(),
+                providers,
+                backend,
+                cancel_token,
+                default_metric,
+            );
+
+            let join_handle = tokio::spawn(manager.run());
+            *self.route_task.lock().await = Some(join_handle);
+        }
+
         Ok(Some(
             self.tun.dhcp_host(self.operation.clone(), packet_plane),
         ))
@@ -66,6 +119,17 @@ impl NativeInstanceRuntimeHost {
     async fn shutdown_runtime(&self) {
         self.cancel.cancel();
         let _operation = self.operation.lock().await;
+
+        #[cfg(all(target_os = "linux", feature = "linux-netlink"))]
+        {
+            let mut join_guard = self.route_task.lock().await;
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+            let res = stop_manager(&self.route_cancel, &mut *join_guard, deadline).await;
+            if let Err(err) = res {
+                tracing::warn!(?err, "failed or incomplete route manager shutdown cleanup");
+            }
+        }
+
         self.event_journal.stop().await;
         self.tun.shutdown().await;
     }

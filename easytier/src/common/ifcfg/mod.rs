@@ -9,9 +9,9 @@
 ))]
 mod darwin;
 #[cfg(all(target_os = "linux", feature = "linux-netlink"))]
-mod netlink;
+pub(crate) mod netlink;
 #[cfg(all(target_os = "linux", feature = "linux-netlink"))]
-mod netlink_wire;
+pub(crate) mod netlink_wire;
 #[cfg(target_os = "windows")]
 mod win;
 #[cfg(target_os = "windows")]
@@ -91,7 +91,7 @@ pub trait IfConfiguerTrait: Send + Sync {
         Ok(())
     }
     async fn wait_interface_show(&self, _name: &str) -> Result<(), Error> {
-        return Ok(());
+        Ok(())
     }
     async fn set_mtu(&self, _name: &str, _mtu: u32) -> Result<(), Error> {
         Ok(())
