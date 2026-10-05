@@ -204,7 +204,7 @@ impl IfConfiguerTrait for WindowsIfConfiger {
         Ok(())
     }
 
-    async fn remove_ipv4_route(
+    async fn del_ipv4_route(
         &self,
         name: &str,
         address: Ipv4Addr,
@@ -237,7 +237,7 @@ impl IfConfiguerTrait for WindowsIfConfiger {
         Self::set_interface_status(name, up).await
     }
 
-    async fn remove_ip(&self, name: &str, ip: Option<Ipv4Inet>) -> Result<(), Error> {
+    async fn del_ipv4_ip(&self, name: &str, ip: Option<Ipv4Inet>) -> Result<(), Error> {
         Self::remove_ip_address(name, ip).await
     }
 
@@ -264,7 +264,7 @@ impl IfConfiguerTrait for WindowsIfConfiger {
         Self::add_ipv6_address(name, Ipv6Inet::new(address, cidr_prefix).unwrap()).await
     }
 
-    async fn remove_ipv6(&self, name: &str, ip: Option<Ipv6Inet>) -> Result<(), Error> {
+    async fn del_ipv6_ip(&self, name: &str, ip: Option<Ipv6Inet>) -> Result<(), Error> {
         Self::remove_ipv6_address(name, ip).await
     }
 
@@ -292,7 +292,7 @@ impl IfConfiguerTrait for WindowsIfConfiger {
         Ok(())
     }
 
-    async fn remove_ipv6_route(
+    async fn del_ipv6_route(
         &self,
         name: &str,
         address: Ipv6Addr,

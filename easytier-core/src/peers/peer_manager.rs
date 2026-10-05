@@ -1286,6 +1286,14 @@ impl PeerManagerCore {
         self.get_route().list_routes().await
     }
 
+    pub fn list_proxy_cidrs_snapshot(&self) -> Arc<BTreeSet<cidr::Ipv4Cidr>> {
+        if let Some(ospf) = self.route_algo_inst.ospf_route() {
+            ospf.proxy_cidrs_snapshot()
+        } else {
+            Arc::new(BTreeSet::new())
+        }
+    }
+
     pub async fn list_public_ipv6_routes(&self) -> BTreeSet<cidr::Ipv6Inet> {
         self.get_route().list_public_ipv6_routes().await
     }

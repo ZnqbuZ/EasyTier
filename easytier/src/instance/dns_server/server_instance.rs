@@ -12,11 +12,10 @@ use super::{
     server::Server,
     system_config::{OSConfig, SystemConfig},
 };
+#[cfg(not(all(target_os = "linux", feature = "linux-netlink")))]
+use crate::common::ifcfg::{IfConfiger, IfConfiguerTrait};
 use crate::{
-    common::{
-        global_ctx::ArcGlobalCtx,
-        ifcfg::{IfConfiger, IfConfiguerTrait},
-    },
+    common::global_ctx::ArcGlobalCtx,
     instance::dns_server::{
         config::{Record, RecordBuilder, RecordType},
         server::build_authority,
@@ -50,6 +49,7 @@ use std::{collections::BTreeMap, io, net::Ipv4Addr, str::FromStr, sync::Arc, tim
 
 pub(super) struct MagicDnsServerInstanceData {
     dns_server: Server,
+    #[allow(dead_code)]
     tun_dev: Option<String>,
     fake_ip: Ipv4Addr,
     route_store: MagicDnsRecordStore,
@@ -332,6 +332,7 @@ pub struct MagicDnsServerInstance {
     _rpc_server: StandAloneServer<RuntimeRpcListener>,
     pub(super) data: Arc<MagicDnsServerInstanceData>,
     packet_filter: MagicDnsResolverRegistration,
+    #[allow(dead_code)]
     tun_inet: Ipv4Inet,
 }
 
@@ -374,6 +375,7 @@ impl MagicDnsServerInstance {
         let mut dns_server = Server::new(dns_config);
         dns_server.run().await?;
 
+        #[cfg(not(all(target_os = "linux", feature = "linux-netlink")))]
         if !tun_inet.contains(&fake_ip)
             && let Some(tun_dev_name) = &tun_dev
         {
@@ -436,6 +438,7 @@ impl MagicDnsServerInstance {
             if let Err(e) = ret {
                 tracing::error!("Failed to close system config: {:?}", e);
             }
+            #[cfg(not(all(target_os = "linux", feature = "linux-netlink")))]
             if !self.tun_inet.contains(&self.data.fake_ip)
                 && let Some(tun_dev_name) = &self.data.tun_dev
             {

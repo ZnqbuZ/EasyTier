@@ -751,20 +751,20 @@ impl VirtualNic {
     pub async fn remove_ipv6_route(&self, address: Ipv6Addr, cidr: u8) -> Result<(), Error> {
         let _g = self.global_ctx.net_ns.guard();
         self.ifcfg
-            .remove_ipv6_route(self.ifname(), address, cidr)
+            .del_ipv6_route(self.ifname(), address, cidr)
             .await?;
         Ok(())
     }
 
     pub async fn remove_ip(&self, ip: Option<Ipv4Inet>) -> Result<(), Error> {
         let _g = self.global_ctx.net_ns.guard();
-        self.ifcfg.remove_ip(self.ifname(), ip).await?;
+        self.ifcfg.del_ipv4_ip(self.ifname(), ip).await?;
         Ok(())
     }
 
     pub async fn remove_ipv6(&self, ip: Option<Ipv6Inet>) -> Result<(), Error> {
         let _g = self.global_ctx.net_ns.guard();
-        self.ifcfg.remove_ipv6(self.ifname(), ip).await?;
+        self.ifcfg.del_ipv6_ip(self.ifname(), ip).await?;
         Ok(())
     }
 
@@ -947,6 +947,7 @@ impl NicCtx {
         }
     }
 
+    #[cfg_attr(all(target_os = "linux", feature = "linux-netlink"), allow(dead_code))]
     async fn apply_route_changes(
         ifcfg: &impl IfConfiguerTrait,
         ifname: &str,
@@ -964,7 +965,7 @@ impl NicCtx {
             }
             let _g = net_ns.guard();
             let ret = ifcfg
-                .remove_ipv4_route(ifname, cidr.first_address(), cidr.network_length())
+                .del_ipv4_route(ifname, cidr.first_address(), cidr.network_length())
                 .await;
 
             if ret.is_err() {
@@ -1012,7 +1013,7 @@ impl NicCtx {
             }
             let _g = net_ns.guard();
             let ret = ifcfg
-                .remove_ipv6_route(ifname, route.address(), route.network_length())
+                .del_ipv6_route(ifname, route.address(), route.network_length())
                 .await;
             if ret.is_err() {
                 tracing::trace!(route = ?route, err = ?ret, "remove public ipv6 route failed");
@@ -1036,6 +1037,7 @@ impl NicCtx {
         }
     }
 
+    #[cfg_attr(all(target_os = "linux", feature = "linux-netlink"), allow(dead_code))]
     async fn run_proxy_cidrs_route_updater(&mut self) -> Result<(), Error> {
         let packet_plane = self.packet_plane.clone();
         let global_ctx = self.global_ctx.clone();
@@ -1288,6 +1290,7 @@ impl NicCtx {
             self.assign_ipv6_to_tun_device(ipv6_addr).await?;
         }
 
+        #[cfg(not(all(target_os = "linux", feature = "linux-netlink")))]
         self.run_proxy_cidrs_route_updater().await?;
         self.run_public_ipv6_route_updater().await?;
         // Keep the updater running so runtime config patches can enable auto mode

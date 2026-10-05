@@ -9,9 +9,9 @@
 ))]
 mod darwin;
 #[cfg(all(target_os = "linux", feature = "linux-netlink"))]
-mod netlink;
+pub(crate) mod netlink;
 #[cfg(all(target_os = "linux", feature = "linux-netlink"))]
-mod netlink_wire;
+pub(crate) mod netlink_wire;
 #[cfg(target_os = "windows")]
 mod win;
 #[cfg(target_os = "windows")]
@@ -40,7 +40,7 @@ pub trait IfConfiguerTrait: Send + Sync {
     ) -> Result<(), Error> {
         Ok(())
     }
-    async fn remove_ipv4_route(
+    async fn del_ipv4_route(
         &self,
         _name: &str,
         _address: Ipv4Addr,
@@ -56,6 +56,9 @@ pub trait IfConfiguerTrait: Send + Sync {
     ) -> Result<(), Error> {
         Ok(())
     }
+    async fn del_ipv4_ip(&self, _name: &str, _ip: Option<Ipv4Inet>) -> Result<(), Error> {
+        Ok(())
+    }
     async fn add_ipv6_route(
         &self,
         _name: &str,
@@ -65,7 +68,7 @@ pub trait IfConfiguerTrait: Send + Sync {
     ) -> Result<(), Error> {
         Ok(())
     }
-    async fn remove_ipv6_route(
+    async fn del_ipv6_route(
         &self,
         _name: &str,
         _address: Ipv6Addr,
@@ -81,17 +84,14 @@ pub trait IfConfiguerTrait: Send + Sync {
     ) -> Result<(), Error> {
         Ok(())
     }
+    async fn del_ipv6_ip(&self, _name: &str, _ip: Option<Ipv6Inet>) -> Result<(), Error> {
+        Ok(())
+    }
     async fn set_link_status(&self, _name: &str, _up: bool) -> Result<(), Error> {
         Ok(())
     }
-    async fn remove_ip(&self, _name: &str, _ip: Option<Ipv4Inet>) -> Result<(), Error> {
-        Ok(())
-    }
-    async fn remove_ipv6(&self, _name: &str, _ip: Option<Ipv6Inet>) -> Result<(), Error> {
-        Ok(())
-    }
     async fn wait_interface_show(&self, _name: &str) -> Result<(), Error> {
-        return Ok(());
+        Ok(())
     }
     async fn set_mtu(&self, _name: &str, _mtu: u32) -> Result<(), Error> {
         Ok(())

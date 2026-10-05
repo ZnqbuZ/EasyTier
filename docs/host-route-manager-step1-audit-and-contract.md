@@ -37,12 +37,12 @@ HostRouteManager：汇总 → 纯函数计算期望路由 → 执行比对并应
 
 | 路由类别 | 需求来源 (Who Needs) | 当前直接写入点 (Who Writes) | 当前归属 (Who Owns) | 如何撤销 (How Revoked) | 失败如何报告 (Failure Reporting) |
 | :--- | :--- | :--- | :--- | :--- | :--- |
-| **自动子网代理路由**<br>`Peer Proxy CIDR` | 对端 Peer 广播自身代理的网段 (`proxy_cidrs`)，宿主需将流量导向 TUN 设备 | **桌面：** `ProxyCidrMonitor` (1s 轮询) -> `VirtualNic::run_proxy_cidrs_route_updater` -> `IfConfiger::add_ipv4_route`<br>**移动：** `mobile_vpn.ts` 轮询 RPC -> `TauriVpnService.kt` `builder.addRoute` | **无**（直接注入 OS 共享主表或 VPN Session，无归属凭据） | **桌面：** 内存快照做 diff 后调 `remove_ipv4_route`；进程崩溃时泄漏<br>**移动：** 全量重启 VPN Session | **桌面：** 仅 `tracing::trace!` 记录<br>**移动：** 前端 catch 后 `console.error` |
+| **自动子网代理路由**<br>`Peer Proxy CIDR` | 对端 Peer 广播自身代理的网段 (`proxy_cidrs`)，宿主需将流量导向 TUN 设备 | **桌面：** `ProxyCidrMonitor` (1s 轮询) -> `VirtualNic::run_proxy_cidrs_route_updater` -> `IfConfiger::add_ipv4_route`<br>**移动：** `mobile_vpn.ts` 轮询 RPC -> `TauriVpnService.kt` `builder.addRoute` | **无**（直接注入 OS 共享主表或 VPN Session，无归属凭据） | **桌面：** 内存快照做 diff 后调 `del_ipv4_route`；进程崩溃时泄漏<br>**移动：** 全量重启 VPN Session | **桌面：** 仅 `tracing::trace!` 记录<br>**移动：** 前端 catch 后 `console.error` |
 | **手工静态路由**<br>`manual_routes` | 用户在配置中显式指定的 CIDR 网段（仅作用于 proxy CIDR 需求集，目前主线实现为 IPv4） | **桌面：** 同上（在 `ProxyCidrMonitor::resolve_proxy_cidrs` 中覆盖 peer 路由）<br>**移动：** `mobile_vpn.ts` 前端并集拼装后传给 VPN | **无** | 同自动子网代理路由 | 同自动子网代理路由 |
 | **接口直连网段路由**<br>`Link Subnet Route` | TUN 网卡分配 IP 与子网掩码（如 `10.144.144.1/24`）时，由内核网络栈派生的链路前缀 | **Linux/Windows：** `VirtualNic::assign_ipv4_to_tun_device` 添加 IP 时由内核栈自动生成<br>**移动端：** `builder.addAddress` | **内核/系统栈派生** | 随 IP 移除或网卡销毁由内核自动收回 | 添加 IP 失败抛出错误；内核派生过程无显式报告 |
 | **平台显式接口前缀路由**<br>`Explicit Prefix Route` | **macOS / FreeBSD** 平台特性：内核不自动为 TUN 派生子网路由，必须显式安装 | **macOS/FreeBSD：** [`VirtualNic::assign_ipv4_to_tun_device`](../easytier/src/instance/virtual_nic.rs#L839-L846) 显式调用 `nic.add_route`；[`assign_ipv6_to_tun_device`](../easytier/src/instance/virtual_nic.rs#L856-L863) 显式调用 `nic.add_ipv6_route` | **无**（目前由 NIC 代码显式写入系统路由表） | 仅在网卡被关闭或 IP 移除时清理；若崩溃则残留 | 失败向上返回 `Result<(), Error>`，阻断网卡就绪流程 |
 | **Public IPv6 默认路由**<br>`::/0` | 开启 public-ipv6 时，分配到的公网 IPv6 前缀出口，用于导入公网流量 | [`VirtualNic::run_public_ipv6_addr_updater`](../easytier/src/instance/virtual_nic.rs#L1181-L1186) -> `nic.add_ipv6_route_with_cost(::, 0, Some(5))` | **无** | 监听到地址变化时调 `nic.remove_ipv6_route(::, 0)`；崩溃则泄漏 | 仅 `tracing::warn!` 记录日志 |
-| **Public IPv6 对等节点路由**<br>`Public IPv6 Routes` | 组网内其他节点声明的 Public IPv6 路由条目（类型为 `Ipv6Inet`，保留地址与前缀信息） | [`VirtualNic::run_public_ipv6_route_updater`](../easytier/src/instance/virtual_nic.rs#L1150) -> `ifcfg.add_ipv6_route` | **无** | 接收事件 diff 后调 `remove_ipv6_route` | 仅 `tracing::trace!` 记录日志 |
+| **Public IPv6 对等节点路由**<br>`Public IPv6 Routes` | 组网内其他节点声明的 Public IPv6 路由条目（类型为 `Ipv6Inet`，保留地址与前缀信息） | [`VirtualNic::run_public_ipv6_route_updater`](../easytier/src/instance/virtual_nic.rs#L1150) -> `ifcfg.add_ipv6_route` | **无** | 接收事件 diff 后调 `del_ipv6_route` | 仅 `tracing::trace!` 记录日志 |
 | **Magic DNS 虚拟 IP 路由**<br>`fake_ip/32` | Magic DNS 分配的虚拟 IP（如 `7.7.7.7`）不在 TUN 子网内时需导入 TUN（Windows 平台具有固有 `cost = Some(4)`） | **主线桌面：** [`MagicDnsServerInstance::new`](../easytier/src/instance/dns_server/server_instance.rs#L385-L388) 临时实例化 `IfConfiger{}` 写入<br>**移动：** `mobile_vpn.ts` 在启用时追加 `100.100.100.101/32` | **无** | **主线桌面：** `MagicDnsServerInstance::clean_env` 主动调用删除（Drop 中不执行，非正常退出泄漏） | 启动失败返回 `anyhow::Result` |
 | **macOS 历史残留清理**<br>`10.0.0.0/24` | `rust-tun` 库在 macOS/FreeBSD 创建网卡时默认注入的死路由 | [`VirtualNic::run`](../easytier/src/instance/virtual_nic.rs#L1256-L1260) -> `nic.ifcfg.remove_ipv4_route("10.0.0.0", 24)` | **无** | 仅开机单次显式删除 | 忽略错误 `let _ = ...` |
 
@@ -55,7 +55,7 @@ HostRouteManager：汇总 → 纯函数计算期望路由 → 执行比对并应
    - 内部包含 3 个由 `tasks: JoinSet` 托管的长期任务：
      - `run_proxy_cidrs_route_updater`（[Line 1048](../easytier/src/instance/virtual_nic.rs#L1048)）：监听 `GlobalCtxEvent::ProxyCidrsUpdated`，负责 peer proxy 路由。
      - `run_public_ipv6_route_updater`（[Line 1118](../easytier/src/instance/virtual_nic.rs#L1118)）：监听 `GlobalCtxEvent::PublicIpv6RoutesUpdated`，负责对端 public IPv6 路由。
-     - `run_public_ipv6_addr_updater`（[Line 1171–1230](../easytier/src/instance/virtual_nic.rs#L1171-L1230)）：监听 `GlobalCtxEvent::PublicIpv6Changed`，**同时负责网卡 link_up、IPv6 本机公网地址的添加与撤销（`add_ipv6` / `remove_ipv6`），以及公网默认路由 `::/0` 的增删（`add_ipv6_route_with_cost(::, 0, Some(5))` / `remove_ipv6_route`）**。
+     - `run_public_ipv6_addr_updater`（[Line 1171–1230](../easytier/src/instance/virtual_nic.rs#L1171-L1230)）：监听 `GlobalCtxEvent::PublicIpv6Changed`， **同时负责网卡 link_up、IPv6 本机公网地址的添加与撤销（`add_ipv6` / `del_ipv6_ip`），以及公网默认路由 `::/0` 的增删（`add_ipv6_route_with_cost(::, 0, Some(5))` / `del_ipv6_route`）**。
    - **关键缺陷分析**：
      - **错误推进缓存**：以 `apply_route_changes`（[Line 997](../easytier/src/instance/virtual_nic.rs#L997)）为例，无论底层 `ifcfg.add_ipv4_route` 是否报错，均无条件执行 `cur_proxy_cidrs.insert(cidr)`。写入失败后内存缓存假定其已存在，导致永久失去重试机会。
      - **缺乏系统核对**：完全依赖内存 `cur_proxy_cidrs`，外部工具篡改或删除后无法感知与恢复。
@@ -195,7 +195,7 @@ pub trait RouteBackend: Send + 'static {
 
 1. **原生桌面分支 (`NativeRouteBackend`)**：
    - 仅持有路由操作接口、网络作用域和可复用系统资源；TUN 及转发任务由 Host 管理，后端不持有或保活设备；
-   - **精确删除改造（必须前提）**：修改现有的 `remove_ipv4_route` / `remove_ipv6_route`，按各平台实际路由身份和创建时的有效参数进行精确定位（如 Linux 按 destination、prefix、ifindex、table 及 priority/metric 精确匹配；Windows 按 LUID 和 next-hop 精确定位；macOS/FreeBSD 按其系统接口能力定位）。若在系统中无法精确定位完全吻合的条目，返回错误，绝不随意删除同网段不同 metric/属性的外部条目。无需将平台专有字段侵入公共 `Route`。
+   - **精确删除改造（必须前提）**：修改现有的 `del_ipv4_route` / `del_ipv6_route`，按各平台实际路由身份和创建时的有效参数进行精确定位（如 Linux 按 destination、prefix、ifindex、table 及 priority/metric 精确匹配；Windows 按 LUID 和 next-hop 精确定位；macOS/FreeBSD 按其系统接口能力定位）。若在系统中无法精确定位完全吻合的条目，返回错误，绝不随意删除同网段不同 metric/属性的外部条目。无需将平台专有字段侵入公共 `Route`。
 2. **移动端委托分支 (`DelegatedRouteBackend`)**：
    - 实现 `apply_routes`，将全量集合一次性传递给 Android `VpnService.Builder` 重建会话；
    - 仅在宿主系统确认会话建立成功后，才整体更新 `applied_routes`；

@@ -27,7 +27,7 @@ impl IfConfiguerTrait for MacIfConfiger {
         .await
     }
 
-    async fn remove_ipv4_route(
+    async fn del_ipv4_route(
         &self,
         name: &str,
         address: Ipv4Addr,
@@ -66,7 +66,7 @@ impl IfConfiguerTrait for MacIfConfiger {
             .await
     }
 
-    async fn remove_ip(&self, name: &str, ip: Option<Ipv4Inet>) -> Result<(), Error> {
+    async fn del_ipv4_ip(&self, name: &str, ip: Option<Ipv4Inet>) -> Result<(), Error> {
         if let Some(ip) = ip {
             run_shell_cmd(format!("ifconfig {} inet {} delete", name, ip.address()).as_str()).await
         } else {
@@ -88,7 +88,7 @@ impl IfConfiguerTrait for MacIfConfiger {
             .await
     }
 
-    async fn remove_ipv6(&self, name: &str, ip: Option<Ipv6Inet>) -> Result<(), Error> {
+    async fn del_ipv6_ip(&self, name: &str, ip: Option<Ipv6Inet>) -> Result<(), Error> {
         if let Some(ip) = ip {
             run_shell_cmd(format!("ifconfig {} inet6 {} delete", name, ip.address()).as_str()).await
         } else {
@@ -118,7 +118,7 @@ impl IfConfiguerTrait for MacIfConfiger {
         run_shell_cmd(cmd.as_str()).await
     }
 
-    async fn remove_ipv6_route(
+    async fn del_ipv6_route(
         &self,
         name: &str,
         address: std::net::Ipv6Addr,
