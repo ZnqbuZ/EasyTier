@@ -412,7 +412,8 @@ impl NetlinkIfConfiger {
                         && msg.dst_len() == v6.network_length()
                         && msg.oif() == Some(ifindex)
                     {
-                        let request = message_request(RTM_DELROUTE, NLM_F_ACK | NLM_F_REQUEST, &msg)?;
+                        let request =
+                            message_request(RTM_DELROUTE, NLM_F_ACK | NLM_F_REQUEST, &msg)?;
                         match send_netlink_req_and_wait_ack(request) {
                             Ok(()) => return Ok(Some(())),
                             Err(Error::IOError(ref e))

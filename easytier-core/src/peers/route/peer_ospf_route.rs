@@ -2380,7 +2380,6 @@ struct PeerRouteServiceImpl {
     last_update_my_foreign_network: AtomicCell<Option<Instant>>,
 
     peer_info_last_update: AtomicCell<Instant>,
-    proxy_cidrs_snapshot: ArcSwap<BTreeSet<Ipv4Cidr>>,
 }
 
 impl Debug for PeerRouteServiceImpl {
@@ -2455,7 +2454,6 @@ impl PeerRouteServiceImpl {
             last_update_my_foreign_network: AtomicCell::new(None),
 
             peer_info_last_update: AtomicCell::new(Instant::now()),
-            proxy_cidrs_snapshot: ArcSwap::from_pointee(BTreeSet::new()),
         }
     }
 
@@ -2484,10 +2482,6 @@ impl PeerRouteServiceImpl {
         self.public_ipv6_service()
             .map(|service| service.handle_route_change())
             .unwrap_or(false)
-    }
-
-    pub fn proxy_cidrs_snapshot(&self) -> Arc<BTreeSet<Ipv4Cidr>> {
-        self.proxy_cidrs_snapshot.load_full()
     }
 
     fn get_or_create_session(&self, dst_peer_id: PeerId) -> Arc<SyncRouteSession> {
@@ -2853,9 +2847,6 @@ impl PeerRouteServiceImpl {
             .as_mut()
             .unwrap()
             .end_update();
-
-        let proxy_cidrs = self.route_table.list_proxy_cidrs_excluding(self.my_peer_id);
-        self.proxy_cidrs_snapshot.store(Arc::new(proxy_cidrs));
     }
 
     fn update_foreign_network_owner_map(&self) {
@@ -4344,10 +4335,6 @@ impl Debug for PeerRoute {
 }
 
 impl PeerRoute {
-    pub fn proxy_cidrs_snapshot(&self) -> Arc<BTreeSet<Ipv4Cidr>> {
-        self.service_impl.proxy_cidrs_snapshot()
-    }
-
     pub(crate) async fn withdraw_self_conn_info(&self) -> bool {
         if self.service_impl.stopped.load(Ordering::Acquire) {
             return true;

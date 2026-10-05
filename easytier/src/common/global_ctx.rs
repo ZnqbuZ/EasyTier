@@ -95,6 +95,8 @@ pub struct GlobalCtx {
 
     flags: ArcSwap<Flags>,
     runtime_endpoint_protocols: Option<HashSet<String>>,
+
+    route_handle: parking_lot::RwLock<Option<crate::instance::route::RouteHandle>>,
 }
 
 impl std::fmt::Debug for GlobalCtx {
@@ -210,6 +212,8 @@ impl GlobalCtx {
 
             flags: ArcSwap::new(Arc::new(flags)),
             runtime_endpoint_protocols,
+
+            route_handle: parking_lot::RwLock::new(None),
         }
     }
 
@@ -256,7 +260,8 @@ impl GlobalCtx {
     pub(crate) fn set_tun_device_ready(&self, name: String) {
         #[cfg(all(target_os = "linux", feature = "linux-netlink"))]
         {
-            let ifindex = crate::common::ifcfg::netlink::NetlinkIfConfiger::get_interface_index(&name).ok();
+            let ifindex =
+                crate::common::ifcfg::netlink::NetlinkIfConfiger::get_interface_index(&name).ok();
             *self.tun_device_index.lock().unwrap() = ifindex;
         }
         self.set_tun_device_name(Some(name.clone()));
@@ -379,6 +384,18 @@ impl GlobalCtx {
             .into_iter()
             .filter(|listener| protocols.contains(&listener.scheme().to_ascii_lowercase()))
             .collect()
+    }
+
+    pub fn set_route_handle(&self, handle: Option<crate::instance::route::RouteHandle>) {
+        *self.route_handle.write() = handle;
+    }
+
+    pub fn get_route_handle(&self) -> Option<crate::instance::route::RouteHandle> {
+        self.route_handle.read().clone()
+    }
+
+    pub fn register_route_lease(&self) -> Option<crate::instance::route::RouteLease> {
+        self.route_handle.read().as_ref().map(|h| h.register())
     }
 }
 
