@@ -1,0 +1,43 @@
+name: Sync upstream
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: znqbuz-sync
+  cancel-in-progress: true
+
+env:
+  GH_TOKEN: ${{ secrets.GH_TOKEN }}
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: actions
+          fetch-depth: 0
+          token: ${{ env.GH_TOKEN }}
+
+      - name: Sync main
+        run: |
+          gh repo sync "$GITHUB_REPOSITORY" \
+            --source EasyTier/EasyTier \
+            --branch main
+
+      - name: Rebase actions
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git remote add upstream https://github.com/EasyTier/EasyTier.git
+          git fetch upstream main
+
+          git rebase upstream/main
+          git push --force-with-lease origin actions
