@@ -80,80 +80,43 @@ impl Flags {
 
 /// Schema defaults and form keys, plus Serde adapters for the generated patch.
 mod flags {
-    use std::fmt::Display;
+    use std::marker::PhantomData;
 
-    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+    use serde::{Deserializer, Serializer};
+    use serde_with::{DeserializeAs, SerializeAs};
 
     include!(concat!(env!("OUT_DIR"), "/flags.rs"));
 
-    pub(super) fn deserialize_number<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+    /// A field-level adapter: Serde's default supplies None for an omitted
+    /// key, while a present key wraps its nullable value in Some. The field's
+    /// skip_serializing_if omits only the outer None.
+    pub(super) struct Presence<A>(PhantomData<A>);
+
+    impl<'de, T, A> DeserializeAs<'de, Option<Option<T>>> for Presence<A>
     where
-        D: Deserializer<'de>,
-        pbjson::private::NumberDeserialize<T>: Deserialize<'de>,
+        A: DeserializeAs<'de, T>,
     {
-        Option::<pbjson::private::NumberDeserialize<T>>::deserialize(deserializer)
-            .map(|value| value.map(|value| value.0))
+        fn deserialize_as<D>(deserializer: D) -> Result<Option<Option<T>>, D::Error>
+        where
+            D: Deserializer<'de>,
+        {
+            Option::<A>::deserialize_as(deserializer).map(Some)
+        }
     }
 
-    // These callbacks run only when the key is present. Serde's field default
-    // supplies the outer None for an omitted key; a present null is Some(None).
-    pub(super) fn deserialize_nullable_number<'de, D, T>(
-        deserializer: D,
-    ) -> Result<Option<Option<T>>, D::Error>
+    impl<T, A> SerializeAs<Option<Option<T>>> for Presence<A>
     where
-        D: Deserializer<'de>,
-        pbjson::private::NumberDeserialize<T>: Deserialize<'de>,
+        A: SerializeAs<T>,
     {
-        deserialize_nullable::<D, pbjson::private::NumberDeserialize<T>>(deserializer)
-            .map(|value| value.map(|value| value.map(|value| value.0)))
-    }
-
-    pub(super) fn deserialize_nullable<'de, D, T>(
-        deserializer: D,
-    ) -> Result<Option<Option<T>>, D::Error>
-    where
-        D: Deserializer<'de>,
-        T: Deserialize<'de>,
-    {
-        Option::<T>::deserialize(deserializer).map(Some)
-    }
-
-    pub(super) fn serialize_number<S, T>(
-        value: &Option<T>,
-        serializer: S,
-    ) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-        T: ToString,
-    {
-        value
-            .as_ref()
-            .map(ToString::to_string)
-            .serialize(serializer)
-    }
-
-    pub(super) fn deserialize_enum<'de, D, E>(deserializer: D) -> Result<Option<i32>, D::Error>
-    where
-        D: Deserializer<'de>,
-        E: Deserialize<'de> + Into<i32>,
-    {
-        Option::<E>::deserialize(deserializer).map(|value| value.map(Into::into))
-    }
-
-    pub(super) fn serialize_enum<S, E>(
-        value: &Option<i32>,
-        serializer: S,
-    ) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-        E: Serialize + TryFrom<i32>,
-        E::Error: Display,
-    {
-        value
-            .map(E::try_from)
-            .transpose()
-            .map_err(serde::ser::Error::custom)?
-            .serialize(serializer)
+        fn serialize_as<S>(value: &Option<Option<T>>, serializer: S) -> Result<S::Ok, S::Error>
+        where
+            S: Serializer,
+        {
+            match value {
+                Some(value) => Option::<A>::serialize_as(value, serializer),
+                None => serializer.serialize_none(),
+            }
+        }
     }
 }
 

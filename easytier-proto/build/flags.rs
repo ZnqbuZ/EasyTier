@@ -28,6 +28,7 @@ pub fn configure(descriptor_set: &[u8], config: &mut prost_build::Config) -> any
         .type_attribute(
             ".common.Flags",
             "#[optionize(name = \"{}Patch\", attrs(\
+                serde_with::serde_as, \
                 derive(Clone, Debug, PartialEq, Eq, Hash, Default, serde::Serialize, serde::Deserialize), \
                 serde(deny_unknown_fields)))]",
         );
@@ -38,50 +39,35 @@ pub fn configure(descriptor_set: &[u8], config: &mut prost_build::Config) -> any
         if field.json_name() != field.name() {
             write!(serde, ", alias = {:?}", field.json_name())?;
         }
-        match field.kind() {
-            Kind::Bool | Kind::String => {
-                if nullable {
-                    serde.push_str(", deserialize_with = \"flags::deserialize_nullable\"");
-                }
+        let adapter = match field.kind() {
+            Kind::Bool | Kind::String if !nullable => None,
+            Kind::Bool | Kind::String => Some("_".to_owned()),
+            Kind::Uint32 => {
+                Some("serde_with::PickFirst<(_, serde_with::DisplayFromStr)>".to_owned())
             }
-            Kind::Uint32 | Kind::Uint64 => {
-                let deserialize = if nullable {
-                    "flags::deserialize_nullable_number"
-                } else {
-                    "flags::deserialize_number"
-                };
-                write!(serde, ", deserialize_with = {deserialize:?}")?;
-                if matches!(field.kind(), Kind::Uint64) {
-                    ensure!(
-                        !nullable,
-                        "common.Flags.{} needs a nullable uint64 serialization adapter",
-                        field.name()
-                    );
-                    serde.push_str(", serialize_with = \"flags::serialize_number\"");
-                }
+            Kind::Uint64 => {
+                Some("serde_with::PickFirst<(serde_with::DisplayFromStr, _)>".to_owned())
             }
             Kind::Enum(enumeration) => {
-                ensure!(
-                    !nullable,
-                    "common.Flags.{} needs a nullable enum serialization adapter",
-                    field.name()
-                );
-                write!(
-                    serde,
-                    ", deserialize_with = \"flags::deserialize_enum::<_, {}>\", \
-                       serialize_with = \"flags::serialize_enum::<_, {}>\"",
-                    enumeration.name(),
-                    enumeration.name(),
-                )?;
+                Some(format!("serde_with::TryFromInto<{}>", enumeration.name()))
             }
             kind => bail!(
                 "common.Flags.{} has unsupported kind {kind:?}",
                 field.name()
             ),
+        };
+        let mut attrs = format!("serde({serde})");
+        if let Some(adapter) = adapter {
+            let adapter = if nullable {
+                format!("flags::Presence<{adapter}>")
+            } else {
+                format!("Option<{adapter}>")
+            };
+            write!(attrs, ", serde_as(as = {adapter:?})")?;
         }
         config.field_attribute(
             format!(".common.Flags.{}", field.name()),
-            format!("#[optionize(attrs(.., -prost, serde({serde})))]"),
+            format!("#[optionize(attrs(.., -prost, {attrs}))]"),
         );
     }
     Ok(())
