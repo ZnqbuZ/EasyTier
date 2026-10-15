@@ -1120,7 +1120,7 @@ pub struct NicCtx {
     close_notifier: Arc<Notify>,
 
     backend: NicBackend,
-    #[cfg(all(target_os = "linux", feature = "linux-netlink", not(mobile)))]
+    #[cfg(native_route)]
     _route_binding: Option<super::route::scope::RouteScopeLease>,
     tasks: JoinSet<()>,
 
@@ -1166,7 +1166,7 @@ impl NicCtx {
             close_notifier,
 
             backend,
-            #[cfg(all(target_os = "linux", feature = "linux-netlink", not(mobile)))]
+            #[cfg(native_route)]
             _route_binding: None,
             tasks: JoinSet::new(),
 
@@ -1682,7 +1682,7 @@ impl NicCtx {
     }
 
     async fn publish_ready(&self) -> Result<(), Error> {
-        #[cfg(all(target_os = "linux", feature = "linux-netlink", not(mobile)))]
+        #[cfg(native_route)]
         if let Some(scope) = self.global_ctx.get_route_scope() {
             let attachment = scope
                 .attachment()
@@ -1718,7 +1718,7 @@ impl NicCtx {
         ipv4_addr: Option<cidr::Ipv4Inet>,
         ipv6_addr: Option<cidr::Ipv6Inet>,
     ) -> Result<(), Error> {
-        #[cfg(all(target_os = "linux", feature = "linux-netlink", not(mobile)))]
+        #[cfg(native_route)]
         if let Some(scope) = self.global_ctx.get_route_scope() {
             let NicBackend::Shared(member) = &self.backend else {
                 return Err(

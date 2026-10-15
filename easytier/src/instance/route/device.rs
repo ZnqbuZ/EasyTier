@@ -166,6 +166,7 @@ pub(crate) struct TunDeviceLifetime {
 }
 
 impl TunDeviceLifetime {
+    #[cfg(test)]
     pub fn registration(&self) -> u64 {
         self.registration
     }

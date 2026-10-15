@@ -10,24 +10,14 @@ pub(super) struct NativeRouteRuntime {
 
 impl NativeRouteRuntime {
     pub(super) fn new(global_ctx: ArcGlobalCtx) -> Self {
-        #[cfg(all(
-            target_os = "linux",
-            feature = "linux-netlink",
-            feature = "tun",
-            not(mobile)
-        ))]
+        #[cfg(native_route)]
         let scope = (!global_ctx.get_flags().no_tun).then(|| {
             let scope = crate::instance::route::scope::RouteScope::new(global_ctx.get_id());
             global_ctx.set_route_handle(Some(scope.handle()));
             global_ctx.set_route_scope(Some(scope.clone()));
             scope
         });
-        #[cfg(not(all(
-            target_os = "linux",
-            feature = "linux-netlink",
-            feature = "tun",
-            not(mobile)
-        )))]
+        #[cfg(not(native_route))]
         let scope = None;
         Self { global_ctx, scope }
     }

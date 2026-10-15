@@ -401,6 +401,7 @@ impl GlobalCtx {
         self.route_scope.read().clone()
     }
 
+    #[cfg(test)]
     pub(crate) fn route_device_state(&self) -> Arc<crate::instance::route::device::TunDeviceState> {
         self.get_route_scope()
             .and_then(|scope| scope.attachment())

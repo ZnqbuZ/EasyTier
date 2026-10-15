@@ -91,6 +91,20 @@ pub struct CleanupIncomplete {
     pub reason: String,
 }
 
+impl std::fmt::Display for CleanupIncomplete {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{}: {} uncleaned, {} unknown",
+            self.reason,
+            self.uncleaned_routes.len(),
+            self.unknown_routes.len()
+        )
+    }
+}
+
+impl std::error::Error for CleanupIncomplete {}
+
 /// Per-item exponential backoff retry state
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RetryState {
@@ -112,5 +126,30 @@ impl RetryState {
         let shift = self.attempts.saturating_sub(1).min(6);
         let backoff_ms = (100u64.saturating_mul(1 << shift)).min(5000);
         self.next_retry = now + std::time::Duration::from_millis(backoff_ms);
+    }
+}
+
+/// Validated per-member route intent and concrete source-selection parameters.
+#[derive(Default)]
+pub(crate) struct RouteProjection {
+    pub scopes: std::collections::BTreeMap<u64, easytier_core::host::route::RouteSet>,
+    pub sources: std::collections::BTreeMap<easytier_core::host::route::RouteSpec, IpAddr>,
+}
+
+impl RouteProjection {
+    #[cfg(any(test, not(native_route)))]
+    pub fn from_inputs(
+        inputs: &[(
+            std::sync::Arc<super::scope::RouteInput>,
+            easytier_core::host::route::RouteSet,
+        )],
+    ) -> Self {
+        Self {
+            scopes: inputs
+                .iter()
+                .map(|(input, routes)| (input.id, routes.clone()))
+                .collect(),
+            sources: std::collections::BTreeMap::new(),
+        }
     }
 }

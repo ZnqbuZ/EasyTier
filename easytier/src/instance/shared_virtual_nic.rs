@@ -53,47 +53,22 @@ pub struct SharedVirtualNic {
     member_tunnel_table: SharedVirtualNicMemberTunnelTable,
     member_registrations: BTreeMap<SharedVirtualNicMemberId, SharedVirtualNicMemberRegistrationId>,
     dispatcher: Option<SharedVirtualNicDispatcher>,
-    #[cfg(all(
-        target_os = "linux",
-        feature = "linux-netlink",
-        feature = "tun",
-        not(mobile)
-    ))]
+    #[cfg(native_route)]
     route_outlet: super::route::outlet::RouteOutlet,
-    #[cfg(all(
-        target_os = "linux",
-        feature = "linux-netlink",
-        feature = "tun",
-        not(mobile)
-    ))]
+    #[cfg(native_route)]
     route_writer_active: bool,
-    #[cfg(all(
-        target_os = "linux",
-        feature = "linux-netlink",
-        feature = "tun",
-        not(mobile)
-    ))]
+    #[cfg(native_route)]
     managed_route_members: BTreeSet<SharedVirtualNicMemberId>,
 }
 
 impl SharedVirtualNic {
     pub fn new(config: VirtualNicConfig) -> Self {
-        #[cfg(all(
-            target_os = "linux",
-            feature = "linux-netlink",
-            feature = "tun",
-            not(mobile)
-        ))]
+        #[cfg(native_route)]
         let route_outlet = super::route::outlet::RouteOutlet::new(
             crate::common::netns::NetNS::new(config.net_ns_name()),
         );
         let nic = VirtualNic::new(config);
-        #[cfg(all(
-            target_os = "linux",
-            feature = "linux-netlink",
-            feature = "tun",
-            not(mobile)
-        ))]
+        #[cfg(native_route)]
         let nic = nic.with_device_state(route_outlet.devices.clone());
         Self {
             nic: Arc::new(Mutex::new(nic)),
@@ -102,37 +77,17 @@ impl SharedVirtualNic {
             member_tunnel_table: SharedVirtualNicMemberTunnelTable::default(),
             member_registrations: BTreeMap::new(),
             dispatcher: None,
-            #[cfg(all(
-                target_os = "linux",
-                feature = "linux-netlink",
-                feature = "tun",
-                not(mobile)
-            ))]
+            #[cfg(native_route)]
             route_outlet,
-            #[cfg(all(
-                target_os = "linux",
-                feature = "linux-netlink",
-                feature = "tun",
-                not(mobile)
-            ))]
+            #[cfg(native_route)]
             route_writer_active: false,
-            #[cfg(all(
-                target_os = "linux",
-                feature = "linux-netlink",
-                feature = "tun",
-                not(mobile)
-            ))]
+            #[cfg(native_route)]
             managed_route_members: BTreeSet::new(),
         }
     }
 
     pub fn mark_invalid(&self) {
-        #[cfg(all(
-            target_os = "linux",
-            feature = "linux-netlink",
-            feature = "tun",
-            not(mobile)
-        ))]
+        #[cfg(native_route)]
         self.route_outlet.request_shutdown();
         self.valid.store(false, Ordering::Release);
     }
@@ -308,12 +263,7 @@ impl SharedVirtualNic {
             dispatcher.remove_sources(member_id).await?;
         }
         self.ifcfg = next_ifcfg;
-        #[cfg(all(
-            target_os = "linux",
-            feature = "linux-netlink",
-            feature = "tun",
-            not(mobile)
-        ))]
+        #[cfg(native_route)]
         if self.route_writer_active {
             self.route_outlet.invalidate_routes();
         }
@@ -346,12 +296,7 @@ impl SharedVirtualNic {
         let old_effective = self.ifcfg.effective();
         let next_effective = next_ifcfg.effective();
         let delta = SharedIfConfigDelta::between(&old_effective, &next_effective);
-        #[cfg(all(
-            target_os = "linux",
-            feature = "linux-netlink",
-            feature = "tun",
-            not(mobile)
-        ))]
+        #[cfg(native_route)]
         if self.route_writer_active
             && (!delta.ipv4_addresses.added.is_empty()
                 || !delta.ipv4_addresses.removed.is_empty()
@@ -443,39 +388,24 @@ impl SharedVirtualNic {
     }
 
     fn directly_manages_routes(&self) -> bool {
-        #[cfg(all(
-            target_os = "linux",
-            feature = "linux-netlink",
-            feature = "tun",
-            not(mobile)
-        ))]
+        #[cfg(native_route)]
         {
             !self.route_writer_active
         }
-        #[cfg(not(all(
-            target_os = "linux",
-            feature = "linux-netlink",
-            feature = "tun",
-            not(mobile)
-        )))]
+        #[cfg(not(native_route))]
         {
             true
         }
     }
 
-    #[cfg(all(
-        target_os = "linux",
-        feature = "linux-netlink",
-        feature = "tun",
-        not(mobile)
-    ))]
+    #[cfg(native_route)]
     pub(crate) async fn project_route_inputs(
         &mut self,
         inputs: &[(
             Arc<super::route::scope::RouteInput>,
             easytier_core::host::route::RouteSet,
         )],
-    ) -> Result<super::route::projection::RouteProjection, Error> {
+    ) -> Result<super::route::RouteProjection, Error> {
         use easytier_core::host::route::{RouteSet, RouteSpec};
         if let Err(error) = self.ensure_valid() {
             self.route_outlet.request_shutdown();
@@ -577,7 +507,7 @@ impl SharedVirtualNic {
             }
         }
         self.ifcfg = next;
-        let mut projection = super::route::projection::RouteProjection {
+        let mut projection = super::route::RouteProjection {
             scopes: BTreeMap::new(),
             sources: BTreeMap::new(),
         };
@@ -595,12 +525,9 @@ impl SharedVirtualNic {
                         cidr::IpCidr::V4(cidr::Ipv4Cidr::new(route.address, route.prefix).unwrap()),
                         metric,
                     );
-                    projection.sources.insert(
-                        spec,
-                        self.ifcfg
-                            .ipv4_route_source_hint(&route)
-                            .map(std::net::IpAddr::V4),
-                    );
+                    if let Some(hint) = self.ifcfg.ipv4_route_source_hint(&route) {
+                        projection.sources.insert(spec, std::net::IpAddr::V4(hint));
+                    }
                     routes.insert(spec);
                 }
             }
@@ -884,12 +811,7 @@ impl SharedVirtualNicMember {
             .map_err(anyhow::Error::from)?
     }
 
-    #[cfg(all(
-        target_os = "linux",
-        feature = "linux-netlink",
-        feature = "tun",
-        not(mobile)
-    ))]
+    #[cfg(native_route)]
     pub(crate) async fn attach_route_scope(
         &self,
         scope: super::route::scope::RouteScope,

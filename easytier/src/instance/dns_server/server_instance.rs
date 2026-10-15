@@ -42,12 +42,7 @@ use easytier_core::gateway::magic_dns::{
     MagicDnsRoute,
 };
 use easytier_core::host::route::RouteDemand;
-#[cfg(all(
-    target_os = "linux",
-    feature = "linux-netlink",
-    feature = "tun",
-    not(mobile)
-))]
+#[cfg(native_route)]
 use easytier_core::host::route::RouteSpec;
 use easytier_core::instance::CorePacketPlane;
 use hickory_proto::rr::LowerName;
@@ -370,12 +365,7 @@ fn get_system_config(
     Ok(None)
 }
 
-#[cfg(all(
-    target_os = "linux",
-    feature = "linux-netlink",
-    feature = "tun",
-    not(mobile)
-))]
+#[cfg(native_route)]
 async fn register_native_dns_route(
     global_ctx: &ArcGlobalCtx,
     tun_dev: Option<&str>,
@@ -441,12 +431,7 @@ async fn register_native_dns_route(
 }
 
 impl MagicDnsServerInstance {
-    #[cfg(not(all(
-        target_os = "linux",
-        feature = "linux-netlink",
-        feature = "tun",
-        not(mobile)
-    )))]
+    #[cfg(not(native_route))]
     async fn add_fake_ip_route(
         tun_dev_name: &str,
         fake_ip: Ipv4Addr,
@@ -524,12 +509,7 @@ impl MagicDnsServerInstance {
         let (route_registration, legacy_route_installed) = if manage_fake_ip_route
             && !tun_inet.contains(&fake_ip)
         {
-            #[cfg(all(
-                target_os = "linux",
-                feature = "linux-netlink",
-                feature = "tun",
-                not(mobile)
-            ))]
+            #[cfg(native_route)]
             {
                 let registration = if !global_ctx.get_flags().no_tun {
                     Some(register_native_dns_route(&global_ctx, tun_dev.as_deref(), fake_ip).await?)
@@ -539,12 +519,7 @@ impl MagicDnsServerInstance {
                 (registration, false)
             }
 
-            #[cfg(not(all(
-                target_os = "linux",
-                feature = "linux-netlink",
-                feature = "tun",
-                not(mobile)
-            )))]
+            #[cfg(not(native_route))]
             {
                 let installed = if let Some(tun_dev_name) = &tun_dev {
                     let cost = if cfg!(target_os = "windows") {
@@ -635,13 +610,7 @@ impl Drop for MagicDnsServerInstance {
     }
 }
 
-#[cfg(all(
-    test,
-    target_os = "linux",
-    feature = "linux-netlink",
-    feature = "tun",
-    not(mobile)
-))]
+#[cfg(all(test, native_route))]
 mod route_tests {
     use super::*;
     use crate::common::global_ctx::tests::get_mock_global_ctx;

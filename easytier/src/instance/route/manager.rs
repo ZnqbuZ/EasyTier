@@ -35,12 +35,7 @@ pub struct RouteMgr<B> {
     nic_changed: watch::Receiver<u64>,
     verified_nic_revision: u64,
     verify_at: Option<tokio::time::Instant>,
-    #[cfg(all(
-        target_os = "linux",
-        feature = "linux-netlink",
-        feature = "tun",
-        not(mobile)
-    ))]
+    #[cfg(native_route)]
     nic: std::sync::Weak<tokio::sync::Mutex<crate::instance::shared_virtual_nic::SharedVirtualNic>>,
 
     installed: BTreeSet<Route>,
@@ -95,12 +90,7 @@ impl<B: RouteBackend> RouteMgr<B> {
         }
     }
 
-    #[cfg(all(
-        target_os = "linux",
-        feature = "linux-netlink",
-        feature = "tun",
-        not(mobile)
-    ))]
+    #[cfg(native_route)]
     pub(crate) fn with_nic(
         mut self,
         nic: std::sync::Weak<
@@ -336,14 +326,7 @@ impl<B: RouteBackend> RouteMgr<B> {
         for scope in self.scopes.values() {
             let visible = ready
                 .iter()
-                .filter(|actual| {
-                    scope.input.is_ready()
-                        && scope
-                            .previous
-                            .range(**actual..)
-                            .next()
-                            .is_some_and(|request| request.destination == actual.destination)
-                })
+                .filter(|actual| scope.input.is_ready() && actual.destination_in(&scope.previous))
                 .copied()
                 .collect();
             scope.input.scope.publish_status(
@@ -465,16 +448,10 @@ impl<B: RouteBackend> RouteMgr<B> {
             .values()
             .map(|scope| (scope.input.clone(), scope.desired()))
             .collect::<Vec<_>>();
-        let mut projection = super::projection::RouteProjection::from_inputs(&requested);
-        #[cfg(all(
-            target_os = "linux",
-            feature = "linux-netlink",
-            feature = "tun",
-            not(mobile)
-        ))]
-        match self.nic.upgrade() {
+        #[cfg(native_route)]
+        let mut projection = match self.nic.upgrade() {
             Some(nic) => match nic.lock().await.project_route_inputs(&requested).await {
-                Ok(accepted) => projection = accepted,
+                Ok(accepted) => accepted,
                 Err(error) => {
                     tracing::warn!(?error, "route outlet is unavailable");
                     return;
@@ -486,8 +463,12 @@ impl<B: RouteBackend> RouteMgr<B> {
                 // deliberately omit the concrete NIC adapter.
                 #[cfg(not(test))]
                 return;
+                #[cfg(test)]
+                super::RouteProjection::from_inputs(&requested)
             }
-        }
+        };
+        #[cfg(not(native_route))]
+        let mut projection = super::RouteProjection::from_inputs(&requested);
         if self.batch_interrupted() || !self.verify_owned_routes().await {
             return;
         }
@@ -506,7 +487,7 @@ impl<B: RouteBackend> RouteMgr<B> {
                     destination: spec.destination,
                     interface: dev.clone(),
                     metric: spec.metric.get(),
-                    preferred_source: projection.sources.get(&spec).copied().flatten(),
+                    preferred_source: projection.sources.get(&spec).copied(),
                 })
                 .collect(),
             None => BTreeSet::new(),
@@ -523,14 +504,8 @@ impl<B: RouteBackend> RouteMgr<B> {
                     .filter(|route| {
                         scope
                             .previous
-                            .range(
-                                RouteSpec::new(
-                                    route.destination,
-                                    std::num::NonZeroU32::new(route.metric).unwrap(),
-                                )..,
-                            )
-                            .next()
-                            .is_some_and(|request| request.destination == route.destination)
+                            .iter()
+                            .any(|request| request.destination == route.destination)
                     })
                     .map(Route::os_route),
             );

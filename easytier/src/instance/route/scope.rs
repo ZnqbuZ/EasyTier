@@ -23,15 +23,9 @@ struct ScopeInner {
     member: uuid::Uuid,
     routes: RouteRegistry,
     config: OnceLock<CoreRuntimeConfigStore>,
-    binding: parking_lot::Mutex<ScopeBindingState>,
-    changed: watch::Sender<Option<RouteAttachment>>,
-}
-
-#[derive(Default)]
-struct ScopeBindingState {
-    closed: bool,
-    current: Option<RouteAttachment>,
-    cleanup: Option<watch::Receiver<bool>>,
+    closed: AtomicBool,
+    binding: watch::Sender<Option<RouteAttachment>>,
+    cleanup: parking_lot::Mutex<Option<watch::Receiver<bool>>>,
 }
 
 #[derive(Clone)]
@@ -51,8 +45,9 @@ impl RouteScope {
             member,
             routes,
             config: OnceLock::new(),
-            binding: parking_lot::Mutex::new(ScopeBindingState::default()),
-            changed: watch::channel(None).0,
+            closed: AtomicBool::new(false),
+            binding: watch::channel(None).0,
+            cleanup: parking_lot::Mutex::new(None),
         }))
     }
 
@@ -84,64 +79,73 @@ impl RouteScope {
     }
 
     pub fn attachment(&self) -> Option<RouteAttachment> {
-        self.0.binding.lock().current.clone()
+        self.0.binding.borrow().clone()
     }
 
     pub fn subscribe_attachment(&self) -> watch::Receiver<Option<RouteAttachment>> {
-        self.0.changed.subscribe()
+        self.0.binding.subscribe()
     }
 
     pub fn mark_ready(&self, id: u64) {
-        let mut state = self.0.binding.lock();
-        if !state.closed {
-            if let Some(attachment) = state
-                .current
-                .as_mut()
-                .filter(|attachment| attachment.id == id)
-            {
-                attachment.ready = true;
-                self.0.changed.send_replace(Some(attachment.clone()));
-            }
+        if !self.is_closed() {
+            self.0.binding.send_if_modified(|current| {
+                if let Some(attachment) = current.as_mut().filter(|a| a.id == id && !a.ready) {
+                    attachment.ready = true;
+                    true
+                } else {
+                    false
+                }
+            });
         }
     }
 
     pub fn mark_unready(&self) {
-        let mut state = self.0.binding.lock();
-        if let Some(attachment) = state.current.as_mut() {
-            attachment.ready = false;
+        let mut changed = false;
+        self.0.binding.send_if_modified(|current| {
+            if let Some(attachment) = current.as_mut().filter(|a| a.ready) {
+                attachment.ready = false;
+                changed = true;
+                true
+            } else {
+                false
+            }
+        });
+        if changed {
             self.0.routes.publish_status(RouteStatus::default());
-            self.0.changed.send_replace(Some(attachment.clone()));
         }
     }
 
     pub fn is_closed(&self) -> bool {
-        self.0.binding.lock().closed
+        self.0.closed.load(Ordering::SeqCst)
     }
 
     fn revoke_binding(&self, id: u64) {
-        let mut state = self.0.binding.lock();
-        if state
-            .current
-            .as_ref()
-            .is_some_and(|attachment| attachment.id == id)
-        {
-            state.current = None;
+        let mut revoked = false;
+        self.0.binding.send_if_modified(|current| {
+            if current.as_ref().is_some_and(|a| a.id == id) {
+                *current = None;
+                revoked = true;
+                true
+            } else {
+                false
+            }
+        });
+        if revoked {
             self.0.routes.publish_status(RouteStatus::default());
-            self.0.changed.send_replace(None);
         }
     }
 
     pub fn close(&self) {
-        let mut state = self.0.binding.lock();
-        state.closed = true;
+        self.0.closed.store(true, Ordering::SeqCst);
         self.0.routes.close();
     }
 
     pub fn publish_status(&self, binding: u64, status: RouteStatus) {
-        let state = self.0.binding.lock();
-        if !state.closed
-            && state
-                .current
+        if !self.is_closed()
+            && self
+                .0
+                .binding
+                .borrow()
                 .as_ref()
                 .is_some_and(|current| current.id == binding)
         {
@@ -150,7 +154,7 @@ impl RouteScope {
     }
 
     pub async fn wait_withdrawn(&self) -> anyhow::Result<()> {
-        let cleanup = self.0.binding.lock().cleanup.clone();
+        let cleanup = self.0.cleanup.lock().clone();
         if let Some(mut cleanup) = cleanup {
             while !*cleanup.borrow_and_update() {
                 cleanup.changed().await.map_err(|_| {
@@ -168,10 +172,8 @@ impl RouteScope {
         member_registration: uuid::Uuid,
     ) -> anyhow::Result<RouteScopeLease> {
         anyhow::ensure!(self.0.config.get().is_some(), "route scope is not prepared");
-        let id = NEXT_BINDING
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
-            .expect("route binding identity exhausted")
-            + 1;
+        anyhow::ensure!(!self.is_closed(), "route scope is closed");
+        let id = NEXT_BINDING.fetch_add(1, Ordering::Relaxed) + 1;
         let attachment = RouteAttachment {
             id,
             devices,
@@ -187,21 +189,15 @@ impl RouteScope {
                 observed: AtomicBool::new(false),
             })
             .ok_or_else(|| anyhow::anyhow!("route outlet is closed"))?;
-        // Register without the binding lock: closing the input collection can
-        // destroy RouteInput and revoke its binding. Keep a payload reference
-        // through publication so a concurrent close cannot destroy it before
-        // the matching binding exists. A writer may see the input early, but
-        // it stays inactive until the attachment and readiness notifications.
         let input = lease
             .get()
             .ok_or_else(|| anyhow::anyhow!("route outlet is closed"))?;
-        let mut state = self.0.binding.lock();
-        anyhow::ensure!(!state.closed, "route scope is closed");
+        if self.is_closed() {
+            anyhow::bail!("route scope is closed");
+        }
         self.0.routes.publish_status(RouteStatus::default());
-        state.current = Some(attachment.clone());
-        state.cleanup = Some(completed);
-        self.0.changed.send_replace(Some(attachment));
-        drop(state);
+        *self.0.cleanup.lock() = Some(completed);
+        self.0.binding.send_replace(Some(attachment));
         drop(input);
         Ok(RouteScopeLease {
             lease: Some(lease),
@@ -227,19 +223,23 @@ impl RouteInput {
         self.observed.store(true, Ordering::Relaxed);
     }
     pub fn is_current(&self) -> bool {
-        let state = self.scope.0.binding.lock();
-        !state.closed
-            && state
-                .current
+        !self.scope.is_closed()
+            && self
+                .scope
+                .0
+                .binding
+                .borrow()
                 .as_ref()
                 .is_some_and(|attachment| attachment.id == self.id)
     }
 
     pub fn is_ready(&self) -> bool {
-        let state = self.scope.0.binding.lock();
-        !state.closed
-            && state
-                .current
+        !self.scope.is_closed()
+            && self
+                .scope
+                .0
+                .binding
+                .borrow()
                 .as_ref()
                 .is_some_and(|attachment| attachment.id == self.id && attachment.ready)
     }

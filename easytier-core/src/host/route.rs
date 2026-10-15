@@ -27,6 +27,24 @@ impl RouteSpec {
             metric,
         }
     }
+
+    /// Checks whether `set` contains a route for this destination with a metric
+    /// less than or equal to this request's metric (lower metric = higher priority).
+    pub fn is_satisfied_by(&self, set: &RouteSet) -> bool {
+        set.range(RouteSpec::new(self.destination, NonZeroU32::MIN)..=*self)
+            .next()
+            .is_some()
+    }
+
+    /// Checks whether `set` contains a route for this destination with any metric.
+    pub fn destination_in(&self, set: &RouteSet) -> bool {
+        set.range(
+            RouteSpec::new(self.destination, NonZeroU32::MIN)
+                ..=RouteSpec::new(self.destination, NonZeroU32::MAX),
+        )
+        .next()
+        .is_some()
+    }
 }
 
 /// Ordinary proxy / DNS routes use the existing metric 65535.
@@ -160,13 +178,9 @@ impl RouteHandle {
                 return Err(RouteRuntimeClosed);
             }
             if snapshot.device_registration == Some(device_registration)
-                && required.iter().all(|request| {
-                    snapshot
-                        .ready
-                        .range(RouteSpec::new(request.destination, NonZeroU32::MIN)..=*request)
-                        .next()
-                        .is_some()
-                })
+                && required
+                    .iter()
+                    .all(|request| request.is_satisfied_by(&snapshot.ready))
             {
                 return Ok(());
             }

@@ -3,14 +3,9 @@ pub(crate) mod device;
 mod inputs;
 pub mod manager;
 pub mod model;
-#[cfg(all(
-    target_os = "linux",
-    feature = "linux-netlink",
-    feature = "tun",
-    not(mobile)
-))]
+#[cfg(native_route)]
 pub(crate) mod outlet;
-pub(crate) mod projection;
+pub(crate) use model::RouteProjection;
 pub(crate) mod scope;
 #[cfg(test)]
 pub(crate) mod test_support;

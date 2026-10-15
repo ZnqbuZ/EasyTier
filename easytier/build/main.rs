@@ -74,6 +74,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 all(target_os = "macos", feature = "macos-ne"),
                 target_env = "ohos"
             )
+        },
+        native_route: {
+            all(
+                target_os = "linux",
+                feature = "linux-netlink",
+                feature = "tun",
+                not(mobile)
+            )
         }
     }
 

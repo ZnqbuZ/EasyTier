@@ -472,7 +472,7 @@ async fn managed_route_projection_preserves_membership_policy_without_writing_ro
             .values()
             .all(|routes| *routes == RouteSet::from([dns]))
     );
-    assert_eq!(accepted.sources[&dns], Some("10.50.0.2".parse().unwrap()));
+    assert_eq!(accepted.sources.get(&dns).copied(), Some("10.50.0.2".parse().unwrap()));
 
     // A shared DNS destination is allowed; another member's address subnet
     // remains exclusive and a rejected replacement keeps its accepted intent.
