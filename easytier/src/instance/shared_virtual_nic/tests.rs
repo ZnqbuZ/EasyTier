@@ -439,8 +439,13 @@ async fn managed_route_projection_preserves_membership_policy_without_writing_ro
         .apply_member_claims(other, address_claims("10.51.0.2/24"));
     nic.managed_route_members.extend([MEMBER, other]);
     let inputs = registry::Registry::default();
+    let dirty = registry::Dirty::<u64>::new();
     let mut bindings = Vec::new();
-    for (member, registration) in [(MEMBER, REGISTRATION), (other, other_registration)] {
+    for (i, (member, registration)) in
+        [(MEMBER, REGISTRATION), (other, other_registration)]
+            .into_iter()
+            .enumerate()
+    {
         let scope = RouteScope::new(member);
         scope
             .prepare(CoreRuntimeConfigStore::new(
@@ -449,7 +454,12 @@ async fn managed_route_projection_preserves_membership_policy_without_writing_ro
             ))
             .unwrap();
         let binding = scope
-            .attach(&inputs, nic.route_outlet.devices.clone(), registration)
+            .attach(
+                &inputs,
+                nic.route_outlet.devices.clone(),
+                registration,
+                dirty.signal(i as u64 + 1),
+            )
             .unwrap();
         scope.mark_ready(scope.attachment().unwrap().id);
         bindings.push(binding);

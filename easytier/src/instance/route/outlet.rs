@@ -1,10 +1,13 @@
 use std::{
     future::{Future, IntoFuture},
     pin::Pin,
-    sync::{Arc, Mutex as StdMutex, Weak},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc, Mutex as StdMutex, Weak,
+    },
 };
 
-use registry::Registry;
+use registry::{Dirty, DirtySender, Registry};
 use tokio::{
     sync::{Mutex, watch},
     task::JoinHandle,
@@ -18,6 +21,8 @@ use super::{
     device::TunDeviceState,
     scope::{RouteInput, RouteScope, RouteScopeLease},
 };
+
+static NEXT_BINDING: AtomicU64 = AtomicU64::new(0);
 
 type RouteJoinResult = Result<Result<(), CleanupIncomplete>, tokio::task::JoinError>;
 type RouteCleanupTask = guarden::task::DetachableTaskFuture<
@@ -44,6 +49,7 @@ fn observe_route_task(task: JoinHandle<Result<(), CleanupIncomplete>>) -> RouteC
 pub(crate) struct RouteOutlet {
     pub devices: Arc<TunDeviceState>,
     inputs: Registry<RouteInput>,
+    dirty: DirtySender<u64>,
     net_ns: NetNS,
     nic_changes: watch::Sender<u64>,
     cancel: CancellationToken,
@@ -52,9 +58,11 @@ pub(crate) struct RouteOutlet {
 
 impl RouteOutlet {
     pub fn new(net_ns: NetNS) -> Self {
+        let (dirty, _) = Dirty::channel();
         Self {
             devices: TunDeviceState::new(Arc::new(StdMutex::new(None))),
             inputs: Registry::default(),
+            dirty,
             net_ns,
             nic_changes: watch::channel(0).0,
             cancel: CancellationToken::new(),
@@ -73,6 +81,7 @@ impl RouteOutlet {
             self.devices.clone(),
             backend,
             self.inputs.clone(),
+            self.dirty.subscribe(),
             self.nic_changes.subscribe(),
             self.cancel.clone(),
         )
@@ -86,7 +95,15 @@ impl RouteOutlet {
         scope: &RouteScope,
         member_registration: uuid::Uuid,
     ) -> anyhow::Result<RouteScopeLease> {
-        scope.attach(&self.inputs, self.devices.clone(), member_registration)
+        let id = NEXT_BINDING.fetch_add(1, Ordering::Relaxed) + 1;
+        let signal = self.dirty.signal(id);
+        scope.attach(&self.inputs, self.devices.clone(), member_registration, signal)
+    }
+
+    #[cfg(test)]
+    #[allow(dead_code)]
+    pub(crate) fn dirty(&self) -> &DirtySender<u64> {
+        &self.dirty
     }
 
     pub fn invalidate_routes(&self) {

@@ -31,6 +31,8 @@ impl<B: RouteBackend> RouteHarness<B> {
         cancel: CancellationToken,
     ) -> Self {
         let inputs = Registry::default();
+        let (dirty_sender, dirty_receiver) = registry::Dirty::channel();
+        let signal = dirty_sender.signal(1);
         let scope = RouteScope::with_registry(global_ctx.get_id(), routes);
         scope.prepare(runtime_config.clone()).unwrap();
         let lease = scope
@@ -38,6 +40,7 @@ impl<B: RouteBackend> RouteHarness<B> {
                 &inputs,
                 global_ctx.tun_devices.clone(),
                 uuid::Uuid::new_v4(),
+                signal,
             )
             .unwrap();
         scope.mark_ready(scope.attachment().unwrap().id);
@@ -46,6 +49,7 @@ impl<B: RouteBackend> RouteHarness<B> {
             global_ctx.tun_devices.clone(),
             backend,
             inputs,
+            dirty_receiver,
             changed,
             cancel,
         );

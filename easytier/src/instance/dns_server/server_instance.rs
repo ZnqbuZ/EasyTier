@@ -41,7 +41,7 @@ use easytier_core::gateway::magic_dns::{
     MagicDnsQuery, MagicDnsQueryResolver, MagicDnsRecordStore, MagicDnsResolverRegistration,
     MagicDnsRoute,
 };
-use easytier_core::host::route::RouteDemand;
+use easytier_core::host::route::{RouteDemand, RouteRegistration};
 #[cfg(native_route)]
 use easytier_core::host::route::RouteSpec;
 use easytier_core::instance::CorePacketPlane;
@@ -49,7 +49,6 @@ use hickory_proto::rr::LowerName;
 use hickory_proto::serialize::binary::{BinDecodable, BinEncoder};
 use hickory_server::authority::{MessageRequest, MessageResponse};
 use hickory_server::server::{Request, RequestHandler, ResponseHandler, ResponseInfo};
-use registry::Registration;
 use std::sync::Mutex;
 use std::{collections::BTreeMap, io, net::Ipv4Addr, str::FromStr, sync::Arc, time::Duration};
 
@@ -342,7 +341,7 @@ pub struct MagicDnsServerInstance {
     packet_filter: MagicDnsResolverRegistration,
     #[allow(dead_code)]
     tun_inet: Ipv4Inet,
-    _route_registration: Option<Registration<RouteDemand>>,
+    _route_registration: Option<RouteRegistration>,
 }
 
 fn get_system_config(
@@ -370,7 +369,7 @@ async fn register_native_dns_route(
     global_ctx: &ArcGlobalCtx,
     tun_dev: Option<&str>,
     fake_ip: Ipv4Addr,
-) -> anyhow::Result<Registration<RouteDemand>> {
+) -> anyhow::Result<RouteRegistration> {
     let handle = global_ctx
         .get_route_handle()
         .context("route handle missing for native route runtime")?;
@@ -637,8 +636,14 @@ mod route_tests {
             ))
             .unwrap();
         let inputs = registry::Registry::default();
+        let dirty = registry::Dirty::<u64>::new();
         let lease = scope
-            .attach(&inputs, ctx.tun_devices.clone(), uuid::Uuid::new_v4())
+            .attach(
+                &inputs,
+                ctx.tun_devices.clone(),
+                uuid::Uuid::new_v4(),
+                dirty.signal(1),
+            )
             .unwrap();
         scope.mark_ready(scope.attachment().unwrap().id);
         ctx.set_route_scope(Some(scope));
@@ -696,11 +701,13 @@ mod route_tests {
         assert!(futures::poll!(startup.as_mut()).is_pending());
         let scope = ctx.get_route_scope().unwrap();
         let replacement_inputs = registry::Registry::default();
+        let dirty2 = registry::Dirty::<u64>::new();
         let _replacement = scope
             .attach(
                 &replacement_inputs,
                 ctx.tun_devices.clone(),
                 uuid::Uuid::new_v4(),
+                dirty2.signal(2),
             )
             .unwrap();
         scope.mark_ready(scope.attachment().unwrap().id);

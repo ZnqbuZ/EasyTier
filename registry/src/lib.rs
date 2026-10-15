@@ -70,6 +70,8 @@
 //! acknowledged without being processed. Business failures are retried by a
 //! host timer; they do not depend on the next registration change.
 
+mod notify;
 mod registry;
 
+pub use notify::{Dirty, DirtySender, ForwardNotify, Notify, Signal};
 pub use registry::{Registration, Registry};

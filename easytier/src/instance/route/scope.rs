@@ -1,18 +1,16 @@
 use std::{
-    sync::atomic::{AtomicBool, AtomicU64, Ordering},
+    sync::atomic::{AtomicBool, Ordering},
     sync::{Arc, OnceLock},
 };
 
 use easytier_core::{
     config::runtime::CoreRuntimeConfigStore,
-    host::route::{RouteHandle, RouteRegistry, RouteStatus},
+    host::route::{RouteHandle, RouteRegistry, RouteSet, RouteStatus, resolve_route_demands},
 };
-use registry::{Registration, Registry};
+use registry::{Registration, Registry, Signal};
 use tokio::sync::watch;
 
 use super::device::TunDeviceState;
-
-static NEXT_BINDING: AtomicU64 = AtomicU64::new(0);
 
 /// One instance's configuration authority, declarations and feedback. This is
 /// an input scope; it never owns a backend, a TUN or installed OS routes.
@@ -33,6 +31,7 @@ pub(crate) struct RouteAttachment {
     pub id: u64,
     pub devices: Arc<TunDeviceState>,
     pub ready: bool,
+    pub signal: Signal<u64>,
 }
 
 impl RouteScope {
@@ -88,28 +87,38 @@ impl RouteScope {
 
     pub fn mark_ready(&self, id: u64) {
         if !self.is_closed() {
+            let mut ready_signal = None;
             self.0.binding.send_if_modified(|current| {
                 if let Some(attachment) = current.as_mut().filter(|a| a.id == id && !a.ready) {
                     attachment.ready = true;
+                    ready_signal = Some(attachment.signal.clone());
                     true
                 } else {
                     false
                 }
             });
+            if let Some(sig) = ready_signal {
+                sig.notify();
+            }
         }
     }
 
     pub fn mark_unready(&self) {
+        let mut unready_signal = None;
         let mut changed = false;
         self.0.binding.send_if_modified(|current| {
             if let Some(attachment) = current.as_mut().filter(|a| a.ready) {
                 attachment.ready = false;
+                unready_signal = Some(attachment.signal.clone());
                 changed = true;
                 true
             } else {
                 false
             }
         });
+        if let Some(sig) = unready_signal {
+            sig.notify();
+        }
         if changed {
             self.0.routes.publish_status(RouteStatus::default());
         }
@@ -120,16 +129,24 @@ impl RouteScope {
     }
 
     fn revoke_binding(&self, id: u64) {
+        let mut revoked_signal = None;
         let mut revoked = false;
         self.0.binding.send_if_modified(|current| {
             if current.as_ref().is_some_and(|a| a.id == id) {
-                *current = None;
+                revoked_signal = current.take().map(|a| a.signal);
                 revoked = true;
                 true
             } else {
                 false
             }
         });
+        self.0.routes.signal().clear();
+        if let Some(config) = self.0.config.get() {
+            config.service_notify().clear();
+        }
+        if let Some(sig) = revoked_signal {
+            sig.notify();
+        }
         if revoked {
             self.0.routes.publish_status(RouteStatus::default());
         }
@@ -137,7 +154,11 @@ impl RouteScope {
 
     pub fn close(&self) {
         self.0.closed.store(true, Ordering::SeqCst);
+        let signal = self.attachment().map(|a| a.signal);
         self.0.routes.close();
+        if let Some(sig) = signal {
+            sig.notify();
+        }
     }
 
     pub fn publish_status(&self, binding: u64, status: RouteStatus) {
@@ -170,14 +191,16 @@ impl RouteScope {
         inputs: &Registry<RouteInput>,
         devices: Arc<TunDeviceState>,
         member_registration: uuid::Uuid,
+        signal: Signal<u64>,
     ) -> anyhow::Result<RouteScopeLease> {
         anyhow::ensure!(self.0.config.get().is_some(), "route scope is not prepared");
         anyhow::ensure!(!self.is_closed(), "route scope is closed");
-        let id = NEXT_BINDING.fetch_add(1, Ordering::Relaxed) + 1;
+        let id = *signal.key();
         let attachment = RouteAttachment {
             id,
             devices,
             ready: false,
+            signal: signal.clone(),
         };
         let (cleanup, completed) = watch::channel(false);
         let lease = inputs
@@ -186,6 +209,7 @@ impl RouteScope {
                 scope: self.clone(),
                 member_registration,
                 cleanup,
+                signal: signal.clone(),
                 observed: AtomicBool::new(false),
             })
             .ok_or_else(|| anyhow::anyhow!("route outlet is closed"))?;
@@ -195,6 +219,11 @@ impl RouteScope {
         if self.is_closed() {
             anyhow::bail!("route scope is closed");
         }
+
+        self.0.routes.signal().forward_to(signal.clone());
+        self.config().service_notify().forward_to(signal.clone());
+        signal.notify();
+
         self.0.routes.publish_status(RouteStatus::default());
         *self.0.cleanup.lock() = Some(completed);
         self.0.binding.send_replace(Some(attachment));
@@ -212,6 +241,7 @@ pub(crate) struct RouteInput {
     pub scope: RouteScope,
     pub member_registration: uuid::Uuid,
     pub cleanup: watch::Sender<bool>,
+    pub signal: Signal<u64>,
     observed: AtomicBool,
 }
 
@@ -243,11 +273,23 @@ impl RouteInput {
                 .as_ref()
                 .is_some_and(|attachment| attachment.id == self.id && attachment.ready)
     }
+
+    pub fn desired(&self) -> RouteSet {
+        if !self.is_ready() {
+            return RouteSet::new();
+        }
+        let config = self.scope.config().snapshot();
+        resolve_route_demands(
+            &self.scope.routes().snapshot(),
+            config.services.manual_routes.as_ref(),
+        )
+    }
 }
 
 impl Drop for RouteInput {
     fn drop(&mut self) {
         self.revoke();
+        self.signal.notify();
         // An input withdrawn before the writer ever saw it has no OS effects.
         if !self.observed.load(Ordering::Relaxed) {
             self.cleanup.send_replace(true);
@@ -291,8 +333,9 @@ mod tests {
         let scope = scope();
         let inputs = Registry::default();
         let devices = TunDeviceState::new(Arc::new(std::sync::Mutex::new(None)));
+        let dirty = registry::Dirty::<u64>::new();
         let _lease = scope
-            .attach(&inputs, devices, uuid::Uuid::new_v4())
+            .attach(&inputs, devices, uuid::Uuid::new_v4(), dirty.signal(1))
             .unwrap();
         scope.mark_ready(scope.attachment().unwrap().id);
         inputs.close();
@@ -311,15 +354,16 @@ mod tests {
         let scope = scope();
         let devices = TunDeviceState::new(Arc::new(std::sync::Mutex::new(None)));
         let first = Registry::default();
+        let dirty = registry::Dirty::<u64>::new();
         let _lease = scope
-            .attach(&first, devices.clone(), uuid::Uuid::new_v4())
+            .attach(&first, devices.clone(), uuid::Uuid::new_v4(), dirty.signal(1))
             .unwrap();
         let id = scope.attachment().unwrap().id;
         let closed = Registry::default();
         closed.close();
         assert!(
             scope
-                .attach(&closed, devices, uuid::Uuid::new_v4())
+                .attach(&closed, devices, uuid::Uuid::new_v4(), dirty.signal(2))
                 .is_err()
         );
         assert_eq!(scope.attachment().unwrap().id, id);

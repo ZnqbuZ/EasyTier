@@ -9,8 +9,11 @@ use std::num::NonZeroU32;
 use std::sync::Arc;
 
 use cidr::{IpCidr, Ipv4Cidr};
-use registry::{Registration, Registry};
+use registry::{ForwardNotify, Registration, Registry};
+pub use registry::Registration as GenericRegistration;
 use tokio::sync::watch;
+
+
 
 /// A concrete direct-route request. The manager supplies the selected device;
 /// the producer supplies the destination and a nonzero Linux route metric.
@@ -83,30 +86,40 @@ pub struct RouteStatus {
     pub closed: bool,
 }
 
+pub type RouteRegistration = Registration<RouteDemand, ForwardNotify>;
+
+
 /// Owner-side route declarations and independently published OS feedback.
 /// Producers receive only [`RouteHandle`]; only the domain manager publishes
 /// feedback and closes this facade. The generic Registry remains unchanged.
 #[derive(Clone, Debug)]
 pub struct RouteRegistry {
-    declarations: Registry<RouteDemand>,
+    declarations: Registry<RouteDemand, ForwardNotify>,
+    signal: ForwardNotify,
     status: watch::Sender<Arc<RouteStatus>>,
 }
 
 impl Default for RouteRegistry {
     fn default() -> Self {
+        let signal = ForwardNotify::new();
         Self {
-            declarations: Registry::default(),
+            declarations: Registry::new(signal.clone()),
+            signal,
             status: watch::channel(Arc::new(RouteStatus::default())).0,
         }
     }
 }
 
 impl RouteRegistry {
+    pub fn signal(&self) -> &ForwardNotify {
+        &self.signal
+    }
+
     pub fn snapshot(&self) -> Vec<Arc<RouteDemand>> {
         self.declarations.snapshot()
     }
     pub fn subscribe(&self) -> watch::Receiver<()> {
-        self.declarations.subscribe()
+        self.signal.subscribe()
     }
     pub fn len(&self) -> usize {
         self.declarations.len()
@@ -141,7 +154,7 @@ impl RouteRegistry {
 /// from closing the underlying registry.
 #[derive(Clone, Debug)]
 pub struct RouteHandle {
-    routes: Registry<RouteDemand>,
+    routes: Registry<RouteDemand, ForwardNotify>,
     status: watch::Receiver<Arc<RouteStatus>>,
 }
 
@@ -155,7 +168,7 @@ impl RouteHandle {
     }
 
     /// Registers a new route demand. Returns `None` if the registry is closed.
-    pub fn register(&self, demand: RouteDemand) -> Option<Registration<RouteDemand>> {
+    pub fn register(&self, demand: RouteDemand) -> Option<RouteRegistration> {
         self.routes.register(demand)
     }
 

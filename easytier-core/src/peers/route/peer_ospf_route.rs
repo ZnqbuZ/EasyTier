@@ -31,13 +31,12 @@ use tokio::{
     task::{JoinHandle, JoinSet},
 };
 
-use registry::Registration;
-
 use crate::{
     config::PeerId,
     config::peers::PeerGroupIdentity,
     foundation::small_map_shard_amount,
-    host::route::RouteDemand,
+    host::route::{RouteDemand, RouteRegistration},
+
     peers::{
         PeerPacketFilter,
         context::{
@@ -2384,7 +2383,7 @@ struct PeerRouteServiceImpl {
     peer_info_last_update: AtomicCell<Instant>,
 
     /// This route table's registration in the instance's route registry.
-    proxy_registration: parking_lot::Mutex<Option<Registration<RouteDemand>>>,
+    proxy_registration: parking_lot::Mutex<Option<RouteRegistration>>,
 }
 
 impl Debug for PeerRouteServiceImpl {
@@ -2415,7 +2414,7 @@ impl PeerRouteServiceImpl {
     fn new(
         my_peer_id: PeerId,
         context: ArcPeerContext,
-        proxy_registration: Option<Registration<RouteDemand>>,
+        proxy_registration: Option<RouteRegistration>,
     ) -> Self {
         PeerRouteServiceImpl {
             my_peer_id,
@@ -4435,7 +4434,7 @@ impl PeerRoute {
         context: ArcPeerContext,
         public_ipv6_runtime: Arc<dyn PublicIpv6Runtime>,
         peer_rpc: Arc<PeerRpcManager>,
-        proxy_registration: Option<Registration<RouteDemand>>,
+        proxy_registration: Option<RouteRegistration>,
     ) -> Arc<Self> {
         let service_impl = Arc::new(PeerRouteServiceImpl::new(
             my_peer_id,
@@ -6573,8 +6572,9 @@ mod tests {
 
     #[tokio::test]
     async fn proxy_registration_withdrawn_on_stop_and_cannot_be_resurrected() {
-        let registry = registry::Registry::default();
-        let reg = registry
+        let registry = crate::host::route::RouteRegistry::default();
+        let handle = crate::host::route::RouteHandle::new(registry.clone());
+        let reg = handle
             .register(RouteDemand::AutoProxy(BTreeSet::new()))
             .unwrap();
         assert_eq!(registry.len(), 1);

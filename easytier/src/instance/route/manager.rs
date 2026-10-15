@@ -15,12 +15,15 @@ use easytier_core::host::route::{RouteDemand, RouteRegistry};
 use super::backend::RouteBackend;
 use super::device::{DeviceFacts, TunDeviceState};
 use super::model::{CleanupIncomplete, DeviceId, RetryState, Route, RouteError};
-use super::{
-    inputs::{self, ScopeWatch},
-    scope::RouteInput,
-};
+use super::scope::RouteInput;
 
 const UNKNOWN_PROBE_DELAY: std::time::Duration = std::time::Duration::from_secs(1);
+
+pub(crate) struct ScopeEntry {
+    pub input: Arc<RouteInput>,
+    pub previous: RouteSet,
+    pub desired: RouteSet,
+}
 
 pub struct RouteMgr<B> {
     devices: Arc<TunDeviceState>,
@@ -28,7 +31,8 @@ pub struct RouteMgr<B> {
 
     inputs: Registry<RouteInput>,
     changed: watch::Receiver<()>,
-    scopes: BTreeMap<u64, ScopeWatch>,
+    pub dirty: registry::Dirty<u64>,
+    scopes: BTreeMap<u64, ScopeEntry>,
     retired_scopes: BTreeMap<u64, Arc<RouteInput>>,
     scope_effects: BTreeMap<u64, BTreeSet<super::OsRoute>>,
     device_changed: watch::Receiver<DeviceFacts>,
@@ -55,6 +59,7 @@ impl<B: RouteBackend> RouteMgr<B> {
         devices: Arc<TunDeviceState>,
         backend: B,
         inputs: Registry<RouteInput>,
+        dirty: registry::Dirty<u64>,
         nic_changed: watch::Receiver<u64>,
         cancel: CancellationToken,
     ) -> Self {
@@ -65,6 +70,7 @@ impl<B: RouteBackend> RouteMgr<B> {
             backend,
             inputs,
             changed,
+            dirty,
             scopes: BTreeMap::new(),
             retired_scopes: BTreeMap::new(),
             scope_effects: BTreeMap::new(),
@@ -88,6 +94,10 @@ impl<B: RouteBackend> RouteMgr<B> {
             desired: None,
             cancel,
         }
+    }
+
+    pub fn dirty_sender(&self) -> registry::DirtySender<u64> {
+        self.dirty.sender()
     }
 
     #[cfg(native_route)]
@@ -193,7 +203,7 @@ impl<B: RouteBackend> RouteMgr<B> {
         self.cancel.is_cancelled()
             || self.changed.has_changed().unwrap_or(true)
             || self.nic_changed.has_changed().unwrap_or(true)
-            || self.scopes.values().any(ScopeWatch::has_changed)
+            || self.dirty.has_changed()
             || self.device_changed.has_changed().unwrap_or(true)
     }
 
@@ -273,14 +283,7 @@ impl<B: RouteBackend> RouteMgr<B> {
                     }
                 }
                 _ = self.nic_changed.changed() => {},
-                _ = async {
-                    let changes = self.scopes.values_mut().map(|scope| Box::pin(scope.changed())).collect::<Vec<_>>();
-                    if changes.is_empty() {
-                        std::future::pending::<()>().await;
-                    } else {
-                        futures::future::select_all(changes).await;
-                    }
-                } => {},
+                _ = self.dirty.changed() => {},
                 changed = self.device_changed.changed() => {
                     if changed.is_err() { break; }
                 }
@@ -420,9 +423,48 @@ impl<B: RouteBackend> RouteMgr<B> {
         // remain pending and stop the obsolete batch after its current result.
         self.changed.mark_unchanged();
         self.nic_changed.mark_unchanged();
-        for removed in inputs::synchronize(&mut self.scopes, &self.inputs) {
-            self.retired_scopes.insert(removed.input.id, removed.input);
+        let dirty_scopes = self.dirty.take();
+        let current_inputs: BTreeMap<u64, Arc<RouteInput>> = self
+            .inputs
+            .snapshot()
+            .into_iter()
+            .map(|input| (input.id, input))
+            .collect();
+
+        let removed_ids: Vec<u64> = self
+            .scopes
+            .keys()
+            .filter(|id| !current_inputs.contains_key(id))
+            .copied()
+            .collect();
+        for id in removed_ids {
+            if let Some(removed) = self.scopes.remove(&id) {
+                self.retired_scopes.insert(id, removed.input);
+            }
         }
+
+        for (id, input) in current_inputs {
+            input.observe();
+            match self.scopes.get_mut(&id) {
+                Some(entry) => {
+                    if dirty_scopes.contains(&id) {
+                        entry.desired = entry.input.desired();
+                    }
+                }
+                None => {
+                    let desired = input.desired();
+                    self.scopes.insert(
+                        id,
+                        ScopeEntry {
+                            input,
+                            previous: RouteSet::new(),
+                            desired,
+                        },
+                    );
+                }
+            }
+        }
+
         self.device_changed.mark_unchanged();
         let device_facts = self.devices.snapshot();
         self.retire_destroyed_devices(&device_facts);
@@ -446,7 +488,7 @@ impl<B: RouteBackend> RouteMgr<B> {
         let requested = self
             .scopes
             .values()
-            .map(|scope| (scope.input.clone(), scope.desired()))
+            .map(|scope| (scope.input.clone(), scope.desired.clone()))
             .collect::<Vec<_>>();
         #[cfg(native_route)]
         let mut projection = match self.nic.upgrade() {
@@ -780,11 +822,13 @@ mod tests {
         let devices = TunDeviceState::new(Arc::new(std::sync::Mutex::new(None)));
         devices.set_for_test(Some(TEST_DEVICE_INDEX));
         let (nic_changes, changed) = watch::channel(0);
+        let (_dirty_sender, dirty_receiver) = registry::Dirty::channel();
         (
             RouteMgr::new(
                 devices,
                 backend,
                 Registry::default(),
+                dirty_receiver,
                 changed,
                 CancellationToken::new(),
             ),
@@ -798,6 +842,10 @@ mod tests {
         super::super::scope::RouteScope,
         super::super::scope::RouteScopeLease,
     ) {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT_ID: AtomicU64 = AtomicU64::new(1);
+        let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
+        let signal = manager.dirty.signal(id);
         let scope = super::super::scope::RouteScope::new(uuid::Uuid::new_v4());
         scope.prepare(test_config_store()).unwrap();
         let lease = scope
@@ -805,6 +853,7 @@ mod tests {
                 &manager.inputs,
                 manager.devices.clone(),
                 uuid::Uuid::new_v4(),
+                signal,
             )
             .unwrap();
         scope.mark_ready(scope.attachment().unwrap().id);
@@ -926,8 +975,9 @@ mod tests {
 
         let (mut new, _new_changes) = test_outlet(MockRouteBackend::new());
         new.devices.set_for_test(Some(TEST_DEVICE_INDEX + 1));
+        let signal = new.dirty.signal(100);
         let _new_binding = scope
-            .attach(&new.inputs, new.devices.clone(), uuid::Uuid::new_v4())
+            .attach(&new.inputs, new.devices.clone(), uuid::Uuid::new_v4(), signal)
             .unwrap();
         let attachment = scope.attachment().unwrap();
         scope.mark_ready(attachment.id);

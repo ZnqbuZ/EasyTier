@@ -63,6 +63,7 @@ struct CoreRuntimeConfigStoreInner {
     update: Mutex<()>,
     peer_changes: tokio::sync::watch::Sender<u64>,
     service_changes: tokio::sync::watch::Sender<u64>,
+    service_notify: registry::ForwardNotify,
 }
 
 /// Atomic configuration authority shared by one core instance and its peer
@@ -82,12 +83,17 @@ impl CoreRuntimeConfigStore {
                 update: Mutex::new(()),
                 peer_changes,
                 service_changes,
+                service_notify: registry::ForwardNotify::new(),
             }),
         }
     }
 
     pub fn snapshot(&self) -> Arc<CoreInstanceRuntimeConfig> {
         self.inner.snapshot.load_full()
+    }
+
+    pub fn service_notify(&self) -> &registry::ForwardNotify {
+        &self.inner.service_notify
     }
 
     pub(crate) fn with_snapshot<T>(&self, read: impl FnOnce(&CoreInstanceRuntimeConfig) -> T) -> T {
@@ -103,6 +109,7 @@ impl CoreRuntimeConfigStore {
         self.inner
             .service_changes
             .send_modify(|version| *version += 1);
+        self.inner.service_notify.notify();
     }
 
     pub(crate) fn replace_with_current(
@@ -119,6 +126,7 @@ impl CoreRuntimeConfigStore {
         self.inner
             .service_changes
             .send_modify(|version| *version += 1);
+        self.inner.service_notify.notify();
         config
     }
 
@@ -132,6 +140,7 @@ impl CoreRuntimeConfigStore {
         self.inner
             .service_changes
             .send_modify(|version| *version += 1);
+        self.inner.service_notify.notify();
     }
 
     pub fn update_peer(&self, peer: Arc<PeerRuntimeSnapshot>) {

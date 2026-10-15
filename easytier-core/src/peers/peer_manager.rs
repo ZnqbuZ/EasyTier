@@ -12,7 +12,7 @@ use anyhow::Context;
 use arc_swap::ArcSwap;
 use dashmap::DashMap;
 use quanta::Instant;
-use registry::Registration;
+
 use serde::{Deserialize, Serialize};
 use tokio::sync::{
     Mutex, RwLock,
@@ -34,7 +34,8 @@ use crate::{
     events::CoreEventSink,
     foundation::task::ExternalTaskSignal,
     host::packet::{HostPacket, HostPacketSender},
-    host::route::RouteDemand,
+    host::route::RouteRegistration,
+
     packet::{
         CompressorAlgo, PacketType, ZCPacket,
         compressor::{Compressor as _, DefaultCompressor},
@@ -348,7 +349,7 @@ impl RouteAlgoInst {
         context: ArcPeerContext,
         public_ipv6_runtime: Arc<dyn PublicIpv6Runtime>,
         peer_rpc_mgr: Arc<super::peer_rpc::PeerRpcManager>,
-        proxy_registration: Option<Registration<RouteDemand>>,
+        proxy_registration: Option<RouteRegistration>,
     ) -> Self {
         match route_algo {
             RouteAlgoType::Ospf => RouteAlgoInst::Ospf(PeerRoute::new(
@@ -828,7 +829,7 @@ impl PeerManagerCore {
         events: Arc<dyn CoreEventSink>,
         credential_storage: Option<Arc<dyn CredentialStorage>>,
         foreign_rpc_registrar: Arc<dyn ForeignNetworkRpcRegistrar>,
-        proxy_registration: Option<Registration<RouteDemand>>,
+        proxy_registration: Option<RouteRegistration>,
     ) -> anyhow::Result<Self> {
         let initial_acl = runtime_config.snapshot().services.acl.build()?;
         let runtime = &mut config.snapshot.runtime;
@@ -968,7 +969,7 @@ impl PeerManagerCore {
         exit_nodes: Vec<IpAddr>,
         foreign_context_default_flags: Flags,
         foreign_rpc_registrar: Arc<dyn ForeignNetworkRpcRegistrar>,
-        proxy_registration: Option<Registration<RouteDemand>>,
+        proxy_registration: Option<RouteRegistration>,
     ) -> Self {
         let stats_manager = core_context.stats_manager();
         let acl_filter = Arc::new(AclFilter::new());

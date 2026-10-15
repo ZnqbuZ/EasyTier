@@ -1,6 +1,5 @@
 pub mod backend;
 pub(crate) mod device;
-mod inputs;
 pub mod manager;
 pub mod model;
 #[cfg(native_route)]

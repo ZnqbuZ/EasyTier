@@ -24,14 +24,16 @@ impl EntryId {
     }
 }
 
-struct Shared<T> {
+use crate::notify::Notify;
+
+struct Shared<T, N = watch::Sender<()>> {
     /// `Some(entries)` while the registry is open; `None` once it is closed.
     entries: Mutex<Option<BTreeMap<EntryId, Arc<T>>>>,
-    signal: watch::Sender<()>,
+    signal: N,
 }
 
-impl<T> Shared<T> {
-    fn new(signal: watch::Sender<()>) -> Self {
+impl<T, N> Shared<T, N> {
+    fn new(signal: N) -> Self {
         Self {
             entries: Mutex::new(Some(BTreeMap::new())),
             signal,
@@ -52,11 +54,11 @@ impl<T> Shared<T> {
 /// [`Registry::close`].
 #[derive(Educe)]
 #[educe(Clone(bound = ""))]
-pub struct Registry<T> {
-    shared: Arc<Shared<T>>,
+pub struct Registry<T, N: Notify = watch::Sender<()>> {
+    shared: Arc<Shared<T, N>>,
 }
 
-impl<T> Debug for Registry<T> {
+impl<T, N: Notify> Debug for Registry<T, N> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let (open, len) = {
             let entries = self.shared.entries.lock();
@@ -69,42 +71,30 @@ impl<T> Debug for Registry<T> {
     }
 }
 
-impl<T> Default for Registry<T> {
+impl<T> Default for Registry<T, watch::Sender<()>> {
     fn default() -> Self {
         let (signal, _) = watch::channel(());
         Self::new(signal)
     }
 }
 
-impl<T> Registry<T> {
+impl<T, N: Notify> Registry<T, N> {
     fn entries(&self) -> Option<MappedMutexGuard<'_, BTreeMap<EntryId, Arc<T>>>> {
         self.shared.entries()
     }
 
     /// Creates a registry that publishes its changes through `signal`.
-    ///
-    /// `watch::Sender` is cloneable, so the registry can share one signal with
-    /// other registries or with producers that commit external facts; a
-    /// notification from any of them wakes consumers of this registry.
-    pub fn new(signal: watch::Sender<()>) -> Self {
+    pub fn new(signal: N) -> Self {
         Self {
             shared: Arc::new(Shared::new(signal)),
         }
-    }
-
-    /// Subscribes a consumer to this registry's invalidation notifications.
-    ///
-    /// The returned receiver starts with the current value marked as seen:
-    /// consumers follow `mark_unchanged` → `snapshot` → work → `changed`.
-    pub fn subscribe(&self) -> watch::Receiver<()> {
-        self.shared.signal.subscribe()
     }
 
     /// Registers `value` and returns the claim that keeps it live.
     ///
     /// Returns `None` once the registry is closed. The payload is destroyed
     /// outside the lock either way.
-    pub fn register(&self, value: T) -> Option<Registration<T>> {
+    pub fn register(&self, value: T) -> Option<Registration<T, N>> {
         // Do not hold the lock when T::Drop is triggered
         self.entries()
             .map(|mut entries| {
@@ -114,7 +104,7 @@ impl<T> Registry<T> {
             })
             // guard dropped here
             .map(|id| {
-                self.shared.signal.send_replace(());
+                self.shared.signal.notify();
                 Registration {
                     shared: Arc::downgrade(&self.shared),
                     id,
@@ -155,8 +145,18 @@ impl<T> Registry<T> {
         let entries = self.shared.entries.lock().take();
 
         entries
-            .map(|_| self.shared.signal.send_replace(()))
+            .map(|_| self.shared.signal.notify())
             .is_some()
+    }
+}
+
+impl<T> Registry<T, watch::Sender<()>> {
+    /// Subscribes a consumer to this registry's invalidation notifications.
+    ///
+    /// The returned receiver starts with the current value marked as seen:
+    /// consumers follow `mark_unchanged` → `snapshot` → work → `changed`.
+    pub fn subscribe(&self) -> watch::Receiver<()> {
+        self.shared.signal.subscribe()
     }
 }
 
@@ -165,12 +165,12 @@ impl<T> Registry<T> {
 /// A `Registration` is not `Clone`; to share one registration between owners,
 /// wrap it in an `Arc` at the call site. Dropping it withdraws its entry
 /// synchronously.
-pub struct Registration<T> {
-    shared: Weak<Shared<T>>,
+pub struct Registration<T, N: Notify = watch::Sender<()>> {
+    shared: Weak<Shared<T, N>>,
     id: EntryId,
 }
 
-impl<T> Registration<T> {
+impl<T, N: Notify> Registration<T, N> {
     /// Returns the currently registered value.
     ///
     /// `None` after the entry is withdrawn, after the registry is closed, or
@@ -191,11 +191,11 @@ impl<T> Registration<T> {
         shared
             .entries()
             .and_then(|mut entries| Some(mem::replace(entries.get_mut(&self.id)?, Arc::new(value))))
-            .map(|_| shared.signal.send_replace(()))
+            .map(|_| shared.signal.notify())
     }
 }
 
-impl<T> Drop for Registration<T> {
+impl<T, N: Notify> Drop for Registration<T, N> {
     fn drop(&mut self) {
         let Some(shared) = self.shared.upgrade() else {
             return;
@@ -205,7 +205,7 @@ impl<T> Drop for Registration<T> {
             .entries()
             .and_then(|mut entries| entries.remove(&self.id));
         if retired.is_some() {
-            shared.signal.send_replace(());
+            shared.signal.notify();
         }
         // Publish committed withdrawal before a payload destructor can reenter
         // the registry or panic. No user code runs under the entries lock.
@@ -213,7 +213,7 @@ impl<T> Drop for Registration<T> {
     }
 }
 
-impl<T> Debug for Registration<T> {
+impl<T, N: Notify> Debug for Registration<T, N> {
     /// Reports the entry id and whether the claim is still live; the payload is
     /// never formatted.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
