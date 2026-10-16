@@ -297,6 +297,7 @@ thunk-rs = { workspace = true, features = [
 
 
 [dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
 criterion = "0.8.2"
 easytier-core = { workspace = true, features = [
     "test-utils",
@@ -459,7 +460,7 @@ hotpath = []
 hotpath-cpu = ["hotpath"]
 hotpath-alloc = ["hotpath"]
 # For Network Extension on macOS
-macos-ne = []
+macos-ne = ["easytier-core/macos-ne"]
 
 [package.metadata.binstall]
 pkg-url = "{ repo }/releases/download/v{ version }/{ name }-{ os-name }-{ target-arch }-v{ version }.zip"

@@ -1,3 +1,5 @@
+use guarden::{guard, guard::boxed::BoxSyncGuard};
+
 use std::{
     collections::BTreeSet,
     io,
@@ -46,10 +48,12 @@ use crate::common::ifcfg::RegistryManager;
 
 use super::shared_virtual_nic::{ArcSharedVirtualNicRegistry, SharedVirtualNicMember};
 
+type TunIo = AsyncDevice;
+
 pin_project! {
     pub struct TunStream {
         #[pin]
-        l: BiLock<AsyncDevice>,
+        l: BiLock<TunIo>,
         cur_buf: BytesMut,
         has_packet_info: bool,
         payload_offset: usize,
@@ -57,7 +61,7 @@ pin_project! {
 }
 
 impl TunStream {
-    pub fn new(l: BiLock<AsyncDevice>, has_packet_info: bool) -> Self {
+    fn new(l: BiLock<TunIo>, has_packet_info: bool) -> Self {
         let mut payload_offset = ZCPacketType::NIC.get_packet_offsets().payload_offset;
         if has_packet_info {
             payload_offset -= 4;
@@ -201,7 +205,7 @@ impl ZCPacketToBytes for TunZCPacketToBytes {
 pin_project! {
     pub struct TunAsyncWrite {
         #[pin]
-        l: BiLock<AsyncDevice>,
+        l: BiLock<TunIo>,
     }
 }
 
@@ -247,6 +251,7 @@ pub struct VirtualNicConfig {
     dev_name: String,
     mtu: u32,
     net_ns: NetNS,
+    routes_managed: bool,
 }
 
 impl VirtualNicConfig {
@@ -255,18 +260,27 @@ impl VirtualNicConfig {
             dev_name,
             mtu,
             net_ns: net_ns.clone(),
+            routes_managed: false,
         }
     }
 
     pub fn mtu(&self) -> u32 {
         self.mtu
     }
+
+    pub(crate) fn with_routes_managed(mut self, managed: bool) -> Self {
+        self.routes_managed = managed;
+        self
+    }
+
+    pub(crate) fn routes_managed(&self) -> bool {
+        self.routes_managed
+    }
 }
 
 pub struct VirtualNic {
     config: VirtualNicConfig,
-
-    ifname: Option<String>,
+    ifname: BoxSyncGuard<Option<String>>,
     ifcfg: Box<dyn IfConfiguerTrait + Send + Sync + 'static>,
 
     // Keep the name reserved through firewall cleanup. The device
@@ -275,26 +289,26 @@ pub struct VirtualNic {
     name_reservation: Option<std::os::windows::io::OwnedHandle>,
 }
 
-impl Drop for VirtualNic {
-    fn drop(&mut self) {
-        #[cfg(target_os = "windows")]
-        self.clear_windows_device();
+fn release_interface_name(ifname: Option<String>) {
+    cfg_select! {
+        windows => {
+            if let Some(ifname) = ifname {
+                if let Err(error) = crate::arch::windows::remove_interface_firewall_rules(&ifname) {
+                    tracing::warn!(%error, %ifname, "failed to remove interface firewall rules");
+                }
+            }
+        },
+        _ => { let _ = ifname; },
     }
 }
 
 impl VirtualNic {
+    pub(crate) fn routes_managed(&self) -> bool {
+        self.config.routes_managed()
+    }
     #[cfg(target_os = "windows")]
     pub(crate) fn clear_windows_device(&mut self) {
-        if let Some(ifname) = self.ifname.take() {
-            // Try to clean up firewall rules, but don't panic in destructor
-            if let Err(error) = crate::arch::windows::remove_interface_firewall_rules(&ifname) {
-                tracing::warn!(
-                    %error,
-                    "failed to remove firewall rules for interface {}",
-                    ifname
-                );
-            }
-        }
+        release_interface_name(self.ifname.take());
         self.name_reservation.take();
     }
 
@@ -302,7 +316,7 @@ impl VirtualNic {
         let ifcfg = Box::new(IfConfiger::new(config.net_ns.clone()));
         Self {
             config,
-            ifname: None,
+            ifname: guard!([ifname = None] release_interface_name(ifname)).boxed(),
             ifcfg,
             #[cfg(target_os = "windows")]
             name_reservation: None,
@@ -597,7 +611,7 @@ impl VirtualNic {
 
     #[cfg(any(mobile, all(test, unix)))]
     pub fn set_mobile_tun_fd_name(&mut self, tun_fd: std::os::fd::RawFd) {
-        self.ifname = Some(format!("tunfd_{}", tun_fd));
+        **self.ifname = Some(format!("tunfd_{}", tun_fd));
     }
 
     #[cfg(any(mobile, all(test, unix)))]
@@ -720,7 +734,7 @@ impl VirtualNic {
             None,
         );
 
-        self.ifname = Some(ifname.to_owned());
+        **self.ifname = Some(ifname.to_owned());
 
         #[cfg(target_os = "windows")]
         {
@@ -749,7 +763,11 @@ impl VirtualNic {
     }
 
     pub fn ifname(&self) -> &str {
-        self.ifname.as_ref().unwrap().as_str()
+        self.ifname.as_ref().map(|s| s.as_str()).unwrap_or("")
+    }
+
+    pub fn ifname_opt(&self) -> Option<String> {
+        self.ifname.as_ref().cloned()
     }
 
     pub async fn link_up(&self) -> Result<(), Error> {
@@ -778,6 +796,9 @@ impl VirtualNic {
         cost: Option<i32>,
         source_hint: Option<Ipv4Addr>,
     ) -> Result<(), Error> {
+        if self.routes_managed() {
+            return Err(anyhow::anyhow!("route mutations belong to RouteController").into());
+        }
         self.ifcfg
             .add_ipv4_route_with_source_hint(self.ifname(), address, cidr, cost, source_hint)
             .await?;
@@ -785,6 +806,9 @@ impl VirtualNic {
     }
 
     pub async fn remove_route(&self, address: Ipv4Addr, cidr: u8) -> Result<(), Error> {
+        if self.routes_managed() {
+            return Err(anyhow::anyhow!("route mutations belong to RouteController").into());
+        }
         self.ifcfg
             .remove_ipv4_route(self.ifname(), address, cidr)
             .await?;
@@ -798,6 +822,9 @@ impl VirtualNic {
         cost: Option<i32>,
         source_hint: Option<Ipv4Addr>,
     ) -> Result<(), Error> {
+        if self.routes_managed() {
+            return Err(anyhow::anyhow!("route mutations belong to RouteController").into());
+        }
         self.ifcfg
             .remove_ipv4_route_with_cost_and_source_hint(
                 self.ifname(),
@@ -820,6 +847,9 @@ impl VirtualNic {
         cidr: u8,
         cost: Option<i32>,
     ) -> Result<(), Error> {
+        if self.routes_managed() {
+            return Err(anyhow::anyhow!("route mutations belong to RouteController").into());
+        }
         self.ifcfg
             .add_ipv6_route(self.ifname(), address, cidr, cost)
             .await?;
@@ -827,6 +857,9 @@ impl VirtualNic {
     }
 
     pub async fn remove_ipv6_route(&self, address: Ipv6Addr, cidr: u8) -> Result<(), Error> {
+        if self.routes_managed() {
+            return Err(anyhow::anyhow!("route mutations belong to RouteController").into());
+        }
         self.ifcfg
             .remove_ipv6_route(self.ifname(), address, cidr)
             .await?;
@@ -868,7 +901,7 @@ impl VirtualNic {
 
     #[cfg(test)]
     pub(crate) fn set_ifname_for_test(&mut self, ifname: String) {
-        self.ifname = Some(ifname);
+        **self.ifname = Some(ifname);
     }
 
     #[cfg(test)]
@@ -1055,6 +1088,7 @@ pub struct NicCtx {
 
     backend: NicBackend,
     tasks: JoinSet<()>,
+    routes: Option<Arc<super::route::runtime::NativeRouteContext>>,
 
     #[cfg(target_os = "windows")]
     windows_udp_broadcast_relay: Option<AbortOnDropHandle<()>>,
@@ -1096,6 +1130,7 @@ impl NicCtx {
 
             backend,
             tasks: JoinSet::new(),
+            routes: None,
 
             #[cfg(target_os = "windows")]
             windows_udp_broadcast_relay: None,
@@ -1108,6 +1143,7 @@ impl NicCtx {
         peer_packet_receiver: Arc<Mutex<HostPacketReceiver>>,
         close_notifier: Arc<Notify>,
         registry: ArcSharedVirtualNicRegistry,
+        routes: Option<Arc<super::route::runtime::NativeRouteContext>>,
     ) -> Result<Self, Error> {
         let nic_config = Self::virtual_nic_config(&global_ctx);
         #[cfg(mobile)]
@@ -1115,6 +1151,12 @@ impl NicCtx {
             dev_name: String::new(),
             net_ns: global_ctx.net_ns.clone(),
             ..nic_config
+        };
+        let nic_config = if let Some(routes) = &routes {
+            routes.ensure_open()?;
+            routes.config(nic_config.mtu())
+        } else {
+            nic_config
         };
         // Only an explicitly configured name opts into sharing.
         let backend = {
@@ -1126,23 +1168,48 @@ impl NicCtx {
             )?)
         };
 
-        Ok(Self::new_with_backend(
+        let mut nic = Self::new_with_backend(
             global_ctx,
             packet_plane,
             peer_packet_receiver,
             close_notifier,
             backend,
-        ))
+        );
+        if let Some(routes) = routes {
+            let NicBackend::Shared(member) = &nic.backend else {
+                unreachable!()
+            };
+            routes.bind_member(member)?;
+            nic.routes = Some(routes);
+        }
+        Ok(nic)
+    }
+
+    pub(crate) fn managed_dns_routes(&self) -> Option<easytier_core::host::route::RouteHandle> {
+        self.routes.as_ref().map(|routes| routes.handle.clone())
     }
 
     pub async fn ifname(&self) -> Option<String> {
         self.backend.ifname().await
     }
 
-    pub(crate) async fn shutdown(&mut self) {
+    pub(crate) async fn shutdown(&mut self) -> anyhow::Result<()> {
+        if let (Some(routes), NicBackend::Shared(member)) = (&self.routes, &self.backend) {
+            routes.unready(member).await;
+        }
         // The forwarding tasks own the TUN stream and sink. Wait until both
         // release the device before another NIC with the same name is created.
         self.tasks.shutdown().await;
+        if let NicBackend::Shared(member) = &self.backend {
+            // `close` awaits the NIC lock, removes this registration's claims
+            // and dispatcher sources, and reports real cleanup failures. The
+            // closed flag alone is never treated as success.
+            member
+                .close()
+                .await
+                .map_err(|error| anyhow::anyhow!("shared NIC member cleanup failed: {error:#}"))?;
+        }
+        Ok(())
     }
 
     async fn tun_ifname(&self) -> Result<String, Error> {
@@ -1204,6 +1271,24 @@ impl NicCtx {
         }
     }
 
+    /// The member cleanup handle used to report a real mobile forwarding end.
+    ///
+    /// It captures the member and registration this NIC was created with; a
+    /// newer binding is never consulted, so a late exit cannot be attributed
+    /// to it.
+    #[cfg(mobile)]
+    fn mobile_unready_handle(
+        &self,
+    ) -> Option<(
+        Arc<super::route::runtime::NativeRouteContext>,
+        SharedVirtualNicMember,
+    )> {
+        match (&self.routes, &self.backend) {
+            (Some(routes), NicBackend::Shared(member)) => Some((routes.clone(), member.clone())),
+            _ => None,
+        }
+    }
+
     fn do_forward_nic_to_peers_task(
         &mut self,
         mut stream: Pin<Box<dyn ZCPacketStream>>,
@@ -1211,6 +1296,8 @@ impl NicCtx {
         // read from nic and write to corresponding tunnel
         let packet_plane = self.packet_plane.clone();
         let close_notifier = self.close_notifier.clone();
+        #[cfg(mobile)]
+        let unready = self.mobile_unready_handle();
         self.tasks.spawn(async move {
             while let Some(ret) = stream.next().await {
                 if ret.is_err() {
@@ -1218,6 +1305,10 @@ impl NicCtx {
                     break;
                 }
                 Self::do_forward_nic_to_peers(ret.unwrap(), packet_plane.as_ref()).await;
+            }
+            #[cfg(mobile)]
+            if let Some((routes, member)) = unready {
+                routes.unready(&member).await;
             }
             close_notifier.notify_one();
             tracing::error!("nic closed when recving from it");
@@ -1229,6 +1320,8 @@ impl NicCtx {
     fn do_forward_peers_to_nic(&mut self, mut sink: Pin<Box<dyn ZCPacketSink>>) {
         let channel = self.peer_packet_receiver.clone();
         let close_notifier = self.close_notifier.clone();
+        #[cfg(mobile)]
+        let unready = self.mobile_unready_handle();
         self.tasks.spawn(async move {
             // unlock until coroutine finished
             let mut channel = channel.lock().await;
@@ -1240,7 +1333,20 @@ impl NicCtx {
                 let ret = sink.send(packet.into_tun_packet()).await;
                 if ret.is_err() {
                     tracing::error!(?ret, "do_forward_tunnel_to_nic sink error");
+                    // Only a really closed sink means this member's forwarding
+                    // is over. Recoverable packet errors keep the existing
+                    // policy and do not invalidate the installed evidence.
+                    #[cfg(mobile)]
+                    if matches!(&ret, Err(easytier_core::tunnel::TunnelError::Shutdown))
+                        && let Some((routes, member)) = &unready
+                    {
+                        routes.unready(member).await;
+                    }
                 }
+            }
+            #[cfg(mobile)]
+            if let Some((routes, member)) = &unready {
+                routes.unready(member).await;
             }
             close_notifier.notify_one();
             tracing::error!("nic closed when sending to it");
@@ -1468,7 +1574,71 @@ impl NicCtx {
         Ok(())
     }
 
-    async fn run_public_ipv6_addr_updater(&mut self) -> Result<(), Error> {
+    /// Desktop managed public IPv6 address updater.
+    ///
+    /// Mobile has no desktop interface-index binding; its addresses are
+    /// installed by the external VPN owner and reconciled through the
+    /// Controller's mobile attachment record.
+    #[cfg(not(mobile))]
+    async fn run_managed_public_ipv6_addr_updater(
+        &mut self,
+        routes: Arc<super::route::runtime::NativeRouteContext>,
+    ) -> Result<(), Error> {
+        async fn apply(
+            backend: &NicBackend,
+            routes: &super::route::runtime::NativeRouteContext,
+            current: &mut Option<cidr::Ipv6Inet>,
+        ) -> Result<(), Error> {
+            let NicBackend::Shared(member) = backend else {
+                unreachable!()
+            };
+            loop {
+                let next = routes.public_address();
+                if *current != next {
+                    routes.unready(member).await;
+                    backend.link_up().await?;
+                    if let Some(old) = *current {
+                        backend.remove_ipv6(Some(old)).await?;
+                    }
+                    if let Some(new) = next {
+                        backend
+                            .add_ipv6(new.address(), new.network_length() as i32)
+                            .await?;
+                    }
+                    *current = next;
+                }
+                if routes.ready(member, *current).await? {
+                    return Ok(());
+                }
+            }
+        }
+        let backend = self.backend.clone();
+        let mut events = self.global_ctx.subscribe();
+        let mut current = None;
+        apply(&backend, &routes, &mut current).await?;
+        let closed = self.close_notifier.clone();
+        self.tasks.spawn(async move {
+            loop {
+                match events.recv().await {
+                    Ok(GlobalCtxEvent::PublicIpv6Changed(..))
+                    | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                    Ok(_) => continue,
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                }
+                if let Err(error) = apply(&backend, &routes, &mut current).await {
+                    if let NicBackend::Shared(member) = &backend {
+                        routes.unready(member).await;
+                    }
+                    tracing::error!(?error, "managed TUN public address update failed");
+                    closed.notify_one();
+                    break;
+                }
+            }
+        });
+        Ok(())
+    }
+
+    async fn run_public_ipv6_addr_updater(&mut self, manage_routes: bool) -> Result<(), Error> {
         let packet_plane = self.packet_plane.clone();
         let global_ctx = self.global_ctx.clone();
         let backend = self.backend.clone();
@@ -1485,9 +1655,10 @@ impl NicCtx {
             {
                 tracing::warn!(addr = ?addr, ?err, "failed to add public ipv6 address");
             }
-            if let Err(err) = backend
-                .add_ipv6_route_with_cost(Ipv6Addr::UNSPECIFIED, 0, Some(5))
-                .await
+            if manage_routes
+                && let Err(err) = backend
+                    .add_ipv6_route_with_cost(Ipv6Addr::UNSPECIFIED, 0, Some(5))
+                    .await
             {
                 tracing::warn!(route = %Ipv6Addr::UNSPECIFIED, prefix = 0, ?err, "failed to add default public ipv6 route");
             }
@@ -1515,9 +1686,10 @@ impl NicCtx {
                     tracing::warn!(?err, "failed to bring public ipv6 nic link up");
                 }
                 if let Some(old) = old {
-                    if let Err(err) = backend
-                        .remove_ipv6_route(Ipv6Addr::UNSPECIFIED, 0)
-                        .await
+                    if manage_routes
+                        && let Err(err) = backend
+                            .remove_ipv6_route(Ipv6Addr::UNSPECIFIED, 0)
+                            .await
                     {
                         tracing::warn!(route = %Ipv6Addr::UNSPECIFIED, prefix = 0, ?err, "failed to remove default public ipv6 route");
                     }
@@ -1532,9 +1704,10 @@ impl NicCtx {
                     {
                         tracing::warn!(addr = ?new, ?err, "failed to add public ipv6 address");
                     }
-                    if let Err(err) = backend
-                        .add_ipv6_route_with_cost(Ipv6Addr::UNSPECIFIED, 0, Some(5))
-                        .await
+                    if manage_routes
+                        && let Err(err) = backend
+                            .add_ipv6_route_with_cost(Ipv6Addr::UNSPECIFIED, 0, Some(5))
+                            .await
                     {
                         tracing::warn!(route = %Ipv6Addr::UNSPECIFIED, prefix = 0, ?err, "failed to add default public ipv6 route");
                     }
@@ -1582,16 +1755,21 @@ impl NicCtx {
             self.assign_ipv6_to_tun_device(ipv6_addr).await?;
         }
 
+        #[cfg(not(mobile))]
+        if let Some(routes) = self.routes.clone() {
+            self.run_managed_public_ipv6_addr_updater(routes).await?;
+            return Ok(());
+        }
         self.run_proxy_cidrs_route_updater().await?;
         self.run_public_ipv6_route_updater().await?;
         // Keep the updater running so runtime config patches can enable auto mode
         // without recreating the NIC.
-        self.run_public_ipv6_addr_updater().await?;
+        self.run_public_ipv6_addr_updater(true).await?;
 
         Ok(())
     }
 
-    #[cfg(any(mobile, test))]
+    #[cfg(test)]
     pub(crate) async fn mobile_tun_claims(
         global_ctx: &ArcGlobalCtx,
         packet_plane: &CorePacketPlane,
@@ -1627,16 +1805,6 @@ impl NicCtx {
         claims
     }
 
-    #[cfg(mobile)]
-    pub(crate) async fn current_mobile_tun_claims(
-        &self,
-    ) -> Option<super::shared_virtual_nic::SharedIfConfigClaims> {
-        match &self.backend {
-            NicBackend::Shared(member) => Some(member.claims().await),
-            NicBackend::Dedicated(_) => None,
-        }
-    }
-
     #[cfg(any(mobile, test))]
     async fn apply_mobile_tun_claims(
         &self,
@@ -1654,7 +1822,7 @@ impl NicCtx {
         self.apply_mobile_tun_claims(claims).await?;
         self.run_proxy_cidrs_route_updater().await?;
         self.run_public_ipv6_route_updater().await?;
-        self.run_public_ipv6_addr_updater().await?;
+        self.run_public_ipv6_addr_updater(true).await?;
         Ok(())
     }
 
@@ -1664,31 +1832,93 @@ impl NicCtx {
         tun_fd: std::os::fd::RawFd,
         replace_tun_fd: bool,
         claims: super::shared_virtual_nic::SharedIfConfigClaims,
+        installed_prefixes: std::collections::BTreeSet<cidr::IpCidr>,
     ) -> Result<(), Error> {
+        // These facts describe the configuration installed by the external
+        // VPN owner, not the mutable dispatcher admission that the controller
+        // may withdraw while this physical generation is still being created.
+        let applied_public_address = self
+            .routes
+            .as_ref()
+            .and_then(|routes| routes.public_address())
+            .filter(|address| claims.ipv6_addresses.contains(address));
+        let ipv4_addresses = claims.ipv4_addresses.clone();
+        let ipv6_addresses = claims.ipv6_addresses.clone();
         // Reject the entire member configuration before touching the shared fd.
         self.apply_mobile_tun_claims(claims).await?;
-        let (tunnel, ifname) = match self
+        // Replacing the shared fd affects every registration on this actual
+        // NIC. Invalidate their old evidence immediately before the physical
+        // update; each member must confirm again through its own attachment.
+        if replace_tun_fd
+            && let (Some(routes), NicBackend::Shared(member)) = (&self.routes, &self.backend)
+        {
+            routes.invalidate_shared_mobile_evidence(member).await?;
+        }
+        let tunnel = match self
             .backend
             .create_dev_for_mobile(tun_fd, replace_tun_fd)
             .await
         {
-            Ok(ret) => {
-                let ifname = self.tun_ifname().await?;
-                (ret, ifname)
-            }
+            Ok(tunnel) => tunnel,
             Err(err) => {
                 self.global_ctx.set_tun_device_error(err.to_string());
                 return Err(err);
             }
         };
+        let ifname = self.tun_ifname().await?;
 
-        self.run_proxy_cidrs_route_updater().await?;
-        self.run_public_ipv6_route_updater().await?;
-        self.run_public_ipv6_addr_updater().await?;
+        if let (Some(routes), NicBackend::Shared(_)) = (&self.routes, &self.backend) {
+            if !self
+                .global_ctx
+                .get_ipv4()
+                .is_none_or(|address| ipv4_addresses.contains(&address))
+                || !self
+                    .global_ctx
+                    .get_ipv6()
+                    .is_none_or(|address| ipv6_addresses.contains(&address))
+            {
+                return Err(
+                    anyhow::anyhow!("mobile TUN addresses changed during attachment").into(),
+                );
+            }
+            // The public-address intent may have moved while the device was
+            // being created; only the intent that is still current may
+            // confirm this configuration.
+            if routes.public_address() != applied_public_address {
+                return Err(
+                    anyhow::anyhow!("mobile TUN public address changed during attachment").into(),
+                );
+            }
+        }
+
+        if self.routes.is_some() {
+            // Managed routes have one continuous writer: the Controller
+            // reconciler. Keep the public address updater, but its route part
+            // is already represented by declarations/the complete plan.
+            self.run_public_ipv6_addr_updater(false).await?;
+        } else {
+            // Legacy path: keep the existing proxy and public route updaters.
+            self.run_proxy_cidrs_route_updater().await?;
+            self.run_public_ipv6_route_updater().await?;
+            self.run_public_ipv6_addr_updater(true).await?;
+        }
 
         self.global_ctx.set_tun_device_ready(ifname);
 
         self.start_tunnel_forwarding(tunnel)?;
+
+        // Record the member only after forwarding really started. A stream
+        // that ended before this point has already made the NIC invalid, so
+        // the Controller check below cannot resurrect a dead attachment.
+        if let (Some(routes), NicBackend::Shared(member)) = (&self.routes, &self.backend)
+            && !routes
+                .record_mobile_ready(member, installed_prefixes)
+                .await?
+        {
+            return Err(
+                anyhow::anyhow!("mobile TUN member is no longer the current registration").into(),
+            );
+        }
 
         Ok(())
     }
@@ -1956,6 +2186,65 @@ mod tests {
             .unwrap();
             assert!(other_stream.next().now_or_never().is_none());
         }
+    }
+
+    #[tokio::test]
+    async fn shutdown_reports_a_real_member_close_failure() {
+        use std::{sync::Arc, time::Duration};
+
+        use easytier_core::{
+            host::packet::HostPacketReceiver, process_runtime::CoreProcessRuntime,
+        };
+        use tokio::sync::{Mutex, Notify, mpsc};
+
+        use super::{NicBackend, NicCtx};
+        use crate::{
+            common::net_ns::tests::test_net_ns,
+            instance::{
+                shared_virtual_nic::SharedVirtualNicRegistry, test_instance::TestInstance,
+                virtual_nic::VirtualNicConfig,
+            },
+        };
+
+        let instance = TestInstance::new_with_process_runtime(
+            crate::common::config::TomlConfig::default(),
+            CoreProcessRuntime::new(),
+        );
+        let global_ctx = instance.get_global_ctx();
+        let run = global_ctx.key();
+        let mut nics = SharedVirtualNicRegistry::new();
+        let member = nics.create_member(
+            "close-failure".into(),
+            VirtualNicConfig::new("close-failure".into(), 1400, test_net_ns(None)),
+            run,
+            Arc::new(Notify::new()),
+        );
+        {
+            let shared = member.shared_nic();
+            let mut nic = shared.lock().await;
+            nic.attach_member_registration(member.member_id(), member.registration_id())
+                .await
+                .unwrap();
+            nic.invalidate_and_shutdown_dispatcher().await;
+        }
+        let (_sender, receiver) = mpsc::channel(1);
+        let mut nic = NicCtx::new_with_backend(
+            global_ctx,
+            instance.get_core_instance().packet_plane(),
+            Arc::new(Mutex::new(HostPacketReceiver::new(receiver))),
+            Arc::new(Notify::new()),
+            NicBackend::Shared(member),
+        );
+        let error = tokio::time::timeout(Duration::from_secs(5), nic.shutdown())
+            .await
+            .expect("member close must not hang")
+            .expect_err("a failed registration cleanup must be reported");
+        assert!(
+            error
+                .to_string()
+                .contains("shared NIC member cleanup failed"),
+            "unexpected shutdown error: {error:#}"
+        );
     }
 
     async fn run_test_helper() -> Result<VirtualNic, Error> {

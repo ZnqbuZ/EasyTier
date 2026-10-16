@@ -14,6 +14,7 @@ export interface InvokeResponse {
 }
 
 export interface StartVpnRequest {
+  snapshotId: string;
   ipv4Addr?: string;
   ipv4Addrs?: string[];
   routes?: string[];
@@ -23,6 +24,7 @@ export interface StartVpnRequest {
 }
 
 export interface VpnStatusResponse {
+  snapshotId?: string;
   running: boolean;
   ipv4Addr?: string;
   ipv4Addrs?: string[];

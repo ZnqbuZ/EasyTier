@@ -1470,6 +1470,7 @@ virtual_ip = "10.82.0.2/24"
             async fn prepare(
                 &self,
                 _packet_plane: Arc<CorePacketPlane>,
+                _runtime_config: crate::config::runtime::CoreRuntimeConfigStore,
             ) -> anyhow::Result<Option<Arc<dyn DhcpHost>>> {
                 Ok(None)
             }
@@ -1504,6 +1505,7 @@ virtual_ip = "10.82.0.2/24"
             async fn prepare(
                 &self,
                 _packet_plane: Arc<CorePacketPlane>,
+                _runtime_config: crate::config::runtime::CoreRuntimeConfigStore,
             ) -> anyhow::Result<Option<Arc<dyn DhcpHost>>> {
                 anyhow::bail!("host prepare failed")
             }
@@ -1615,6 +1617,7 @@ virtual_ip = "10.82.0.2/24"
             async fn prepare(
                 &self,
                 _packet_plane: Arc<CorePacketPlane>,
+                _runtime_config: crate::config::runtime::CoreRuntimeConfigStore,
             ) -> anyhow::Result<Option<Arc<dyn DhcpHost>>> {
                 self.prepare_started.notify_one();
                 self.prepare_release.notified().await;
@@ -1669,6 +1672,7 @@ virtual_ip = "10.82.0.2/24"
             async fn prepare(
                 &self,
                 _packet_plane: Arc<CorePacketPlane>,
+                _runtime_config: crate::config::runtime::CoreRuntimeConfigStore,
             ) -> anyhow::Result<Option<Arc<dyn DhcpHost>>> {
                 assert_eq!(tokio::runtime::Handle::current().id(), self.handle.id());
                 self.prepare_started.notify_one();
@@ -1754,6 +1758,7 @@ virtual_ip = "10.82.0.2/24"
             async fn prepare(
                 &self,
                 _packet_plane: Arc<CorePacketPlane>,
+                _runtime_config: crate::config::runtime::CoreRuntimeConfigStore,
             ) -> anyhow::Result<Option<Arc<dyn DhcpHost>>> {
                 Ok(None)
             }
@@ -1836,6 +1841,7 @@ virtual_ip = "10.82.0.2/24"
             async fn prepare(
                 &self,
                 _packet_plane: Arc<CorePacketPlane>,
+                _runtime_config: crate::config::runtime::CoreRuntimeConfigStore,
             ) -> anyhow::Result<Option<Arc<dyn DhcpHost>>> {
                 Ok(None)
             }
@@ -2126,6 +2132,7 @@ virtual_ip = "10.82.0.2/24"
             async fn prepare(
                 &self,
                 _packet_plane: Arc<CorePacketPlane>,
+                _runtime_config: crate::config::runtime::CoreRuntimeConfigStore,
             ) -> anyhow::Result<Option<Arc<dyn DhcpHost>>> {
                 Ok(None)
             }

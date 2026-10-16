@@ -77,19 +77,6 @@ pub fn aggregate_tun_routes(instance: &RuntimeInstanceState) -> Vec<String> {
     simplify_routes(raw_routes)
 }
 
-pub fn aggregate_requested_tun_routes(instances: &[RuntimeInstanceState]) -> Vec<String> {
-    let mut aggregated_routes = Vec::new();
-    let mut seen_routes = HashSet::new();
-    for instance in instances.iter().filter(|instance| instance.tun_required) {
-        for route in aggregate_tun_routes(instance) {
-            if seen_routes.insert(route.clone()) {
-                aggregated_routes.push(route);
-            }
-        }
-    }
-    aggregated_routes
-}
-
 #[cfg(test)]
 mod tests {
     use super::{aggregate_tun_routes, simplify_routes};

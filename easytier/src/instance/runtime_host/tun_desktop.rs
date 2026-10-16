@@ -10,10 +10,7 @@ use tokio::{
 };
 use tokio_util::sync::CancellationToken;
 
-use super::{
-    MagicDnsRuntime,
-    tun_common::{NativeDhcpHost, TunNicState},
-};
+use super::tun_common::{NativeDhcpHost, TunNicState};
 use crate::{
     common::{error::Error, global_ctx::ArcGlobalCtx},
     instance::{shared_virtual_nic::ArcSharedVirtualNicRegistry, virtual_nic::NicCtx},
@@ -25,6 +22,7 @@ pub(super) struct NativeTunRuntime {
     nic: TunNicState,
     shared_virtual_nic_registry: ArcSharedVirtualNicRegistry,
     static_ip_task: Mutex<Option<JoinHandle<()>>>,
+    routes: Option<Arc<crate::instance::route::runtime::NativeRouteContext>>,
 }
 
 impl NativeTunRuntime {
@@ -32,6 +30,7 @@ impl NativeTunRuntime {
         global_ctx: ArcGlobalCtx,
         cancel: CancellationToken,
         shared_virtual_nic_registry: ArcSharedVirtualNicRegistry,
+        routes: Option<Arc<crate::instance::route::runtime::NativeRouteContext>>,
     ) -> Self {
         Self {
             global_ctx,
@@ -39,6 +38,7 @@ impl NativeTunRuntime {
             nic: TunNicState::empty(),
             shared_virtual_nic_registry,
             static_ip_task: Mutex::new(None),
+            routes,
         }
     }
 
@@ -70,6 +70,7 @@ impl NativeTunRuntime {
         let global_ctx = self.global_ctx.clone();
         let receiver = self.nic.receiver();
         let shared_virtual_nic_registry = self.shared_virtual_nic_registry.clone();
+        let routes = self.routes.clone();
         let (output, first_round) = oneshot::channel();
         let task = tokio::spawn(async move {
             let mut output = Some(output);
@@ -78,7 +79,12 @@ impl NativeTunRuntime {
                     Self::report_static_ip_cancelled(&mut output);
                     return;
                 }
-                nic_state.stop().await;
+                if let Err(error) = nic_state.stop().await {
+                    if let Some(output) = output.take() {
+                        let _ = output.send(Err(error.into()));
+                    }
+                    return;
+                }
                 let closed = Arc::new(Notify::new());
                 let nic = NicCtx::new(
                     global_ctx.clone(),
@@ -86,9 +92,10 @@ impl NativeTunRuntime {
                     receiver.clone(),
                     closed.clone(),
                     shared_virtual_nic_registry.clone(),
+                    routes.clone(),
                 )
                 .await;
-                let mut nic = match nic {
+                let nic = match nic {
                     Ok(nic) => nic,
                     Err(error) => {
                         if let Some(output) = output.take() {
@@ -97,17 +104,33 @@ impl NativeTunRuntime {
                         return;
                     }
                 };
-                let result = tokio::select! {
-                    biased;
-                    _ = cancel.cancelled() => {
+                let result = nic_state
+                    .configure(
+                        nic,
+                        &cancel,
+                        global_ctx.clone(),
+                        packet_plane.clone(),
+                        easytier_core::gateway::dhcp::DhcpAddresses { ipv4, ipv6 },
+                    )
+                    .await;
+                if let Err(error) = result {
+                    // A stop request is not an interface failure. Leave the
+                    // current NIC state to the existing Host cleanup, which
+                    // first waits for route drain and only then runs
+                    // `tun.shutdown`.
+                    if cancel.is_cancelled() {
                         Self::report_static_ip_cancelled(&mut output);
                         return;
                     }
-                    result = nic.run(ipv4, ipv6) => result,
-                };
-                if let Err(error) = result {
+                    let error = anyhow::Error::from(error);
+                    let error = match nic_state.stop().await {
+                        Ok(()) => error,
+                        Err(cleanup) => error.context(format!(
+                            "desktop TUN cleanup failed after interface error: {cleanup:#}"
+                        )),
+                    };
                     if let Some(output) = output.take() {
-                        let _ = output.send(Err(error));
+                        let _ = output.send(Err(error.into()));
                         return;
                     }
                     tracing::error!(?error, "failed to create native interface");
@@ -118,19 +141,6 @@ impl NativeTunRuntime {
                     continue;
                 }
 
-                let magic_dns = if let Some(ip) = ipv4 {
-                    let shared_route_backend = nic.shared_route_backend_for_dns();
-                    MagicDnsRuntime::start(
-                        global_ctx.clone(),
-                        packet_plane.clone(),
-                        nic.ifname().await,
-                        ip,
-                        shared_route_backend,
-                    )
-                } else {
-                    MagicDnsRuntime::default()
-                };
-                nic_state.install(nic, magic_dns).await;
                 if let Some(output) = output.take() {
                     let _ = output.send(Ok(()));
                 }
@@ -148,7 +158,7 @@ impl NativeTunRuntime {
     }
 
     pub(super) async fn prepare(&self, packet_plane: Arc<CorePacketPlane>) -> anyhow::Result<()> {
-        self.nic.drain().await;
+        self.nic.drain().await?;
         if !self.global_ctx.get_flags().no_tun
             && !self.global_ctx.config.get_dhcp()
             && !self.global_ctx.config.get_dhcpv6()
@@ -158,11 +168,22 @@ impl NativeTunRuntime {
         Ok(())
     }
 
-    pub(super) async fn shutdown(&self) {
-        if let Some(task) = self.static_ip_task.lock().await.take() {
-            let _ = task.await;
+    pub(super) async fn shutdown(&self) -> anyhow::Result<()> {
+        let task_result = if let Some(task) = self.static_ip_task.lock().await.take() {
+            task.await.map_err(|error| {
+                anyhow::anyhow!("desktop TUN worker stopped without completing: {error}")
+            })
+        } else {
+            Ok(())
+        };
+        let nic_result = self.nic.stop().await;
+        match (task_result, nic_result) {
+            (Ok(()), Ok(())) => Ok(()),
+            (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
+            (Err(worker), Err(cleanup)) => {
+                Err(worker.context(format!("desktop TUN local cleanup failed: {cleanup:#}")))
+            }
         }
-        self.nic.stop().await;
     }
 
     pub(super) fn attach_fd(&self, _fd: i32) -> anyhow::Result<()> {
@@ -182,6 +203,7 @@ impl NativeTunRuntime {
             closed: Arc::new(Notify::new()),
             packet_plane,
             shared_virtual_nic_registry: self.shared_virtual_nic_registry.clone(),
+            routes: self.routes.clone(),
         })
     }
 }

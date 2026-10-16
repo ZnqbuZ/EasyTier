@@ -4,7 +4,38 @@ use easytier_core::gateway::dhcp::{DhcpAddresses, DhcpApplyOutcome, DhcpApplyPer
 use super::tun_common::NativeDhcpHost;
 #[cfg(not(feature = "tun"))]
 use super::tun_runtime::NativeDhcpHost;
-use crate::common::global_ctx::GlobalCtxEvent;
+use crate::common::global_ctx::{ArcGlobalCtx, GlobalCtxEvent};
+
+/// Write the actual runtime addresses, then invalidate the route input if a
+/// value really changed.
+///
+/// `Some` means that address family takes part in this update; the inner value
+/// is the exact value written. The invalidation runs after the write, so a
+/// configuration mark published before the native value moved cannot be the
+/// only wake-up. Equal values never mark.
+pub(super) fn write_runtime_addresses(
+    global_ctx: &ArcGlobalCtx,
+    invalidate: impl FnOnce(),
+    ipv4: Option<Option<cidr::Ipv4Inet>>,
+    ipv6: Option<Option<cidr::Ipv6Inet>>,
+) {
+    let mut changed = false;
+    if let Some(next) = ipv4
+        && global_ctx.get_ipv4() != next
+    {
+        global_ctx.set_ipv4(next);
+        changed = true;
+    }
+    if let Some(next) = ipv6
+        && global_ctx.get_ipv6() != next
+    {
+        global_ctx.set_ipv6(next);
+        changed = true;
+    }
+    if changed {
+        invalidate();
+    }
+}
 
 impl NativeDhcpHost {
     pub(super) fn current(&self) -> DhcpAddresses {
@@ -38,12 +69,23 @@ impl NativeDhcpHost {
     pub(super) fn set_addresses(&self, addresses: DhcpAddresses) {
         // A static configuration patch uses a different operation lock. Never
         // write a previously read static address back over such a patch.
-        if self.global_ctx.config.get_dhcp() {
-            self.global_ctx.set_ipv4(addresses.ipv4);
-        }
-        if self.global_ctx.config.get_dhcpv6() {
-            self.global_ctx.set_ipv6(addresses.ipv6);
-        }
+        let ipv4 = self.global_ctx.config.get_dhcp().then_some(addresses.ipv4);
+        let ipv6 = self
+            .global_ctx
+            .config
+            .get_dhcpv6()
+            .then_some(addresses.ipv6);
+        write_runtime_addresses(
+            &self.global_ctx,
+            || {
+                #[cfg(feature = "tun")]
+                if let Some(routes) = &self.routes {
+                    routes.invalidate_input();
+                }
+            },
+            ipv4,
+            ipv6,
+        );
     }
 
     pub(super) fn ensure_open(&self) -> anyhow::Result<()> {
@@ -85,5 +127,60 @@ impl DhcpHost for NativeDhcpHost {
                 GlobalCtxEvent::DhcpIpv6Changed(previous.ipv6, actual.ipv6)
             });
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::common::{config::TomlConfig, global_ctx::GlobalCtx};
+    use std::sync::Arc;
+
+    #[test]
+    fn route_inputs_are_invalidated_only_after_an_actual_address_change() {
+        let global_ctx = Arc::new(GlobalCtx::new(TomlConfig::default()));
+        let invalidations = std::cell::Cell::new(0);
+        let ipv4: cidr::Ipv4Inet = "10.9.0.7/24".parse().unwrap();
+
+        write_runtime_addresses(
+            &global_ctx,
+            || {
+                assert_eq!(
+                    global_ctx.get_ipv4(),
+                    Some(ipv4),
+                    "the actual value is written before invalidation"
+                );
+                invalidations.set(invalidations.get() + 1);
+            },
+            Some(Some(ipv4)),
+            None,
+        );
+        assert_eq!(global_ctx.get_ipv4(), Some(ipv4));
+        assert_eq!(invalidations.get(), 1);
+
+        write_runtime_addresses(
+            &global_ctx,
+            || invalidations.set(invalidations.get() + 1),
+            Some(Some(ipv4)),
+            None,
+        );
+        assert_eq!(invalidations.get(), 1, "an equal value is not a change");
+
+        write_runtime_addresses(
+            &global_ctx,
+            || invalidations.set(invalidations.get() + 1),
+            None,
+            None,
+        );
+        assert_eq!(invalidations.get(), 1, "an absent family is not written");
+
+        write_runtime_addresses(
+            &global_ctx,
+            || invalidations.set(invalidations.get() + 1),
+            Some(None),
+            None,
+        );
+        assert_eq!(global_ctx.get_ipv4(), None);
+        assert_eq!(invalidations.get(), 2, "clearing the address is a change");
     }
 }

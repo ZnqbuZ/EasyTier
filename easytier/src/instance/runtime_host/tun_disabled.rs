@@ -32,7 +32,9 @@ impl NativeTunRuntime {
         Ok(())
     }
 
-    pub(super) async fn shutdown(&self) {}
+    pub(super) async fn shutdown(&self) -> anyhow::Result<()> {
+        Ok(())
+    }
 
     pub(super) fn attach_fd(&self, _fd: i32) -> anyhow::Result<()> {
         anyhow::bail!("external TUN attachment is only supported on mobile Hosts")

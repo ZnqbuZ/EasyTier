@@ -175,10 +175,10 @@ pub(crate) fn merge_network_config_toml(
     for field in Flags::flags() {
         if let (Some(name), Some(json_name)) = (field.name.as_deref(), field.json_name.as_deref())
             && name != json_name
-                && let Some(val) = merged_flags.remove(json_name)
-            {
-                merged_flags.entry(name.to_owned()).or_insert(val);
-            }
+            && let Some(val) = merged_flags.remove(json_name)
+        {
+            merged_flags.entry(name.to_owned()).or_insert(val);
+        }
     }
 
     // The keys a config form owns are the flags it offers a control for, which

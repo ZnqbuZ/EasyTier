@@ -77,6 +77,8 @@ pub async fn prepare_env_with_tld_dns_zone(
         Arc::new(tokio::sync::Mutex::new(
             crate::instance::shared_virtual_nic::SharedVirtualNicRegistry::new(),
         )),
+        #[cfg(all(target_os = "linux", feature = "linux-netlink"))]
+        None,
     )
     .await
     .unwrap();

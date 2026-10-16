@@ -30,9 +30,7 @@ use crate::{
             HandshakeResponse, MagicDnsServerRpc, MagicDnsServerRpcServer, UpdateDnsRecordRequest,
             dns_record::{self},
         },
-        rpc::standalone::{
-            RpcServerHook, RuntimeRpcListener, StandAloneServer, runtime_rpc_listener,
-        },
+        rpc::standalone::{NetNSRpcListener, RpcServerHook, StandAloneServer, net_ns_rpc_listener},
         rpc_types::controller::{BaseController, Controller},
     },
 };
@@ -333,7 +331,7 @@ impl RpcServerHook for MagicDnsServerInstanceData {
 }
 
 pub struct MagicDnsServerInstance {
-    _rpc_server: StandAloneServer<RuntimeRpcListener>,
+    _rpc_server: StandAloneServer<NetNSRpcListener>,
     pub(super) data: Arc<MagicDnsServerInstanceData>,
     packet_filter: MagicDnsResolverRegistration,
     tun_inet: Ipv4Inet,
@@ -419,15 +417,27 @@ impl MagicDnsServerInstance {
         fake_ip: Ipv4Addr,
         manage_fake_ip_route: bool,
     ) -> Result<Self, anyhow::Error> {
-        let tcp_listener = runtime_rpc_listener(MAGIC_DNS_INSTANCE_SOCKET_ADDR.parse()?);
+        let tcp_listener = net_ns_rpc_listener(
+            global_ctx.net_ns.clone(),
+            MAGIC_DNS_INSTANCE_SOCKET_ADDR.parse()?,
+        )?;
         let mut rpc_server = StandAloneServer::new(tcp_listener);
         rpc_server.serve().await?;
+        // Reserve the per-domain server role before publishing a route. Client
+        // instances must not compete for the fake IP through a different TUN.
+        // The returned server is prepared only: its resolver is running but
+        // system DNS is not applied until `apply_system_config` is called after
+        // route readiness.
 
         let dns_config = RunConfigBuilder::default()
             .general(GeneralConfigBuilder::default().build()?)
             .excluded_forward_nameservers(vec![fake_ip.into()])
             .build()?;
-        let mut dns_server = Server::new(dns_config);
+        let mut dns_server = Server::in_net_ns(
+            dns_config,
+            global_ctx.net_ns.clone(),
+            global_ctx.get_flags().socket_mark,
+        )?;
         dns_server.run().await?;
 
         if manage_fake_ip_route
@@ -466,11 +476,6 @@ impl MagicDnsServerInstance {
             .await
             .context("Failed to initialize DNS zone")?;
 
-        let data_clone = data.clone();
-        tokio::task::spawn_blocking(move || data_clone.do_system_config(&tld_dns_zone_clone))
-            .await
-            .context("Failed to configure system")??;
-
         // Install the resolver only after all fallible initialization has
         // completed, so construction failure cannot leave a managed pipeline
         // registration that never reaches async cleanup.
@@ -486,7 +491,16 @@ impl MagicDnsServerInstance {
         })
     }
 
-    pub async fn clean_env(&self) {
+    pub(crate) async fn apply_system_config(&self, zone: String) -> anyhow::Result<()> {
+        let data_clone = self.data.clone();
+        tokio::task::spawn_blocking(move || data_clone.do_system_config(&zone))
+            .await
+            .context("Failed to configure system")??;
+        Ok(())
+    }
+
+    pub async fn clean_env(&mut self) {
+        self._rpc_server.shutdown().await;
         if let Some(configer) = &self.data.system_config {
             let ret = configer.close();
             if let Err(e) = ret {

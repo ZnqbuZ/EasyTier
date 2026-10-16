@@ -1,6 +1,5 @@
 use std::sync::{Arc, OnceLock};
 
-#[cfg(not(mobile))]
 use easytier_core::instance::CorePacketPlane;
 use easytier_core::{gateway::dhcp::DhcpAddresses, host::packet::HostPacketReceiver};
 #[cfg(not(mobile))]
@@ -63,7 +62,7 @@ impl TunNicState {
             .clone()
     }
 
-    pub(super) async fn stop(&self) {
+    pub(super) async fn stop(&self) -> anyhow::Result<()> {
         let old = self.nic_ctx.lock().await.take();
         match old {
             Some(NicCtxContainer::Active {
@@ -71,26 +70,58 @@ impl TunNicState {
                 mut magic_dns,
             }) => {
                 magic_dns.stop().await;
-                nic_ctx.shutdown().await;
+                if let Err(error) = nic_ctx.shutdown().await {
+                    // Keep the partially shut owner so a later cleanup can
+                    // retry the real member registration cleanup.
+                    *self.nic_ctx.lock().await =
+                        Some(NicCtxContainer::Active { nic_ctx, magic_dns });
+                    return Err(error);
+                }
             }
             Some(NicCtxContainer::PacketDrain(mut tasks)) => tasks.shutdown().await,
             None => {}
         }
+        Ok(())
     }
 
-    #[cfg(mobile)]
-    pub(super) async fn mobile_tun_claims(
+    #[cfg(not(mobile))]
+    pub(super) async fn configure(
         &self,
-    ) -> Option<crate::instance::shared_virtual_nic::SharedIfConfigClaims> {
-        let nic = self.nic_ctx.lock().await;
-        match nic.as_ref()? {
-            NicCtxContainer::Active { nic_ctx, .. } => nic_ctx.current_mobile_tun_claims().await,
-            NicCtxContainer::PacketDrain(_) => None,
+        nic: NicCtx,
+        cancel: &CancellationToken,
+        global_ctx: ArcGlobalCtx,
+        packet_plane: Arc<CorePacketPlane>,
+        addresses: DhcpAddresses,
+    ) -> anyhow::Result<()> {
+        self.stop().await?;
+        let mut slot = self.nic_ctx.lock().await;
+        *slot = Some(NicCtxContainer::new(nic, MagicDnsRuntime::default()));
+        let Some(NicCtxContainer::Active { nic_ctx, magic_dns }) = slot.as_mut() else {
+            unreachable!()
+        };
+        // Publish the actual owner before starting setup. If this future is
+        // cancelled, shutdown still finds the NIC and waits for its detached
+        // creation/configuration operations before draining routes.
+        tokio::select! {
+            biased;
+            _ = cancel.cancelled() => anyhow::bail!("instance is closing; TUN setup cancelled"),
+            result = nic_ctx.run(addresses.ipv4, addresses.ipv6) => result?,
         }
+        if let Some(ip) = addresses.ipv4 {
+            *magic_dns = MagicDnsRuntime::start(
+                global_ctx,
+                packet_plane,
+                nic_ctx.ifname().await,
+                ip,
+                nic_ctx.shared_route_backend_for_dns(),
+                nic_ctx.managed_dns_routes(),
+            );
+        }
+        Ok(())
     }
 
-    pub(super) async fn drain(&self) {
-        self.stop().await;
+    pub(super) async fn drain(&self) -> anyhow::Result<()> {
+        self.stop().await?;
         let receiver = self.receiver();
         let mut tasks = JoinSet::new();
         tasks.spawn(async move {
@@ -103,14 +134,40 @@ impl TunNicState {
             .lock()
             .await
             .replace(NicCtxContainer::packet_drain(tasks));
+        Ok(())
     }
 
-    pub(super) async fn install(&self, nic: NicCtx, magic_dns: MagicDnsRuntime) {
-        self.stop().await;
-        self.nic_ctx
-            .lock()
-            .await
-            .replace(NicCtxContainer::new(nic, magic_dns));
+    #[cfg(mobile)]
+    pub(super) async fn configure_for_mobile(
+        &self,
+        nic: NicCtx,
+        global_ctx: ArcGlobalCtx,
+        packet_plane: Arc<CorePacketPlane>,
+        fd: i32,
+        replace_tun_fd: bool,
+        claims: crate::instance::shared_virtual_nic::SharedIfConfigClaims,
+        installed_prefixes: std::collections::BTreeSet<cidr::IpCidr>,
+    ) -> anyhow::Result<()> {
+        self.stop().await?;
+        let mut slot = self.nic_ctx.lock().await;
+        *slot = Some(NicCtxContainer::new(nic, MagicDnsRuntime::default()));
+        let Some(NicCtxContainer::Active { nic_ctx, magic_dns }) = slot.as_mut() else {
+            unreachable!()
+        };
+        nic_ctx
+            .run_for_mobile(fd, replace_tun_fd, claims, installed_prefixes)
+            .await?;
+        if let Some(ip) = global_ctx.get_ipv4() {
+            *magic_dns = MagicDnsRuntime::start(
+                global_ctx,
+                packet_plane,
+                None,
+                ip,
+                nic_ctx.shared_route_backend_for_dns(),
+                nic_ctx.managed_dns_routes(),
+            );
+        }
+        Ok(())
     }
 }
 
@@ -125,6 +182,7 @@ pub(super) struct NativeDhcpHost {
     pub(super) packet_plane: Arc<CorePacketPlane>,
     #[cfg(not(mobile))]
     pub(super) shared_virtual_nic_registry: ArcSharedVirtualNicRegistry,
+    pub(super) routes: Option<Arc<crate::instance::route::runtime::NativeRouteContext>>,
 }
 
 impl NativeDhcpHost {
@@ -149,10 +207,11 @@ impl NativeDhcpHost {
         if next == self.current() {
             return Ok(());
         }
-        tokio::select! {
+        let drained = tokio::select! {
             _ = self.cancel.cancelled() => anyhow::bail!("instance is closing; DHCP update cancelled"),
-            _ = self.nic.drain() => {}
-        }
+            result = self.nic.drain() => result,
+        };
+        drained?;
         #[cfg(not(mobile))]
         self.set_addresses(DhcpAddresses::default());
         self.ensure_open()?;
@@ -161,31 +220,24 @@ impl NativeDhcpHost {
         {
             let addresses = self.with_static_addresses(next);
             if !self.global_ctx.no_tun() && (addresses.ipv4.is_some() || addresses.ipv6.is_some()) {
-                let mut nic = NicCtx::new(
+                let nic = NicCtx::new(
                     self.global_ctx.clone(),
                     self.packet_plane.clone(),
                     self.nic.receiver(),
                     self.closed.clone(),
                     self.shared_virtual_nic_registry.clone(),
+                    self.routes.clone(),
                 )
                 .await?;
-                tokio::select! {
-                    _ = self.cancel.cancelled() => anyhow::bail!("instance is closing; DHCP update cancelled"),
-                    result = nic.run(addresses.ipv4, addresses.ipv6) => result?,
-                }
-                let magic_dns = if let Some(ip) = addresses.ipv4 {
-                    let shared_route_backend = nic.shared_route_backend_for_dns();
-                    MagicDnsRuntime::start(
+                self.nic
+                    .configure(
+                        nic,
+                        &self.cancel,
                         self.global_ctx.clone(),
                         self.packet_plane.clone(),
-                        nic.ifname().await,
-                        ip,
-                        shared_route_backend,
+                        addresses,
                     )
-                } else {
-                    MagicDnsRuntime::default()
-                };
-                self.nic.install(nic, magic_dns).await;
+                    .await?;
             }
         }
         self.set_addresses(next);
@@ -200,6 +252,51 @@ mod tests {
     use super::*;
     use crate::{common::global_ctx::GlobalCtxEvent, instance::test_instance::TestInstance};
 
+    #[cfg(not(mobile))]
+    #[tokio::test]
+    async fn cancelled_setup_keeps_the_nic_owned_until_explicit_stop() {
+        let instance = TestInstance::new_with_process_runtime(
+            TomlConfig::default(),
+            CoreProcessRuntime::new(),
+        );
+        let global = instance.get_global_ctx();
+        let state = TunNicState::empty();
+        let (_sender, receiver) = tokio::sync::mpsc::channel(1);
+        state
+            .install_receiver(HostPacketReceiver::new(receiver))
+            .unwrap();
+        let nic = NicCtx::new(
+            global.clone(),
+            instance.get_core_instance().packet_plane(),
+            state.receiver(),
+            Arc::new(Notify::new()),
+            TestInstance::current_shared_virtual_nic_registry(),
+            None,
+        )
+        .await
+        .unwrap();
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        assert!(
+            state
+                .configure(
+                    nic,
+                    &cancel,
+                    global,
+                    instance.get_core_instance().packet_plane(),
+                    DhcpAddresses::default()
+                )
+                .await
+                .is_err()
+        );
+        assert!(matches!(
+            *state.nic_ctx.lock().await,
+            Some(NicCtxContainer::Active { .. })
+        ));
+        state.stop().await.unwrap();
+        assert!(state.nic_ctx.lock().await.is_none());
+    }
+
     #[tokio::test]
     async fn stop_releases_packet_receiver_before_returning() {
         let state = TunNicState::empty();
@@ -208,7 +305,7 @@ mod tests {
             .install_receiver(HostPacketReceiver::new(receiver))
             .unwrap();
         let receiver = state.receiver();
-        state.drain().await;
+        state.drain().await.unwrap();
         // Let the drain acquire the receiver and block waiting for a packet.
         tokio::time::timeout(std::time::Duration::from_secs(5), async {
             while receiver.try_lock().is_ok() {
@@ -218,7 +315,7 @@ mod tests {
         .await
         .unwrap();
 
-        state.stop().await;
+        state.stop().await.unwrap();
         assert!(receiver.try_lock().is_ok());
     }
 
@@ -238,6 +335,7 @@ mod tests {
             global_ctx.clone(),
             cancel.clone(),
             TestInstance::current_shared_virtual_nic_registry(),
+            None,
         );
         let (_sender, receiver) = tokio::sync::mpsc::channel(1);
         runtime
@@ -290,6 +388,6 @@ mod tests {
         assert_eq!(outcome.actual, addresses);
         assert_eq!(global_ctx.get_ipv4(), addresses.ipv4);
         assert_eq!(global_ctx.get_ipv6(), addresses.ipv6);
-        runtime.shutdown().await;
+        runtime.shutdown().await.unwrap();
     }
 }

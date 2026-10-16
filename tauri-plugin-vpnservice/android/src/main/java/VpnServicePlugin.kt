@@ -21,6 +21,7 @@ class PingArgs {
 
 @InvokeArg
 class StartVpnArgs {
+    var snapshotId: String? = null
     var ipv4Addr: String? = null
     var ipv4Addrs: Array<String> = emptyArray()
     var routes: Array<String> = emptyArray()
@@ -107,6 +108,7 @@ class VpnServicePlugin(private val activity: Activity) : Plugin(activity) {
                 ret.put("errorMsg", "need_prepare")
             } else {
                 val intent = Intent(activity, TauriVpnService::class.java)
+                intent.putExtra(TauriVpnService.SNAPSHOT_ID, args.snapshotId)
                 intent.putExtra(TauriVpnService.IPV4_ADDR, args.ipv4Addr)
                 intent.putExtra(TauriVpnService.IPV4_ADDRS, args.ipv4Addrs)
                 intent.putExtra(TauriVpnService.ROUTES, args.routes)
@@ -142,6 +144,7 @@ class VpnServicePlugin(private val activity: Activity) : Plugin(activity) {
         ret.put("ipv4Addr", TauriVpnService.ipv4Addr)
         ret.put("ipv4Addrs", JSONArray(TauriVpnService.ipv4Addrs))
         ret.put("routes", JSONArray(TauriVpnService.routes))
+        ret.put("snapshotId", TauriVpnService.snapshotId)
         ret.put("dns", TauriVpnService.dns)
         invoke.resolve(ret)
     }

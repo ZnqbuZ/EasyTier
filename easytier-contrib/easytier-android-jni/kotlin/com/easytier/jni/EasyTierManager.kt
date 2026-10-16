@@ -42,9 +42,8 @@ class EasyTierManager(
     private var isRunning = false
     private var currentIpv4: String? = null
     private var currentProxyCidrs: List<String> = emptyList()
-    private var vpnServiceIntent: Intent? = null
 
-    // JSON 解析器
+    // JSON 解析器，仅用于诊断信息展示，不参与 VPN 配置或路由决策。
     private val moshi = Moshi.Builder().add(WireJsonAdapterFactory()).build()
     private val adapter = moshi.adapter(NetworkInstanceRunningInfoMap::class.java)
 
@@ -73,7 +72,8 @@ class EasyTierManager(
                 isRunning = true
                 Log.i(TAG, "EasyTier 实例启动成功: $instanceName")
 
-                // 开始监控网络状态
+                // 立即请求现有 VpnService 后台入口刷新，并开始周期监控。
+                requestVpnRefresh()
                 handler.post(monitorRunnable)
             } else {
                 Log.e(TAG, "EasyTier 实例启动失败: $result")
@@ -98,14 +98,14 @@ class EasyTierManager(
         handler.removeCallbacks(monitorRunnable)
 
         try {
-            // 停止 VpnService
+            // 停止 VpnService；其后台入口负责串行释放本地 FD 借用。
             stopVpnService()
 
             // 停止 EasyTier 实例
             EasyTierJNI.stopAllInstances()
             Log.i(TAG, "EasyTier 实例已停止: $instanceName")
 
-            // 重置状态
+            // 重置诊断状态
             currentIpv4 = null
             currentProxyCidrs = emptyList()
         } catch (e: Exception) {
@@ -113,8 +113,18 @@ class EasyTierManager(
         }
     }
 
-    /** 监控网络状态 */
+    /**
+     * 监控网络状态。
+     *
+     * 网络信息只用于状态展示/诊断。VPN 配置的权威来源是 Service 后台入口读取的完整
+     * MobileTunConfig，本类不根据 proxy CIDR 或 virtual IP 自行生成路由。
+     */
     private fun monitorNetworkStatus() {
+        updateNetworkDiagnostics()
+        requestVpnRefresh()
+    }
+
+    private fun updateNetworkDiagnostics() {
         try {
             val infosJson = EasyTierJNI.collectNetworkInfos(10)
             if (infosJson.isNullOrEmpty()) {
@@ -124,57 +134,25 @@ class EasyTierManager(
 
             val networkInfoMap = parseNetworkInfo(infosJson)
             val networkInfo = networkInfoMap?.map?.get(instanceName)
-
             if (networkInfo == null) {
                 Log.d(TAG, "未找到实例 $instanceName 的网络信息")
                 return
             }
 
-            Log.d(TAG, "网络信息: $networkInfo")
-
-            // 检查实例是否正在运行
             if (!networkInfo.running) {
                 Log.w(TAG, "EasyTier 实例未运行: ${networkInfo.error_msg}")
-                return
             }
 
-            val newIpv4Inet = networkInfo.my_node_info?.virtual_ipv4
+            currentIpv4 =
+                    parseIpv4InetToString(networkInfo.my_node_info?.virtual_ipv4)
 
-            if (newIpv4Inet == null) {
-                Log.w(TAG, "EasyTier No Ipv4: $networkInfo")
-                return
-            }
-
-            // 获取当前节点的 IPv4 地址
-            val newIpv4 = parseIpv4InetToString(newIpv4Inet)
-
-            // 获取所有节点的 proxy_cidrs
-            val newProxyCidrs = mutableListOf<String>()
+            val proxyCidrs = mutableListOf<String>()
             networkInfo.routes?.forEach { route ->
-                route.proxy_cidrs?.let { cidrs -> newProxyCidrs.addAll(cidrs) }
+                route.proxy_cidrs?.let { cidrs -> proxyCidrs.addAll(cidrs) }
             }
-
-            // 检查是否有变化
-            val ipv4Changed = newIpv4 != currentIpv4
-            val proxyCidrsChanged = newProxyCidrs != currentProxyCidrs
-
-            if (ipv4Changed || proxyCidrsChanged) {
-                Log.i(TAG, "网络状态发生变化:")
-                Log.i(TAG, "  IPv4: $currentIpv4 -> $newIpv4")
-                Log.i(TAG, "  Proxy CIDRs: $currentProxyCidrs -> $newProxyCidrs")
-
-                // 更新状态
-                currentIpv4 = newIpv4
-                currentProxyCidrs = newProxyCidrs.toList()
-
-                // 重启 VpnService
-                if (newIpv4 != null) {
-                    restartVpnService(newIpv4, newProxyCidrs)
-                }
-            } else {
-                Log.d(TAG, "网络状态无变化 - IPv4: $currentIpv4, Proxy CIDRs: ${currentProxyCidrs.size} 个")
-            }
+            currentProxyCidrs = proxyCidrs.toList()
         } catch (e: Exception) {
+            // 诊断读取失败不影响 VPN 刷新请求；完整配置读取由 Service 处理。
             Log.e(TAG, "监控网络状态时发生异常", e)
         }
     }
@@ -189,44 +167,34 @@ class EasyTierManager(
         }
     }
 
-    /** 重启 VpnService */
-    private fun restartVpnService(ipv4: String, proxyCidrs: List<String>) {
+    /**
+     * 向既有 VpnService 后台入口提交一次刷新意图。
+     *
+     * 连续意图由 Service 合并为最新值；本方法不读取完整配置、不创建安装线程、
+     * 不决定路由或 VPN 重建。
+     */
+    private fun requestVpnRefresh() {
         try {
-            // 先停止现有的 VpnService
-            stopVpnService()
-
-            // 启动新的 VpnService
-            startVpnService(ipv4, proxyCidrs)
-        } catch (e: Exception) {
-            Log.e(TAG, "重启 VpnService 时发生异常", e)
-        }
-    }
-
-    /** 启动 VpnService */
-    private fun startVpnService(ipv4: String, proxyCidrs: List<String>) {
-        try {
-            val intent = Intent(activity, EasyTierVpnService::class.java)
-            intent.putExtra("ipv4_address", ipv4)
-            intent.putStringArrayListExtra("proxy_cidrs", ArrayList(proxyCidrs))
-            intent.putExtra("instance_name", instanceName)
-
+            val intent =
+                    Intent(activity, EasyTierVpnService::class.java).apply {
+                        action = EasyTierVpnService.ACTION_REFRESH
+                        putExtra(
+                                EasyTierVpnService.EXTRA_INSTANCE_NAME,
+                                instanceName
+                        )
+                    }
             activity.startService(intent)
-            vpnServiceIntent = intent
-
-            Log.i(TAG, "VpnService 已启动 - IPv4: $ipv4, Proxy CIDRs: $proxyCidrs")
+            Log.d(TAG, "已请求 VpnService 刷新: $instanceName")
         } catch (e: Exception) {
-            Log.e(TAG, "启动 VpnService 时发生异常", e)
+            Log.e(TAG, "请求 VpnService 刷新时发生异常", e)
         }
     }
 
-    /** 停止 VpnService */
+    /** 停止 VpnService；清理由 Service 的后台执行入口完成。 */
     private fun stopVpnService() {
         try {
-            vpnServiceIntent?.let { intent ->
-                activity.stopService(intent)
-                Log.i(TAG, "VpnService 已停止")
-            }
-            vpnServiceIntent = null
+            activity.stopService(Intent(activity, EasyTierVpnService::class.java))
+            Log.i(TAG, "VpnService 停止请求已提交")
         } catch (e: Exception) {
             Log.e(TAG, "停止 VpnService 时发生异常", e)
         }

@@ -7,10 +7,7 @@ use easytier_core::{
 use tokio::sync::{Mutex, Notify, mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
-use super::{
-    MagicDnsRuntime,
-    tun_common::{NativeDhcpHost, TunNicState},
-};
+use super::tun_common::{NativeDhcpHost, TunNicState};
 use crate::{
     common::global_ctx::ArcGlobalCtx,
     instance::{shared_virtual_nic::ArcSharedVirtualNicRegistry, virtual_nic::NicCtx},
@@ -21,10 +18,12 @@ struct MobileTunAttachment {
     replace_tun_fd: bool,
     completion: Option<oneshot::Sender<anyhow::Result<()>>>,
     claims: Option<crate::instance::shared_virtual_nic::SharedIfConfigClaims>,
+    installed_prefixes: std::collections::BTreeSet<cidr::IpCidr>,
 }
 
 pub(super) struct NativeTunRuntime {
     global_ctx: ArcGlobalCtx,
+    routes: Option<Arc<crate::instance::route::runtime::NativeRouteContext>>,
     cancel: CancellationToken,
     nic: TunNicState,
     tun_fd: mpsc::Sender<MobileTunAttachment>,
@@ -38,10 +37,12 @@ impl NativeTunRuntime {
         global_ctx: ArcGlobalCtx,
         cancel: CancellationToken,
         shared_virtual_nic_registry: ArcSharedVirtualNicRegistry,
+        routes: Option<Arc<crate::instance::route::runtime::NativeRouteContext>>,
     ) -> Self {
         let (tun_fd, tun_fd_receiver) = mpsc::channel(16);
         Self {
             global_ctx,
+            routes,
             cancel,
             nic: TunNicState::empty(),
             tun_fd,
@@ -66,39 +67,46 @@ impl NativeTunRuntime {
         replace_tun_fd: bool,
         shared_virtual_nic_registry: ArcSharedVirtualNicRegistry,
         claims: Option<crate::instance::shared_virtual_nic::SharedIfConfigClaims>,
+        routes: Option<Arc<crate::instance::route::runtime::NativeRouteContext>>,
+        installed_prefixes: std::collections::BTreeSet<cidr::IpCidr>,
     ) -> anyhow::Result<()> {
-        nic_state.drain().await;
+        nic_state.drain().await?;
         if fd <= 0 {
             return Ok(());
         }
         let closed = Arc::new(Notify::new());
-        let mut nic = NicCtx::new(
+        let nic = NicCtx::new(
             global_ctx.clone(),
             packet_plane.clone(),
             nic_state.receiver(),
             closed,
             shared_virtual_nic_registry,
+            routes,
         )
         .await?;
         let claims = match claims {
             Some(claims) => claims,
-            None => NicCtx::mobile_tun_claims(&global_ctx, &packet_plane).await,
+            None => {
+                anyhow::bail!("mobile TUN attachment requires its installed configuration snapshot")
+            }
         };
-        nic.run_for_mobile(fd, replace_tun_fd, claims)
+        nic_state
+            .configure_for_mobile(
+                nic,
+                global_ctx,
+                packet_plane,
+                fd,
+                replace_tun_fd,
+                claims,
+                installed_prefixes,
+            )
             .await
             .context("attach mobile TUN failed")?;
-        let magic_dns = if let Some(ip) = global_ctx.get_ipv4() {
-            let shared_route_backend = nic.shared_route_backend_for_dns();
-            MagicDnsRuntime::start(global_ctx, packet_plane, None, ip, shared_route_backend)
-        } else {
-            MagicDnsRuntime::default()
-        };
-        nic_state.install(nic, magic_dns).await;
         Ok(())
     }
 
     pub(super) async fn prepare(&self, packet_plane: Arc<CorePacketPlane>) -> anyhow::Result<()> {
-        self.nic.drain().await;
+        self.nic.drain().await?;
         let Some(mut tun_fds) = self.tun_fd_receiver.lock().await.take() else {
             return Ok(());
         };
@@ -106,13 +114,15 @@ impl NativeTunRuntime {
         let global_ctx = self.global_ctx.clone();
         let cancel = self.cancel.clone();
         let shared_virtual_nic_registry = self.shared_virtual_nic_registry.clone();
+        let routes = self.routes.clone();
         self.task.lock().await.replace(tokio::spawn(async move {
-            loop {
+            let unfinished = loop {
                 let attachment = tokio::select! {
-                    _ = cancel.cancelled() => return,
+                    biased;
+                    _ = cancel.cancelled() => break "instance is closing",
                     attachment = tun_fds.recv() => match attachment {
                         Some(attachment) => attachment,
-                        None => return,
+                        None => break "the mobile TUN runtime stopped",
                     },
                 };
                 let result = Self::install_mobile_tun(
@@ -123,36 +133,62 @@ impl NativeTunRuntime {
                     attachment.replace_tun_fd,
                     shared_virtual_nic_registry.clone(),
                     attachment.claims,
+                    routes.clone(),
+                    attachment.installed_prefixes,
                 )
                 .await;
-                if let Err(error) = &result {
-                    tracing::error!(?error, "failed to attach mobile TUN fd");
-                }
+                let result = match result {
+                    Ok(()) => Ok(()),
+                    Err(error) => {
+                        tracing::error!(?error, "failed to attach mobile TUN fd");
+                        // Finish the existing NIC error cleanup before reporting
+                        // the real failure to the caller.
+                        match nic_state.stop().await {
+                            Ok(()) => Err(error),
+                            Err(cleanup) => Err(error.context(format!(
+                                "mobile TUN cleanup failed after attachment error: {cleanup:#}"
+                            ))),
+                        }
+                    }
+                };
                 if let Some(completion) = attachment.completion {
                     let _ = completion.send(result);
+                }
+            };
+            // Requests already accepted by the channel but never picked up
+            // still receive a real "not executed" result.
+            while let Ok(attachment) = tun_fds.try_recv() {
+                if let Some(completion) = attachment.completion {
+                    let _ = completion.send(Err(anyhow::anyhow!(
+                        "mobile TUN attachment was not executed: {unfinished}"
+                    )));
                 }
             }
         }));
         Ok(())
     }
 
-    pub(super) async fn shutdown(&self) {
+    pub(super) async fn shutdown(&self) -> anyhow::Result<()> {
         self.cancel.cancel();
-        if let Some(task) = self.task.lock().await.take() {
-            let _ = task.await;
+        let task_result = if let Some(task) = self.task.lock().await.take() {
+            task.await.map_err(|error| {
+                anyhow::anyhow!("mobile TUN worker stopped without completing: {error}")
+            })
+        } else {
+            Ok(())
+        };
+        let nic_result = self.nic.stop().await;
+        match (task_result, nic_result) {
+            (Ok(()), Ok(())) => Ok(()),
+            (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
+            (Err(worker), Err(cleanup)) => {
+                Err(worker.context(format!("mobile TUN local cleanup failed: {cleanup:#}")))
+            }
         }
-        self.nic.stop().await;
     }
 
-    pub(super) fn attach_fd(&self, fd: i32) -> anyhow::Result<()> {
-        self.tun_fd
-            .try_send(MobileTunAttachment {
-                fd,
-                replace_tun_fd: true,
-                completion: None,
-                claims: None,
-            })
-            .map_err(|error| anyhow::anyhow!("failed to send TUN fd: {error}"))
+    pub(super) fn attach_fd(&self, _fd: i32) -> anyhow::Result<()> {
+        anyhow::bail!("use attach_mobile_tun_fd with the installed configuration snapshot")
     }
 
     pub(super) async fn attach_mobile_fd(
@@ -160,12 +196,14 @@ impl NativeTunRuntime {
         fd: i32,
         replace_tun_fd: bool,
         claims: Option<crate::instance::shared_virtual_nic::SharedIfConfigClaims>,
+        installed_prefixes: std::collections::BTreeSet<cidr::IpCidr>,
     ) -> anyhow::Result<()> {
         if self.task.lock().await.is_none() {
             anyhow::bail!("mobile TUN runtime is not running");
         }
 
         let (completion, result) = oneshot::channel();
+        // Cancellation may only prevent the request from being submitted.
         tokio::select! {
             _ = self.cancel.cancelled() => anyhow::bail!("instance is closing; TUN attachment cancelled"),
             send_result = self.tun_fd.send(MobileTunAttachment {
@@ -173,14 +211,17 @@ impl NativeTunRuntime {
                 replace_tun_fd,
                 completion: Some(completion),
                 claims,
-            }) => send_result.map_err(|error| anyhow::anyhow!("failed to send TUN fd: {error}"))?,
+                installed_prefixes,
+            }) => send_result.map_err(|error| {
+                anyhow::anyhow!("mobile TUN attachment was not executed: {error}")
+            })?,
         }
 
-        tokio::select! {
-            _ = self.cancel.cancelled() => anyhow::bail!("instance is closing; TUN attachment cancelled"),
-            result = result => result
-                .map_err(|_| anyhow::anyhow!("mobile TUN runtime stopped before attachment completed"))?,
-        }
+        // Once submitted, the real completion decides the outcome; closing the
+        // instance does not make an accepted installation end.
+        result.await.map_err(|_| {
+            anyhow::anyhow!("mobile TUN runtime stopped before attachment completed")
+        })?
     }
 
     pub(super) fn dhcp_host(
@@ -193,12 +234,129 @@ impl NativeTunRuntime {
             operation,
             cancel: self.cancel.clone(),
             nic: self.nic.clone(),
+            routes: self.routes.clone(),
         })
     }
+}
 
-    pub(super) async fn current_mobile_tun_claims(
-        &self,
-    ) -> Option<crate::instance::shared_virtual_nic::SharedIfConfigClaims> {
-        self.nic.mobile_tun_claims().await
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use easytier_core::{config::toml::TomlConfig, process_runtime::CoreProcessRuntime};
+
+    use crate::instance::test_instance::TestInstance;
+
+    /// Cancellation after the real channel accepted a request must produce a
+    /// real "not executed" completion, not a silent channel drop.
+    #[tokio::test(flavor = "current_thread")]
+    async fn cancellation_after_enqueue_reports_not_executed() {
+        let instance = TestInstance::new_with_process_runtime(
+            TomlConfig::default(),
+            CoreProcessRuntime::new(),
+        );
+        let cancel = CancellationToken::new();
+        let runtime = NativeTunRuntime::new(
+            instance.get_global_ctx(),
+            cancel.clone(),
+            TestInstance::current_shared_virtual_nic_registry(),
+            None,
+        );
+        let (_sender, receiver) = mpsc::channel(1);
+        runtime
+            .install_packet_receiver(HostPacketReceiver::new(receiver))
+            .unwrap();
+        runtime
+            .prepare(instance.get_core_instance().packet_plane())
+            .await
+            .unwrap();
+
+        let mut attach =
+            Box::pin(runtime.attach_mobile_fd(0, false, None, std::collections::BTreeSet::new()));
+        assert!(
+            futures::poll!(attach.as_mut()).is_pending(),
+            "the request must really be enqueued before cancellation"
+        );
+        cancel.cancel();
+        let error = attach.await.unwrap_err().to_string();
+        assert!(
+            error.contains("not executed"),
+            "a queued request must receive the real unexecuted result: {error}"
+        );
+        runtime.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn install_failure_cleans_up_before_returning_the_error() {
+        let instance = TestInstance::new_with_process_runtime(
+            TomlConfig::default(),
+            CoreProcessRuntime::new(),
+        );
+        let cancel = CancellationToken::new();
+        let runtime = NativeTunRuntime::new(
+            instance.get_global_ctx(),
+            cancel,
+            TestInstance::current_shared_virtual_nic_registry(),
+            None,
+        );
+        let (_sender, receiver) = mpsc::channel(1);
+        runtime
+            .install_packet_receiver(HostPacketReceiver::new(receiver))
+            .unwrap();
+        runtime
+            .prepare(instance.get_core_instance().packet_plane())
+            .await
+            .unwrap();
+
+        let error = runtime
+            .attach_mobile_fd(1, false, None, std::collections::BTreeSet::new())
+            .await
+            .expect_err("an attachment without its claims must fail");
+        assert!(
+            error
+                .to_string()
+                .contains("installed configuration snapshot"),
+            "unexpected failure: {error:#}"
+        );
+        // The worker performed its NIC cleanup before the error completion and
+        // can still accept the local detach.
+        runtime
+            .attach_mobile_fd(0, false, None, std::collections::BTreeSet::new())
+            .await
+            .unwrap();
+        runtime.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn stopped_runtime_rejects_a_late_attachment() {
+        let instance = TestInstance::new_with_process_runtime(
+            TomlConfig::default(),
+            CoreProcessRuntime::new(),
+        );
+        let cancel = CancellationToken::new();
+        let runtime = NativeTunRuntime::new(
+            instance.get_global_ctx(),
+            cancel,
+            TestInstance::current_shared_virtual_nic_registry(),
+            None,
+        );
+        let (_sender, receiver) = mpsc::channel(1);
+        runtime
+            .install_packet_receiver(HostPacketReceiver::new(receiver))
+            .unwrap();
+        runtime
+            .prepare(instance.get_core_instance().packet_plane())
+            .await
+            .unwrap();
+        runtime.shutdown().await.unwrap();
+
+        let error = runtime
+            .attach_mobile_fd(0, false, None, std::collections::BTreeSet::new())
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("not running"),
+            "a late FD must be rejected without re-registering the old run: {error}"
+        );
     }
 }

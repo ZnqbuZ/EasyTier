@@ -296,7 +296,7 @@ fn enumerate_interfaces() -> Vec<NetworkInterface> {
                     .unwrap_or_default()
             },
             _ => {
-                Vec::new();
+                Vec::new()
             },
         }
     })

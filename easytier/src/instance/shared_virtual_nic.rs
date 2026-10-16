@@ -1,3 +1,5 @@
+use guarden::{guard, guard::boxed::BoxSyncGuard};
+
 use easytier_core::net_ns::NetNS;
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -8,7 +10,7 @@ use std::{
     },
 };
 
-use cidr::{Ipv4Inet, Ipv6Inet};
+use cidr::{IpCidr, Ipv4Inet, Ipv6Inet};
 use tokio::sync::{Mutex, Notify};
 
 use crate::common::error::Error;
@@ -23,7 +25,6 @@ mod dispatcher;
 mod ifcfg;
 
 pub(crate) use ifcfg::SharedIfConfig;
-#[cfg(any(mobile, test))]
 pub(crate) use ifcfg::SharedIfConfigConflict;
 use ifcfg::SharedIfConfigDelta;
 pub use ifcfg::{SharedIfConfigClaims, SharedIpv4Route, SharedIpv6Route};
@@ -42,6 +43,7 @@ fn shared_virtual_nic_runtime() -> tokio::runtime::Handle {
 }
 
 pub struct SharedVirtualNic {
+    managed_routes: bool,
     nic: Arc<Mutex<VirtualNic>>,
     ifcfg: SharedIfConfig,
     valid: Arc<AtomicBool>,
@@ -54,6 +56,7 @@ pub struct SharedVirtualNic {
 impl SharedVirtualNic {
     pub fn new(config: VirtualNicConfig) -> Self {
         Self {
+            managed_routes: config.routes_managed(),
             nic: Arc::new(Mutex::new(VirtualNic::new(config))),
             ifcfg: SharedIfConfig::default(),
             valid: Arc::new(AtomicBool::new(true)),
@@ -72,6 +75,66 @@ impl SharedVirtualNic {
         self.valid.load(Ordering::Acquire)
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn prepare_managed_routes(
+        &self,
+        member: SharedVirtualNicMemberId,
+        registration: SharedVirtualNicMemberRegistrationId,
+        routes: &BTreeSet<IpCidr>,
+    ) -> anyhow::Result<SharedIfConfigClaims> {
+        anyhow::ensure!(
+            self.managed_routes,
+            "NIC routes are controlled by the legacy backend"
+        );
+        anyhow::ensure!(self.is_valid(), "NIC is invalid");
+        anyhow::ensure!(
+            self.is_current_member_registration(member, registration),
+            "NIC member registration changed"
+        );
+        let mut claims = self.ifcfg.claims_of(member);
+        claims.ipv4_routes.clear();
+        claims.ipv6_routes.clear();
+        for prefix in routes {
+            match prefix {
+                IpCidr::V4(prefix) => {
+                    claims.ipv4_routes.insert(SharedIpv4Route::new(
+                        prefix.first_address(),
+                        prefix.network_length(),
+                        None,
+                    ));
+                }
+                IpCidr::V6(prefix) => {
+                    claims.ipv6_routes.insert(SharedIpv6Route::new(
+                        prefix.first_address(),
+                        prefix.network_length(),
+                        None,
+                    ));
+                }
+            }
+        }
+        // Withdrawal must work even when historical claims are conflicting.
+        if !routes.is_empty() {
+            self.ifcfg.ensure_disjoint(member, &claims)?;
+        }
+        Ok(claims)
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) async fn commit_managed_routes(
+        &mut self,
+        member: SharedVirtualNicMemberId,
+        registration: SharedVirtualNicMemberRegistrationId,
+        claims: SharedIfConfigClaims,
+    ) -> Result<(), Error> {
+        if !self.managed_routes || !self.is_current_member_registration(member, registration) {
+            return Err(anyhow::anyhow!("NIC member registration changed").into());
+        }
+        self.sync_dispatcher_sources_for_claims(member, &claims)
+            .await?;
+        self.ifcfg.apply_member_claims(member, claims);
+        Ok(())
+    }
+
     #[cfg(test)]
     pub(crate) fn ifcfg(&self) -> &SharedIfConfig {
         &self.ifcfg
@@ -79,6 +142,10 @@ impl SharedVirtualNic {
 
     pub fn nic(&self) -> Arc<Mutex<VirtualNic>> {
         self.nic.clone()
+    }
+
+    pub async fn ifname(&self) -> Option<String> {
+        self.nic.lock().await.ifname_opt()
     }
 
     #[cfg(not(target_os = "linux"))]
@@ -95,7 +162,7 @@ impl SharedVirtualNic {
         Ok(())
     }
 
-    async fn attach_member_registration(
+    pub(crate) async fn attach_member_registration(
         &mut self,
         member_id: SharedVirtualNicMemberId,
         registration_id: SharedVirtualNicMemberRegistrationId,
@@ -119,7 +186,7 @@ impl SharedVirtualNic {
         Ok(())
     }
 
-    fn is_current_member_registration(
+    pub(crate) fn is_current_member_registration(
         &self,
         member_id: SharedVirtualNicMemberId,
         registration_id: SharedVirtualNicMemberRegistrationId,
@@ -127,6 +194,23 @@ impl SharedVirtualNic {
         self.member_registrations
             .get(&member_id)
             .is_some_and(|current| *current == registration_id)
+    }
+
+    /// The registrations currently attached to this actual shared NIC.
+    ///
+    /// A mobile FD replacement affects the whole NIC, so the routing layer
+    /// needs the affected registration identities before the physical update.
+    #[cfg(mobile)]
+    pub(crate) fn member_registrations_snapshot(
+        &self,
+    ) -> Vec<(
+        SharedVirtualNicMemberId,
+        SharedVirtualNicMemberRegistrationId,
+    )> {
+        self.member_registrations
+            .iter()
+            .map(|(member, registration)| (*member, *registration))
+            .collect()
     }
 
     async fn apply_member_claims_for_registration(
@@ -267,21 +351,23 @@ impl SharedVirtualNic {
             .collect();
         let nic = self.nic.lock().await;
 
-        for route in delta
-            .ipv4_routes
-            .removed
-            .iter()
-            .chain(changed_routes.iter().copied())
-        {
-            let source_hint = self.ifcfg.ipv4_route_source_hint(route);
-            ignore_removed_ifcfg_not_found(
-                remove_shared_ipv4_route(&nic, route, source_hint).await,
-            )?;
-        }
-        for route in &delta.ipv6_routes.removed {
-            ignore_removed_ifcfg_not_found(
-                nic.remove_ipv6_route(route.address, route.prefix).await,
-            )?;
+        if !self.managed_routes {
+            for route in delta
+                .ipv4_routes
+                .removed
+                .iter()
+                .chain(changed_routes.iter().copied())
+            {
+                let source_hint = self.ifcfg.ipv4_route_source_hint(route);
+                ignore_removed_ifcfg_not_found(
+                    remove_shared_ipv4_route(&nic, route, source_hint).await,
+                )?;
+            }
+            for route in &delta.ipv6_routes.removed {
+                ignore_removed_ifcfg_not_found(
+                    nic.remove_ipv6_route(route.address, route.prefix).await,
+                )?;
+            }
         }
         for ip in &delta.ipv4_addresses.removed {
             ignore_removed_ifcfg_not_found(nic.remove_ip(Some(*ip)).await)?;
@@ -297,19 +383,20 @@ impl SharedVirtualNic {
             nic.add_ipv6(ip.address(), ip.network_length() as i32)
                 .await?;
         }
-        for route in delta
-            .ipv4_routes
-            .added
-            .iter()
-            .chain(changed_routes.iter().copied())
-        {
-            add_shared_ipv4_route(&nic, route, next_ifcfg).await?;
+        if !self.managed_routes {
+            for route in delta
+                .ipv4_routes
+                .added
+                .iter()
+                .chain(changed_routes.iter().copied())
+            {
+                add_shared_ipv4_route(&nic, route, next_ifcfg).await?;
+            }
+            for route in &delta.ipv6_routes.added {
+                nic.add_ipv6_route_with_cost(route.address, route.prefix, route.cost)
+                    .await?;
+            }
         }
-        for route in &delta.ipv6_routes.added {
-            nic.add_ipv6_route_with_cost(route.address, route.prefix, route.cost)
-                .await?;
-        }
-
         if old_effective.mtu != next_effective.mtu {
             nic.set_mtu(next_effective.mtu.unwrap_or_else(|| nic.configured_mtu()))
                 .await?;
@@ -317,7 +404,7 @@ impl SharedVirtualNic {
 
         cfg_select! {
             target_os = "linux" => {
-                if !delta.ipv4_addresses.removed.is_empty() {
+                if !self.managed_routes && !delta.ipv4_addresses.removed.is_empty() {
                     for route in &next_effective.ipv4_routes {
                         ignore_added_ifcfg_already_exists(
                             add_shared_ipv4_route(&nic, route, next_ifcfg).await,
@@ -325,7 +412,7 @@ impl SharedVirtualNic {
                     }
                 }
 
-                if !delta.ipv6_addresses.removed.is_empty() {
+                if !self.managed_routes && !delta.ipv6_addresses.removed.is_empty() {
                     for route in &next_effective.ipv6_routes {
                         ignore_added_ifcfg_already_exists(
                             nic.add_ipv6_route_with_cost(route.address, route.prefix, route.cost)
@@ -503,7 +590,13 @@ fn ignore_added_ifcfg_already_exists(result: Result<(), Error>) -> Result<(), Er
     }
 }
 
+#[derive(derive_more::Deref)]
 struct SharedVirtualNicMemberRegistration {
+    guard: BoxSyncGuard<MemberRegistration>,
+}
+
+struct MemberRegistration {
+    closed: AtomicBool,
     member_id: SharedVirtualNicMemberId,
     registration_id: SharedVirtualNicMemberRegistrationId,
     shared_nic: Arc<Mutex<SharedVirtualNic>>,
@@ -513,47 +606,49 @@ struct SharedVirtualNicMemberRegistration {
 
 impl SharedVirtualNicMemberRegistration {
     fn register_tunnel(&self, close_notifier: Arc<Notify>) -> Result<Box<dyn Tunnel>, Error> {
+        if self.closed.load(Ordering::Acquire) {
+            return Err(anyhow::anyhow!("shared NIC member is closed").into());
+        }
         self.member_tunnel_table
             .register(self.member_id, self.registration_id, close_notifier)
     }
 }
 
-impl Drop for SharedVirtualNicMemberRegistration {
-    fn drop(&mut self) {
-        {
-            let mut lifetimes = self.lifetimes.lock().unwrap();
-            let count = lifetimes
-                .as_mut()
-                .expect("live registration cannot belong to a retired NIC");
-            *count = count
-                .checked_sub(1)
-                .expect("shared NIC registration count underflow");
-        }
-        self.member_tunnel_table
-            .unregister(self.member_id, self.registration_id);
-        let shared_nic = self.shared_nic.clone();
-        let member_id = self.member_id;
-        let registration_id = self.registration_id;
-
-        let Ok(shared) = crate::host_runtime::native_host_runtime().shared_executor() else {
-            // Global shutdown already stopped the dispatcher and its actual I/O.
-            // Late registration destruction must not panic or restart a driver.
-            return;
-        };
-        shared.spawn(async move {
-            let mut shared_nic = shared_nic.lock().await;
-            if let Err(err) = shared_nic
-                .remove_member_registration_claims(member_id, registration_id)
-                .await
-            {
-                tracing::warn!(
-                    ?member_id,
-                    ?err,
-                    "failed to clean shared virtual nic member claims"
-                );
-            }
-        });
+fn release_member_registration(registration: MemberRegistration) {
+    {
+        let mut lifetimes = registration.lifetimes.lock().unwrap();
+        let count = lifetimes
+            .as_mut()
+            .expect("live registration cannot belong to a retired NIC");
+        *count = count
+            .checked_sub(1)
+            .expect("shared NIC registration count underflow");
     }
+    registration
+        .member_tunnel_table
+        .unregister(registration.member_id, registration.registration_id);
+    let shared_nic = registration.shared_nic.clone();
+    let member_id = registration.member_id;
+    let registration_id = registration.registration_id;
+
+    let Ok(shared) = crate::host_runtime::native_host_runtime().shared_executor() else {
+        // Global shutdown already stopped the dispatcher and its actual I/O.
+        // Late registration destruction must not panic or restart a driver.
+        return;
+    };
+    shared.spawn(async move {
+        let mut shared_nic = shared_nic.lock().await;
+        if let Err(err) = shared_nic
+            .remove_member_registration_claims(member_id, registration_id)
+            .await
+        {
+            tracing::warn!(
+                ?member_id,
+                ?err,
+                "failed to clean shared virtual nic member claims"
+            );
+        }
+    });
 }
 
 #[derive(Clone)]
@@ -566,6 +661,29 @@ pub struct SharedVirtualNicMember {
 }
 
 impl SharedVirtualNicMember {
+    pub(crate) fn ensure_open(&self) -> Result<(), Error> {
+        if self.registration.closed.load(Ordering::Acquire) {
+            return Err(anyhow::anyhow!("shared NIC member is closed").into());
+        }
+        Ok(())
+    }
+
+    pub(crate) fn member_id(&self) -> SharedVirtualNicMemberId {
+        self.member_id
+    }
+
+    pub(crate) fn registration_id(&self) -> SharedVirtualNicMemberRegistrationId {
+        self.registration.registration_id
+    }
+
+    pub(crate) async fn close(&self) -> Result<(), Error> {
+        self.registration.closed.store(true, Ordering::Release);
+        // Serialize behind any detached creation/configuration transaction.
+        // Queued transactions recheck closed under this same NIC lock.
+        let mut nic = self.shared_nic.lock().await;
+        nic.remove_member_registration_claims(self.member_id, self.registration.registration_id)
+            .await
+    }
     fn new(
         member_id: SharedVirtualNicMemberId,
         configured_mtu: u32,
@@ -581,16 +699,19 @@ impl SharedVirtualNicMember {
             shared_nic: shared_nic.clone(),
             close_notifier,
             registration: Arc::new(SharedVirtualNicMemberRegistration {
-                member_id,
-                registration_id,
-                shared_nic: shared_nic.clone(),
-                member_tunnel_table,
-                lifetimes,
+                guard: guard!([registration = MemberRegistration {
+                        closed: AtomicBool::new(false),
+                        member_id,
+                        registration_id,
+                        shared_nic: shared_nic.clone(),
+                        member_tunnel_table,
+                        lifetimes,
+                    }] release_member_registration(registration))
+                .boxed(),
             }),
         }
     }
 
-    #[cfg(mobile)]
     pub(crate) async fn claims(&self) -> SharedIfConfigClaims {
         self.shared_nic.lock().await.ifcfg.claims_of(self.member_id)
     }
@@ -602,9 +723,11 @@ impl SharedVirtualNicMember {
     ) -> Result<(), Error> {
         claims.mtu = Some(self.configured_mtu);
         let member = self.clone();
-        shared_virtual_nic_runtime()
+        crate::host_runtime::native_host_runtime()
+            .shared_executor()?
             .spawn(async move {
                 let mut shared_nic = member.shared_nic.lock().await;
+                member.ensure_open()?;
                 shared_nic
                     .attach_member_registration(
                         member.member_id,
@@ -629,9 +752,11 @@ impl SharedVirtualNicMember {
 
     pub async fn create_dev(&self) -> Result<Box<dyn Tunnel>, Error> {
         let member = self.clone();
-        shared_virtual_nic_runtime()
+        crate::host_runtime::native_host_runtime()
+            .shared_executor()?
             .spawn(async move {
                 let mut shared_nic = member.shared_nic.lock().await;
+                member.ensure_open()?;
                 shared_nic
                     .attach_member_registration(
                         member.member_id,
@@ -645,12 +770,15 @@ impl SharedVirtualNicMember {
                         member.registration.registration_id,
                         member.configured_mtu,
                     )
-                    .await
+                    .await?;
+                Ok::<_, Error>(())
             })
             .await
             .map_err(anyhow::Error::from)??;
-        self.registration
-            .register_tunnel(self.close_notifier.clone())
+        let tunnel = self
+            .registration
+            .register_tunnel(self.close_notifier.clone())?;
+        Ok(tunnel)
     }
 
     #[cfg(mobile)]
@@ -660,9 +788,11 @@ impl SharedVirtualNicMember {
         replace_tun_fd: bool,
     ) -> Result<Box<dyn Tunnel>, Error> {
         let member = self.clone();
-        shared_virtual_nic_runtime()
+        crate::host_runtime::native_host_runtime()
+            .shared_executor()?
             .spawn(async move {
                 let mut shared_nic = member.shared_nic.lock().await;
+                member.ensure_open()?;
                 shared_nic
                     .attach_member_registration(
                         member.member_id,
@@ -678,12 +808,19 @@ impl SharedVirtualNicMember {
                         member.registration.registration_id,
                         member.configured_mtu,
                     )
-                    .await
+                    .await?;
+                Ok::<_, Error>(())
             })
             .await
             .map_err(anyhow::Error::from)??;
-        self.registration
-            .register_tunnel(self.close_notifier.clone())
+        let tunnel = self
+            .registration
+            .register_tunnel(self.close_notifier.clone())?;
+        Ok(tunnel)
+    }
+
+    pub async fn ifname(&self) -> Option<String> {
+        self.shared_nic.lock().await.ifname().await
     }
 
     #[cfg(not(target_os = "linux"))]
@@ -786,11 +923,20 @@ impl SharedVirtualNicMember {
         // Complete OS changes and commit their claims even if the caller is cancelled.
         // Holding the registration also defers member cleanup until the commit.
         let member = self.clone();
-        shared_virtual_nic_runtime()
+        crate::host_runtime::native_host_runtime()
+            .shared_executor()?
             .spawn(async move {
                 let mut shared_nic = member.shared_nic.lock().await;
-                let mut claims = shared_nic.ifcfg.claims_of(member.member_id);
+                member.ensure_open()?;
+                let previous = shared_nic.ifcfg.claims_of(member.member_id);
+                let mut claims = previous.clone();
                 update(&mut claims);
+                if shared_nic.managed_routes
+                    && (claims.ipv4_routes != previous.ipv4_routes
+                        || claims.ipv6_routes != previous.ipv6_routes)
+                {
+                    return Err(anyhow::anyhow!("route mutations belong to RouteController").into());
+                }
                 shared_nic
                     .apply_member_claims_for_registration(
                         member.member_id,
@@ -812,25 +958,25 @@ pub struct SharedVirtualNicRegistry {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
-enum SharedVirtualNicRegistryKey {
+pub(crate) enum SharedVirtualNicRegistryKey {
     Named(String),
     Anonymous(uuid::Uuid),
 }
 
 impl SharedVirtualNicRegistryKey {
-    fn new(dev_name: String, member: uuid::Uuid) -> Self {
+    pub(crate) fn new(dev_name: String, member: uuid::Uuid) -> Self {
         if dev_name.is_empty() {
             return Self::Anonymous(member);
         }
-        let dev_name = cfg_select! {
-            target_os = "windows" => dev_name.to_lowercase(),
-            _ => dev_name,
-        };
-        Self::Named(dev_name)
+        cfg_select! {
+            target_os = "windows" => Self::Named(dev_name.to_lowercase()),
+            _ => Self::Named(dev_name),
+        }
     }
 }
 
 struct SharedVirtualNicRegistryEntry {
+    managed_routes: bool,
     lifetimes: Arc<std::sync::Mutex<Option<usize>>>,
     nic: Arc<Mutex<SharedVirtualNic>>,
     valid: Arc<AtomicBool>,
@@ -856,6 +1002,7 @@ impl SharedVirtualNicRegistryEntry {
 
     fn new(nic: SharedVirtualNic) -> Self {
         Self {
+            managed_routes: nic.managed_routes,
             lifetimes: nic.lifetimes.clone(),
             valid: nic.valid_flag(),
             member_tunnel_table: nic.member_tunnel_table(),
@@ -931,11 +1078,18 @@ impl SharedVirtualNicRegistry {
         dev_name: String,
         config: VirtualNicConfig,
         member: uuid::Uuid,
-    ) -> &SharedVirtualNicRegistryEntry {
+    ) -> Result<&SharedVirtualNicRegistryEntry, Error> {
         // Only explicit completion can retire an entry; weak references do not prove teardown.
         self.nics
             .retain(|_, entry| entry.lifetimes.lock().unwrap().is_some());
         let key = SharedVirtualNicRegistryKey::new(dev_name, member);
+        if let Some(entry) = self.nics.get(&key).filter(|entry| entry.is_valid())
+            && entry.managed_routes != config.routes_managed()
+        {
+            return Err(
+                anyhow::anyhow!("cannot mix Legacy and managed routes on the same NIC").into(),
+            );
+        }
         let needs_new_entry = self
             .nics
             .get(&key)
@@ -946,9 +1100,10 @@ impl SharedVirtualNicRegistry {
             self.nics.insert(key.clone(), entry);
         }
 
-        self.nics
+        Ok(self
+            .nics
             .get(&key)
-            .expect("shared virtual nic registry entry should exist")
+            .expect("shared virtual nic registry entry should exist"))
     }
 
     pub(crate) fn try_create_member(
@@ -962,7 +1117,7 @@ impl SharedVirtualNicRegistry {
             return Err(anyhow::anyhow!("network namespace NIC admission is closed").into());
         }
         let configured_mtu = config.mtu();
-        let entry = self.get_or_create_entry(dev_name, config, member_id);
+        let entry = self.get_or_create_entry(dev_name, config, member_id)?;
         Ok(SharedVirtualNicMember::new(
             member_id,
             configured_mtu,

@@ -6,11 +6,13 @@ const mocks = vi.hoisted(() => {
   const listeners = new Map<string, (payload: unknown) => Promise<void>>()
   const configs = new Map<string, Record<string, unknown>>()
   const networkInfo = new Map<string, unknown>()
+  const mobileTables = new Map<string, { addresses: string[], routes: string[], dns?: string }>()
 
   return {
     listeners,
     configs,
     networkInfo,
+    mobileTables,
     addPluginListener: vi.fn(async (_plugin: string, event: string, listener: (payload: unknown) => Promise<void>) => {
       listeners.set(event, listener)
     }),
@@ -26,8 +28,8 @@ const mocks = vi.hoisted(() => {
     setTunFd: vi.fn(async (fd: number, instanceIds?: string[]) => fd > 0
       ? makeMobileTunConfig(instanceIds ?? [...configs.keys()])
       : { instance_ids: [], addresses: [], routes: [], rejected: [] }),
-    startVpn: vi.fn(async () => {
-      await listeners.get('vpn_service_start')?.({ fd: 1 })
+    startVpn: vi.fn(async (request: { snapshotId: string }) => {
+      await listeners.get('vpn_service_start')?.({ fd: 1, snapshotId: request.snapshotId })
       return {}
     }),
     stopVpn: vi.fn(async () => {
@@ -65,38 +67,69 @@ vi.mock('./backend', () => ({
 }))
 
 function makeMobileTunConfig(instanceIds: string[]): MobileTunConfig {
+  // This mock is the Controller/Factory boundary: it returns one complete
+  // table for the requested scope. It deliberately does not inspect the GUI's
+  // manual/proxy route inputs.
+  const selected = [...instanceIds].sort()
+  const addresses = new Set<string>()
+  const routes = new Set<string>()
+  let dns: string | undefined
+  for (const id of selected) {
+    const table = mocks.mobileTables.get(id)
+    if (!table)
+      continue
+    table.addresses.forEach(address => addresses.add(address))
+    table.routes.forEach(route => routes.add(route))
+    dns ??= table.dns
+  }
+  return {
+    snapshot_id: '00000000-0000-0000-0000-000000000001',
+    instance_ids: selected,
+    addresses: [...addresses].sort(),
+    routes: [...routes].sort(),
+    dns,
+    rejected: [],
+  }
+}
+
+function refreshReadyTable(instanceId: string) {
+  const config = mocks.configs.get(instanceId)
+  const info = mocks.networkInfo.get(instanceId) as any
+  if (!config || !info) {
+    mocks.mobileTables.delete(instanceId)
+    return
+  }
+  const ipv4 = info.my_node_info?.virtual_ipv4
+  const ipv6 = info.my_node_info?.virtual_ipv6
+  if ((!ipv4?.address?.addr && !ipv6?.address?.addr) || info.error_msg) {
+    mocks.mobileTables.delete(instanceId)
+    return
+  }
+
   const addresses: string[] = []
   const routes = new Set<string>()
   let dns: string | undefined
-  for (const id of instanceIds) {
-    const config = mocks.configs.get(id)!
-    const info = mocks.networkInfo.get(id) as any
-    const ipv4 = info?.my_node_info?.virtual_ipv4
-    const ipv6 = info?.my_node_info?.virtual_ipv6
-    if ((!ipv4?.address?.addr && !ipv6?.address?.addr) || info.error_msg)
-      continue
-    if (ipv4?.address?.addr) {
-      const address = `${ipv4.address.addr}/${ipv4.network_length || 24}`
-      addresses.push(address)
-      const range = IPv4CidrRange.fromCidr(address)
-      routes.add(`${range.getFirst()}/${range.getPrefix()}`)
-    }
-    if (ipv6?.address?.addr) {
-      const address = `${ipv6.address.addr}/${ipv6.network_length || 64}`
-      addresses.push(address)
-      const range = IPv6CidrRange.fromCidr(address)
-      routes.add(`${range.getFirst()}/${range.getPrefix()}`)
-    }
-    const configuredRoutes = config.enable_manual_routes
-      ? config.routes as string[]
-      : (info.routes ?? []).flatMap((route: any) => route.proxy_cidrs ?? [])
-    configuredRoutes.forEach((route: string) => routes.add(route.includes('/') ? route : `${route}/32`))
-    if (config.enable_magic_dns && ipv4?.address?.addr) {
-      routes.add('100.100.100.101/32')
-      dns = '100.100.100.101'
-    }
+  if (ipv4?.address?.addr) {
+    const address = `${ipv4.address.addr}/${ipv4.network_length || 24}`
+    addresses.push(address)
+    const range = IPv4CidrRange.fromCidr(address)
+    routes.add(`${range.getFirst()}/${range.getPrefix()}`)
   }
-  return { instance_ids: [...instanceIds].sort(), addresses: addresses.sort(), routes: [...routes].sort(), dns, rejected: [] }
+  if (ipv6?.address?.addr) {
+    const address = `${ipv6.address.addr}/${ipv6.network_length || 64}`
+    addresses.push(address)
+    const range = IPv6CidrRange.fromCidr(address)
+    routes.add(`${range.getFirst()}/${range.getPrefix()}`)
+  }
+  const configuredRoutes = config.enable_manual_routes
+    ? config.routes as string[]
+    : (info.routes ?? []).flatMap((route: any) => route.proxy_cidrs ?? [])
+  configuredRoutes.forEach((route: string) => routes.add(route.includes('/') ? route : `${route}/32`))
+  if (config.enable_magic_dns && ipv4?.address?.addr) {
+    routes.add('100.100.100.101/32')
+    dns = '100.100.100.101'
+  }
+  mocks.mobileTables.set(instanceId, { addresses, routes: [...routes], dns })
 }
 
 function setConfig(instanceId: string, noTun = false, devName?: string) {
@@ -120,12 +153,19 @@ function setReady(instanceId: string, ipv4: string) {
     },
     routes: [],
   })
+  refreshReadyTable(instanceId)
 }
 
 function setReadyIpv6(instanceId: string, ipv6: string) {
   const info = mocks.networkInfo.get(instanceId) as any ?? { my_node_info: {}, routes: [] }
   info.my_node_info.virtual_ipv6 = { address: { addr: ipv6 }, network_length: 64 }
   mocks.networkInfo.set(instanceId, info)
+  refreshReadyTable(instanceId)
+}
+
+function clearReady(instanceId: string) {
+  mocks.networkInfo.set(instanceId, { my_node_info: {}, routes: [] })
+  mocks.mobileTables.delete(instanceId)
 }
 
 async function loadVpnModule() {
@@ -141,6 +181,7 @@ beforeEach(() => {
   mocks.listeners.clear()
   mocks.configs.clear()
   mocks.networkInfo.clear()
+  mocks.mobileTables.clear()
   mocks.addPluginListener.mockClear()
   mocks.collectNetworkInfo.mockClear()
   mocks.consumeVpnTileAction.mockReset()
@@ -179,7 +220,7 @@ describe('mobile VPN reconciliation', () => {
       routes: ['fd12:0:0:0:0:0:0:0/64'],
       dns: undefined,
     }))
-    expect(mocks.setTunFd).toHaveBeenCalledWith(1, ['A'])
+    expect(mocks.setTunFd).toHaveBeenCalledWith(1, ['A'], '00000000-0000-0000-0000-000000000001')
   })
 
   it('preserves IPv4 when the DHCPv6 address changes or is withdrawn', async () => {
@@ -221,9 +262,9 @@ describe('mobile VPN reconciliation', () => {
     expect(mocks.startVpn).toHaveBeenLastCalledWith(expect.objectContaining({
       ipv4Addrs: ['fd12::7/64'],
     }))
-    expect(mocks.setTunFd).toHaveBeenLastCalledWith(1, ['A'])
+    expect(mocks.setTunFd).toHaveBeenLastCalledWith(1, ['A'], '00000000-0000-0000-0000-000000000001')
 
-    mocks.networkInfo.set('A', { my_node_info: {}, routes: [] })
+    clearReady('A')
     await vpn.onNetworkInstanceUpdate('A')
     expect(mocks.setTunFd).toHaveBeenLastCalledWith(0)
   })
@@ -245,7 +286,7 @@ describe('mobile VPN reconciliation', () => {
     expect(mocks.startVpn).toHaveBeenLastCalledWith(expect.objectContaining({
       ipv4Addrs: ['10.0.0.1/24', 'fd12::7/64'],
     }))
-    expect(mocks.setTunFd).toHaveBeenLastCalledWith(1, ['A', 'B'])
+    expect(mocks.setTunFd).toHaveBeenLastCalledWith(1, ['A', 'B'], '00000000-0000-0000-0000-000000000001')
   })
 
   it('preserves healthy members and reports a rejected bootstrap member', async () => {
@@ -305,7 +346,7 @@ describe('mobile VPN reconciliation', () => {
     const vpn = await loadVpnModule()
     let completed = false
     const start = vpn.onNetworkInstanceChange('A').then(() => { completed = true })
-    await vi.waitFor(() => expect(mocks.setTunFd).toHaveBeenCalledWith(1, ['A']))
+    await vi.waitFor(() => expect(mocks.setTunFd).toHaveBeenCalledWith(1, ['A'], '00000000-0000-0000-0000-000000000001'))
     expect(completed).toBe(false)
     resolve(makeMobileTunConfig(['A']))
     await start
@@ -346,7 +387,7 @@ describe('mobile VPN reconciliation', () => {
     }))
   })
 
-  it('keeps a ready member active while a new shared member awaits an IP', async () => {
+  it('reattaches when a new shared member joins before its IP is ready', async () => {
     setConfig('A', false, 'shared0')
     setReady('A', '10.0.0.1')
     const vpn = await loadVpnModule()
@@ -354,12 +395,16 @@ describe('mobile VPN reconciliation', () => {
 
     setConfig('B', false, 'shared0')
     await vpn.onNetworkInstanceChange('B')
-    expect(mocks.stopVpn).not.toHaveBeenCalled()
-    expect(mocks.startVpn).toHaveBeenCalledTimes(1)
+    expect(mocks.stopVpn).toHaveBeenCalledTimes(1)
+    expect(mocks.startVpn).toHaveBeenCalledTimes(2)
+    expect(mocks.startVpn).toHaveBeenLastCalledWith(expect.objectContaining({
+      ipv4Addrs: ['10.0.0.1/24'],
+    }))
+    expect(mocks.setTunFd).toHaveBeenLastCalledWith(1, ['A', 'B'], '00000000-0000-0000-0000-000000000001')
 
     setReady('B', '10.0.1.1')
     await vpn.onNetworkInstanceUpdate('B')
-    expect(mocks.stopVpn).toHaveBeenCalledTimes(1)
+    expect(mocks.stopVpn).toHaveBeenCalledTimes(2)
     expect(mocks.startVpn).toHaveBeenLastCalledWith(expect.objectContaining({
       ipv4Addrs: ['10.0.0.1/24', '10.0.1.1/24'],
     }))
@@ -377,7 +422,7 @@ describe('mobile VPN reconciliation', () => {
     expect(mocks.startVpn).toHaveBeenCalledWith(expect.objectContaining({
       ipv4Addrs: ['10.0.0.1/24', '10.0.1.1/24'],
     }))
-    expect(mocks.setTunFd).toHaveBeenCalledWith(1, ['A', 'B'])
+    expect(mocks.setTunFd).toHaveBeenCalledWith(1, ['A', 'B'], '00000000-0000-0000-0000-000000000001')
 
     mocks.startVpn.mockClear()
     mocks.stopVpn.mockClear()
@@ -388,7 +433,7 @@ describe('mobile VPN reconciliation', () => {
     expect(mocks.startVpn).toHaveBeenCalledWith(expect.objectContaining({
       ipv4Addrs: ['10.0.1.1/24'],
     }))
-    expect(mocks.setTunFd).toHaveBeenLastCalledWith(1, ['B'])
+    expect(mocks.setTunFd).toHaveBeenLastCalledWith(1, ['B'], '00000000-0000-0000-0000-000000000001')
   })
 
   it.each(['A', 'B'])('reattaches a replacement member %s with the same VPN configuration', async (replacementId) => {
@@ -406,7 +451,7 @@ describe('mobile VPN reconciliation', () => {
     const startReplacement = vpn.onNetworkInstanceChange(replacementId)
     await Promise.all([stopA, startReplacement])
 
-    expect(mocks.setTunFd).toHaveBeenLastCalledWith(1, [replacementId])
+    expect(mocks.setTunFd).toHaveBeenLastCalledWith(1, [replacementId], '00000000-0000-0000-0000-000000000001')
     expect(mocks.startVpn).toHaveBeenCalledTimes(2)
     expect(mocks.stopVpn).toHaveBeenCalledTimes(1)
 
@@ -495,14 +540,14 @@ describe('mobile VPN reconciliation', () => {
     const vpn = await loadVpnModule()
     await vpn.onNetworkInstanceChange('A')
 
-    mocks.networkInfo.set('B', { my_node_info: {}, routes: [] })
+    clearReady('B')
     await vpn.onNetworkInstanceUpdate('B')
 
     expect(mocks.stopVpn).toHaveBeenCalledTimes(1)
     expect(mocks.startVpn).toHaveBeenLastCalledWith(expect.objectContaining({
       ipv4Addrs: ['10.0.0.1/24'],
     }))
-    expect(mocks.setTunFd).toHaveBeenLastCalledWith(1, ['A', 'B'])
+    expect(mocks.setTunFd).toHaveBeenLastCalledWith(1, ['A', 'B'], '00000000-0000-0000-0000-000000000001')
   })
 
   it('uses manual routes instead of peer proxy routes', async () => {
@@ -590,7 +635,7 @@ describe('mobile VPN reconciliation', () => {
 
     const staleUpdate = vpn.onNetworkInstanceUpdate('A')
     await collectStarted
-    const newerUpdate = vpn.onNetworkInstanceChange('B')
+    const newerUpdate = vpn.onNetworkInstanceUpdate('B')
     resolveNetworkInfo({
       info: {
         map: {
@@ -611,6 +656,153 @@ describe('mobile VPN reconciliation', () => {
 
     expect(mocks.startVpn).not.toHaveBeenCalled()
     expect(mocks.stopVpn).not.toHaveBeenCalled()
+  })
+
+  it('applies the complete backend table in order without deriving routes', async () => {
+    setConfig('A')
+    setReady('A', '10.0.0.1')
+    const complete: MobileTunConfig = {
+      snapshot_id: '00000000-0000-0000-0000-000000000002',
+      instance_ids: ['A'],
+      addresses: ['10.44.0.7/24', 'fd44::7/64'],
+      routes: ['203.0.113.0/24', '10.44.0.0/24', '100.100.100.101/32'],
+      dns: '100.100.100.101',
+      rejected: [],
+    }
+    mocks.getMobileTunConfig.mockResolvedValue(complete)
+    mocks.setTunFd.mockImplementation(async (fd: number) => fd > 0
+      ? complete
+      : { instance_ids: [], addresses: [], routes: [], rejected: [] })
+    const vpn = await loadVpnModule()
+
+    await vpn.onNetworkInstanceChange('A')
+
+    expect(mocks.startVpn).toHaveBeenCalledWith({
+      snapshotId: complete.snapshot_id,
+      ipv4Addrs: complete.addresses,
+      routes: complete.routes,
+      dns: complete.dns,
+      disallowedApplications: ['com.kkrainbow.easytier'],
+      mtu: 1300,
+    })
+    expect(mocks.setTunFd).toHaveBeenCalledWith(1, ['A'], complete.snapshot_id)
+  })
+
+  it('queries the complete table for every running TUN instance', async () => {
+    setConfig('A')
+    setConfig('B')
+    setReady('A', '10.0.0.1')
+    const vpn = await loadVpnModule()
+
+    await vpn.onNetworkInstanceChange('A')
+
+    expect(mocks.getMobileTunConfig).toHaveBeenCalledWith(['A', 'B'])
+    expect(mocks.setTunFd).toHaveBeenCalledWith(1, ['A', 'B'], '00000000-0000-0000-0000-000000000001')
+  })
+
+  it('waits for a stale Native snapshot rejection before closing the VPN', async () => {
+    setConfig('A')
+    setReady('A', '10.0.0.1')
+    let rejectAttachment!: (error: Error) => void
+    mocks.setTunFd.mockImplementationOnce(() => new Promise((_resolve, reject) => {
+      rejectAttachment = reject
+    }))
+    const vpn = await loadVpnModule()
+    const errorHandler = vi.fn()
+    vpn.setMobileVpnErrorHandler(errorHandler)
+
+    const starting = vpn.onNetworkInstanceChange('A')
+    await vi.waitFor(() => expect(mocks.setTunFd).toHaveBeenCalledWith(
+      1,
+      ['A'],
+      '00000000-0000-0000-0000-000000000001',
+    ))
+    expect(mocks.stopVpn).not.toHaveBeenCalled()
+
+    rejectAttachment(new Error('mobile TUN configuration changed; query and install a new snapshot before attaching'))
+    await starting
+
+    expect(errorHandler).toHaveBeenCalledWith(
+      'Error: mobile TUN configuration changed; query and install a new snapshot before attaching',
+    )
+    expect(mocks.stopVpn).toHaveBeenCalledOnce()
+  })
+
+  it('waits for local detach before closing the hosted FD', async () => {
+    setConfig('A')
+    setReady('A', '10.0.0.1')
+    const vpn = await loadVpnModule()
+    await vpn.onNetworkInstanceChange('A')
+    mocks.stopVpn.mockClear()
+    mocks.setTunFd.mockClear()
+
+    let resolveDetach!: (value: MobileTunConfig) => void
+    mocks.setTunFd.mockImplementationOnce((fd: number) => {
+      expect(fd).toBe(0)
+      return new Promise((resolve) => {
+        resolveDetach = resolve
+      })
+    })
+    mocks.listNetworkInstanceIds.mockResolvedValue({ running_inst_ids: [] })
+
+    const stopping = vpn.onNetworkInstanceChange('A')
+    await vi.waitFor(() => expect(mocks.setTunFd).toHaveBeenCalledWith(0))
+    expect(mocks.stopVpn).not.toHaveBeenCalled()
+
+    resolveDetach({
+      snapshot_id: '00000000-0000-0000-0000-000000000001',
+      instance_ids: [],
+      addresses: [],
+      routes: [],
+      rejected: [],
+    })
+    await stopping
+
+    expect(mocks.stopVpn).toHaveBeenCalledOnce()
+  })
+
+  it('does not close the VPN when local detach cannot release the FD', async () => {
+    setConfig('A')
+    setReady('A', '10.0.0.1')
+    const vpn = await loadVpnModule()
+    await vpn.onNetworkInstanceChange('A')
+    mocks.stopVpn.mockClear()
+    mocks.setTunFd.mockImplementation(async (fd: number) => {
+      if (fd <= 0)
+        throw new Error('local detach is still owed')
+      return makeMobileTunConfig(['A'])
+    })
+    mocks.listNetworkInstanceIds.mockResolvedValue({ running_inst_ids: [] })
+
+    await vpn.onNetworkInstanceChange('A')
+
+    expect(mocks.stopVpn).not.toHaveBeenCalled()
+  })
+
+  it('does not let a newer generation cancel a queued Native attachment wait', async () => {
+    setConfig('A')
+    setReady('A', '10.0.0.1')
+    let resolveAttachment!: (value: MobileTunConfig) => void
+    mocks.setTunFd.mockImplementationOnce(() => new Promise((resolve) => {
+      resolveAttachment = resolve
+    }))
+    const vpn = await loadVpnModule()
+
+    let firstCompleted = false
+    const first = vpn.onNetworkInstanceChange('A').then(() => {
+      firstCompleted = true
+    })
+    await vi.waitFor(() => expect(mocks.setTunFd).toHaveBeenCalled())
+    const newer = vpn.onNetworkInstanceUpdate('A')
+    await Promise.resolve()
+    expect(firstCompleted).toBe(false)
+
+    resolveAttachment(makeMobileTunConfig(['A']))
+    await first
+    await newer
+
+    expect(firstCompleted).toBe(true)
+    expect(mocks.stopVpn).toHaveBeenCalled()
   })
 
   it('preserves a native VPN while network info is unavailable', async () => {

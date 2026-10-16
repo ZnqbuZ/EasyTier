@@ -200,15 +200,16 @@ public class EasyTierVpnService extends VpnService {
     
     @Override
     public int onStartCommand(Intent intent, int flags, int startId) {
-        // 建立 VPN 连接
-        ParcelFileDescriptor vpnInterface = establishVpnInterface();
+        // 获取快照，并按其中的 addresses/routes/dns 配置系统 VPN。
+        JSONObject config = new JSONObject(EasyTierJNI.getMobileTunConfig("my_instance"));
+        ParcelFileDescriptor vpnInterface = establishVpnInterface(config);
         
         if (vpnInterface != null) {
             int fd = vpnInterface.getFd();
             
             // 设置 TUN 文件描述符
             try {
-                EasyTierJNI.setTunFd("my_instance", fd);
+                EasyTierJNI.setTunFd("my_instance", fd, config.getString("snapshot_id"));
             } catch (RuntimeException e) {
                 Log.e("EasyTier", "设置 TUN FD 失败", e);
             }
@@ -237,7 +238,8 @@ public class EasyTierVpnService extends VpnService {
 |------|------|------|--------|
 | `parseConfig(String config)` | 解析 TOML 配置 | config: 配置字符串 | 0=成功, -1=失败 |
 | `runNetworkInstance(String config)` | 启动网络实例 | config: 配置字符串 | 0=成功, -1=失败 |
-| `setTunFd(String instanceName, int fd)` | 设置 TUN 文件描述符 | instanceName: 实例名, fd: 文件描述符 | 0=成功, -1=失败 |
+| `getMobileTunConfig(String instanceName)` | 获取系统 VPN 配置快照 | instanceName: 实例名 | 含 snapshot_id、addresses、routes、dns 的 JSON |
+| `setTunFd(String instanceName, int fd, String snapshotId)` | 确认已安装的快照并交回 TUN fd | snapshotId: 创建 VPN 时使用的快照标识；fd <= 0 时传空字符串 | 0=成功, -1=失败 |
 | `retainNetworkInstance(String[] names)` | 保留指定实例 | names: 实例名数组 | 0=成功, -1=失败 |
 | `collectNetworkInfos(int maxLength)` | 收集网络信息 | maxLength: 最大条目数 | 信息字符串数组 |
 | `collectNetworkInfosAsMap(int maxLength)` | 收集网络信息为 Map | maxLength: 最大条目数 | Map<String, String> |

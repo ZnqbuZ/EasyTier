@@ -166,6 +166,7 @@ wasm-host-tunnel-outbound = ["wasm-host-tunnel"]
 test-utils = []
 tracing-log = ["tracing/log"]
 zstd = ["dep:zstd"]
+macos-ne = []
 
 [dev-dependencies]
 futures = { workspace = true, features = ["executor"] }
