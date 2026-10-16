@@ -94,6 +94,7 @@ pub(crate) fn collect_network_infos() -> Vec<KeyValuePair> {
 pub(crate) fn set_tun_fd(
     config_id: String,
     fd: i32,
+    snapshot_id: Option<String>,
     parse_instance_uuid: impl Fn(&str) -> Option<uuid::Uuid>,
 ) -> bool {
     let Some(instance_id) = parse_instance_uuid(&config_id) else {
@@ -101,21 +102,56 @@ pub(crate) fn set_tun_fd(
         return false;
     };
 
-    INSTANCE_MANAGER
-        .attach_tun_fd(instance_id, fd)
+    #[cfg(target_env = "ohos")]
+    let result = {
+        let snapshot = match snapshot_id.map(|id| uuid::Uuid::parse_str(&id)).transpose() {
+            Ok(id) => id,
+            Err(error) => {
+                ohrs_log_error!("[Rust] invalid VPN snapshot: {}", error);
+                return false;
+            }
+        };
+        ASYNC_RUNTIME
+            .block_on(easytier::instance::factory::attach_mobile_tun_fd(
+                INSTANCE_MANAGER.as_ref(),
+                fd,
+                Some(&[instance_id]),
+                snapshot,
+            ))
+            .map(|_| ())
+    };
+    #[cfg(not(target_env = "ohos"))]
+    let result = {
+        let _ = snapshot_id;
+        INSTANCE_MANAGER.attach_tun_fd(instance_id, fd)
+    };
+    result
         .map(|_| {
-            mark_tun_attached(&config_id);
-            ohrs_log_info!(
-                "[Rust] set_tun_fd success instance={} fd={} marked_attached=true",
-                config_id,
-                fd
-            );
+            if fd > 0 {
+                mark_tun_attached(&config_id);
+            } else {
+                clear_tun_attached(&config_id);
+            }
             true
         })
-        .unwrap_or_else(|err| {
-            ohrs_log_error!("[Rust] set_tun_fd failed {}: {}", config_id, err);
+        .unwrap_or_else(|error| {
+            ohrs_log_error!("[Rust] set_tun_fd failed {}: {}", config_id, error);
             false
         })
+}
+
+pub(crate) fn get_mobile_tun_config(
+    config_id: String,
+    parse_instance_uuid: impl Fn(&str) -> Option<uuid::Uuid>,
+) -> Option<String> {
+    let id = parse_instance_uuid(&config_id)?;
+    cfg_select! {
+        target_env = "ohos" => {
+            let config = ASYNC_RUNTIME.block_on(easytier::instance::factory::get_mobile_tun_config(INSTANCE_MANAGER.as_ref(), &[id]));
+            serde_json::to_string(&config).ok()
+        },
+        _ => { let _ = id; None },
+    }
 }
 
 pub(crate) fn collect_runtime_state() -> RuntimeAggregateState {

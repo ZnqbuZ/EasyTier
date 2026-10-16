@@ -18,7 +18,8 @@ object EasyTierJNI {
      * @return 0 表示成功，-1 表示失败
      * @throws RuntimeException 当操作失败时抛出异常
      */
-    @JvmStatic external fun setTunFd(instanceName: String, fd: Int): Int
+    @JvmStatic external fun setTunFd(instanceName: String, fd: Int, snapshotId: String): Int
+    @JvmStatic external fun getMobileTunConfig(instanceName: String): String
 
     /**
      * 解析配置字符串

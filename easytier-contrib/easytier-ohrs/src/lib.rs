@@ -1054,8 +1054,13 @@ pub fn collect_network_infos() -> Vec<KeyValuePair> {
 }
 
 #[napi]
-pub fn set_tun_fd(config_id: String, fd: i32) -> bool {
-    exports::runtime_api::set_tun_fd(config_id, fd, parse_instance_uuid)
+pub fn set_tun_fd(config_id: String, fd: i32, snapshot_id: Option<String>) -> bool {
+    exports::runtime_api::set_tun_fd(config_id, fd, snapshot_id, parse_instance_uuid)
+}
+
+#[napi]
+pub fn get_mobile_tun_config(config_id: String) -> Option<String> {
+    exports::runtime_api::get_mobile_tun_config(config_id, parse_instance_uuid)
 }
 
 #[napi]

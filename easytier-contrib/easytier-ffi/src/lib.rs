@@ -187,13 +187,28 @@ pub unsafe extern "C" fn collect_network_infos(
 /// # Safety
 /// `inst_name` must be a non-null pointer to a null-terminated UTF-8 string.
 /// `fd` must be a valid TUN file descriptor owned by the caller.
+/// On mobile targets, `snapshot_id` must identify the configuration actually installed,
+/// or be null when detaching (`fd <= 0`).
 ///
 /// # Return
 /// Returns `0` if the descriptor is accepted by the instance, or `-1` on
 /// failure.
 #[cfg_attr(feature = "c-abi", unsafe(no_mangle))]
-pub unsafe extern "C" fn set_tun_fd(inst_name: *const c_char, fd: c_int) -> c_int {
-    unsafe { instance_api::set_tun_fd(inst_name, fd) }
+pub unsafe extern "C" fn set_tun_fd(
+    inst_name: *const c_char,
+    fd: c_int,
+    snapshot_id: *const c_char,
+) -> c_int {
+    unsafe { instance_api::set_tun_fd(inst_name, fd, snapshot_id) }
+}
+
+/// Get the exact VPN configuration to install, as JSON. Free with `free_string`.
+///
+/// # Safety
+/// `inst_name` must point to a null-terminated UTF-8 instance name.
+#[cfg_attr(feature = "c-abi", unsafe(no_mangle))]
+pub unsafe extern "C" fn get_mobile_tun_config(inst_name: *const c_char) -> *mut c_char {
+    unsafe { instance_api::get_mobile_tun_config(inst_name) }
 }
 
 /// Call an exposed EasyTier RPC method using protobuf JSON.

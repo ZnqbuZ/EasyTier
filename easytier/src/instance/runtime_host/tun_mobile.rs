@@ -7,10 +7,7 @@ use easytier_core::{
 use tokio::sync::{Mutex, Notify, mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
-use super::{
-    MagicDnsRuntime,
-    tun_common::{NativeDhcpHost, TunNicState},
-};
+use super::tun_common::{NativeDhcpHost, TunNicState};
 use crate::{
     common::global_ctx::ArcGlobalCtx,
     instance::{shared_virtual_nic::ArcSharedVirtualNicRegistry, virtual_nic::NicCtx},
@@ -25,6 +22,7 @@ struct MobileTunAttachment {
 
 pub(super) struct NativeTunRuntime {
     global_ctx: ArcGlobalCtx,
+    routes: Option<Arc<crate::instance::route::runtime::NativeRouteContext>>,
     cancel: CancellationToken,
     nic: TunNicState,
     tun_fd: mpsc::Sender<MobileTunAttachment>,
@@ -38,10 +36,12 @@ impl NativeTunRuntime {
         global_ctx: ArcGlobalCtx,
         cancel: CancellationToken,
         shared_virtual_nic_registry: ArcSharedVirtualNicRegistry,
+        routes: Option<Arc<crate::instance::route::runtime::NativeRouteContext>>,
     ) -> Self {
         let (tun_fd, tun_fd_receiver) = mpsc::channel(16);
         Self {
             global_ctx,
+            routes,
             cancel,
             nic: TunNicState::empty(),
             tun_fd,
@@ -66,34 +66,32 @@ impl NativeTunRuntime {
         replace_tun_fd: bool,
         shared_virtual_nic_registry: ArcSharedVirtualNicRegistry,
         claims: Option<crate::instance::shared_virtual_nic::SharedIfConfigClaims>,
+        routes: Option<Arc<crate::instance::route::runtime::NativeRouteContext>>,
     ) -> anyhow::Result<()> {
         nic_state.drain().await;
         if fd <= 0 {
             return Ok(());
         }
         let closed = Arc::new(Notify::new());
-        let mut nic = NicCtx::new(
+        let nic = NicCtx::new(
             global_ctx.clone(),
             packet_plane.clone(),
             nic_state.receiver(),
             closed,
             shared_virtual_nic_registry,
+            routes,
         )
         .await?;
         let claims = match claims {
             Some(claims) => claims,
-            None => NicCtx::mobile_tun_claims(&global_ctx, &packet_plane).await,
+            None => {
+                anyhow::bail!("mobile TUN attachment requires its installed configuration snapshot")
+            }
         };
-        nic.run_for_mobile(fd, replace_tun_fd, claims)
+        nic_state
+            .configure_for_mobile(nic, global_ctx, packet_plane, fd, replace_tun_fd, claims)
             .await
             .context("attach mobile TUN failed")?;
-        let magic_dns = if let Some(ip) = global_ctx.get_ipv4() {
-            let shared_route_backend = nic.shared_route_backend_for_dns();
-            MagicDnsRuntime::start(global_ctx, packet_plane, None, ip, shared_route_backend)
-        } else {
-            MagicDnsRuntime::default()
-        };
-        nic_state.install(nic, magic_dns).await;
         Ok(())
     }
 
@@ -106,6 +104,7 @@ impl NativeTunRuntime {
         let global_ctx = self.global_ctx.clone();
         let cancel = self.cancel.clone();
         let shared_virtual_nic_registry = self.shared_virtual_nic_registry.clone();
+        let routes = self.routes.clone();
         self.task.lock().await.replace(tokio::spawn(async move {
             loop {
                 let attachment = tokio::select! {
@@ -123,6 +122,7 @@ impl NativeTunRuntime {
                     attachment.replace_tun_fd,
                     shared_virtual_nic_registry.clone(),
                     attachment.claims,
+                    routes.clone(),
                 )
                 .await;
                 if let Err(error) = &result {
@@ -144,15 +144,8 @@ impl NativeTunRuntime {
         self.nic.stop().await;
     }
 
-    pub(super) fn attach_fd(&self, fd: i32) -> anyhow::Result<()> {
-        self.tun_fd
-            .try_send(MobileTunAttachment {
-                fd,
-                replace_tun_fd: true,
-                completion: None,
-                claims: None,
-            })
-            .map_err(|error| anyhow::anyhow!("failed to send TUN fd: {error}"))
+    pub(super) fn attach_fd(&self, _fd: i32) -> anyhow::Result<()> {
+        anyhow::bail!("use attach_mobile_tun_fd with the installed configuration snapshot")
     }
 
     pub(super) async fn attach_mobile_fd(
@@ -193,6 +186,7 @@ impl NativeTunRuntime {
             operation,
             cancel: self.cancel.clone(),
             nic: self.nic.clone(),
+            routes: self.routes.clone(),
         })
     }
 

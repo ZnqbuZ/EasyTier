@@ -30,6 +30,7 @@ let vpnTileActionHandler: ((action: VpnTileAction) => Promise<void>) | undefined
 let vpnTileActionQueue: Promise<void> = Promise.resolve()
 let vpnAttachedInstanceIds: string[] = []
 let vpnStartingInstanceIds: string[] | undefined
+let vpnStartingSnapshotId: string | undefined
 let vpnAttachment: Promise<MobileTunConfig> | null = null
 let vpnErrorHandler: ((error: string) => void) | undefined
 let vpnMemberErrors = ''
@@ -218,16 +219,19 @@ async function doStartVpn(
   ipv4Addrs: string[],
   routes: string[],
   dns: string | undefined,
+  snapshotId: string,
 ) {
   if (curVpnStatus.running) {
     return
   }
 
   vpnStartingInstanceIds = instanceIds
+  vpnStartingSnapshotId = snapshotId
   vpnAttachment = null
 
   console.log('start vpn service', ipv4Addrs, routes, dns)
   const request = {
+    snapshotId,
     ipv4Addrs,
     routes,
     dns,
@@ -273,9 +277,13 @@ async function waitVpnAttachment() {
 
 async function onVpnServiceStart(payload: any) {
   console.log('vpn service start', JSON.stringify(payload))
+  // The acknowledgement must originate from the same VPN configuration
+  // request. Delayed callbacks from a previous start cannot acknowledge this one.
+  if (!payload.snapshotId || payload.snapshotId !== vpnStartingSnapshotId)
+    return
   curVpnStatus.running = true
   if (payload.fd) {
-    vpnAttachment = setTunFd(payload.fd, vpnStartingInstanceIds)
+    vpnAttachment = setTunFd(payload.fd, vpnStartingInstanceIds, payload.snapshotId)
     await vpnAttachment.then(async (actual) => {
       reportRejectedMembers(actual)
       vpnAttachedInstanceIds = [...actual.instance_ids].sort()
@@ -291,6 +299,8 @@ async function onVpnServiceStart(payload: any) {
 
 async function onVpnServiceStop(payload: any) {
   console.log('vpn service stop', JSON.stringify(payload))
+  if (payload.snapshotId && payload.snapshotId !== vpnStartingSnapshotId)
+    return
   await detachTunFd()
   curVpnStatus.running = false
   resetVpnConfigStatus()
@@ -451,7 +461,7 @@ async function reconcileNetworkInstance(generation: number) {
       return
 
     try {
-      await doStartVpn(instanceIds, sortedIpv4Addrs, sortedRoutes, dns)
+      await doStartVpn(instanceIds, sortedIpv4Addrs, sortedRoutes, dns, config.snapshot_id)
       if (!isCurrentVpnReconcile(generation))
         await doStopVpn()
     }

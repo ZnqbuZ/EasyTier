@@ -5,7 +5,7 @@
 //! modules so this facade stays readable as an API map.
 //!
 //! Network management APIs:
-//! - `setTunFd(instanceName, fd)`: attach an Android TUN fd to an instance.
+//! - `setTunFd(instanceName, fd, snapshotId)`: attach an Android TUN fd to an instance.
 //! - `parseConfig(config)`: validate TOML config text.
 //! - `runNetworkInstance(config)`: start a local network instance.
 //! - `retainNetworkInstance(instanceNames)`: retain named instances and stop the rest.
@@ -38,7 +38,7 @@ use jni::sys::{jboolean, jint, jstring};
 /// Attach a TUN file descriptor to an EasyTier network instance.
 ///
 /// Java signature:
-/// `EasyTierJNI.setTunFd(instanceName: String, fd: Int): Int`
+/// `EasyTierJNI.setTunFd(instanceName: String, fd: Int, snapshotId: String): Int`
 ///
 /// `instanceName` must name an instance known to the shared FFI instance cache.
 /// The `fd` must be a valid Android TUN file descriptor. On failure this
@@ -50,9 +50,21 @@ pub extern "system" fn Java_com_easytier_jni_EasyTierJNI_setTunFd(
     class: JClass,
     inst_name: JString,
     fd: jint,
+    snapshot_id: JString,
 ) -> jint {
     logger::init();
-    network_api::set_tun_fd_jni(env, class, inst_name, fd)
+    network_api::set_tun_fd_jni(env, class, inst_name, fd, snapshot_id)
+}
+
+/// Return the system VPN configuration to install, including its snapshot ID.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_easytier_jni_EasyTierJNI_getMobileTunConfig(
+    env: JNIEnv,
+    class: JClass,
+    inst_name: JString,
+) -> jstring {
+    logger::init();
+    network_api::get_mobile_tun_config_jni(env, class, inst_name)
 }
 
 /// Validate a TOML network config string.

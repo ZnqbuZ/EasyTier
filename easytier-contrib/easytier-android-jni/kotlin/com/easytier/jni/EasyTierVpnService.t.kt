@@ -4,6 +4,7 @@ import android.content.Intent
 import android.net.VpnService
 import android.os.ParcelFileDescriptor
 import android.util.Log
+import org.json.JSONObject
 import kotlin.concurrent.thread
 
 class EasyTierVpnService : VpnService() {
@@ -22,25 +23,16 @@ class EasyTierVpnService : VpnService() {
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        // 获取传入的参数
-        val ipv4Address = intent?.getStringExtra("ipv4_address")
-        val proxyCidrs = intent?.getStringArrayListExtra("proxy_cidrs") ?: arrayListOf()
         instanceName = intent?.getStringExtra("instance_name")
-
-        if (ipv4Address == null || instanceName == null) {
-            Log.e(TAG, "缺少必要参数: ipv4Address=$ipv4Address, instanceName=$instanceName")
+        if (instanceName.isNullOrEmpty()) {
+            Log.e(TAG, "Missing EasyTier instance name")
             stopSelf()
             return START_NOT_STICKY
         }
 
-        Log.i(
-                TAG,
-                "启动 VPN Service - IPv4: $ipv4Address, Proxy CIDRs: $proxyCidrs, Instance: $instanceName"
-        )
-
         thread {
             try {
-                setupVpnInterface(ipv4Address, proxyCidrs)
+                setupVpnInterface()
             } catch (t: Throwable) {
                 Log.e(TAG, "VPN 设置失败", t)
                 stopSelf()
@@ -50,29 +42,24 @@ class EasyTierVpnService : VpnService() {
         return START_STICKY
     }
 
-    private fun setupVpnInterface(ipv4Address: String, proxyCidrs: List<String>) {
+    private fun setupVpnInterface() {
         try {
-            // 解析 IPv4 地址和网络长度
-            val (ip, networkLength) = parseIpv4Address(ipv4Address)
-
-            // 1. 准备 VpnService.Builder
-            val builder = Builder()
-            builder.setSession("EasyTier VPN")
-                    .addAddress(ip, networkLength)
-                    .addDnsServer("223.5.5.5")
-                    .addDnsServer("114.114.114.114")
+            val name = requireNotNull(instanceName)
+            val config = JSONObject(EasyTierJNI.getMobileTunConfig(name))
+            val snapshotId = config.getString("snapshot_id")
+            val builder = Builder().setSession("EasyTier VPN")
                     .addDisallowedApplication("com.easytier.easytiervpn")
-
-            // 2. 添加路由表 - 为每个 proxy CIDR 添加路由
-            proxyCidrs.forEach { cidr ->
-                try {
-                    val (routeIp, routeLength) = parseCidr(cidr)
-                    builder.addRoute(routeIp, routeLength)
-                    Log.d(TAG, "添加路由: $routeIp/$routeLength")
-                } catch (e: Exception) {
-                    Log.w(TAG, "解析 CIDR 失败: $cidr", e)
-                }
+            val addresses = config.getJSONArray("addresses")
+            for (index in 0 until addresses.length()) {
+                val (ip, length) = parseCidr(addresses.getString(index))
+                builder.addAddress(ip, length)
             }
+            val routes = config.getJSONArray("routes")
+            for (index in 0 until routes.length()) {
+                val (ip, length) = parseCidr(routes.getString(index))
+                builder.addRoute(ip, length)
+            }
+            if (!config.isNull("dns")) builder.addDnsServer(config.getString("dns"))
 
             // 3. 构建虚拟网络接口
             vpnInterface = builder.establish()
@@ -87,7 +74,7 @@ class EasyTierVpnService : VpnService() {
             // 4. 将 TUN 文件描述符传递给 EasyTier
             instanceName?.let { name ->
                 val fd = vpnInterface!!.fd
-                val result = EasyTierJNI.setTunFd(name, fd)
+                val result = EasyTierJNI.setTunFd(name, fd, snapshotId)
                 if (result == 0) {
                     Log.i(TAG, "TUN 文件描述符设置成功: $fd")
                 } else {
@@ -108,17 +95,6 @@ class EasyTierVpnService : VpnService() {
         }
     }
 
-    /** 解析 IPv4 地址，返回 IP 和网络长度 */
-    private fun parseIpv4Address(ipv4Address: String): Pair<String, Int> {
-        return if (ipv4Address.contains("/")) {
-            val parts = ipv4Address.split("/")
-            Pair(parts[0], parts[1].toInt())
-        } else {
-            // 默认使用 /24 网络
-            Pair(ipv4Address, 24)
-        }
-    }
-
     /** 解析 CIDR，返回 IP 和网络长度 */
     private fun parseCidr(cidr: String): Pair<String, Int> {
         val parts = cidr.split("/")
@@ -130,6 +106,9 @@ class EasyTierVpnService : VpnService() {
 
     private fun cleanup() {
         isRunning = false
+        instanceName?.let { name ->
+            try { EasyTierJNI.setTunFd(name, 0, "") } catch (error: Exception) { Log.w(TAG, "TUN detach failed", error) }
+        }
         vpnInterface?.close()
         vpnInterface = null
         Log.i(TAG, "VPN 接口已清理")

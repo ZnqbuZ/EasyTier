@@ -2,8 +2,9 @@ use std::{ffi::CStr, ptr};
 
 use easytier::proto::api::manage::{NetworkInstanceRunningInfo, NetworkInstanceRunningInfoMap};
 use easytier_ffi::{
-    KeyValuePair, collect_network_infos, delete_network_instance, free_string, list_instance,
-    parse_config, retain_network_instance, run_network_instance, set_tun_fd,
+    KeyValuePair, collect_network_infos, delete_network_instance, free_string,
+    get_mobile_tun_config, list_instance, parse_config, retain_network_instance,
+    run_network_instance, set_tun_fd,
 };
 use jni::JNIEnv;
 use jni::objects::{JClass, JObjectArray, JString};
@@ -19,6 +20,7 @@ pub(crate) fn set_tun_fd_jni(
     _class: JClass,
     inst_name: JString,
     fd: jint,
+    snapshot_id: JString,
 ) -> jint {
     let inst_name_cstr = match jstring_to_cstring(&mut env, &inst_name) {
         Ok(cstr) => cstr,
@@ -27,14 +29,54 @@ pub(crate) fn set_tun_fd_jni(
             return -1;
         }
     };
+    let snapshot = match jstring_to_cstring(&mut env, &snapshot_id) {
+        Ok(value) => value,
+        Err(error) => {
+            throw_exception(&mut env, &format!("Invalid VPN snapshot: {error}"));
+            return -1;
+        }
+    };
     unsafe {
-        let result = set_tun_fd(inst_name_cstr.as_ptr(), fd);
+        let result = set_tun_fd(inst_name_cstr.as_ptr(), fd, snapshot.as_ptr());
         if result != 0
             && let Some(error) = get_last_error()
         {
             throw_exception(&mut env, &error);
         }
         result
+    }
+}
+
+pub(crate) fn get_mobile_tun_config_jni(
+    mut env: JNIEnv,
+    _class: JClass,
+    inst_name: JString,
+) -> jstring {
+    let name = match jstring_to_cstring(&mut env, &inst_name) {
+        Ok(value) => value,
+        Err(error) => {
+            throw_exception(&mut env, &error.to_string());
+            return ptr::null_mut();
+        }
+    };
+    let config = unsafe { get_mobile_tun_config(name.as_ptr()) };
+    if config.is_null() {
+        throw_exception(
+            &mut env,
+            &get_last_error().unwrap_or_else(|| "VPN configuration is unavailable".to_owned()),
+        );
+        return ptr::null_mut();
+    }
+    let json = unsafe { CStr::from_ptr(config) }
+        .to_string_lossy()
+        .into_owned();
+    unsafe { free_string(config) };
+    match env.new_string(json) {
+        Ok(value) => value.into_raw(),
+        Err(error) => {
+            throw_exception(&mut env, &error.to_string());
+            ptr::null_mut()
+        }
     }
 }
 

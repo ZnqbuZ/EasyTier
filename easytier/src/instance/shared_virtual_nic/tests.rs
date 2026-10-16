@@ -372,6 +372,25 @@ fn registry_shares_named_devices_but_isolates_anonymous_members() {
     ));
 }
 
+#[cfg(all(target_os = "linux", feature = "linux-netlink"))]
+#[test]
+fn registry_rejects_mixed_route_ownership_without_reserving_another_member() {
+    let mut registry = SharedVirtualNicRegistry::new();
+    let first = create_member(&mut registry, "et-route-modes", 1400, None);
+    let managed = virtual_nic_config(1400, None).with_routes_managed(true);
+    assert!(
+        registry
+            .try_create_member(
+                "et-route-modes".into(),
+                managed,
+                uuid::Uuid::new_v4(),
+                Arc::new(Notify::new())
+            )
+            .is_err()
+    );
+    assert_eq!(*first.registration.lifetimes.lock().unwrap(), Some(1));
+}
+
 #[tokio::test]
 async fn pending_registration_prevents_retirement_and_last_drop_allows_compaction() {
     let mut registry = SharedVirtualNicRegistry::new();
@@ -394,6 +413,33 @@ async fn pending_registration_prevents_retirement_and_last_drop_allows_compactio
     assert_eq!(registry.nics.len(), 1);
 }
 
+#[tokio::test]
+async fn explicit_member_close_waits_for_the_nic_and_rejects_queued_creation() {
+    use futures::FutureExt;
+    let mut registry = SharedVirtualNicRegistry::new();
+    let member = create_member(&mut registry, "et-pending-close", 1400, None);
+    let nic = member.shared_nic();
+    let held = nic.lock().await;
+    let close = member.close();
+    tokio::pin!(close);
+    assert!(close.as_mut().now_or_never().is_none());
+    let create = member.create_dev();
+    tokio::pin!(create);
+    assert!(create.as_mut().now_or_never().is_none());
+    drop(held);
+    close.await.unwrap();
+    let error = create.await.err().expect("queued setup must be rejected");
+    assert!(error.to_string().contains("closed"), "{error:?}");
+    assert!(nic.lock().await.dispatcher.is_none());
+    let error = member
+        .create_dev()
+        .await
+        .err()
+        .expect("closed member must not reopen");
+    assert!(error.to_string().contains("closed"), "{error:?}");
+    member.close().await.unwrap();
+}
+
 #[test]
 fn registry_replaces_invalid_devices() {
     let mut registry = SharedVirtualNicRegistry::new();
@@ -412,4 +458,110 @@ fn registry_replaces_invalid_devices() {
             .unwrap(),
         &next.shared_nic,
     ));
+}
+
+#[cfg(all(target_os = "linux", feature = "linux-netlink"))]
+#[tokio::test]
+async fn managed_route_admission_keeps_previous_claims_on_rejection_and_withdraws_without_os_writes()
+ {
+    use easytier_core::host::route::{RouteSet, RouteSpec};
+    let config = virtual_nic_config(1500, None).with_routes_managed(true);
+    let mut nic = SharedVirtualNic::new(config);
+    nic.member_registrations.insert(MEMBER, REGISTRATION);
+    nic.ifcfg
+        .apply_member_claims(MEMBER, address_claims("10.50.0.2/24"));
+    nic.ifcfg
+        .apply_member_claims(uuid::Uuid::from_u128(2), address_claims("10.60.0.2/24"));
+    let ifcfg = RecordingIfConfiger::default();
+    set_ifcfg(&nic, ifcfg.clone()).await;
+    let wanted = RouteSet::from([RouteSpec::for_tun("10.70.0.0/24".parse().unwrap())]);
+    let claims = nic
+        .prepare_managed_routes(MEMBER, REGISTRATION, &wanted)
+        .unwrap();
+    nic.commit_managed_routes(MEMBER, REGISTRATION, claims)
+        .await
+        .unwrap();
+    let accepted = nic.ifcfg.claims_of(MEMBER);
+    assert_eq!(accepted.ipv4_routes.len(), 1);
+    let conflict = RouteSet::from([RouteSpec::for_tun("10.60.0.0/24".parse().unwrap())]);
+    assert!(
+        nic.prepare_managed_routes(MEMBER, REGISTRATION, &conflict)
+            .is_err()
+    );
+    assert_eq!(nic.ifcfg.claims_of(MEMBER), accepted);
+    let withdraw = nic
+        .prepare_managed_routes(MEMBER, REGISTRATION, &RouteSet::new())
+        .unwrap();
+    nic.commit_managed_routes(MEMBER, REGISTRATION, withdraw)
+        .await
+        .unwrap();
+    assert!(nic.ifcfg.claims_of(MEMBER).ipv4_routes.is_empty());
+    assert_eq!(
+        nic.ifcfg.claims_of(MEMBER).ipv4_addresses,
+        accepted.ipv4_addresses
+    );
+    assert!(ifcfg.routes.lock().unwrap().is_empty());
+}
+
+#[cfg(all(target_os = "linux", feature = "linux-netlink"))]
+#[tokio::test]
+async fn managed_address_changes_do_not_readd_or_remove_controller_routes() {
+    let config = virtual_nic_config(1500, None).with_routes_managed(true);
+    let mut nic = SharedVirtualNic::new(config);
+    let mut before = address_claims("10.50.0.2/24");
+    before
+        .ipv4_routes
+        .insert(SharedIpv4Route::new("10.70.0.0".parse().unwrap(), 24, None));
+    nic.ifcfg.apply_member_claims(MEMBER, before.clone());
+    let ifcfg = RecordingIfConfiger::default();
+    set_ifcfg(&nic, ifcfg.clone()).await;
+    let mut changed = before;
+    changed.ipv4_addresses = BTreeSet::from(["10.51.0.2/24".parse().unwrap()]);
+    let mut next = nic.ifcfg.clone();
+    next.apply_member_claims(MEMBER, changed);
+    nic.apply_ifcfg_update(&next).await.unwrap();
+    assert!(
+        ifcfg.routes.lock().unwrap().is_empty(),
+        "address changes must not invoke legacy route restoration"
+    );
+}
+
+#[cfg(all(target_os = "linux", feature = "linux-netlink"))]
+#[tokio::test]
+async fn legacy_route_entrypoints_reject_managed_devices_before_any_syscall() {
+    let config = || virtual_nic_config(1500, None).with_routes_managed(true);
+    let device = VirtualNic::new(config());
+    assert!(
+        device
+            .add_route("10.70.0.0".parse().unwrap(), 24)
+            .await
+            .is_err()
+    );
+    assert!(
+        device
+            .remove_route("10.70.0.0".parse().unwrap(), 24)
+            .await
+            .is_err()
+    );
+    assert!(
+        device
+            .add_ipv6_route("2001:db8::".parse().unwrap(), 64)
+            .await
+            .is_err()
+    );
+    assert!(
+        device
+            .remove_ipv6_route("2001:db8::".parse().unwrap(), 64)
+            .await
+            .is_err()
+    );
+    let mut registry = SharedVirtualNicRegistry::new();
+    let member =
+        registry.create_member("et0".to_owned(), config(), MEMBER, Arc::new(Notify::new()));
+    assert!(
+        member
+            .add_route("10.70.0.0".parse().unwrap(), 24)
+            .await
+            .is_err()
+    );
 }

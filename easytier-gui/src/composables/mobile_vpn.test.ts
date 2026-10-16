@@ -26,8 +26,8 @@ const mocks = vi.hoisted(() => {
     setTunFd: vi.fn(async (fd: number, instanceIds?: string[]) => fd > 0
       ? makeMobileTunConfig(instanceIds ?? [...configs.keys()])
       : { instance_ids: [], addresses: [], routes: [], rejected: [] }),
-    startVpn: vi.fn(async () => {
-      await listeners.get('vpn_service_start')?.({ fd: 1 })
+    startVpn: vi.fn(async (request: { snapshotId: string }) => {
+      await listeners.get('vpn_service_start')?.({ fd: 1, snapshotId: request.snapshotId })
       return {}
     }),
     stopVpn: vi.fn(async () => {
@@ -96,7 +96,7 @@ function makeMobileTunConfig(instanceIds: string[]): MobileTunConfig {
       dns = '100.100.100.101'
     }
   }
-  return { instance_ids: [...instanceIds].sort(), addresses: addresses.sort(), routes: [...routes].sort(), dns, rejected: [] }
+  return { snapshot_id: '00000000-0000-0000-0000-000000000001', instance_ids: [...instanceIds].sort(), addresses: addresses.sort(), routes: [...routes].sort(), dns, rejected: [] }
 }
 
 function setConfig(instanceId: string, noTun = false, devName?: string) {
@@ -179,7 +179,7 @@ describe('mobile VPN reconciliation', () => {
       routes: ['fd12:0:0:0:0:0:0:0/64'],
       dns: undefined,
     }))
-    expect(mocks.setTunFd).toHaveBeenCalledWith(1, ['A'])
+    expect(mocks.setTunFd).toHaveBeenCalledWith(1, ['A'], '00000000-0000-0000-0000-000000000001')
   })
 
   it('preserves IPv4 when the DHCPv6 address changes or is withdrawn', async () => {
@@ -221,7 +221,7 @@ describe('mobile VPN reconciliation', () => {
     expect(mocks.startVpn).toHaveBeenLastCalledWith(expect.objectContaining({
       ipv4Addrs: ['fd12::7/64'],
     }))
-    expect(mocks.setTunFd).toHaveBeenLastCalledWith(1, ['A'])
+    expect(mocks.setTunFd).toHaveBeenLastCalledWith(1, ['A'], '00000000-0000-0000-0000-000000000001')
 
     mocks.networkInfo.set('A', { my_node_info: {}, routes: [] })
     await vpn.onNetworkInstanceUpdate('A')
@@ -245,7 +245,7 @@ describe('mobile VPN reconciliation', () => {
     expect(mocks.startVpn).toHaveBeenLastCalledWith(expect.objectContaining({
       ipv4Addrs: ['10.0.0.1/24', 'fd12::7/64'],
     }))
-    expect(mocks.setTunFd).toHaveBeenLastCalledWith(1, ['A', 'B'])
+    expect(mocks.setTunFd).toHaveBeenLastCalledWith(1, ['A', 'B'], '00000000-0000-0000-0000-000000000001')
   })
 
   it('preserves healthy members and reports a rejected bootstrap member', async () => {
@@ -305,7 +305,7 @@ describe('mobile VPN reconciliation', () => {
     const vpn = await loadVpnModule()
     let completed = false
     const start = vpn.onNetworkInstanceChange('A').then(() => { completed = true })
-    await vi.waitFor(() => expect(mocks.setTunFd).toHaveBeenCalledWith(1, ['A']))
+    await vi.waitFor(() => expect(mocks.setTunFd).toHaveBeenCalledWith(1, ['A'], '00000000-0000-0000-0000-000000000001'))
     expect(completed).toBe(false)
     resolve(makeMobileTunConfig(['A']))
     await start
@@ -377,7 +377,7 @@ describe('mobile VPN reconciliation', () => {
     expect(mocks.startVpn).toHaveBeenCalledWith(expect.objectContaining({
       ipv4Addrs: ['10.0.0.1/24', '10.0.1.1/24'],
     }))
-    expect(mocks.setTunFd).toHaveBeenCalledWith(1, ['A', 'B'])
+    expect(mocks.setTunFd).toHaveBeenCalledWith(1, ['A', 'B'], '00000000-0000-0000-0000-000000000001')
 
     mocks.startVpn.mockClear()
     mocks.stopVpn.mockClear()
@@ -388,7 +388,7 @@ describe('mobile VPN reconciliation', () => {
     expect(mocks.startVpn).toHaveBeenCalledWith(expect.objectContaining({
       ipv4Addrs: ['10.0.1.1/24'],
     }))
-    expect(mocks.setTunFd).toHaveBeenLastCalledWith(1, ['B'])
+    expect(mocks.setTunFd).toHaveBeenLastCalledWith(1, ['B'], '00000000-0000-0000-0000-000000000001')
   })
 
   it.each(['A', 'B'])('reattaches a replacement member %s with the same VPN configuration', async (replacementId) => {
@@ -406,7 +406,7 @@ describe('mobile VPN reconciliation', () => {
     const startReplacement = vpn.onNetworkInstanceChange(replacementId)
     await Promise.all([stopA, startReplacement])
 
-    expect(mocks.setTunFd).toHaveBeenLastCalledWith(1, [replacementId])
+    expect(mocks.setTunFd).toHaveBeenLastCalledWith(1, [replacementId], '00000000-0000-0000-0000-000000000001')
     expect(mocks.startVpn).toHaveBeenCalledTimes(2)
     expect(mocks.stopVpn).toHaveBeenCalledTimes(1)
 
@@ -502,7 +502,7 @@ describe('mobile VPN reconciliation', () => {
     expect(mocks.startVpn).toHaveBeenLastCalledWith(expect.objectContaining({
       ipv4Addrs: ['10.0.0.1/24'],
     }))
-    expect(mocks.setTunFd).toHaveBeenLastCalledWith(1, ['A', 'B'])
+    expect(mocks.setTunFd).toHaveBeenLastCalledWith(1, ['A', 'B'], '00000000-0000-0000-0000-000000000001')
   })
 
   it('uses manual routes instead of peer proxy routes', async () => {

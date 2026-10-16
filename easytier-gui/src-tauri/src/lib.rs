@@ -239,19 +239,28 @@ async fn set_logging_level(level: String) -> Result<(), String> {
 }
 
 #[tauri::command]
-async fn set_tun_fd(fd: i32, instance_ids: Option<Vec<Uuid>>) -> Result<MobileTunConfig, String> {
+async fn set_tun_fd(
+    fd: i32,
+    instance_ids: Option<Vec<Uuid>>,
+    snapshot_id: Option<Uuid>,
+) -> Result<MobileTunConfig, String> {
     let Some(instance_manager) = INSTANCE_MANAGER.read().await.clone() else {
         return Err("set_tun_fd is not supported in remote mode".to_string());
     };
 
     #[cfg(any(target_os = "android", target_os = "ios"))]
-    return attach_mobile_tun_fd(instance_manager.as_ref(), fd, instance_ids.as_deref())
-        .await
-        .map_err(|error| error.to_string());
+    return attach_mobile_tun_fd(
+        instance_manager.as_ref(),
+        fd,
+        instance_ids.as_deref(),
+        snapshot_id,
+    )
+    .await
+    .map_err(|error| error.to_string());
 
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
     {
-        let _ = instance_ids;
+        let _ = (instance_ids, snapshot_id);
         if let Some(instance_id) = get_client_manager!()?
             .get_enabled_instances_with_tun_ids()
             .next()

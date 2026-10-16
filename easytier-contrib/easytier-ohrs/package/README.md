@@ -134,13 +134,15 @@ runNetworkInstance(cfgJson: string): boolean
 ### setTunFd
 
 ```ts
-setTunFd(instId: string, fd: number): boolean
+getMobileTunConfig(instId: string): string | null
+setTunFd(instId: string, fd: number, snapshotId?: string): boolean
 ```
 
-为指定网络实例设置 TUN 设备文件描述符。
+先获取配置 JSON，并按其中的 `addresses`、`routes`、`dns` 创建系统 VPN；然后将该配置的 `snapshot_id` 随 TUN fd 一起交回。配置过期时返回失败，调用方应重新获取快照并配置 VPN。
 
 * `instId`：网络实例 ID
-* `fd`：TUN 设备文件描述符
+* `fd`：TUN 设备文件描述符；小于等于 0 表示解绑
+* `snapshotId`：实际安装的配置 JSON 中的 `snapshot_id`；解绑时可省略
 
 ---
 

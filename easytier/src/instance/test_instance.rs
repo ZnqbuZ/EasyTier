@@ -66,6 +66,19 @@ impl TestInstance {
             process_runtime,
             runtime_host.clone(),
         );
+        #[cfg(feature = "tun")]
+        if let Some(routes) = runtime_host.route_context() {
+            adapters.routes = Some(routes.handle.clone());
+            #[cfg(feature = "public-ipv6-provider")]
+            {
+                adapters.public_ipv6_host = Some(Arc::new(
+                    crate::instance::route::runtime::NativePublicIpv6Host::new(
+                        global_ctx.clone(),
+                        routes,
+                    ),
+                ));
+            }
+        }
         customize(&mut adapters);
         adapters.instance_runtime = runtime_host;
         let core = CoreInstance::from_toml(config, adapters)

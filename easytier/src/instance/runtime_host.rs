@@ -1,11 +1,15 @@
-use std::sync::Arc;
-
 #[cfg(feature = "web-client")]
 use easytier_core::config::runtime::CoreInstanceRuntimeConfig;
 use easytier_core::{
     gateway::dhcp::DhcpHost, host::packet::HostPacketReceiver, instance::CorePacketPlane,
 };
-use tokio::sync::Mutex;
+use guarden::guard;
+use guarden::guard::boxed::BoxSyncGuard;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
+use tokio::sync::{Mutex, watch};
 use tokio_util::sync::CancellationToken;
 
 use crate::common::global_ctx::ArcGlobalCtx;
@@ -40,27 +44,40 @@ use event_journal::EventJournal;
 use magic_dns::MagicDnsRuntime;
 use tun_runtime::NativeTunRuntime;
 
+#[derive(derive_more::Deref)]
 pub(crate) struct NativeInstanceRuntimeHost {
+    guard: BoxSyncGuard<NativeInstanceRuntimeState>,
+}
+
+pub(crate) struct NativeInstanceRuntimeState {
     global_ctx: ArcGlobalCtx,
     operation: Arc<Mutex<()>>,
     cancel: CancellationToken,
-    event_journal: EventJournal,
-    tun: NativeTunRuntime,
+    event_journal: Arc<EventJournal>,
+    tun: Arc<NativeTunRuntime>,
+    cleanup_started: AtomicBool,
+    cleanup_result: watch::Sender<Option<Result<(), Arc<str>>>>,
+    #[cfg(feature = "tun")]
+    routes: Option<Arc<super::route::runtime::NativeRouteRuntime>>,
     executor: Option<NativeInstanceExecutor>,
 }
 
 impl NativeInstanceRuntimeHost {
     #[cfg(test)]
     pub(crate) fn new(global_ctx: ArcGlobalCtx) -> Arc<Self> {
-        Self::new_with_executor(global_ctx, None)
+        Self::new_with_executor(global_ctx, None).unwrap()
     }
 
     pub(super) fn new_with_executor(
         global_ctx: ArcGlobalCtx,
         executor: Option<NativeInstanceExecutor>,
-    ) -> Arc<Self> {
+    ) -> anyhow::Result<Arc<Self>> {
+        #[cfg(feature = "tun")]
+        let routes = (!global_ctx.no_tun())
+            .then(|| super::route::runtime::NativeRouteRuntime::new(&global_ctx).map(Arc::new))
+            .transpose()?;
         let cancel = CancellationToken::new();
-        let tun = NativeTunRuntime::new(
+        let tun = Arc::new(NativeTunRuntime::new(
             global_ctx.clone(),
             cancel.clone(),
             #[cfg(feature = "tun")]
@@ -68,22 +85,41 @@ impl NativeInstanceRuntimeHost {
                 .expect("native instance domain must be registered")
                 .nics
                 .clone(),
-        );
-        let event_journal = EventJournal::new(&global_ctx);
-        Arc::new(Self {
+            #[cfg(feature = "tun")]
+            routes.as_ref().map(|routes| routes.context()),
+        ));
+        let event_journal = Arc::new(EventJournal::new(&global_ctx));
+        let state = NativeInstanceRuntimeState {
             global_ctx,
             event_journal,
             operation: Arc::new(Mutex::new(())),
             cancel,
             tun,
             executor,
-        })
+            cleanup_started: AtomicBool::new(false),
+            cleanup_result: watch::channel(None).0,
+            #[cfg(feature = "tun")]
+            routes,
+        };
+        Ok(Arc::new(Self {
+            guard: guard!([state] state.request_runtime_shutdown()).boxed(),
+        }))
     }
 
     async fn prepare_runtime(
         &self,
         packet_plane: Arc<CorePacketPlane>,
+        runtime_config: easytier_core::config::runtime::CoreRuntimeConfigStore,
     ) -> anyhow::Result<Option<Arc<dyn DhcpHost>>> {
+        let _operation = self.operation.lock().await;
+        anyhow::ensure!(!self.cancel.is_cancelled(), "instance runtime is closing");
+        #[cfg(feature = "tun")]
+        if let Some(routes) = &self.routes {
+            routes.bind_config(runtime_config)?;
+        }
+        #[cfg(not(feature = "tun"))]
+        let _ = runtime_config;
+        anyhow::ensure!(!self.cancel.is_cancelled(), "instance runtime is closing");
         self.event_journal.start(self.cancel.clone()).await;
         self.tun.prepare(packet_plane.clone()).await?;
         Ok(Some(
@@ -92,14 +128,26 @@ impl NativeInstanceRuntimeHost {
     }
 
     async fn shutdown_runtime(&self) {
-        self.cancel.cancel();
-        let _operation = self.operation.lock().await;
-        self.event_journal.stop().await;
-        self.tun.shutdown().await;
+        self.request_runtime_shutdown();
+        let mut result = self.cleanup_result.subscribe();
+        while result.borrow_and_update().is_none() {
+            if result.changed().await.is_err() {
+                break;
+            }
+        }
     }
 
-    fn request_runtime_shutdown(&self) {
-        self.cancel.cancel();
+    fn runtime_shutdown_error(&self) -> Option<String> {
+        self.cleanup_result
+            .borrow()
+            .as_ref()
+            .and_then(|result| result.as_ref().err())
+            .map(ToString::to_string)
+    }
+
+    #[cfg(feature = "tun")]
+    pub(super) fn route_context(&self) -> Option<Arc<super::route::runtime::NativeRouteContext>> {
+        self.routes.as_ref().map(|routes| routes.context())
     }
 
     fn management_events_snapshot(&self) -> Vec<String> {
@@ -167,24 +215,118 @@ impl NativeInstanceRuntimeHost {
     #[cfg(all(feature = "tun", mobile))]
     pub(crate) async fn mobile_tun_claims(
         &self,
-        packet_plane: &CorePacketPlane,
-    ) -> (
+        _packet_plane: &CorePacketPlane,
+    ) -> anyhow::Result<(
         crate::instance::shared_virtual_nic::SharedIfConfigClaims,
         Option<crate::instance::shared_virtual_nic::SharedIfConfigClaims>,
         bool,
-    ) {
-        (
-            crate::instance::virtual_nic::NicCtx::mobile_tun_claims(&self.global_ctx, packet_plane)
-                .await,
+    )> {
+        use crate::instance::shared_virtual_nic::{
+            SharedIfConfigClaims, SharedIpv4Route, SharedIpv6Route,
+        };
+        let routes = self
+            .route_context()
+            .ok_or_else(|| anyhow::anyhow!("mobile route controller is unavailable"))?;
+        let mut claims = SharedIfConfigClaims::default();
+        claims.ipv4_addresses.extend(self.global_ctx.get_ipv4());
+        claims.ipv6_addresses.extend(self.global_ctx.get_ipv6());
+        claims.ipv6_addresses.extend(routes.public_address());
+        for route in routes.external_routes()? {
+            match route.destination {
+                cidr::IpCidr::V4(prefix) => {
+                    claims.ipv4_routes.insert(SharedIpv4Route::new(
+                        prefix.first_address(),
+                        prefix.network_length(),
+                        None,
+                    ));
+                }
+                cidr::IpCidr::V6(prefix) => {
+                    claims.ipv6_routes.insert(SharedIpv6Route::new(
+                        prefix.first_address(),
+                        prefix.network_length(),
+                        None,
+                    ));
+                }
+            }
+        }
+        Ok((
+            claims,
             self.tun.current_mobile_tun_claims().await,
             cfg!(feature = "magic-dns")
                 && self.global_ctx.get_flags().accept_dns
                 && self.global_ctx.get_ipv4().is_some(),
-        )
+        ))
+    }
+
+    #[cfg(all(feature = "tun", mobile))]
+    pub(crate) fn instance_run_key(&self) -> uuid::Uuid {
+        self.global_ctx.key()
     }
 
     fn install_packet_receiver(&self, receiver: HostPacketReceiver) -> anyhow::Result<()> {
         self.tun.install_packet_receiver(receiver)
+    }
+}
+
+impl NativeInstanceRuntimeState {
+    fn request_runtime_shutdown(&self) {
+        self.cancel.cancel();
+        #[cfg(feature = "tun")]
+        if let Some(routes) = &self.routes {
+            routes.request_close();
+        }
+        if self.cleanup_started.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let operation = self.operation.clone();
+        let journal = self.event_journal.clone();
+        let tun = self.tun.clone();
+        let result = self.cleanup_result.clone();
+        #[cfg(feature = "tun")]
+        let routes = self.routes.clone();
+        // Created before spawn so loss of an unpolled cleanup is visible too.
+        let on_interrupted = {
+            let result = result.clone();
+            #[cfg(feature = "tun")]
+            let routes = routes.clone();
+            move || {
+                let reason: Arc<str> = "native runtime cleanup was interrupted".into();
+                #[cfg(feature = "tun")]
+                if let Some(routes) = routes {
+                    routes.abandon(reason.clone());
+                }
+                result.send_replace(Some(Err(reason)));
+            }
+        };
+        let interrupted = guard!([on_interrupted] { on_interrupted(); });
+        match crate::host_runtime::native_host_runtime().shared_executor() {
+            Ok(shared) => {
+                shared.spawn(async move {
+                    let _operation = operation.lock().await;
+                    journal.stop().await;
+                    tun.shutdown().await;
+                    #[cfg(feature = "tun")]
+                    let drained = match routes {
+                        Some(routes) => routes
+                            .drain()
+                            .await
+                            .map_err(|error| Arc::<str>::from(format!("{error:#}"))),
+                        None => Ok(()),
+                    };
+                    #[cfg(not(feature = "tun"))]
+                    let drained = Ok(());
+                    if let Err(error) = &drained {
+                        tracing::warn!(%error, "native runtime cleanup incomplete");
+                    }
+                    result.send_replace(Some(drained));
+                    let _ = interrupted.defuse();
+                });
+            }
+            Err(error) => {
+                tracing::error!(?error, "native cleanup executor unavailable");
+                drop(interrupted);
+            }
+        }
     }
 }
 
@@ -198,6 +340,23 @@ mod tests {
 
     fn runtime_host(global_ctx: ArcGlobalCtx) -> Arc<NativeInstanceRuntimeHost> {
         NativeInstanceRuntimeHost::new(global_ctx)
+    }
+
+    #[tokio::test]
+    async fn cleanup_survives_cancellation_of_its_first_waiter() {
+        let global_ctx = Arc::new(GlobalCtx::new(TomlConfig::default()));
+        let host = runtime_host(global_ctx);
+        let permit = host.operation.lock().await;
+        let waiter_host = host.clone();
+        let waiter = tokio::spawn(async move { waiter_host.shutdown_runtime().await });
+        tokio::task::yield_now().await;
+        waiter.abort();
+        let _ = waiter.await;
+        drop(permit);
+        tokio::time::timeout(std::time::Duration::from_secs(3), host.shutdown_runtime())
+            .await
+            .unwrap();
+        assert_eq!(host.cleanup_result.borrow().as_ref(), Some(&Ok(())));
     }
 
     #[cfg(feature = "web-client")]

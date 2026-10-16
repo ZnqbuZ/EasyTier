@@ -4,14 +4,14 @@ use std::collections::BTreeSet;
 #[cfg(mobile)]
 use super::{NativeInstanceManager, NativeInstanceRuntimeHost};
 #[cfg(any(mobile, test))]
-use crate::instance::shared_virtual_nic::{
-    SharedIfConfig, SharedIfConfigClaims, SharedIfConfigConflict, SharedIpv4Route,
-};
+use crate::instance::shared_virtual_nic::{SharedIfConfig, SharedIfConfigClaims, SharedIpv4Route};
 #[cfg(mobile)]
 use easytier_core::instance::CoreInstanceState;
 
-#[derive(Clone, Debug, Default, serde::Serialize)]
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
 pub struct MobileTunConfig {
+    /// Identifies the exact routes/addresses and instance runs installed by the VPN owner.
+    pub snapshot_id: uuid::Uuid,
     pub instance_ids: Vec<uuid::Uuid>,
     pub addresses: Vec<String>,
     pub routes: Vec<String>,
@@ -19,7 +19,7 @@ pub struct MobileTunConfig {
     pub rejected: Vec<MobileTunMemberError>,
 }
 
-#[derive(Clone, Debug, serde::Serialize)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct MobileTunMemberError {
     pub instance_id: uuid::Uuid,
     pub error: String,
@@ -28,6 +28,7 @@ pub struct MobileTunMemberError {
 #[cfg(any(mobile, test))]
 struct MobileTunMember {
     instance_id: uuid::Uuid,
+    run: uuid::Uuid,
     claims: SharedIfConfigClaims,
     current_claims: Option<SharedIfConfigClaims>,
     dns: bool,
@@ -127,6 +128,27 @@ fn config_for_members(
     config.instance_ids.sort();
     config.addresses = addresses.into_iter().collect();
     config.routes = routes.into_iter().collect();
+    let mut runs = members
+        .iter()
+        .map(|member| (member.instance_id, member.run))
+        .collect::<Vec<_>>();
+    runs.sort();
+    // Hash normalized content rather than keeping an unbounded server-side
+    // snapshot cache. Identical declarations keep the same acknowledgement ID.
+    config.snapshot_id = uuid::Uuid::new_v5(
+        &uuid::Uuid::NAMESPACE_OID,
+        format!(
+            "{:?}",
+            (
+                &config.instance_ids,
+                &config.addresses,
+                &config.routes,
+                &config.dns,
+                runs
+            )
+        )
+        .as_bytes(),
+    );
     config
 }
 
@@ -155,11 +177,22 @@ async fn collect_members(
             });
             continue;
         };
-        let (claims, current_claims, dns) = runtime
+        let (claims, current_claims, dns) = match runtime
             .mobile_tun_claims(&instance.as_ref().unwrap().packet_plane())
-            .await;
+            .await
+        {
+            Ok(claims) => claims,
+            Err(error) => {
+                rejected.push(MobileTunMemberError {
+                    instance_id,
+                    error: error.to_string(),
+                });
+                continue;
+            }
+        };
         members.push(MobileTunMember {
             instance_id,
+            run: runtime.instance_run_key(),
             claims,
             current_claims,
             dns,
@@ -178,11 +211,11 @@ pub async fn get_mobile_tun_config(
     config_for_members(&members, rejected)
 }
 
-#[cfg(any(mobile, test))]
+#[cfg(test)]
 fn is_claim_conflict(error: &anyhow::Error) -> bool {
     error
         .chain()
-        .any(|error| error.is::<SharedIfConfigConflict>())
+        .any(|error| error.is::<crate::instance::shared_virtual_nic::SharedIfConfigConflict>())
 }
 
 #[cfg(mobile)]
@@ -190,6 +223,7 @@ pub async fn attach_mobile_tun_fd(
     manager: &NativeInstanceManager,
     fd: i32,
     instance_ids: Option<&[uuid::Uuid]>,
+    snapshot_id: Option<uuid::Uuid>,
 ) -> anyhow::Result<MobileTunConfig> {
     let all_ids = manager
         .instances()
@@ -207,7 +241,7 @@ pub async fn attach_mobile_tun_fd(
     if fd <= 0 {
         let mut errors = Vec::new();
         for id in all_ids {
-            if let Err(error) = attach_member(manager, id, 0, false, None).await {
+            if let Err(error) = attach_member(manager, id, 0, false, None, None).await {
                 errors.push(error.to_string());
             }
         }
@@ -219,7 +253,12 @@ pub async fn attach_mobile_tun_fd(
         return Ok(MobileTunConfig::default());
     }
     let (members, rejected) = collect_members(manager, instance_ids.unwrap_or(&all_ids)).await;
-    let (members, mut rejected) = select_members(members, rejected);
+    let (members, rejected) = select_members(members, rejected);
+    let config = config_for_members(&members, rejected);
+    anyhow::ensure!(
+        snapshot_id == Some(config.snapshot_id),
+        "mobile TUN configuration changed; query and install a new snapshot before attaching"
+    );
     let mut attached = Vec::new();
     // Open once; a rejected member never replaces or tears down this shared fd.
     for member in members {
@@ -228,27 +267,27 @@ pub async fn attach_mobile_tun_fd(
             member.instance_id,
             fd,
             attached.is_empty(),
-            Some(member.claims.clone()),
+            Some(member.run),
+            Some({
+                let mut claims = member.claims.clone();
+                if member.dns {
+                    claims.ipv4_routes.insert(magic_dns_route());
+                }
+                claims
+            }),
         )
         .await
         {
             Ok(()) => attached.push(member),
-            Err(error) if is_claim_conflict(&error) => {
-                attach_member(manager, member.instance_id, 0, false, None).await?;
-                rejected.push(MobileTunMemberError {
-                    instance_id: member.instance_id,
-                    error: error.to_string(),
-                });
-            }
             Err(error) => {
                 for id in &all_ids {
-                    let _ = attach_member(manager, *id, 0, false, None).await;
+                    let _ = attach_member(manager, *id, 0, false, None, None).await;
                 }
                 return Err(error.context("failed to attach mobile TUN fd"));
             }
         }
     }
-    Ok(config_for_members(&attached, rejected))
+    Ok(config)
 }
 
 #[cfg(mobile)]
@@ -257,6 +296,7 @@ async fn attach_member(
     instance_id: uuid::Uuid,
     fd: i32,
     replace_tun_fd: bool,
+    expected_run: Option<uuid::Uuid>,
     claims: Option<SharedIfConfigClaims>,
 ) -> anyhow::Result<()> {
     let instance = manager
@@ -265,6 +305,10 @@ async fn attach_member(
     let runtime = instance
         .runtime_host::<NativeInstanceRuntimeHost>()
         .ok_or_else(|| anyhow::anyhow!("native runtime host is unavailable"))?;
+    anyhow::ensure!(
+        expected_run.is_none_or(|run| run == runtime.instance_run_key()),
+        "instance restarted after its VPN configuration was prepared"
+    );
     runtime
         .attach_mobile_tun_fd(fd, replace_tun_fd, claims)
         .await
@@ -278,6 +322,7 @@ mod tests {
     fn member(id: u128, address: &str) -> MobileTunMember {
         MobileTunMember {
             instance_id: uuid::Uuid::from_u128(id),
+            run: uuid::Uuid::from_u128(id),
             claims: SharedIfConfigClaims {
                 ipv4_addresses: BTreeSet::from([address.parse().unwrap()]),
                 ..Default::default()
@@ -285,6 +330,26 @@ mod tests {
             current_claims: None,
             dns: false,
         }
+    }
+
+    #[test]
+    fn snapshot_tracks_installed_content_and_runs_not_rejection_diagnostics() {
+        let members = vec![member(1, "10.126.126.1/24")];
+        let plain = config_for_members(&members, Vec::new());
+        let rejected = config_for_members(
+            &members,
+            vec![MobileTunMemberError {
+                instance_id: uuid::Uuid::from_u128(2),
+                error: "overlapping subnet".into(),
+            }],
+        );
+        assert_eq!(plain.snapshot_id, rejected.snapshot_id);
+        let mut restarted = members;
+        restarted[0].run = uuid::Uuid::from_u128(3);
+        assert_ne!(
+            plain.snapshot_id,
+            config_for_members(&restarted, Vec::new()).snapshot_id
+        );
     }
 
     #[test]

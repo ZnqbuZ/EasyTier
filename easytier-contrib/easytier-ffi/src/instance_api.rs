@@ -11,7 +11,11 @@ use crate::{
 
 /// # Safety
 /// Set the tun fd
-pub(crate) unsafe fn set_tun_fd(inst_name: *const c_char, fd: c_int) -> c_int {
+pub(crate) unsafe fn set_tun_fd(
+    inst_name: *const c_char,
+    fd: c_int,
+    snapshot_id: *const c_char,
+) -> c_int {
     let inst_name = unsafe {
         assert!(!inst_name.is_null());
         std::ffi::CStr::from_ptr(inst_name)
@@ -30,11 +34,50 @@ pub(crate) unsafe fn set_tun_fd(inst_name: *const c_char, fd: c_int) -> c_int {
         }
     };
 
-    match ffi_context().manager.attach_tun_fd(inst_id, fd) {
+    let result;
+    cfg_select! {
+        any(target_os = "android", target_os = "ios", target_env = "ohos", all(target_os = "macos", feature = "macos-ne")) => {
+            let snapshot = if fd > 0 {
+                let value = match unsafe { crate::strings::c_str_to_string(snapshot_id, "snapshot_id") } {
+                    Ok(value) => value, Err(error) => { set_error_msg(&error); return -1; }
+                };
+                match uuid::Uuid::parse_str(&value) { Ok(id) => Some(id), Err(error) => { set_error_msg(&error.to_string()); return -1; } }
+            } else { None };
+            result = ffi_context().runtime.block_on(easytier::instance::factory::attach_mobile_tun_fd(ffi_context().manager.as_ref(), fd, Some(&[inst_id]), snapshot)).map(|_| ());
+        },
+        _ => {
+            let _ = snapshot_id;
+            result = ffi_context().manager.attach_tun_fd(inst_id, fd);
+        },
+    }
+    match result {
         Ok(_) => 0,
         Err(e) => {
             set_error_msg(&format!("failed to set tun fd: {}", e));
             -1
+        }
+    }
+}
+
+/// Returns the configuration the local VPN owner must install before attaching.
+pub(crate) unsafe fn get_mobile_tun_config(inst_name: *const c_char) -> *mut c_char {
+    let result = (|| -> Result<String, String> {
+        let name = unsafe { crate::strings::c_str_to_string(inst_name, "instance_name") }?;
+        let id = resolve_instance_id_by_name(&name)?
+            .ok_or_else(|| format!("instance not found: {name}"))?;
+        cfg_select! {
+            any(target_os = "android", target_os = "ios", target_env = "ohos", all(target_os = "macos", feature = "macos-ne")) => {
+                let config = ffi_context().runtime.block_on(easytier::instance::factory::get_mobile_tun_config(ffi_context().manager.as_ref(), &[id]));
+                serde_json::to_string(&config).map_err(|error| error.to_string())
+            },
+            _ => { let _ = id; Err("system VPN configuration is unavailable on this target".to_owned()) },
+        }
+    })();
+    match result.and_then(|json| CString::new(json).map_err(|error| error.to_string())) {
+        Ok(json) => json.into_raw(),
+        Err(error) => {
+            set_error_msg(&error);
+            std::ptr::null_mut()
         }
     }
 }
