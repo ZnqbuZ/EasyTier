@@ -3,6 +3,9 @@ use tokio_util::sync::CancellationToken;
 
 use std::{net::Ipv4Addr, sync::Arc, time::Duration};
 
+use easytier_core::host::route::{
+    RouteHandle, RouteSet, RouteSlot, RouteSource, RouteSpec, RouteStatus,
+};
 use easytier_core::instance::CorePacketPlane;
 
 use crate::{common::global_ctx::ArcGlobalCtx, instance::virtual_nic::NicBackend};
@@ -18,31 +21,35 @@ pub struct DnsRunner {
     tun_inet: Ipv4Inet,
     fake_ip: Ipv4Addr,
     shared_route_backend: Option<NicBackend>,
+    managed_routes: Option<RouteHandle>,
     active_fake_ip_route: Option<MagicDnsFakeIpRouteClaim>,
 }
 
-struct MagicDnsFakeIpRouteClaim {
-    fake_ip: Ipv4Addr,
-    route_backend: NicBackend,
+enum MagicDnsFakeIpRouteClaim {
+    Legacy {
+        fake_ip: Ipv4Addr,
+        route_backend: NicBackend,
+    },
+    Managed {
+        slot: RouteSlot,
+    },
 }
 
 impl MagicDnsFakeIpRouteClaim {
-    async fn add(&self) -> anyhow::Result<()> {
-        let cost = if cfg!(target_os = "windows") {
-            Some(4)
-        } else {
-            None
-        };
-
-        self.route_backend
-            .add_route_with_cost(self.fake_ip, 32, cost)
-            .await?;
-        Ok(())
-    }
-
-    async fn remove(&self) {
-        if let Err(err) = self.route_backend.remove_route(self.fake_ip, 32).await {
-            tracing::warn!(?err, fake_ip = ?self.fake_ip, "remove magic dns route failed");
+    async fn remove(self) {
+        match self {
+            // Dropping the slot only withdraws this declaration. It does not
+            // guarantee the physical route is uninstalled: another owner may
+            // still need the same prefix.
+            Self::Managed { slot } => drop(slot),
+            Self::Legacy {
+                fake_ip,
+                route_backend,
+            } => {
+                if let Err(err) = route_backend.remove_route(fake_ip, 32).await {
+                    tracing::warn!(?err, ?fake_ip, "remove magic dns route failed");
+                }
+            }
         }
     }
 }
@@ -64,6 +71,7 @@ impl DnsRunner {
             tun_inet,
             fake_ip,
             shared_route_backend: None,
+            managed_routes: None,
             active_fake_ip_route: None,
         }
     }
@@ -73,33 +81,30 @@ impl DnsRunner {
         self
     }
 
+    pub(crate) fn with_managed_routes(mut self, routes: RouteHandle) -> Self {
+        self.managed_routes = Some(routes);
+        self.shared_route_backend = None;
+        self
+    }
+
     async fn clean_env(&mut self) {
+        if let Some(mut server) = self.server.take() {
+            server.clean_env().await;
+        }
         if let Some(claim) = self.active_fake_ip_route.take() {
             claim.remove().await;
-        }
-        if let Some(server) = self.server.take() {
-            server.clean_env().await;
         }
         self.client.take();
     }
 
     fn should_manage_fake_ip_route_externally(&self) -> bool {
-        self.shared_route_backend.is_some() && !self.tun_inet.contains(&self.fake_ip)
-    }
-
-    fn fake_ip_route_claim(&self) -> Option<MagicDnsFakeIpRouteClaim> {
-        if !self.should_manage_fake_ip_route_externally() {
-            return None;
-        }
-
-        Some(MagicDnsFakeIpRouteClaim {
-            fake_ip: self.fake_ip,
-            route_backend: self.shared_route_backend.clone()?,
-        })
+        (self.shared_route_backend.is_some() || self.managed_routes.is_some())
+            && !self.tun_inet.contains(&self.fake_ip)
     }
 
     async fn run_once(&mut self, cancel_token: &CancellationToken) -> anyhow::Result<()> {
-        // try server first
+        // Try to become the server first. The prepared server owns the resolver
+        // but does not touch system DNS until its fake-ip route is ready.
         let server_result = if self.should_manage_fake_ip_route_externally() {
             MagicDnsServerInstance::new_with_external_fake_ip_route(
                 self.packet_plane.clone(),
@@ -122,15 +127,75 @@ impl DnsRunner {
 
         match server_result {
             Ok(server) => {
+                // Own the prepared server before publishing any route so every
+                // later failure reaches async cleanup through `clean_env`.
                 self.server = Some(server);
-                // Keep the initialized resolver owned by the runner before adding
-                // its route, so route failure still reaches async server cleanup.
-                self.active_fake_ip_route = self.fake_ip_route_claim();
-                if let Some(claim) = &self.active_fake_ip_route {
-                    claim.add().await.map_err(|err| {
-                        anyhow::anyhow!("failed to add magic dns fake-ip route: {err}")
-                    })?;
+
+                if let Some(routes) = self.managed_routes.clone()
+                    && !self.tun_inet.contains(&self.fake_ip)
+                {
+                    let slot = routes.open_slot(RouteSource::Additional)?;
+                    let spec =
+                        RouteSpec::for_tun(cidr::Ipv4Cidr::new(self.fake_ip, 32).unwrap().into());
+                    slot.set_routes(RouteSet::from([spec.clone()]));
+                    self.active_fake_ip_route =
+                        Some(MagicDnsFakeIpRouteClaim::Managed { slot: slot.clone() });
+
+                    loop {
+                        let notified = slot.changed().notified();
+                        match slot.statuses().get(&spec) {
+                            Some(RouteStatus::Ready) => break,
+                            Some(RouteStatus::Pending { .. }) => {
+                                tokio::select! {
+                                    _ = cancel_token.cancelled() => {
+                                        anyhow::bail!("DNS fake-ip route readiness cancelled")
+                                    }
+                                    _ = notified => {}
+                                }
+                            }
+                            Some(RouteStatus::Suppressed(err)) => {
+                                anyhow::bail!("magic dns fake-ip route suppressed: {err}")
+                            }
+                            Some(RouteStatus::Rejected(err)) => {
+                                anyhow::bail!("magic dns fake-ip route rejected: {err}")
+                            }
+                            Some(RouteStatus::Failed(err)) => {
+                                anyhow::bail!("magic dns fake-ip route failed: {err}")
+                            }
+                            None => anyhow::bail!(
+                                "magic dns fake-ip route declaration disappeared while waiting"
+                            ),
+                        }
+                    }
+                } else if self.should_manage_fake_ip_route_externally()
+                    && let Some(route_backend) = self.shared_route_backend.clone()
+                {
+                    self.active_fake_ip_route = Some(MagicDnsFakeIpRouteClaim::Legacy {
+                        fake_ip: self.fake_ip,
+                        route_backend: route_backend.clone(),
+                    });
+                    let cost = if cfg!(target_os = "windows") {
+                        Some(4)
+                    } else {
+                        None
+                    };
+                    route_backend
+                        .add_route_with_cost(self.fake_ip, 32, cost)
+                        .await
+                        .map_err(|err| {
+                            anyhow::anyhow!("failed to add magic dns fake-ip route: {err}")
+                        })?;
                 }
+
+                if cancel_token.is_cancelled() {
+                    anyhow::bail!("DNS server cancelled after route preparation");
+                }
+
+                self.server
+                    .as_ref()
+                    .unwrap()
+                    .apply_system_config(self.global_ctx.get_flags().tld_dns_zone.clone())
+                    .await?;
                 tracing::info!("DnsRunner::run_once: server started");
             }
             Err(e) => {
@@ -138,12 +203,13 @@ impl DnsRunner {
             }
         }
 
-        // Every runner must run a client. Only this phase is cancellable: server
-        // initialization and route updates must finish before async cleanup.
+        // Every runner must run a client. This phase and the pending route wait
+        // above both observe cancellation; server initialization and the system
+        // DNS write are awaited to completion before async cleanup starts.
         tokio::select! {
             _ = cancel_token.cancelled() => Ok(()),
             ret = async {
-                let client = MagicDnsClientInstance::new(self.packet_plane.clone()).await?;
+                let client = MagicDnsClientInstance::new(self.packet_plane.clone(), self.global_ctx.net_ns.clone()).await?;
                 self.client = Some(client);
                 self.client.as_mut().unwrap().run_and_wait().await;
                 Err(anyhow::anyhow!("Client instance exit"))
@@ -172,3 +238,5 @@ impl DnsRunner {
         tracing::info!("DnsRunner::run: cancelled");
     }
 }
+
+

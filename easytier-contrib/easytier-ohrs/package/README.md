@@ -131,16 +131,22 @@ runNetworkInstance(cfgJson: string): boolean
 
 ---
 
-### setTunFd
+### 完整 VPN 配置与本地 TUN
 
 ```ts
-setTunFd(instId: string, fd: number): boolean
+getMobileTunConfig(instId: string): string | null
+setTunFd(instId: string, fd: number, snapshotId?: string): boolean
 ```
 
-为指定网络实例设置 TUN 设备文件描述符。
+`getMobileTunConfig` 会提交该实例的参与范围并返回 Controller 的完整配置 JSON；调用方必须原样使用其中的 `addresses`、`routes` 和 `dns` 创建系统 VPN，不得再按 proxy CIDR、manual 配置或成员信息筛选。正 fd 的 `setTunFd` 等待本地 attach 完成，并在成功后才更新 attached 展示状态；配置过期时返回失败，调用方应重新获取快照并配置 VPN。
 
 * `instId`：网络实例 ID
-* `fd`：TUN 设备文件描述符
+* `fd`：TUN 设备文件描述符；小于等于 0 表示解绑
+* `snapshotId`：实际安装的配置 JSON 中的 `snapshot_id`；解绑时可省略
+
+运行状态读取与范围提交是两类操作：`collectRuntimeStateJson` / `listInstancesJson` 等状态查询只读取当前完整结果，不改变参与范围；查询失败会抛出 NAPI 错误，不会返回默认状态、空 routes 或 `{}` 冒充成功。状态中的 `aggregatedRoutes`/`dnsServers` 只是完整表的展示映射，不是逐路由 Ready；`attachedInstanceIds` 只表示真实本地接入成功后仍有效的成员。
+
+TUN/VPN/FD 始终由 ArkTS 宿主拥有。`setTunFd` 成功只表示本地接入结果，不代表系统 VPN 已创建或关闭；停止时应先等待本地 detach（`fd <= 0`）完成，再释放或关闭宿主自己的 FD。本绑定没有 request/pending/complete 或 MobileAction 协议。
 
 ---
 

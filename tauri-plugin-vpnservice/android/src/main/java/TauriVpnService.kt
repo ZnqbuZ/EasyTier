@@ -23,11 +23,13 @@ class TauriVpnService : VpnService() {
         @JvmField var ipv4Addr: String? = null
         @JvmField var ipv4Addrs: Array<String> = emptyArray()
         @JvmField var routes: Array<String> = emptyArray()
+        @JvmField var snapshotId: String? = null
         @JvmField var dns: String? = null
 
         const val IPV4_ADDR = "IPV4_ADDR"
         const val IPV4_ADDRS = "IPV4_ADDRS"
         const val ROUTES = "ROUTES"
+        const val SNAPSHOT_ID = "SNAPSHOT_ID"
         const val DNS = "DNS"
         const val DISALLOWED_APPLICATIONS = "DISALLOWED_APPLICATIONS"
         const val MTU = "MTU"
@@ -51,6 +53,8 @@ class TauriVpnService : VpnService() {
         startVpnForegroundService()
         ipv4Addr = ipv4Addrs.firstOrNull()
         routes = args?.getStringArray(ROUTES) ?: emptyArray()
+        snapshotId = args?.getString(SNAPSHOT_ID)
+        if (snapshotId == null) { stopSelf(startId); return START_NOT_STICKY }
         dns = args?.getString(DNS)
 
         vpnInterface = createVpnInterface(args)
@@ -58,6 +62,7 @@ class TauriVpnService : VpnService() {
 
         var event_data = JSObject()
         event_data.put("fd", vpnInterface.fd)
+        event_data.put("snapshotId", snapshotId)
         triggerCallback("vpn_service_start", event_data)
         EasyTierVpnTileService.requestStateUpdate(this)
 
@@ -92,7 +97,9 @@ class TauriVpnService : VpnService() {
 
     private fun disconnect() {
         if (self == this && this::vpnInterface.isInitialized) {
-            triggerCallback("vpn_service_stop", JSObject())
+            val event = JSObject()
+            event.put("snapshotId", snapshotId)
+            triggerCallback("vpn_service_stop", event)
             vpnInterface.close()
         }
         clearStatus()
@@ -102,6 +109,7 @@ class TauriVpnService : VpnService() {
         ipv4Addr = null
         ipv4Addrs = emptyArray()
         routes = emptyArray()
+        snapshotId = null
         dns = null
     }
 

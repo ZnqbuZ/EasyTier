@@ -1,6 +1,9 @@
 //! Atomic runtime configuration owned by one core instance.
 
-use std::{collections::BTreeSet, sync::Arc};
+use std::{
+    collections::BTreeSet,
+    sync::{Arc, OnceLock},
+};
 
 use arc_swap::ArcSwap;
 use cidr::{Ipv4Cidr, Ipv6Cidr};
@@ -11,6 +14,7 @@ use super::{
     gateway::{GatewayRuntimeConfig, ProxyRuntimeConfig},
     peers::{AclRuleConfig, PeerRuntimeSnapshot, PublicIpv6ProviderConfig},
 };
+use crate::foundation::dirty::DirtyFlag;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CoreRuntimeConfig {
@@ -63,6 +67,7 @@ struct CoreRuntimeConfigStoreInner {
     update: Mutex<()>,
     peer_changes: tokio::sync::watch::Sender<u64>,
     service_changes: tokio::sync::watch::Sender<u64>,
+    route_dirty: OnceLock<Arc<DirtyFlag>>,
 }
 
 /// Atomic configuration authority shared by one core instance and its peer
@@ -82,12 +87,29 @@ impl CoreRuntimeConfigStore {
                 update: Mutex::new(()),
                 peer_changes,
                 service_changes,
+                route_dirty: OnceLock::new(),
             }),
         }
     }
 
     pub fn snapshot(&self) -> Arc<CoreInstanceRuntimeConfig> {
         self.inner.snapshot.load_full()
+    }
+
+    /// Binds the shared route dirty flag to this store. Only the first binding
+    /// succeeds; a rejected binding neither replaces nor marks the passed flag.
+    /// The bound flag is marked so routes read any policy configured before the
+    /// binding.
+    pub fn bind_route_dirty(&self, dirty: Arc<DirtyFlag>) -> Result<(), ()> {
+        self.inner.route_dirty.set(dirty).map_err(|_| ())?;
+        self.invalidate_routes();
+        Ok(())
+    }
+
+    fn invalidate_routes(&self) {
+        if let Some(dirty) = self.inner.route_dirty.get() {
+            dirty.mark();
+        }
     }
 
     pub(crate) fn with_snapshot<T>(&self, read: impl FnOnce(&CoreInstanceRuntimeConfig) -> T) -> T {
@@ -102,6 +124,8 @@ impl CoreRuntimeConfigStore {
         self.inner
             .service_changes
             .send_modify(|version| *version += 1);
+        drop(_update);
+        self.invalidate_routes();
     }
 
     pub(crate) fn replace_with_current(
@@ -118,6 +142,8 @@ impl CoreRuntimeConfigStore {
         self.inner
             .service_changes
             .send_modify(|version| *version += 1);
+        drop(_update);
+        self.invalidate_routes();
         config
     }
 
@@ -129,22 +155,36 @@ impl CoreRuntimeConfigStore {
         self.inner
             .service_changes
             .send_modify(|version| *version += 1);
+        drop(_update);
+        self.invalidate_routes();
     }
 
     pub fn update_peer(&self, peer: Arc<PeerRuntimeSnapshot>) {
         let _update = self.inner.update.lock();
         let mut config = self.inner.snapshot.load_full().as_ref().clone();
+        let previous_peer = config.peer.clone();
         config.peer = peer;
+        let route_inputs_changed = peer_route_inputs_changed(&previous_peer, &config.peer);
         self.inner.snapshot.store(Arc::new(config));
         self.inner.peer_changes.send_modify(|version| *version += 1);
+        drop(_update);
+        if route_inputs_changed {
+            self.invalidate_routes();
+        }
     }
 
     pub(crate) fn update_peer_with(&self, update: impl FnOnce(&mut PeerRuntimeSnapshot)) {
         let _update = self.inner.update.lock();
         let mut config = self.inner.snapshot.load_full().as_ref().clone();
+        let previous_peer = config.peer.clone();
         update(Arc::make_mut(&mut config.peer));
+        let route_inputs_changed = peer_route_inputs_changed(&previous_peer, &config.peer);
         self.inner.snapshot.store(Arc::new(config));
         self.inner.peer_changes.send_modify(|version| *version += 1);
+        drop(_update);
+        if route_inputs_changed {
+            self.invalidate_routes();
+        }
     }
 
     pub fn subscribe_peer_runtime_changes(&self) -> tokio::sync::watch::Receiver<u64> {
@@ -163,6 +203,17 @@ impl CoreRuntimeConfigStore {
     pub(crate) fn service_change_subscriber_count(&self) -> usize {
         self.inner.service_changes.receiver_count()
     }
+}
+
+/// Peer values the shared route inputs are derived from. Comparisons are by
+/// value; holding a new `Arc` for an equal snapshot is not a change.
+fn peer_route_inputs_changed(
+    previous: &PeerRuntimeSnapshot,
+    current: &PeerRuntimeSnapshot,
+) -> bool {
+    previous.flags.accept_dns != current.flags.accept_dns
+        || previous.runtime.core.routes.ipv4 != current.runtime.core.routes.ipv4
+        || previous.runtime.core.routes.ipv6 != current.runtime.core.routes.ipv6
 }
 
 #[cfg(test)]

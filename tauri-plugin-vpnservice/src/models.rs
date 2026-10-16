@@ -21,6 +21,7 @@ pub struct VoidRequest {}
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct StartVpnRequest {
+    pub snapshot_id: String,
     pub ipv4_addr: Option<String>,
     pub ipv4_addrs: Option<Vec<String>>,
     pub routes: Option<Vec<String>>,
@@ -38,6 +39,7 @@ pub struct Status {
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct VpnStatus {
+    pub snapshot_id: Option<String>,
     pub running: bool,
     pub ipv4_addr: Option<String>,
     pub ipv4_addrs: Option<Vec<String>>,

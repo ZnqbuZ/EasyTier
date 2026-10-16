@@ -10,7 +10,8 @@ use easytier_core::{
 };
 
 use crate::{
-    host_runtime::{NativeHostRuntime, native_host_runtime},
+    common::net_ns::NetNS,
+    host_runtime::{NativeHostRuntime, NativeNetNSServices, native_host_runtime, net_ns_services},
     tunnel::TunnelUrl,
 };
 
@@ -19,6 +20,37 @@ pub use easytier_core::rpc::standalone::{RpcServerHook, StandAloneServer};
 pub type RuntimeRpcDialer = TcpTunnelDialer<NativeHostRuntime>;
 pub type RuntimeRpcListener = TcpTunnelListener<NativeHostRuntime>;
 pub type RuntimeRpcClient = StandAloneClient<RuntimeRpcDialer>;
+pub(crate) type NetNSRpcListener = TcpTunnelListener<NativeNetNSServices>;
+pub(crate) type NetNSRpcClient = StandAloneClient<TcpTunnelDialer<NativeNetNSServices>>;
+
+pub(crate) fn net_ns_rpc_client(
+    net_ns: NetNS,
+    remote_url: url::Url,
+) -> anyhow::Result<NetNSRpcClient> {
+    let net_ns = net_ns_services(&net_ns)?;
+    Ok(StandAloneClient::new(TcpTunnelDialer::new(
+        remote_url,
+        net_ns.clone(),
+        net_ns,
+    )))
+}
+
+pub(crate) fn net_ns_rpc_listener(
+    net_ns: NetNS,
+    local_addr: std::net::SocketAddr,
+) -> anyhow::Result<NetNSRpcListener> {
+    let bind = BindConfig {
+        local_addr: Some(local_addr),
+        only_v6: true,
+        need_protect: false,
+        ..BindConfig::default()
+    };
+    Ok(TcpTunnelListener::new_with_bind(
+        local_addr,
+        bind,
+        net_ns_services(&net_ns)?,
+    ))
+}
 
 pub fn runtime_rpc_dialer(remote_url: url::Url) -> RuntimeRpcDialer {
     TcpTunnelDialer::new(remote_url, native_host_runtime(), native_host_runtime())

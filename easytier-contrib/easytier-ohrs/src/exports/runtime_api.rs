@@ -1,7 +1,7 @@
 use crate::config::repository::{clear_runtime_config_snapshot, get_runtime_config_snapshot};
 use crate::config::types::stored_config::KeyValuePair;
 use crate::kernel_bridge::{
-    aggregate_requested_tun_routes, start_local_socket_server as start_local_socket_server_inner,
+    start_local_socket_server as start_local_socket_server_inner,
     stop_local_socket_server as stop_local_socket_server_inner,
 };
 use crate::runtime::state::runtime_state::{
@@ -10,6 +10,7 @@ use crate::runtime::state::runtime_state::{
     runtime_instance_from_running_info,
 };
 use crate::{ASYNC_RUNTIME, INSTANCE_MANAGER, WEB_CLIENTS};
+use easytier::instance::factory::MobileTunConfig;
 
 pub(crate) fn start_kernel(
     config_id: String,
@@ -24,8 +25,8 @@ pub(crate) fn stop_kernel(
     parse_instance_uuid: impl Fn(&str) -> Option<uuid::Uuid>,
     maybe_stop_local_socket_server: impl Fn(),
 ) -> bool {
-    clear_tun_attached(&config_id);
     if stop_web_client(&config_id) {
+        clear_tun_attached(&config_id);
         clear_runtime_config_snapshot(&config_id);
         return true;
     }
@@ -44,6 +45,7 @@ pub(crate) fn stop_kernel(
             false
         });
     if ret {
+        clear_tun_attached(&config_id);
         clear_runtime_config_snapshot(&config_id);
     }
     let has_active_instances = !INSTANCE_MANAGER.instance_ids().is_empty();
@@ -94,6 +96,7 @@ pub(crate) fn collect_network_infos() -> Vec<KeyValuePair> {
 pub(crate) fn set_tun_fd(
     config_id: String,
     fd: i32,
+    snapshot_id: Option<String>,
     parse_instance_uuid: impl Fn(&str) -> Option<uuid::Uuid>,
 ) -> bool {
     let Some(instance_id) = parse_instance_uuid(&config_id) else {
@@ -101,41 +104,130 @@ pub(crate) fn set_tun_fd(
         return false;
     };
 
-    INSTANCE_MANAGER
-        .attach_tun_fd(instance_id, fd)
+    #[cfg(target_env = "ohos")]
+    let result = {
+        let snapshot = match snapshot_id.map(|id| uuid::Uuid::parse_str(&id)).transpose() {
+            Ok(id) => id,
+            Err(error) => {
+                ohrs_log_error!("[Rust] invalid VPN snapshot: {}", error);
+                return false;
+            }
+        };
+        ASYNC_RUNTIME
+            .block_on(easytier::instance::factory::attach_mobile_tun_fd(
+                INSTANCE_MANAGER.as_ref(),
+                fd,
+                Some(&[instance_id]),
+                snapshot,
+            ))
+            .and_then(|config| {
+                if fd > 0 && !config.instance_ids.contains(&instance_id) {
+                    anyhow::bail!(
+                        "instance {} is not part of the attached mobile configuration",
+                        config_id
+                    );
+                }
+                Ok(())
+            })
+    };
+    #[cfg(not(target_env = "ohos"))]
+    let result = {
+        let _ = snapshot_id;
+        INSTANCE_MANAGER.attach_tun_fd(instance_id, fd)
+    };
+    result
         .map(|_| {
-            mark_tun_attached(&config_id);
-            ohrs_log_info!(
-                "[Rust] set_tun_fd success instance={} fd={} marked_attached=true",
-                config_id,
-                fd
-            );
+            if fd > 0 {
+                mark_tun_attached(&config_id);
+            } else {
+                clear_tun_attached(&config_id);
+            }
             true
         })
-        .unwrap_or_else(|err| {
-            ohrs_log_error!("[Rust] set_tun_fd failed {}: {}", config_id, err);
+        .unwrap_or_else(|error| {
+            // A failed positive attach or negative detach cannot leave a
+            // previous success marker behind.
+            clear_tun_attached(&config_id);
+            ohrs_log_error!("[Rust] set_tun_fd failed {}: {}", config_id, error);
             false
         })
 }
 
-pub(crate) fn collect_runtime_state() -> RuntimeAggregateState {
-    let infos = match ASYNC_RUNTIME.block_on(INSTANCE_MANAGER.collect_network_infos()) {
-        Ok(infos) => infos,
-        Err(err) => {
-            ohrs_log_error!("[Rust] collect network infos failed {}", err);
-            return RuntimeAggregateState {
-                instances: vec![],
-                tun: TunAggregateState {
-                    active: false,
-                    attached_instance_ids: vec![],
-                    aggregated_routes: vec![],
-                    dns_servers: vec![],
-                    need_rebuild: false,
-                },
-                running_instance_count: 0,
-            };
-        }
-    };
+pub(crate) fn get_mobile_tun_config(
+    config_id: String,
+    parse_instance_uuid: impl Fn(&str) -> Option<uuid::Uuid>,
+) -> Option<String> {
+    let id = parse_instance_uuid(&config_id)?;
+    cfg_select! {
+        target_env = "ohos" => {
+            let config = ASYNC_RUNTIME
+                .block_on(easytier::instance::factory::get_mobile_tun_config(
+                    INSTANCE_MANAGER.as_ref(),
+                    &[id],
+                ))
+                .map_err(|error| {
+                    ohrs_log_error!("[Rust] get mobile tun config failed {}: {error:#}", config_id);
+                    error
+                })
+                .ok()?;
+            serde_json::to_string(&config).ok()
+        },
+        _ => { let _ = id; None },
+    }
+}
+
+fn current_mobile_config() -> anyhow::Result<MobileTunConfig> {
+    #[cfg(target_env = "ohos")]
+    {
+        return ASYNC_RUNTIME
+            .block_on(easytier::instance::factory::current_mobile_tun_config(
+                INSTANCE_MANAGER.as_ref(),
+            ))
+            .map_err(|error| {
+                anyhow::anyhow!("read current mobile TUN configuration failed: {error:#}")
+            });
+    }
+    #[cfg(not(target_env = "ohos"))]
+    {
+        anyhow::bail!("current mobile TUN configuration is unavailable on this target")
+    }
+}
+
+fn runtime_aggregate_state(
+    mut instances: Vec<RuntimeInstanceState>,
+    mobile_config: MobileTunConfig,
+) -> RuntimeAggregateState {
+    instances.sort_by(|a, b| {
+        a.display_name
+            .cmp(&b.display_name)
+            .then_with(|| a.instance_id.cmp(&b.instance_id))
+    });
+    let attached_instance_ids = instances
+        .iter()
+        .filter(|instance| instance.running && instance.tun_attached)
+        .map(|instance| instance.instance_id.clone())
+        .collect::<Vec<_>>();
+    let running_instance_count =
+        instances.iter().filter(|instance| instance.running).count() as i32;
+    let tun_active = !attached_instance_ids.is_empty();
+    RuntimeAggregateState {
+        instances,
+        tun: TunAggregateState {
+            active: tun_active,
+            attached_instance_ids,
+            aggregated_routes: mobile_config.routes,
+            dns_servers: mobile_config.dns.into_iter().collect(),
+            need_rebuild: false,
+        },
+        running_instance_count,
+    }
+}
+
+pub(crate) fn collect_runtime_state() -> anyhow::Result<RuntimeAggregateState> {
+    let infos = ASYNC_RUNTIME
+        .block_on(INSTANCE_MANAGER.collect_network_infos())
+        .map_err(|error| anyhow::anyhow!("collect network infos failed: {error:#}"))?;
+    let mobile_config = current_mobile_config()?;
     let mut live_infos = infos
         .into_iter()
         .map(|(instance_id, info)| (instance_id.to_string(), info))
@@ -191,30 +283,7 @@ pub(crate) fn collect_runtime_state() -> RuntimeAggregateState {
         }
     }
 
-    instances.sort_by(|a, b| {
-        a.display_name
-            .cmp(&b.display_name)
-            .then_with(|| a.instance_id.cmp(&b.instance_id))
-    });
-    let attached_instance_ids = instances
-        .iter()
-        .filter(|instance| instance.tun_required)
-        .map(|instance| instance.instance_id.clone())
-        .collect::<Vec<_>>();
-    let aggregated_routes = aggregate_requested_tun_routes(&instances);
-    let running_instance_count =
-        instances.iter().filter(|instance| instance.running).count() as i32;
-    let tun_active = !attached_instance_ids.is_empty();
-
-    RuntimeAggregateState {
-        instances,
-        tun: TunAggregateState {
-            active: tun_active,
-            attached_instance_ids,
-            aggregated_routes,
-            dns_servers: vec![],
-            need_rebuild: false,
-        },
-        running_instance_count,
-    }
+    Ok(runtime_aggregate_state(instances, mobile_config))
 }
+
+

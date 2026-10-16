@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use hickory_proto::rr;
 use hickory_proto::rr::LowerName;
 use hickory_resolver::config::ResolverOpts;
-use hickory_resolver::name_server::TokioConnectionProvider;
+use hickory_resolver::name_server::GenericConnector;
 use hickory_resolver::system_conf::read_system_conf;
 use hickory_server::ServerFuture;
 use hickory_server::authority::{AuthorityObject, Catalog, ZoneType};
@@ -13,14 +13,19 @@ use std::net::SocketAddr;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::net::{TcpListener, UdpSocket};
+use tokio::net::{TcpSocket, UdpSocket};
 use tokio::sync::{RwLock, RwLockReadGuard};
 
-use crate::common::dns::get_default_resolver_config;
+use crate::common::{
+    dns::{RuntimeDnsIoProvider, get_default_resolver_config},
+    net_ns::NetNS,
+};
 
 use super::config::{GeneralConfig, Record, RunConfig};
 
 pub struct Server {
+    net_ns: NetNS,
+    socket_mark: Option<u32>,
     server: ServerFuture<CatalogRequestHandler>,
     catalog: Arc<RwLock<Catalog>>,
     general_config: GeneralConfig,
@@ -71,11 +76,21 @@ pub fn build_authority(domain: &str, records: &[Record]) -> Result<InMemoryAutho
 }
 
 impl Server {
+    #[allow(dead_code)]
     pub fn new(config: RunConfig) -> Self {
         Self::try_new(config).unwrap()
     }
 
+    #[allow(dead_code)]
     fn try_new(config: RunConfig) -> Result<Self> {
+        Self::in_net_ns(config, crate::common::net_ns::current()?, None)
+    }
+
+    pub(crate) fn in_net_ns(
+        config: RunConfig,
+        net_ns: NetNS,
+        socket_mark: Option<u32>,
+    ) -> Result<Self> {
         let mut catalog = Catalog::new();
         for (domain, records) in config.zones().iter() {
             let zone = rr::Name::from_str(domain.as_str())?;
@@ -103,7 +118,7 @@ impl Server {
         };
         let auth = ForwardAuthority::builder_with_config(
             forward_config,
-            TokioConnectionProvider::default(),
+            GenericConnector::new(RuntimeDnsIoProvider::in_net_ns(net_ns.clone(), socket_mark)),
         )
         .build()
         .unwrap();
@@ -115,6 +130,8 @@ impl Server {
         let server = ServerFuture::new(handler);
 
         Ok(Self {
+            net_ns,
+            socket_mark,
             server,
             catalog,
             general_config: config.general().clone(),
@@ -130,31 +147,34 @@ impl Server {
     pub async fn register_udp_socket(&mut self, address: String) -> Result<SocketAddr> {
         let bind_addr = SocketAddr::from_str(&address)
             .with_context(|| format!("DNS Server failed to parse address {}", address))?;
-        let socket = socket2::Socket::new(
-            socket2::Domain::IPV4,
-            socket2::Type::DGRAM,
-            Some(socket2::Protocol::UDP),
-        )
-        .with_context(|| {
-            format!(
-                "DNS Server failed to create UDP socket for address {}",
-                address
+        let socket = self.net_ns.run(|| -> Result<socket2::Socket> {
+            let socket = socket2::Socket::new(
+                socket2::Domain::for_address(bind_addr),
+                socket2::Type::DGRAM,
+                Some(socket2::Protocol::UDP),
             )
-        })?;
-        socket2::SockRef::from(&socket)
-            .set_reuse_address(true)
             .with_context(|| {
                 format!(
-                    "DNS Server failed to set reuse address on socket {}",
+                    "DNS Server failed to create UDP socket for address {}",
                     address
                 )
             })?;
-        socket.bind(&bind_addr.into()).with_context(|| {
-            format!("DNS Server failed to bind socket to address {}", bind_addr)
-        })?;
-        socket
-            .set_nonblocking(true)
-            .with_context(|| "DNS Server failed to set socket to non-blocking".to_string())?;
+            socket2::SockRef::from(&socket)
+                .set_reuse_address(true)
+                .with_context(|| {
+                    format!(
+                        "DNS Server failed to set reuse address on socket {}",
+                        address
+                    )
+                })?;
+            socket.bind(&bind_addr.into()).with_context(|| {
+                format!("DNS Server failed to bind socket to address {}", bind_addr)
+            })?;
+            socket
+                .set_nonblocking(true)
+                .with_context(|| "DNS Server failed to set socket to non-blocking".to_string())?;
+            Ok(socket)
+        })??;
         let socket = UdpSocket::from_std(socket.into()).with_context(|| {
             format!(
                 "DNS Server failed to convert socket to UdpSocket for address {}",
@@ -170,11 +190,59 @@ impl Server {
         Ok(local_addr)
     }
 
+    async fn tcp_addresses(&self, address: &str) -> Result<Vec<SocketAddr>> {
+        use easytier_core::{
+            host::dns::{DnsQuery, DnsResolver},
+            socket::SocketContext,
+        };
+        if let Ok(address) = address.parse() {
+            return Ok(vec![address]);
+        }
+        let (host, port) = address
+            .rsplit_once(':')
+            .context("DNS TCP address requires a port")?;
+        let port: u16 = port.parse().context("invalid DNS TCP port")?;
+        let resolver = crate::common::dns::RuntimeDnsResolver::in_net_ns(self.net_ns.clone());
+        let addresses = resolver
+            .resolve(DnsQuery::new(
+                host,
+                SocketContext {
+                    socket_mark: self.socket_mark,
+                    ..SocketContext::default()
+                },
+            ))
+            .await?;
+        anyhow::ensure!(
+            !addresses.is_empty(),
+            "DNS TCP address resolved to no addresses"
+        );
+        Ok(addresses
+            .into_iter()
+            .map(|ip| SocketAddr::new(ip, port))
+            .collect())
+    }
+
     pub async fn run(&mut self) -> Result<()> {
         if let Some(address) = self.general_config.listen_tcp() {
-            let tcp_listener = TcpListener::bind(address.clone())
-                .await
-                .with_context(|| format!("DNS Server failed to bind TCP address {}", address))?;
+            let mut listener = Err(std::io::Error::other(
+                "DNS TCP address resolved to no addresses",
+            ));
+            for address in self.tcp_addresses(address).await? {
+                listener = self.net_ns.run(|| -> std::io::Result<_> {
+                    let socket = if address.is_ipv4() {
+                        TcpSocket::new_v4()?
+                    } else {
+                        TcpSocket::new_v6()?
+                    };
+                    socket.bind(address)?;
+                    socket.listen(1024)
+                })?;
+                if listener.is_ok() {
+                    break;
+                }
+            }
+            let tcp_listener = listener
+                .with_context(|| format!("DNS Server failed to bind TCP address {address}"))?;
             self.server
                 .register_listener(tcp_listener, Duration::from_secs(5));
         }

@@ -1,9 +1,13 @@
-use std::{ffi::CStr, ptr};
+use std::{
+    ffi::{CStr, CString, c_char},
+    ptr,
+};
 
 use easytier::proto::api::manage::{NetworkInstanceRunningInfo, NetworkInstanceRunningInfoMap};
 use easytier_ffi::{
-    KeyValuePair, collect_network_infos, delete_network_instance, free_string, list_instance,
-    parse_config, retain_network_instance, run_network_instance, set_tun_fd,
+    KeyValuePair, collect_network_infos, delete_network_instance, free_string,
+    get_mobile_tun_config, list_instance, parse_config, retain_network_instance,
+    run_network_instance, set_tun_fd,
 };
 use jni::JNIEnv;
 use jni::objects::{JClass, JObjectArray, JString};
@@ -11,15 +15,47 @@ use jni::sys::{jint, jstring};
 
 use crate::{
     error::{get_last_error, throw_exception},
-    strings::jstring_to_cstring,
+    strings::{jstring_to_cstring, optional_jstring_to_cstring},
 };
+
+/// Select the native snapshot pointer for one JNI setTunFd call.
+///
+/// A positive FD requires a snapshot; detach does not. The returned pointer
+/// borrows the CString that the caller keeps alive for the FFI call.
+fn snapshot_pointer(fd: jint, snapshot: Option<&CString>) -> Result<*const c_char, String> {
+    if fd > 0 && snapshot.is_none() {
+        return Err("VPN snapshot is required when attaching a TUN fd".to_owned());
+    }
+    Ok(snapshot.map_or(ptr::null(), |snapshot| snapshot.as_ptr()))
+}
+
+/// Take ownership of a string returned by easytier-ffi.
+///
+/// The pointer is always released for non-null input. A null pointer is an
+/// FFI error, not an empty configuration.
+unsafe fn take_ffi_string(value: *const c_char) -> Result<String, String> {
+    if value.is_null() {
+        return Err("FFI returned a null string".to_owned());
+    }
+    let result = unsafe { CStr::from_ptr(value) }
+        .to_str()
+        .map(str::to_owned)
+        .map_err(|error| format!("FFI returned invalid UTF-8: {error}"));
+    free_string(value);
+    result
+}
 
 pub(crate) fn set_tun_fd_jni(
     mut env: JNIEnv,
     _class: JClass,
     inst_name: JString,
     fd: jint,
+    snapshot_id: JString,
 ) -> jint {
+    if inst_name.is_null() {
+        throw_exception(&mut env, "instanceName is null");
+        return -1;
+    }
     let inst_name_cstr = match jstring_to_cstring(&mut env, &inst_name) {
         Ok(cstr) => cstr,
         Err(e) => {
@@ -27,14 +63,71 @@ pub(crate) fn set_tun_fd_jni(
             return -1;
         }
     };
+    // Kotlin declares snapshotId nullable for the detach path. A positive FD
+    // still requires it; C receives null only when detaching.
+    let snapshot = match optional_jstring_to_cstring(&mut env, &snapshot_id) {
+        Ok(value) => value,
+        Err(error) => {
+            throw_exception(&mut env, &format!("Invalid VPN snapshot: {error}"));
+            return -1;
+        }
+    };
+    let snapshot_ptr = match snapshot_pointer(fd, snapshot.as_ref()) {
+        Ok(value) => value,
+        Err(error) => {
+            throw_exception(&mut env, &error);
+            return -1;
+        }
+    };
     unsafe {
-        let result = set_tun_fd(inst_name_cstr.as_ptr(), fd);
-        if result != 0
-            && let Some(error) = get_last_error()
-        {
+        let result = set_tun_fd(inst_name_cstr.as_ptr(), fd, snapshot_ptr);
+        if result != 0 {
+            let error = get_last_error().unwrap_or_else(|| "setTunFd failed".to_owned());
             throw_exception(&mut env, &error);
         }
         result
+    }
+}
+
+pub(crate) fn get_mobile_tun_config_jni(
+    mut env: JNIEnv,
+    _class: JClass,
+    inst_name: JString,
+) -> jstring {
+    if inst_name.is_null() {
+        throw_exception(&mut env, "instanceName is null");
+        return ptr::null_mut();
+    }
+    let name = match jstring_to_cstring(&mut env, &inst_name) {
+        Ok(value) => value,
+        Err(error) => {
+            throw_exception(&mut env, &format!("Invalid instance name: {error}"));
+            return ptr::null_mut();
+        }
+    };
+    let config = unsafe { get_mobile_tun_config(name.as_ptr()) };
+    if config.is_null() {
+        throw_exception(
+            &mut env,
+            &get_last_error().unwrap_or_else(|| "VPN configuration is unavailable".to_owned()),
+        );
+        return ptr::null_mut();
+    }
+    // The FFI payload is already the Controller's complete JSON table. JNI
+    // copies it without parsing or filtering routes.
+    let json = match unsafe { take_ffi_string(config) } {
+        Ok(json) => json,
+        Err(error) => {
+            throw_exception(&mut env, &format!("Invalid VPN configuration: {error}"));
+            return ptr::null_mut();
+        }
+    };
+    match env.new_string(json) {
+        Ok(value) => value.into_raw(),
+        Err(error) => {
+            throw_exception(&mut env, &error.to_string());
+            ptr::null_mut()
+        }
     }
 }
 
@@ -283,3 +376,5 @@ pub(crate) fn list_instances_jni(mut env: JNIEnv, _class: JClass, max_length: ji
         }
     }
 }
+
+

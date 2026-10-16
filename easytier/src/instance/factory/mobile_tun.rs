@@ -1,273 +1,451 @@
-#[cfg(any(mobile, test))]
-use std::collections::BTreeSet;
+#![cfg(all(mobile, feature = "management-rpc"))]
 
-#[cfg(mobile)]
-use super::{NativeInstanceManager, NativeInstanceRuntimeHost};
-#[cfg(any(mobile, test))]
-use crate::instance::shared_virtual_nic::{
-    SharedIfConfig, SharedIfConfigClaims, SharedIfConfigConflict, SharedIpv4Route,
+//! Mobile execution adapter.
+//!
+//! The Controller owns every route/member decision. This module only locates
+//! the existing route domain, accepts the host's participation scope for a
+//! query, transfers the complete table, and executes the accepted/withdrawn
+//! members through the existing Native attachment queue. It never selects,
+//! merges or projects routes of its own.
+
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    sync::Arc,
 };
-#[cfg(mobile)]
+
+use anyhow::Context as _;
 use easytier_core::instance::CoreInstanceState;
+use tokio::sync::Notify;
+use uuid::Uuid;
 
-#[derive(Clone, Debug, Default, serde::Serialize)]
-pub struct MobileTunConfig {
-    pub instance_ids: Vec<uuid::Uuid>,
-    pub addresses: Vec<String>,
-    pub routes: Vec<String>,
-    pub dns: Option<String>,
-    pub rejected: Vec<MobileTunMemberError>,
+use super::{NativeCoreInstance, NativeInstanceManager, NativeInstanceRuntimeHost};
+use crate::instance::{
+    route::{
+        RouteController,
+        mobile::{MobilePlan, MobileTunConfig, MobileTunMember, empty_mobile_tun_config},
+    },
+    shared_virtual_nic::SharedVirtualNicMember,
+};
+
+/// One existing route domain observed through an instance's Native runtime.
+struct MobileDomain {
+    controller: RouteController,
+    instance_ids: BTreeSet<Uuid>,
 }
 
-#[derive(Clone, Debug, serde::Serialize)]
-pub struct MobileTunMemberError {
-    pub instance_id: uuid::Uuid,
-    pub error: String,
+fn route_controller(instance: &NativeCoreInstance) -> Option<RouteController> {
+    instance
+        .runtime_host::<NativeInstanceRuntimeHost>()?
+        .route_context()
+        .map(|context| context.controller())
 }
 
-#[cfg(any(mobile, test))]
-struct MobileTunMember {
-    instance_id: uuid::Uuid,
-    claims: SharedIfConfigClaims,
-    current_claims: Option<SharedIfConfigClaims>,
-    dns: bool,
-}
-
-#[cfg(any(mobile, test))]
-fn magic_dns_route() -> SharedIpv4Route {
-    SharedIpv4Route::new(
-        crate::instance::dns_server::MAGIC_DNS_FAKE_IP
-            .parse()
-            .unwrap(),
-        32,
-        Some(1),
-    )
-}
-
-#[cfg(any(mobile, test))]
-fn comparable_claims(mut claims: SharedIfConfigClaims) -> SharedIfConfigClaims {
-    claims.mtu = None;
-    let magic_dns = magic_dns_route();
-    claims
-        .ipv4_routes
-        .retain(|route| route.address != magic_dns.address || route.prefix != magic_dns.prefix);
-    claims
-}
-
-#[cfg(any(mobile, test))]
-fn select_members(
-    mut members: Vec<MobileTunMember>,
-    mut rejected: Vec<MobileTunMemberError>,
-) -> (Vec<MobileTunMember>, Vec<MobileTunMemberError>) {
-    // Keep unchanged attached members ahead of new or reconfigured members.
-    members.sort_by_key(|member| {
-        !member.current_claims.as_ref().is_some_and(|current| {
-            comparable_claims(current.clone()) == comparable_claims(member.claims.clone())
-        })
-    });
-    let mut ifcfg = SharedIfConfig::default();
-    let mut accepted = Vec::new();
-    for member in members {
-        let mut claims = member.claims.clone();
-        if member.dns {
-            claims.ipv4_routes.insert(magic_dns_route());
-        }
-        if let Err(error) = ifcfg.ensure_disjoint(member.instance_id, &claims) {
-            rejected.push(MobileTunMemberError {
-                instance_id: member.instance_id,
-                error: error.to_string(),
-            });
-            continue;
-        }
-        ifcfg.apply_member_claims(member.instance_id, claims);
-        accepted.push(member);
-    }
-    (accepted, rejected)
-}
-
-#[cfg(any(mobile, test))]
-fn config_for_members(
-    members: &[MobileTunMember],
-    rejected: Vec<MobileTunMemberError>,
-) -> MobileTunConfig {
-    let mut config = MobileTunConfig {
-        rejected,
-        ..Default::default()
-    };
-    let mut addresses = BTreeSet::new();
-    let mut routes = BTreeSet::new();
-    for member in members {
-        config.instance_ids.push(member.instance_id);
-        for address in &member.claims.ipv4_addresses {
-            addresses.insert(format!("{address:#}"));
-            routes.insert(format!("{:#}", address.network()));
-        }
-        for address in &member.claims.ipv6_addresses {
-            addresses.insert(format!("{address:#}"));
-            routes.insert(format!("{:#}", address.network()));
-        }
-        for route in &member.claims.ipv4_routes {
-            if let Ok(route) = cidr::Ipv4Inet::new(route.address, route.prefix) {
-                routes.insert(format!("{:#}", route.network()));
-            }
-        }
-        for route in &member.claims.ipv6_routes {
-            if let Ok(route) = cidr::Ipv6Inet::new(route.address, route.prefix) {
-                routes.insert(format!("{:#}", route.network()));
-            }
-        }
-        if member.dns {
-            config.dns = Some(crate::instance::dns_server::MAGIC_DNS_FAKE_IP.to_owned());
-            routes.insert(format!(
-                "{}/32",
-                crate::instance::dns_server::MAGIC_DNS_FAKE_IP
-            ));
-        }
-    }
-    config.instance_ids.sort();
-    config.addresses = addresses.into_iter().collect();
-    config.routes = routes.into_iter().collect();
-    config
-}
-
-#[cfg(mobile)]
-async fn collect_members(
-    manager: &NativeInstanceManager,
-    instance_ids: &[uuid::Uuid],
-) -> (Vec<MobileTunMember>, Vec<MobileTunMemberError>) {
-    let mut members = Vec::new();
-    let mut rejected = Vec::new();
-    let mut seen = BTreeSet::new();
-    for &instance_id in instance_ids {
-        if !seen.insert(instance_id) {
-            continue;
-        }
-        let instance = manager.instance(instance_id);
-        let runtime = instance
-            .as_ref()
-            .filter(|instance| instance.state() == CoreInstanceState::Running)
-            .and_then(|instance| instance.runtime_host::<NativeInstanceRuntimeHost>())
-            .filter(|runtime| runtime.tun_enabled());
-        let Some(runtime) = runtime else {
-            rejected.push(MobileTunMemberError {
-                instance_id,
-                error: "TUN-enabled instance is not running".to_owned(),
-            });
+fn domains(manager: &NativeInstanceManager) -> Vec<MobileDomain> {
+    let mut domains: Vec<MobileDomain> = Vec::new();
+    for instance in manager.instances() {
+        let Some(controller) = route_controller(&instance) else {
             continue;
         };
-        let (claims, current_claims, dns) = runtime
-            .mobile_tun_claims(&instance.as_ref().unwrap().packet_plane())
-            .await;
-        members.push(MobileTunMember {
-            instance_id,
-            claims,
-            current_claims,
-            dns,
+        let instance_id = instance.instance_id();
+        if let Some(domain) = domains
+            .iter_mut()
+            .find(|domain| domain.controller.same_controller(&controller))
+        {
+            domain.instance_ids.insert(instance_id);
+        } else {
+            domains.push(MobileDomain {
+                controller,
+                instance_ids: BTreeSet::from([instance_id]),
+            });
+        }
+    }
+    domains
+}
+
+/// Select exactly one existing route domain for the host's instance scope.
+///
+/// No domain means there is no Controller-owned table to query. Multiple
+/// domains are never merged: the extra instances must disambiguate one, and a
+/// scope spanning several domains is rejected.
+fn select_domain<'a>(
+    domains: &'a [MobileDomain],
+    scope: &BTreeSet<Uuid>,
+) -> anyhow::Result<Option<&'a MobileDomain>> {
+    match domains {
+        [] => Ok(None),
+        [domain] => Ok(Some(domain)),
+        _ => {
+            let matching = domains
+                .iter()
+                .filter(|domain| !domain.instance_ids.is_disjoint(scope))
+                .collect::<Vec<_>>();
+            match matching.as_slice() {
+                [domain] => Ok(Some(domain)),
+                [] if scope.is_empty() => {
+                    anyhow::bail!(
+                        "multiple mobile route domains are available; instance ids are required"
+                    )
+                }
+                [] => anyhow::bail!(
+                    "none of the requested instances belongs to an available mobile route domain"
+                ),
+                _ => anyhow::bail!("requested instances span multiple mobile route domains"),
+            }
+        }
+    }
+}
+
+fn instances_by_id(
+    manager: &NativeInstanceManager,
+) -> BTreeMap<Uuid, std::sync::Arc<NativeCoreInstance>> {
+    manager
+        .instances()
+        .into_iter()
+        .map(|instance| (instance.instance_id(), instance))
+        .collect()
+}
+
+/// Withdraw one member decided by the complete plan.
+///
+/// A still-existing Native runtime receives the existing local detach request.
+/// A removed runtime has no worker left; its Native shutdown owns the final
+/// cleanup, so the plan's member handle is used for a direct registration
+/// close and any error is returned.
+async fn withdraw_plan_member(
+    instances: &BTreeMap<Uuid, std::sync::Arc<NativeCoreInstance>>,
+    run: Uuid,
+    member: Option<&SharedVirtualNicMember>,
+) -> anyhow::Result<()> {
+    for (instance_id, instance) in instances {
+        let Some(runtime) = instance.runtime_host::<NativeInstanceRuntimeHost>() else {
+            continue;
+        };
+        if runtime.instance_run_key() != run {
+            continue;
+        }
+        match runtime
+            .attach_mobile_tun_fd(0, false, None, BTreeSet::new())
+            .await
+        {
+            Ok(()) => return Ok(()),
+            Err(error) => {
+                if let Some(member) = member {
+                    // The runtime can no longer run the queued detach (for
+                    // example it already stopped); closing this registration is
+                    // the remaining local withdrawal.
+                    member.close().await.map_err(|close| {
+                        anyhow::anyhow!(
+                            "failed to detach instance {instance_id} run {run}: {error:#}; \
+                             member close also failed: {close:#}"
+                        )
+                    })?;
+                    return Ok(());
+                }
+                return Err(error)
+                    .with_context(|| format!("failed to detach instance {instance_id} run {run}"));
+            }
+        }
+    }
+    if let Some(member) = member {
+        return member.close().await.map_err(|error| {
+            anyhow::anyhow!("failed to close withdrawn member of removed run {run}: {error:#}")
         });
     }
-    (members, rejected)
+    anyhow::bail!("no native runtime or member handle remains for withdrawn run {run}")
 }
 
-#[cfg(mobile)]
+/// Borrow the existing mobile route domain's change notification.
+///
+/// The handle carries no route table, instance or Registry root: a host task
+/// may keep it while re-reading the complete configuration and must still
+/// decide whether any system VPN action is needed. `None` means no existing
+/// route domain can be identified; this function never creates one and starts
+/// no worker. Once the host task observes a notification it should subscribe
+/// again before reading, because the notification carries no payload and only
+/// wakes waiters registered at the time of the change.
+pub fn mobile_tun_changed() -> Option<Arc<Notify>> {
+    crate::host_runtime::native_host_runtime()
+        .existing_route_controller()
+        .map(|controller| controller.changed().clone())
+}
+
+/// Read the current complete table without submitting a participation scope.
+///
+/// This is the read-only counterpart of [`get_mobile_tun_config`]. It resolves
+/// the same existing Factory domains, then asks the one domain for its current
+/// `mobile_config()`; it never calls `set_mobile_scope`, creates a domain, marks
+/// the shared route input dirty or computes a second policy result.
+///
+/// No identifiable domain returns the normalized empty table. Multiple
+/// distinct domains are an ambiguity error instead of an arbitrary choice or a
+/// merge.
+async fn current_mobile_tun_config_from_domains(
+    domains: &[MobileDomain],
+) -> anyhow::Result<MobileTunConfig> {
+    let Some(domain) = select_domain(domains, &BTreeSet::new())? else {
+        return Ok(empty_mobile_tun_config());
+    };
+    domain.controller.mobile_config().await
+}
+
+/// Read the current complete table of the existing mobile route domain.
+///
+/// This does not accept or submit a participation scope and does not mutate
+/// Controller input state. It is intended for status/diagnostic consumers;
+/// hosts that intentionally change the range must use
+/// [`get_mobile_tun_config`].
+pub async fn current_mobile_tun_config(
+    manager: &NativeInstanceManager,
+) -> anyhow::Result<MobileTunConfig> {
+    let domains = domains(manager);
+    current_mobile_tun_config_from_domains(&domains).await
+}
+
+/// Query the complete table for the host's explicit participation scope.
+///
+/// `instance_ids` is always an explicit scope, including an empty slice. The
+/// Factory only sends it to the Controller and returns the complete result.
 pub async fn get_mobile_tun_config(
     manager: &NativeInstanceManager,
-    instance_ids: &[uuid::Uuid],
-) -> MobileTunConfig {
-    let (members, rejected) = collect_members(manager, instance_ids).await;
-    let (members, rejected) = select_members(members, rejected);
-    config_for_members(&members, rejected)
+    instance_ids: &[Uuid],
+) -> anyhow::Result<MobileTunConfig> {
+    let scope = instance_ids.iter().copied().collect::<BTreeSet<_>>();
+    let domains = domains(manager);
+    let Some(domain) = select_domain(&domains, &scope)? else {
+        // No native route domain exists. This is the normalized empty table,
+        // not a synthesized member list.
+        return Ok(empty_mobile_tun_config());
+    };
+    domain.controller.set_mobile_scope(Some(scope))?;
+    domain.controller.mobile_config().await
 }
 
-#[cfg(any(mobile, test))]
-fn is_claim_conflict(error: &anyhow::Error) -> bool {
-    error
-        .chain()
-        .any(|error| error.is::<SharedIfConfigConflict>())
+/// Detach the host's local TUN from every still-existing Native runtime.
+///
+/// A stopped instance that no longer has an install worker is confirmed through
+/// its Controller record, not by its `closed` flag. An id that was already
+/// removed from the manager is confirmed through a surviving route domain; if
+/// no domain is available, this reports that local release cannot be confirmed.
+async fn detach_mobile_tun_fd(
+    manager: &NativeInstanceManager,
+    instance_ids: Option<&[Uuid]>,
+) -> anyhow::Result<MobileTunConfig> {
+    let instances = instances_by_id(manager);
+    let mut errors = Vec::new();
+    let mut present = BTreeSet::new();
+
+    for (instance_id, instance) in &instances {
+        present.insert(*instance_id);
+        let Some(runtime) = instance.runtime_host::<NativeInstanceRuntimeHost>() else {
+            errors.push(format!(
+                "instance {instance_id} has no native runtime; local release cannot be confirmed"
+            ));
+            continue;
+        };
+        if !runtime.tun_enabled() {
+            continue;
+        }
+        match runtime
+            .attach_mobile_tun_fd(0, false, None, BTreeSet::new())
+            .await
+        {
+            Ok(()) => {}
+            Err(error) if instance.state() != CoreInstanceState::Running => {
+                let confirmed = match runtime.route_context() {
+                    Some(context) => context.drain_local().await,
+                    None => {
+                        errors.push(format!(
+                            "instance {instance_id} has no route context; \
+                             local release cannot be confirmed: {error:#}"
+                        ));
+                        continue;
+                    }
+                };
+                if let Err(confirm) = confirmed {
+                    errors.push(format!(
+                        "instance {instance_id} local detach failed: {error:#}; \
+                         route cleanup is still unconfirmed: {confirm:#}"
+                    ));
+                }
+            }
+            Err(error) => errors.push(format!(
+                "instance {instance_id} local detach failed: {error:#}"
+            )),
+        }
+    }
+
+    if let Some(instance_ids) = instance_ids {
+        let domains = domains(manager);
+        for instance_id in instance_ids
+            .iter()
+            .copied()
+            .collect::<BTreeSet<_>>()
+            .difference(&present)
+        {
+            if domains.is_empty() {
+                errors.push(format!(
+                    "instance {instance_id} is no longer in the manager and no route domain \
+                     is available to confirm its local release"
+                ));
+                continue;
+            }
+            for domain in &domains {
+                if let Err(error) = domain
+                    .controller
+                    .drain_mobile_instance_id(*instance_id)
+                    .await
+                {
+                    errors.push(format!(
+                        "instance {instance_id} was removed from the manager but its local \
+                         route release is unconfirmed: {error:#}"
+                    ));
+                }
+            }
+        }
+    }
+
+    anyhow::ensure!(
+        errors.is_empty(),
+        "mobile TUN local detach is incomplete: {}",
+        errors.join("; ")
+    );
+    // The non-positive FD branch remains an empty local-detach result, never a
+    // complete route table. Callers obtain the target only from get.
+    Ok(MobileTunConfig::default())
 }
 
-#[cfg(mobile)]
+/// Execute one already-validated complete plan.
+///
+/// The Factory never reselects members. It withdraws exactly the plan's
+/// withdrawals, then attaches exactly the accepted members in order. Any real
+/// attach failure waits for the completed queue calls, performs the necessary
+/// local cleanup and returns the original error with cleanup failures in the
+/// chain.
+async fn execute_plan(
+    manager: &NativeInstanceManager,
+    fd: i32,
+    plan: &MobilePlan,
+    scope: Option<&BTreeSet<Uuid>>,
+) -> anyhow::Result<()> {
+    if let Some(scope) = scope
+        && let Some(member) = plan
+            .members
+            .iter()
+            .find(|member| !scope.contains(&member.instance_id))
+    {
+        anyhow::bail!(
+            "accepted member {} is outside the attach caller's instance list",
+            member.instance_id
+        );
+    }
+
+    let instances = instances_by_id(manager);
+    for withdraw in &plan.withdraw {
+        withdraw_plan_member(&instances, withdraw.run, Some(&withdraw.member))
+            .await
+            .with_context(|| {
+                format!("failed to execute mobile route withdrawal {}", withdraw.run)
+            })?;
+    }
+
+    let mut attempted: Vec<&MobileTunMember> = Vec::new();
+    for member in &plan.members {
+        let instance = instances.get(&member.instance_id).ok_or_else(|| {
+            anyhow::anyhow!(
+                "accepted instance {} is no longer in the manager",
+                member.instance_id
+            )
+        })?;
+        anyhow::ensure!(
+            instance.state() == CoreInstanceState::Running,
+            "accepted instance {} is not running",
+            member.instance_id
+        );
+        let runtime = instance
+            .runtime_host::<NativeInstanceRuntimeHost>()
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "accepted instance {} has no native runtime",
+                    member.instance_id
+                )
+            })?;
+        anyhow::ensure!(
+            runtime.tun_enabled(),
+            "accepted instance {} no longer owns a TUN",
+            member.instance_id
+        );
+        anyhow::ensure!(
+            runtime.instance_run_key() == member.run,
+            "instance {} restarted after its VPN configuration was prepared",
+            member.instance_id
+        );
+
+        attempted.push(member);
+        let replace_tun_fd = attempted.len() == 1;
+        if let Err(error) = runtime
+            .attach_mobile_tun_fd(
+                fd,
+                replace_tun_fd,
+                Some(member.claims.clone()),
+                member.installed_prefixes.clone(),
+            )
+            .await
+        {
+            let mut cleanup_errors = Vec::new();
+            for attempted_member in &attempted {
+                if let Err(cleanup) =
+                    withdraw_plan_member(&instances, attempted_member.run, None).await
+                {
+                    cleanup_errors.push(format!(
+                        "instance {}: {cleanup:#}",
+                        attempted_member.instance_id
+                    ));
+                }
+            }
+            let error = error.context("failed to attach mobile TUN fd");
+            if cleanup_errors.is_empty() {
+                return Err(error);
+            }
+            return Err(error.context(format!(
+                "mobile TUN cleanup after attach failure is incomplete: {}",
+                cleanup_errors.join("; ")
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Attach the host's FD to exactly the complete plan accepted for
+/// `snapshot_id`. The current scope is never rewritten here.
 pub async fn attach_mobile_tun_fd(
     manager: &NativeInstanceManager,
     fd: i32,
-    instance_ids: Option<&[uuid::Uuid]>,
+    instance_ids: Option<&[Uuid]>,
+    snapshot_id: Option<Uuid>,
 ) -> anyhow::Result<MobileTunConfig> {
-    let all_ids = manager
-        .instances()
-        .into_iter()
-        .filter(|instance| {
-            instance.state() == CoreInstanceState::Running
-                && instance
-                    .runtime_host::<NativeInstanceRuntimeHost>()
-                    .is_some_and(NativeInstanceRuntimeHost::tun_enabled)
-        })
-        .map(|instance| instance.instance_id())
-        .collect::<BTreeSet<_>>()
-        .into_iter()
-        .collect::<Vec<_>>();
     if fd <= 0 {
-        let mut errors = Vec::new();
-        for id in all_ids {
-            if let Err(error) = attach_member(manager, id, 0, false, None).await {
-                errors.push(error.to_string());
-            }
-        }
-        anyhow::ensure!(
-            errors.is_empty(),
-            "failed to detach mobile TUN fd: {}",
-            errors.join("; ")
-        );
-        return Ok(MobileTunConfig::default());
+        return detach_mobile_tun_fd(manager, instance_ids).await;
     }
-    let (members, rejected) = collect_members(manager, instance_ids.unwrap_or(&all_ids)).await;
-    let (members, mut rejected) = select_members(members, rejected);
-    let mut attached = Vec::new();
-    // Open once; a rejected member never replaces or tears down this shared fd.
-    for member in members {
-        match attach_member(
-            manager,
-            member.instance_id,
-            fd,
-            attached.is_empty(),
-            Some(member.claims.clone()),
-        )
-        .await
-        {
-            Ok(()) => attached.push(member),
-            Err(error) if is_claim_conflict(&error) => {
-                attach_member(manager, member.instance_id, 0, false, None).await?;
-                rejected.push(MobileTunMemberError {
-                    instance_id: member.instance_id,
-                    error: error.to_string(),
-                });
-            }
-            Err(error) => {
-                for id in &all_ids {
-                    let _ = attach_member(manager, *id, 0, false, None).await;
-                }
-                return Err(error.context("failed to attach mobile TUN fd"));
-            }
-        }
-    }
-    Ok(config_for_members(&attached, rejected))
+    let scope = instance_ids.map(|ids| ids.iter().copied().collect::<BTreeSet<_>>());
+    let lookup_scope = scope
+        .clone()
+        .unwrap_or_else(|| manager.instance_ids().into_iter().collect::<BTreeSet<_>>());
+    let domains = domains(manager);
+    let Some(domain) = select_domain(&domains, &lookup_scope)? else {
+        anyhow::bail!("mobile route domain is unavailable; fetch the mobile table first");
+    };
+    let snapshot_id =
+        snapshot_id.ok_or_else(|| anyhow::anyhow!("mobile TUN attach requires a snapshot id"))?;
+    let plan = domain.controller.prepare_mobile_attach(snapshot_id).await?;
+    execute_plan(manager, fd, &plan, scope.as_ref()).await?;
+    Ok(plan.config)
 }
 
-#[cfg(mobile)]
-async fn attach_member(
-    manager: &NativeInstanceManager,
-    instance_id: uuid::Uuid,
-    fd: i32,
-    replace_tun_fd: bool,
-    claims: Option<SharedIfConfigClaims>,
-) -> anyhow::Result<()> {
-    let instance = manager
-        .instance(instance_id)
-        .ok_or_else(|| anyhow::anyhow!("instance {instance_id} is unavailable"))?;
-    let runtime = instance
-        .runtime_host::<NativeInstanceRuntimeHost>()
-        .ok_or_else(|| anyhow::anyhow!("native runtime host is unavailable"))?;
-    runtime
-        .attach_mobile_tun_fd(fd, replace_tun_fd, claims)
-        .await
+#[cfg(test)]
+fn is_claim_conflict(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .any(|error| error.is::<crate::instance::shared_virtual_nic::SharedIfConfigConflict>())
 }
 
 #[cfg(test)]

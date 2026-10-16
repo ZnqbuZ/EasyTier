@@ -446,7 +446,17 @@ pub fn start_local_socket_server() -> bool {
                 continue;
             }
 
-            let snapshot = collect_runtime_state_inner();
+            let snapshot = match collect_runtime_state_inner() {
+                Ok(snapshot) => snapshot,
+                Err(error) => {
+                    // Keep the last successful topology push; a failed state
+                    // query must not be broadcast as an empty success.
+                    ohrs_log_error!("[Rust] collect runtime topology failed: {error:#}");
+                    last_instance_poll_at = Some(now);
+                    thread::sleep(SOCKET_TICK_INTERVAL);
+                    continue;
+                }
+            };
             last_instance_poll_at = Some(now);
             match serde_json::to_string(&snapshot) {
                 Ok(json) => {

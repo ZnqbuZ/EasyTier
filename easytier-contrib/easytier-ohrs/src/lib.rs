@@ -588,11 +588,15 @@ fn pro_runtime_registry_snapshot() -> HashMap<String, String> {
         .unwrap_or_default()
 }
 
-fn call_json_rpc_inner(service_name: &str, method_name: &str, payload_json: &str) -> String {
-    let state = collect_runtime_state_inner();
+fn call_json_rpc_inner(
+    service_name: &str,
+    method_name: &str,
+    payload_json: &str,
+) -> anyhow::Result<String> {
+    let state = collect_runtime_state_inner()?;
     let selector = selected_instance_from_payload(payload_json);
     let Some(instance) = find_runtime_instance(&state, selector.as_deref()) else {
-        return "{}".to_string();
+        return Ok("{}".to_string());
     };
 
     let method = method_name.trim();
@@ -637,7 +641,7 @@ fn call_json_rpc_inner(service_name: &str, method_name: &str, payload_json: &str
         }
         _ => serde_json::json!({}),
     };
-    response.to_string()
+    Ok(response.to_string())
 }
 
 fn resolve_instance_id_from_state(
@@ -651,7 +655,13 @@ fn resolve_instance_id_from_state(
 }
 
 fn resolve_instance_id_inner(instance_name: &str) -> Option<String> {
-    resolve_instance_id_from_state(&collect_runtime_state_inner(), instance_name)
+    match collect_runtime_state_inner() {
+        Ok(state) => resolve_instance_id_from_state(&state, instance_name),
+        Err(error) => {
+            ohrs_log_error!("[Rust] resolve instance id state failed: {error:#}");
+            None
+        }
+    }
 }
 
 fn convert_toml_to_network_config_inner(toml_text: &str) -> Result<String, String> {
@@ -892,25 +902,36 @@ pub fn drain_config_server_events() -> String {
     serde_json::to_string(&drain_config_server_events_inner()).unwrap_or_else(|_| "[]".to_string())
 }
 
-#[napi]
-pub fn collect_runtime_state_json() -> String {
-    serde_json::to_string(&collect_runtime_state_inner()).unwrap_or_else(|_| "{}".to_string())
+fn napi_state_error(error: anyhow::Error) -> napi_ohos::Error {
+    napi_ohos::Error::from_reason(format!("{error:#}"))
 }
 
 #[napi]
-pub fn list_instances_json() -> String {
-    list_instances_json_inner(&collect_runtime_state_inner())
+pub fn collect_runtime_state_json() -> napi_ohos::Result<String> {
+    let state = collect_runtime_state_inner().map_err(napi_state_error)?;
+    serde_json::to_string(&state).map_err(|error| napi_ohos::Error::from_reason(error.to_string()))
 }
 
 #[napi]
-pub fn list_pro_instances_json() -> String {
+pub fn list_instances_json() -> napi_ohos::Result<String> {
+    let state = collect_runtime_state_inner().map_err(napi_state_error)?;
+    Ok(list_instances_json_inner(&state))
+}
+
+#[napi]
+pub fn list_pro_instances_json() -> napi_ohos::Result<String> {
+    let state = collect_runtime_state_inner().map_err(napi_state_error)?;
     let registry = pro_runtime_registry_snapshot();
-    list_pro_instances_json_inner(&collect_runtime_state_inner(), &registry)
+    Ok(list_pro_instances_json_inner(&state, &registry))
 }
 
 #[napi]
-pub fn call_json_rpc(service_name: String, method_name: String, payload_json: String) -> String {
-    call_json_rpc_inner(&service_name, &method_name, &payload_json)
+pub fn call_json_rpc(
+    service_name: String,
+    method_name: String,
+    payload_json: String,
+) -> napi_ohos::Result<String> {
+    call_json_rpc_inner(&service_name, &method_name, &payload_json).map_err(napi_state_error)
 }
 
 #[napi]
@@ -918,15 +939,16 @@ pub fn call_pro_json_rpc(
     service_name: String,
     method_name: String,
     payload_json: String,
-) -> String {
+) -> napi_ohos::Result<String> {
+    let state = collect_runtime_state_inner().map_err(napi_state_error)?;
     let registry = pro_runtime_registry_snapshot();
-    call_pro_json_rpc_inner(
-        &collect_runtime_state_inner(),
+    Ok(call_pro_json_rpc_inner(
+        &state,
         &registry,
         &service_name,
         &method_name,
         &payload_json,
-    )
+    ))
 }
 
 #[napi]
@@ -1054,8 +1076,13 @@ pub fn collect_network_infos() -> Vec<KeyValuePair> {
 }
 
 #[napi]
-pub fn set_tun_fd(config_id: String, fd: i32) -> bool {
-    exports::runtime_api::set_tun_fd(config_id, fd, parse_instance_uuid)
+pub fn set_tun_fd(config_id: String, fd: i32, snapshot_id: Option<String>) -> bool {
+    exports::runtime_api::set_tun_fd(config_id, fd, snapshot_id, parse_instance_uuid)
+}
+
+#[napi]
+pub fn get_mobile_tun_config(config_id: String) -> Option<String> {
+    exports::runtime_api::get_mobile_tun_config(config_id, parse_instance_uuid)
 }
 
 #[napi]
@@ -1224,7 +1251,7 @@ mod tests {
     }
 }
 
-pub(crate) fn collect_runtime_state_inner() -> RuntimeAggregateState {
+pub(crate) fn collect_runtime_state_inner() -> anyhow::Result<RuntimeAggregateState> {
     exports::runtime_api::collect_runtime_state()
 }
 

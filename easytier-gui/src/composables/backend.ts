@@ -88,6 +88,7 @@ export async function setLoggingLevel(level: string) {
 }
 
 export interface MobileTunConfig {
+  snapshot_id: string
   instance_ids: string[]
   addresses: string[]
   routes: string[]
@@ -99,8 +100,8 @@ export async function getMobileTunConfig(instanceIds: string[]) {
   return await invoke<MobileTunConfig>('get_mobile_tun_config', { instanceIds })
 }
 
-export async function setTunFd(fd: number, instanceIds?: string[]) {
-  return await invoke<MobileTunConfig>('set_tun_fd', { fd, instanceIds })
+export async function setTunFd(fd: number, instanceIds?: string[], snapshotId?: string) {
+  return await invoke<MobileTunConfig>('set_tun_fd', { fd, instanceIds, snapshotId })
 }
 
 export async function getEasytierVersion() {
