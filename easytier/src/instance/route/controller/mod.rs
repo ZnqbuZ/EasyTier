@@ -40,6 +40,8 @@ mod desktop;
 mod member;
 #[cfg(all(mobile, feature = "tun"))]
 mod mobile;
+#[cfg(test)]
+mod tests;
 
 #[cfg(not(mobile))]
 use self::desktop::RouteReconciler;

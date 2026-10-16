@@ -6562,4 +6562,84 @@ mod tests {
             Some(3)
         );
     }
+    #[tokio::test]
+    async fn committed_topology_publishes_raw_host_routes_and_stop_withdraws_them() {
+        use crate::foundation::dirty::DirtyFlag;
+        use crate::host::route::Registry;
+        let registry = Arc::new(Registry::new(Arc::new(DirtyFlag::new(false))));
+        let handle = registry.handle();
+        let rpc = Arc::new(PeerRpcManager::new(TestPeerRpcTransport));
+        let route = PeerRoute::new(
+            1,
+            Arc::new(NoopPeerContext::default()),
+            Arc::new(TestPublicIpv6Runtime),
+            rpc,
+        );
+        route.bind_host_routes(&handle).unwrap();
+        assert!(route.bind_host_routes(&handle).is_err());
+        let raw = || {
+            route
+                .service_impl
+                .host_routes
+                .lock()
+                .as_ref()
+                .map(|slot| slot.statuses().into_keys().collect::<RouteSet>())
+                .unwrap_or_default()
+        };
+        assert!(raw().is_empty());
+        let service = &route.service_impl;
+        install_peer_info(service, 1, vec![1; 32], false);
+        install_peer_info(service, 2, vec![2; 32], false);
+        service
+            .synced_route_info
+            .peer_infos
+            .write()
+            .get_mut(&1)
+            .unwrap()
+            .proxy_cidrs = vec!["10.90.0.0/24".into()];
+        service
+            .synced_route_info
+            .peer_infos
+            .write()
+            .get_mut(&2)
+            .unwrap()
+            .proxy_cidrs = vec!["10.50.0.0/24".into()];
+        install_conn_row(service, 1, [2]);
+        install_conn_row(service, 2, [1]);
+        service.synced_route_info.version.inc();
+        service.update_route_table();
+        assert_eq!(
+            raw(),
+            RouteSet::from([RouteSpec::for_tun("10.50.0.0/24".parse().unwrap())])
+        );
+        service.update_route_table();
+        assert_eq!(
+            raw(),
+            RouteSet::from([RouteSpec::for_tun("10.50.0.0/24".parse().unwrap())])
+        );
+        service
+            .synced_route_info
+            .peer_infos
+            .write()
+            .get_mut(&2)
+            .unwrap()
+            .proxy_cidrs = vec!["10.51.0.0/24".into()];
+        service.synced_route_info.version.inc();
+        service.update_route_table();
+        assert_eq!(
+            raw(),
+            RouteSet::from([RouteSpec::for_tun("10.51.0.0/24".parse().unwrap())])
+        );
+        service.synced_route_info.conn_map.write().clear();
+        service.synced_route_info.version.inc();
+        service.update_route_table();
+        assert!(raw().is_empty());
+        route.stop().await;
+        assert!(route.service_impl.host_routes.lock().is_none());
+        assert!(
+            registry.slots().is_empty(),
+            "the stopped producer must leave no input for the registry"
+        );
+        assert!(route.bind_host_routes(&handle).is_err());
+    }
 }

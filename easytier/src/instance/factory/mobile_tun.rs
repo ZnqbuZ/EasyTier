@@ -450,105 +450,142 @@ fn is_claim_conflict(error: &anyhow::Error) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::{sync::Arc, time::Duration};
+
     use super::*;
-    use crate::instance::shared_virtual_nic::SharedIpv6Route;
+    use crate::{
+        common::{config::TomlConfig, global_ctx::GlobalCtx, net_ns::tests::test_net_ns},
+        instance::{
+            shared_virtual_nic::{SharedIfConfig, SharedVirtualNicRegistry},
+            virtual_nic::VirtualNicConfig,
+        },
+        utils::dirty::DirtyFlag,
+    };
+    use tokio::sync::Notify;
 
-    fn member(id: u128, address: &str) -> MobileTunMember {
-        MobileTunMember {
-            instance_id: uuid::Uuid::from_u128(id),
-            claims: SharedIfConfigClaims {
-                ipv4_addresses: BTreeSet::from([address.parse().unwrap()]),
-                ..Default::default()
+    fn test_controller() -> RouteController {
+        RouteController::new(Arc::new(DirtyFlag::new(false)))
+    }
+
+    fn input_instance(
+        controller: &RouteController,
+        ipv4: &str,
+    ) -> (
+        Uuid,
+        Arc<GlobalCtx>,
+        Arc<easytier_core::host::route::Registry>,
+    ) {
+        let global = Arc::new(GlobalCtx::new(TomlConfig::default()));
+        let run = global.key();
+        let root = controller.open_instance(run).unwrap();
+        controller
+            .bind_mobile_inputs(
+                run,
+                Arc::downgrade(&global),
+                Arc::new(parking_lot::Mutex::new(None)),
+            )
+            .unwrap();
+        global.set_ipv4(Some(ipv4.parse().unwrap()));
+        (global.get_id(), global, root)
+    }
+
+    #[test]
+    fn domain_selection_never_merges_and_requires_an_explicit_disambiguator() {
+        let controller_a =
+            RouteController::new(Arc::new(crate::utils::dirty::DirtyFlag::new(false)));
+        let controller_b =
+            RouteController::new(Arc::new(crate::utils::dirty::DirtyFlag::new(false)));
+        let id_a = Uuid::from_u128(1);
+        let id_b = Uuid::from_u128(2);
+        let domains = vec![
+            MobileDomain {
+                controller: controller_a,
+                instance_ids: BTreeSet::from([id_a]),
             },
-            current_claims: None,
-            dns: false,
-        }
-    }
+            MobileDomain {
+                controller: controller_b,
+                instance_ids: BTreeSet::from([id_b]),
+            },
+        ];
 
-    #[test]
-    fn keeps_attached_member_when_bootstrap_subnets_overlap() {
-        let mut existing = member(2, "10.126.126.2/24");
-        existing.current_claims = Some(existing.claims.clone());
-        let (members, rejected) =
-            select_members(vec![member(1, "10.126.126.1/24"), existing], Vec::new());
-        let config = config_for_members(&members, rejected);
-        assert_eq!(config.instance_ids, vec![uuid::Uuid::from_u128(2)]);
-        assert_eq!(config.addresses, vec!["10.126.126.2/24"]);
-        assert_eq!(config.routes, vec!["10.126.126.0/24"]);
-        assert_eq!(config.rejected[0].instance_id, uuid::Uuid::from_u128(1));
-    }
-
-    #[test]
-    fn reconfigured_member_does_not_displace_unchanged_member() {
-        let mut changed = member(1, "10.0.2.1/24");
-        changed.current_claims = Some(member(1, "10.0.1.1/24").claims);
-        let mut unchanged = member(2, "10.0.2.2/24");
-        unchanged.current_claims = Some(unchanged.claims.clone());
-        unchanged.current_claims.as_mut().unwrap().mtu = Some(1300);
-        let (members, rejected) = select_members(vec![changed, unchanged], Vec::new());
-        let config = config_for_members(&members, rejected);
-        assert_eq!(config.instance_ids, vec![uuid::Uuid::from_u128(2)]);
-        assert_eq!(config.rejected[0].instance_id, uuid::Uuid::from_u128(1));
-    }
-
-    #[test]
-    fn projects_ipv6_and_shared_dns_and_rejects_overlapping_proxy_routes() {
-        let mut first = member(1, "10.0.1.1/24");
-        first.dns = true;
-        first
-            .claims
-            .ipv4_addresses
-            .insert("10.0.4.1/32".parse().unwrap());
-        first
-            .claims
-            .ipv6_addresses
-            .insert("2001:db8::1/128".parse().unwrap());
-        first
-            .claims
-            .ipv6_routes
-            .insert(SharedIpv6Route::new("::".parse().unwrap(), 0, Some(5)));
-        let mut second = member(2, "10.0.2.1/24");
-        second.dns = true;
-        let (members, rejected) = select_members(
-            vec![first, second, member(3, "100.100.100.101/32")],
-            Vec::new(),
+        assert!(
+            select_domain(&domains, &BTreeSet::from([id_a]))
+                .unwrap()
+                .is_some()
         );
-        let config = config_for_members(&members, rejected);
-        assert_eq!(config.instance_ids.len(), 2);
-        assert!(config.addresses.contains(&"10.0.4.1/32".to_owned()));
-        assert!(config.routes.contains(&"10.0.4.1/32".to_owned()));
-        assert!(config.addresses.contains(&"2001:db8::1/128".to_owned()));
-        assert!(config.routes.contains(&"2001:db8::1/128".to_owned()));
-        assert!(config.routes.contains(&"::/0".to_owned()));
-        assert_eq!(
-            config
-                .routes
-                .iter()
-                .filter(|route| *route == "100.100.100.101/32")
-                .count(),
-            1
+        assert!(
+            select_domain(&domains, &BTreeSet::from([id_a, id_b])).is_err(),
+            "an attach spanning domains must be rejected, not merged"
         );
-        assert_eq!(config.dns.as_deref(), Some("100.100.100.101"));
-        assert_eq!(config.rejected[0].instance_id, uuid::Uuid::from_u128(3));
-        let mut route_owner = member(2, "10.0.2.1/24");
-        route_owner.claims.ipv4_routes.insert(SharedIpv4Route::new(
-            "10.0.1.0".parse().unwrap(),
-            24,
+        assert!(
+            select_domain(&domains, &BTreeSet::new()).is_err(),
+            "an empty scope cannot choose between existing domains"
+        );
+        assert!(select_domain(&domains, &BTreeSet::from([Uuid::from_u128(3)])).is_err());
+    }
+
+    #[test]
+    fn empty_mobile_config_is_normalized_not_a_default_uuid() {
+        let config = empty_mobile_tun_config();
+        assert_ne!(config.snapshot_id, Uuid::nil());
+        assert!(config.instance_ids.is_empty());
+        assert!(config.addresses.is_empty());
+        assert!(config.routes.is_empty());
+        assert!(config.rejected.is_empty());
+    }
+
+    #[tokio::test]
+    async fn no_domain_returns_an_empty_get_and_rejects_real_attach() {
+        use easytier_core::process_runtime::CoreProcessRuntime;
+
+        let manager = easytier_core::instance::manager::InstanceManager::new(
+            super::super::NativeInstanceFactory::new(CoreProcessRuntime::new()),
             None,
-        ));
-        let (members, rejected) =
-            select_members(vec![member(1, "10.0.1.1/24"), route_owner], Vec::new());
-        let config = config_for_members(&members, rejected);
-        assert_eq!(config.instance_ids.len(), 1);
-        assert_eq!(config.rejected[0].instance_id, uuid::Uuid::from_u128(2));
+        );
+        let config = get_mobile_tun_config(&manager, &[]).await.unwrap();
+        assert_eq!(config.snapshot_id, empty_mobile_tun_config().snapshot_id);
+        assert!(config.instance_ids.is_empty());
+
+        let current = current_mobile_tun_config(&manager).await.unwrap();
+        assert_eq!(current.snapshot_id, empty_mobile_tun_config().snapshot_id);
+        assert!(current.instance_ids.is_empty());
+
+        let attach =
+            attach_mobile_tun_fd(&manager, 1, Some(&[Uuid::new_v4()]), Some(Uuid::new_v4()))
+                .await
+                .expect_err("real attach without a route domain must fail");
+        assert!(attach.to_string().contains("route domain"));
+
+        let detach = attach_mobile_tun_fd(&manager, 0, Some(&[Uuid::new_v4()]), None)
+            .await
+            .expect_err("a removed instance cannot be claimed as locally released");
+        assert!(
+            detach.to_string().contains("cannot be confirmed")
+                || detach.to_string().contains("no route domain")
+        );
     }
 
     #[test]
     fn distinguishes_claim_conflicts_from_device_failures_through_context() {
+        let id = Uuid::from_u128(1);
         let mut claims = SharedIfConfig::default();
-        claims.apply_member_claims(uuid::Uuid::from_u128(1), member(1, "10.0.1.1/24").claims);
+        claims.apply_member_claims(
+            id,
+            crate::instance::shared_virtual_nic::SharedIfConfigClaims {
+                ipv4_addresses: std::collections::BTreeSet::from(["10.0.1.1/24".parse().unwrap()]),
+                ..Default::default()
+            },
+        );
         let conflict = claims
-            .ensure_disjoint(uuid::Uuid::from_u128(2), &member(2, "10.0.1.2/24").claims)
+            .ensure_disjoint(
+                Uuid::from_u128(2),
+                &crate::instance::shared_virtual_nic::SharedIfConfigClaims {
+                    ipv4_addresses: std::collections::BTreeSet::from(["10.0.1.2/24"
+                        .parse()
+                        .unwrap()]),
+                    ..Default::default()
+                },
+            )
             .unwrap_err();
         let error = anyhow::Error::new(crate::common::error::Error::from(conflict))
             .context("attach mobile TUN failed");
@@ -556,5 +593,132 @@ mod tests {
         assert!(!is_claim_conflict(&anyhow::Error::new(
             std::io::Error::from_raw_os_error(19)
         )));
+    }
+
+    #[tokio::test]
+    async fn current_read_keeps_the_existing_scope_and_inputs_quiet() {
+        let controller = test_controller();
+        let (id_a, _global_a, _root_a) = input_instance(&controller, "10.1.1.1/24");
+        let (id_b, _global_b, _root_b) = input_instance(&controller, "10.2.2.1/24");
+        let domains = vec![MobileDomain {
+            controller: controller.clone(),
+            instance_ids: BTreeSet::from([id_a, id_b]),
+        }];
+
+        controller
+            .set_mobile_scope(Some(BTreeSet::from([id_a])))
+            .unwrap();
+        controller.reset_route_input_dirty();
+        let changed = controller.changed().clone();
+        let notified = changed.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+
+        let config = current_mobile_tun_config_from_domains(&domains)
+            .await
+            .unwrap();
+        assert_eq!(config.instance_ids, vec![id_a]);
+        assert!(
+            config
+                .addresses
+                .iter()
+                .any(|address| address == "10.1.1.1/24")
+        );
+        assert!(
+            !config
+                .addresses
+                .iter()
+                .any(|address| address == "10.2.2.1/24")
+        );
+        assert!(!controller.route_input_is_dirty());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), notified)
+                .await
+                .is_err(),
+            "a read-only query must not notify"
+        );
+
+        // Reading again keeps the same scope; it does not expand to all members.
+        let again = current_mobile_tun_config_from_domains(&domains)
+            .await
+            .unwrap();
+        assert_eq!(again.instance_ids, vec![id_a]);
+        assert!(!controller.route_input_is_dirty());
+
+        controller.set_mobile_scope(None).unwrap();
+        controller.reset_route_input_dirty();
+        let all = current_mobile_tun_config_from_domains(&domains)
+            .await
+            .unwrap();
+        assert_eq!(
+            all.instance_ids.into_iter().collect::<BTreeSet<_>>(),
+            BTreeSet::from([id_a, id_b])
+        );
+        assert!(!controller.route_input_is_dirty());
+
+        controller.set_mobile_scope(Some(BTreeSet::new())).unwrap();
+        controller.reset_route_input_dirty();
+        let empty = current_mobile_tun_config_from_domains(&domains)
+            .await
+            .unwrap();
+        assert!(empty.instance_ids.is_empty());
+        assert!(empty.addresses.is_empty());
+        assert!(empty.routes.is_empty());
+        assert!(!controller.route_input_is_dirty());
+    }
+
+    #[tokio::test]
+    async fn current_read_distinguishes_no_domain_from_multiple_domains() {
+        let config = current_mobile_tun_config_from_domains(&[]).await.unwrap();
+        assert_eq!(config.snapshot_id, empty_mobile_tun_config().snapshot_id);
+        assert!(config.instance_ids.is_empty());
+
+        let domains = vec![
+            MobileDomain {
+                controller: test_controller(),
+                instance_ids: BTreeSet::from([Uuid::from_u128(1)]),
+            },
+            MobileDomain {
+                controller: test_controller(),
+                instance_ids: BTreeSet::from([Uuid::from_u128(2)]),
+            },
+        ];
+        let error = current_mobile_tun_config_from_domains(&domains)
+            .await
+            .expect_err("multiple domains must be an explicit ambiguity error");
+        assert!(
+            error.to_string().contains("multiple mobile route domains"),
+            "{error:#}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn current_read_propagates_a_claim_read_failure() {
+        let controller = test_controller();
+        let (id, _global, _root) = input_instance(&controller, "10.3.3.1/24");
+        let run = _global.key();
+        let mut nics = SharedVirtualNicRegistry::new();
+        let member = nics.create_member(
+            format!("et-{run}"),
+            VirtualNicConfig::new(format!("et-{run}"), 1400, test_net_ns(None)),
+            run,
+            Arc::new(Notify::new()),
+        );
+        controller.bind_member(run, &member).unwrap();
+        let shared_nic = member.shared_nic();
+        let lock = shared_nic.lock().await;
+        let domains = vec![MobileDomain {
+            controller,
+            instance_ids: BTreeSet::from([id]),
+        }];
+
+        let error = current_mobile_tun_config_from_domains(&domains)
+            .await
+            .expect_err("a facts read failure must propagate");
+        assert!(
+            format!("{error:#}").contains("timed out reading current claims"),
+            "{error:#}"
+        );
+        drop(lock);
     }
 }

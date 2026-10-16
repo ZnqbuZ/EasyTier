@@ -384,4 +384,391 @@ fn comparable_claims(claims: &SharedIfConfigClaims) -> ComparableClaims {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::instance::shared_virtual_nic::SharedIpv6Route as TestIpv6Route;
 
+    fn member(id: u128, address: &str) -> MobileTunMember {
+        MobileTunMember::new(
+            uuid::Uuid::from_u128(id),
+            uuid::Uuid::from_u128(id),
+            SharedIfConfigClaims {
+                ipv4_addresses: BTreeSet::from([address.parse().unwrap()]),
+                ..Default::default()
+            },
+            None,
+            false,
+        )
+    }
+
+    #[test]
+    fn snapshot_tracks_installed_content_and_runs_not_rejection_diagnostics() {
+        let members = vec![member(1, "10.126.126.1/24")];
+        let plain = config_for_members(&members, Vec::new());
+        let rejected = config_for_members(
+            &members,
+            vec![MobileTunMemberError {
+                instance_id: uuid::Uuid::from_u128(2),
+                error: "overlapping subnet".into(),
+            }],
+        );
+        assert_eq!(plain.snapshot_id, rejected.snapshot_id);
+        let mut restarted = members;
+        restarted[0].run = uuid::Uuid::from_u128(3);
+        assert_ne!(
+            plain.snapshot_id,
+            config_for_members(&restarted, Vec::new()).snapshot_id
+        );
+    }
+
+    #[test]
+    fn snapshot_tracks_per_member_route_ownership() {
+        let mut owner_a = member(1, "10.0.1.1/24");
+        owner_a.claims.ipv4_routes.insert(SharedIpv4Route::new(
+            "10.0.5.0".parse().unwrap(),
+            24,
+            None,
+        ));
+        let (members, rejected) =
+            select_members(vec![owner_a, member(2, "10.0.2.1/24")], Vec::new());
+        assert!(rejected.is_empty());
+        let before = config_for_members(&members, rejected);
+
+        let mut owner_b = member(2, "10.0.2.1/24");
+        owner_b.claims.ipv4_routes.insert(SharedIpv4Route::new(
+            "10.0.5.0".parse().unwrap(),
+            24,
+            None,
+        ));
+        let (members, rejected) =
+            select_members(vec![member(1, "10.0.1.1/24"), owner_b], Vec::new());
+        assert!(rejected.is_empty());
+        let after = config_for_members(&members, rejected);
+
+        assert_eq!(before.addresses, after.addresses);
+        assert_eq!(before.routes, after.routes);
+        assert_eq!(before.instance_ids, after.instance_ids);
+        assert_ne!(before.snapshot_id, after.snapshot_id);
+    }
+
+    #[test]
+    fn snapshot_tracks_dns_owner_when_union_is_unchanged() {
+        let mut first = member(1, "10.0.1.1/24");
+        first.dns = true;
+        let (members, rejected) = select_members(vec![first, member(2, "10.0.2.1/24")], Vec::new());
+        assert!(rejected.is_empty());
+        let before = config_for_members(&members, rejected);
+
+        let mut second = member(2, "10.0.2.1/24");
+        second.dns = true;
+        let (members, rejected) =
+            select_members(vec![member(1, "10.0.1.1/24"), second], Vec::new());
+        assert!(rejected.is_empty());
+        let after = config_for_members(&members, rejected);
+
+        assert_eq!(before.dns, after.dns);
+        assert_eq!(before.routes, after.routes);
+        assert_ne!(before.snapshot_id, after.snapshot_id);
+    }
+
+    #[test]
+    fn snapshot_ignores_member_input_order() {
+        let first = member(1, "10.0.1.1/24");
+        let second = member(2, "10.0.2.1/24");
+        let (members, rejected) = select_members(vec![first.clone(), second.clone()], Vec::new());
+        assert!(rejected.is_empty());
+        let forward = config_for_members(&members, rejected);
+        let (members, rejected) = select_members(vec![second, first], Vec::new());
+        assert!(rejected.is_empty());
+        let backward = config_for_members(&members, rejected);
+
+        assert_eq!(forward.routes, backward.routes);
+        assert_eq!(forward.snapshot_id, backward.snapshot_id);
+    }
+
+    #[test]
+    fn snapshot_ignores_mtu_costs_hints_and_diagnostics() {
+        let first = member(1, "10.0.1.1/24");
+        let second = member(2, "10.0.2.1/24");
+        let (members, rejected) = select_members(vec![first.clone(), second.clone()], Vec::new());
+        assert!(rejected.is_empty());
+        let base = config_for_members(&members, rejected);
+
+        let mut with_mtu = first.clone();
+        with_mtu.claims.mtu = Some(1300);
+        let (members, rejected) = select_members(vec![with_mtu, second.clone()], Vec::new());
+        assert!(rejected.is_empty());
+        assert_eq!(
+            base.snapshot_id,
+            config_for_members(&members, rejected).snapshot_id
+        );
+
+        let mut cheap = first.clone();
+        cheap.claims.ipv4_routes.insert(SharedIpv4Route::new(
+            "10.0.7.0".parse().unwrap(),
+            24,
+            Some(1),
+        ));
+        let mut expensive = cheap.clone();
+        expensive.claims.ipv4_routes = BTreeSet::from([SharedIpv4Route::new(
+            "10.0.7.0".parse().unwrap(),
+            24,
+            Some(9),
+        )]);
+        let (members, rejected) = select_members(vec![cheap, second.clone()], Vec::new());
+        assert!(rejected.is_empty());
+        let cheap = config_for_members(&members, rejected);
+        let (members, rejected) = select_members(vec![expensive, second.clone()], Vec::new());
+        assert!(rejected.is_empty());
+        let expensive = config_for_members(&members, rejected);
+        assert_eq!(cheap.routes, expensive.routes);
+        assert_eq!(cheap.snapshot_id, expensive.snapshot_id);
+
+        let mut hinted = first.clone();
+        hinted.current_claims = Some(SharedIfConfigClaims {
+            ipv4_addresses: BTreeSet::from(["10.0.9.1/24".parse().unwrap()]),
+            ..Default::default()
+        });
+        let (members, rejected) = select_members(vec![hinted, second], Vec::new());
+        assert!(rejected.is_empty());
+        assert_eq!(
+            base.snapshot_id,
+            config_for_members(&members, rejected).snapshot_id
+        );
+
+        let (members, rejected) = select_members(vec![first, member(2, "10.0.2.1/24")], Vec::new());
+        assert!(rejected.is_empty());
+        let diagnosed = config_for_members(
+            &members,
+            vec![MobileTunMemberError {
+                instance_id: uuid::Uuid::from_u128(3),
+                error: "overlapping subnet".into(),
+            }],
+        );
+        assert!(base.rejected.is_empty());
+        assert_eq!(diagnosed.rejected[0].instance_id, uuid::Uuid::from_u128(3));
+        assert_eq!(base.snapshot_id, diagnosed.snapshot_id);
+    }
+
+    #[test]
+    fn hint_comparison_ignores_unexported_mtu_cost_and_magic_dns() {
+        let mut first = member(1, "10.0.1.1/24");
+        first.claims.ipv4_routes.insert(SharedIpv4Route::new(
+            "10.0.7.0".parse().unwrap(),
+            24,
+            Some(1),
+        ));
+        let mut hinted = first.claims.clone();
+        hinted.mtu = Some(1300);
+        hinted.ipv4_routes = BTreeSet::from([SharedIpv4Route::new(
+            "10.0.7.5".parse().unwrap(),
+            24,
+            Some(9),
+        )]);
+        hinted.ipv4_routes.insert(magic_dns_route());
+        assert_eq!(comparable_claims(&first.claims), comparable_claims(&hinted));
+
+        let mut changed_address = first.claims.clone();
+        changed_address.ipv4_addresses = BTreeSet::from(["10.0.1.2/24".parse().unwrap()]);
+        assert_ne!(
+            comparable_claims(&first.claims),
+            comparable_claims(&changed_address)
+        );
+    }
+
+    #[test]
+    fn skips_invalid_claim_route_prefixes_in_member_projection() {
+        let mut invalid = member(1, "10.0.1.1/24");
+        invalid.claims.ipv4_routes.insert(SharedIpv4Route::new(
+            "10.0.9.0".parse().unwrap(),
+            33,
+            None,
+        ));
+        let (members, rejected) = select_members(vec![invalid], Vec::new());
+        assert!(rejected.is_empty());
+        assert_eq!(
+            member_prefixes(&members[0]),
+            BTreeSet::from(["10.0.1.0/24".parse().unwrap()])
+        );
+        assert_eq!(
+            config_for_members(&members, rejected).routes,
+            vec!["10.0.1.0/24"]
+        );
+    }
+
+    #[test]
+    fn keeps_attached_member_when_bootstrap_subnets_overlap() {
+        let mut existing = member(2, "10.126.126.2/24");
+        existing.current_claims = Some(existing.claims.clone());
+        let (members, rejected) =
+            select_members(vec![member(1, "10.126.126.1/24"), existing], Vec::new());
+        let config = config_for_members(&members, rejected);
+        assert_eq!(config.instance_ids, vec![uuid::Uuid::from_u128(2)]);
+        assert_eq!(config.addresses, vec!["10.126.126.2/24"]);
+        assert_eq!(config.routes, vec!["10.126.126.0/24"]);
+        assert_eq!(config.rejected[0].instance_id, uuid::Uuid::from_u128(1));
+    }
+
+    #[test]
+    fn reconfigured_member_does_not_displace_unchanged_member() {
+        let mut changed = member(1, "10.0.2.1/24");
+        changed.current_claims = Some(member(1, "10.0.1.1/24").claims);
+        let mut unchanged = member(2, "10.0.2.2/24");
+        unchanged.current_claims = Some(unchanged.claims.clone());
+        unchanged.current_claims.as_mut().unwrap().mtu = Some(1300);
+        let (members, rejected) = select_members(vec![changed, unchanged], Vec::new());
+        let config = config_for_members(&members, rejected);
+        assert_eq!(config.instance_ids, vec![uuid::Uuid::from_u128(2)]);
+        assert_eq!(config.rejected[0].instance_id, uuid::Uuid::from_u128(1));
+    }
+
+    #[test]
+    fn projects_ipv6_and_shared_dns_and_rejects_overlapping_proxy_routes() {
+        let mut first = member(1, "10.0.1.1/24");
+        first.dns = true;
+        first
+            .claims
+            .ipv4_addresses
+            .insert("10.0.4.1/32".parse().unwrap());
+        first
+            .claims
+            .ipv6_addresses
+            .insert("2001:db8::1/128".parse().unwrap());
+        first
+            .claims
+            .ipv6_routes
+            .insert(TestIpv6Route::new("::".parse().unwrap(), 0, Some(5)));
+        let mut second = member(2, "10.0.2.1/24");
+        second.dns = true;
+        let (members, rejected) = select_members(
+            vec![first, second, member(3, "100.100.100.101/32")],
+            Vec::new(),
+        );
+        let config = config_for_members(&members, rejected);
+        assert_eq!(config.instance_ids.len(), 2);
+        assert!(config.addresses.contains(&"10.0.4.1/32".to_owned()));
+        assert!(config.routes.contains(&"10.0.4.1/32".to_owned()));
+        assert!(config.addresses.contains(&"2001:db8::1/128".to_owned()));
+        assert!(config.routes.contains(&"2001:db8::1/128".to_owned()));
+        assert!(config.routes.contains(&"::/0".to_owned()));
+        assert_eq!(
+            config
+                .routes
+                .iter()
+                .filter(|route| *route == "100.100.100.101/32")
+                .count(),
+            1
+        );
+        assert_eq!(config.dns.as_deref(), Some("100.100.100.101"));
+        assert_eq!(config.rejected[0].instance_id, uuid::Uuid::from_u128(3));
+        let mut route_owner = member(2, "10.0.2.1/24");
+        route_owner.claims.ipv4_routes.insert(SharedIpv4Route::new(
+            "10.0.1.0".parse().unwrap(),
+            24,
+            None,
+        ));
+        let (members, rejected) =
+            select_members(vec![member(1, "10.0.1.1/24"), route_owner], Vec::new());
+        let config = config_for_members(&members, rejected);
+        assert_eq!(config.instance_ids.len(), 1);
+        assert_eq!(config.rejected[0].instance_id, uuid::Uuid::from_u128(2));
+    }
+
+    #[test]
+    fn policy_projects_address_networks_public_default_and_magic_dns() {
+        let claims = claims_from_facts(
+            Some("10.0.1.1/24".parse().unwrap()),
+            Some("fd00::1/64".parse().unwrap()),
+            Some("2001:db8::1/128".parse().unwrap()),
+            vec!["10.9.0.0/16".parse::<IpCidr>().unwrap()],
+        );
+        let mut member = MobileTunMember::new(
+            uuid::Uuid::from_u128(1),
+            uuid::Uuid::from_u128(11),
+            claims,
+            None,
+            true,
+        );
+        member.claims.mtu = Some(1400);
+        let (members, config) = select_and_project(vec![member], Vec::new());
+        assert!(config.rejected.is_empty());
+        let config = &members[0];
+        assert!(config.claims.ipv4_routes.contains(&magic_dns_route()));
+        assert_eq!(config.installed_prefixes, member_prefixes(config));
+        for prefix in [
+            "10.0.1.0/24",
+            "fd00::/64",
+            "2001:db8::1/128",
+            "::/0",
+            "10.9.0.0/16",
+            "100.100.100.101/32",
+        ] {
+            assert!(
+                config
+                    .installed_prefixes
+                    .contains(&prefix.parse::<IpCidr>().unwrap()),
+                "{prefix} is part of the accepted member's installation data"
+            );
+        }
+    }
+
+    #[test]
+    fn scope_is_applied_before_selection_and_rejects_foreign_ids() {
+        let first = member(1, "10.0.1.1/24");
+        let second = member(2, "10.0.2.1/24");
+
+        let (all, rejected) = filter_scope(vec![first.clone(), second.clone()], None);
+        assert_eq!(all.len(), 2);
+        assert!(rejected.is_empty());
+
+        let (empty, rejected) =
+            filter_scope(vec![first.clone(), second.clone()], Some(&BTreeSet::new()));
+        assert!(empty.is_empty());
+        assert!(rejected.is_empty());
+
+        let subset = BTreeSet::from([uuid::Uuid::from_u128(2)]);
+        let (selected, rejected) = filter_scope(vec![first.clone(), second.clone()], Some(&subset));
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].instance_id, uuid::Uuid::from_u128(2));
+        assert!(rejected.is_empty());
+
+        let foreign = BTreeSet::from([uuid::Uuid::from_u128(3)]);
+        let (selected, rejected) = filter_scope(vec![first, second], Some(&foreign));
+        assert!(selected.is_empty());
+        assert_eq!(rejected.len(), 1);
+        assert_eq!(rejected[0].instance_id, uuid::Uuid::from_u128(3));
+        assert!(rejected[0].error.contains("not participating"));
+    }
+
+    #[test]
+    fn policy_changes_alter_the_final_table_and_snapshot() {
+        let before = claims_from_facts(
+            Some("10.0.1.1/24".parse().unwrap()),
+            None,
+            None,
+            vec!["10.9.0.0/16".parse::<IpCidr>().unwrap()],
+        );
+        let after = claims_from_facts(
+            Some("10.0.1.1/24".parse().unwrap()),
+            None,
+            None,
+            vec!["10.10.0.0/16".parse::<IpCidr>().unwrap()],
+        );
+        let build = |claims| {
+            let member = MobileTunMember::new(
+                uuid::Uuid::from_u128(1),
+                uuid::Uuid::from_u128(1),
+                claims,
+                None,
+                false,
+            );
+            let (_, config) = select_and_project(vec![member], Vec::new());
+            config
+        };
+        let before = build(before);
+        let after = build(after);
+        assert_ne!(before.routes, after.routes);
+        assert_ne!(before.snapshot_id, after.snapshot_id);
+    }
+}

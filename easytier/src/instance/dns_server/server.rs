@@ -355,4 +355,50 @@ mod tests {
         server.shutdown().await?;
         Ok(())
     }
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    #[ignore = "run inside an isolated user+network namespace"]
+    async fn net_ns_dns_listeners_and_udp_tcp_queries_stay_in_their_domain() -> Result<()> {
+        use crate::common::net_ns::tests::isolated_net_ns_for_test;
+        use hickory_proto::xfer::Protocol;
+        use hickory_resolver::{
+            Resolver,
+            config::{NameServerConfig, ResolverConfig},
+        };
+        let a = isolated_net_ns_for_test()?;
+        let b = isolated_net_ns_for_test()?;
+        let address = "127.0.0.1:6053";
+        let config = |ip: &str| -> Result<RunConfig> {
+            Ok(RunConfigBuilder::default().general(GeneralConfigBuilder::default().listen_udp(address).listen_tcp(address).build()?)
+                .zones(hashmap! { "et.internal.".to_owned() => vec![
+                    RecordBuilder::default().rr_type(RecordType::A).name("www.et.internal.".to_owned()).value(ip.to_owned()).ttl(Duration::from_secs(60)).build()?,
+                    RecordBuilder::default().rr_type(RecordType::SOA).name("et.internal.".to_owned()).value("ns.et.internal. hostmaster.et.internal. 2023101001 7200 3600 1209600 86400".to_owned()).ttl(Duration::from_secs(60)).build()?,
+                ] }).build()?)
+        };
+        let mut sa = Server::in_net_ns(config("192.0.2.1")?, a.clone(), None)?;
+        let mut sb = Server::in_net_ns(config("192.0.2.2")?, b.clone(), None)?;
+        sa.run().await?;
+        sb.run().await?;
+        for protocol in [Protocol::Udp, Protocol::Tcp] {
+            for (net_ns, ip) in [(&a, "192.0.2.1"), (&b, "192.0.2.2")] {
+                let mut resolver_config = ResolverConfig::new();
+                resolver_config.add_name_server(NameServerConfig::new(address.parse()?, protocol));
+                let provider =
+                    GenericConnector::new(RuntimeDnsIoProvider::in_net_ns(net_ns.clone(), None));
+                let resolver = Resolver::builder_with_config(resolver_config, provider).build();
+                let lookup = tokio::time::timeout(
+                    Duration::from_secs(3),
+                    resolver.ipv4_lookup("www.et.internal."),
+                )
+                .await??;
+                assert_eq!(
+                    lookup.iter().next().unwrap().0,
+                    ip.parse::<std::net::Ipv4Addr>()?
+                );
+            }
+        }
+        sa.shutdown().await?;
+        sb.shutdown().await?;
+        Ok(())
+    }
 }

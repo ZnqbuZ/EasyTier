@@ -382,4 +382,258 @@ impl Drop for RouteSlotInner {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
 
+    fn registry() -> (Arc<Registry>, Arc<DirtyFlag>) {
+        let dirty = Arc::new(DirtyFlag::new(false));
+        (Arc::new(Registry::new(dirty.clone())), dirty)
+    }
+
+    fn route(destination: &str) -> RouteSpec<RouteDevice> {
+        RouteSpec::for_tun(destination.parse().unwrap())
+    }
+
+    #[test]
+    fn full_replacement_preserves_unchanged_statuses() {
+        let (registry, dirty) = registry();
+        let slot = registry.handle().open_slot(RouteSource::AutoProxy).unwrap();
+        let clone = slot.clone();
+
+        let a = route("10.0.0.0/24");
+        let b = route("10.1.0.0/24");
+        let c = route("10.2.0.0/24");
+
+        slot.set_routes(RouteSet::from([a.clone(), b.clone()]));
+        slot.inner
+            .update_statuses(|route| (route == &a).then_some(RouteStatus::Ready));
+        assert_eq!(clone.statuses().get(&a), Some(&RouteStatus::Ready));
+
+        dirty.reset();
+        // Re-publishing the same declaration set changes nothing.
+        clone.set_routes(RouteSet::from([a.clone(), b.clone()]));
+        assert!(!dirty.peek());
+        assert_eq!(slot.statuses().get(&a), Some(&RouteStatus::Ready));
+
+        // {a, b} -> {a, c}: a keeps its feedback, c starts pending, b is gone.
+        clone.set_routes(RouteSet::from([a.clone(), c.clone()]));
+        let statuses = slot.statuses();
+        assert_eq!(statuses.get(&a), Some(&RouteStatus::Ready));
+        assert_eq!(statuses.get(&b), None);
+        assert_eq!(
+            statuses.get(&c),
+            Some(&RouteStatus::Pending { error: None })
+        );
+        assert!(dirty.peek());
+    }
+
+    #[test]
+    fn last_inner_arc_release_marks_after_slot_clones_drop() {
+        let (registry, dirty) = registry();
+        let slot = registry
+            .handle()
+            .open_slot(RouteSource::Additional)
+            .unwrap();
+        let clone = slot.clone();
+        slot.set_routes(RouteSet::from([route("10.0.0.0/24")]));
+        let upgraded = registry.slots()[0].upgrade().unwrap();
+
+        dirty.reset();
+        drop(clone);
+        assert!(
+            !dirty.peek(),
+            "dropping one clone must not withdraw the slot"
+        );
+
+        slot.inner.update_statuses(|_| Some(RouteStatus::Ready));
+        assert!(!dirty.peek(), "status feedback alone must not mark dirty");
+
+        drop(slot);
+        assert!(
+            !dirty.peek(),
+            "a temporary inner handle still holds the input"
+        );
+
+        drop(upgraded);
+        assert!(
+            dirty.peek(),
+            "the final inner release must wake the controller"
+        );
+    }
+
+    #[test]
+    fn registry_release_requires_last_strong_arc_and_keeps_slots_usable() {
+        let (registry, dirty) = registry();
+        let handle = registry.handle();
+        let slot = handle.open_slot(RouteSource::Additional).unwrap();
+        let temporary = Arc::downgrade(&registry).upgrade().unwrap();
+
+        dirty.reset();
+        drop(registry);
+        assert!(
+            !dirty.peek(),
+            "a temporary registry handle still keeps the input alive"
+        );
+
+        drop(temporary);
+        assert!(
+            dirty.peek(),
+            "the final registry release must wake the controller"
+        );
+
+        assert!(matches!(
+            handle.open_slot(RouteSource::Additional),
+            Err(RouteInputError::Closed)
+        ));
+
+        dirty.reset();
+        let target = route("10.9.0.0/24");
+        slot.set_routes(RouteSet::from([target.clone()]));
+        assert_eq!(slot.inner.routes(), RouteSet::from([target]));
+        assert!(dirty.peek(), "an orphaned slot still wakes the controller");
+    }
+
+    #[tokio::test]
+    async fn status_updates_target_current_entries_and_notify_once() {
+        let (registry, dirty) = registry();
+        let slot = registry.handle().open_slot(RouteSource::AutoProxy).unwrap();
+        let a = route("10.0.0.0/24");
+        let b = route("10.1.0.0/24");
+        let withdrawn = route("10.2.0.0/24");
+        slot.set_routes(RouteSet::from([a.clone(), b.clone()]));
+        dirty.reset();
+
+        // A waiter created before the batch must still observe the
+        // notification even though it only awaits after the status write.
+        let notified = slot.changed().notified();
+        tokio::pin!(notified);
+
+        slot.inner.update_statuses(|route| {
+            if route == &a {
+                Some(RouteStatus::Ready)
+            } else if route == &b {
+                Some(RouteStatus::Suppressed("policy".into()))
+            } else if route == &withdrawn {
+                Some(RouteStatus::Ready)
+            } else {
+                None
+            }
+        });
+
+        let statuses = slot.statuses();
+        assert_eq!(statuses.get(&a), Some(&RouteStatus::Ready));
+        assert_eq!(
+            statuses.get(&b),
+            Some(&RouteStatus::Suppressed("policy".into()))
+        );
+        assert_eq!(
+            statuses.get(&withdrawn),
+            None,
+            "a withdrawn declaration must not be resurrected"
+        );
+        assert!(
+            !dirty.peek(),
+            "status feedback must not wake the controller"
+        );
+        notified.await;
+
+        // Rewriting equal statuses neither notifies nor marks.
+        let notified = slot.changed().notified();
+        tokio::pin!(notified);
+        slot.inner.update_statuses(|route| {
+            if route == &a {
+                Some(RouteStatus::Ready)
+            } else {
+                None
+            }
+        });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), notified)
+                .await
+                .is_err(),
+            "unchanged statuses must not notify"
+        );
+        assert!(!dirty.peek());
+    }
+
+    #[cfg(not(mobile))]
+    #[test]
+    fn resolve_translates_only_the_device() {
+        let tun = RouteSpec::for_tun("10.0.0.0/24".parse().unwrap());
+        assert_eq!(tun.clone().resolve(None), None);
+
+        let resolved = tun.resolve(Some(7)).unwrap();
+        assert_eq!(
+            resolved.destination,
+            "10.0.0.0/24".parse::<IpCidr>().unwrap()
+        );
+        match resolved.action {
+            RouteAction::Unicast { dev, via } => {
+                assert_eq!(dev, 7);
+                assert_eq!(via, None);
+            }
+            _ => panic!("expected a unicast action"),
+        }
+
+        let indexed = RouteSpec::<RouteDevice> {
+            destination: "10.1.0.0/24".parse().unwrap(),
+            action: RouteAction::Unicast {
+                dev: RouteDevice::Index(9),
+                via: Some("192.0.2.1".parse().unwrap()),
+            },
+            #[cfg(any(target_os = "linux", windows))]
+            metric: 10,
+            #[cfg(target_os = "linux")]
+            table: Some(100),
+        };
+        let resolved = indexed.clone().resolve(None).unwrap();
+        assert_eq!(
+            resolved.action,
+            RouteAction::Unicast {
+                dev: 9,
+                via: Some("192.0.2.1".parse().unwrap()),
+            },
+            "an explicit interface index must not need a bound tun device"
+        );
+        #[cfg(any(target_os = "linux", windows))]
+        assert_eq!(resolved.metric, 10);
+        #[cfg(target_os = "linux")]
+        assert_eq!(resolved.table, Some(100));
+
+        #[cfg(target_os = "linux")]
+        {
+            let blackhole = RouteSpec::<RouteDevice> {
+                destination: "10.2.0.0/24".parse().unwrap(),
+                action: RouteAction::Blackhole,
+                metric: 5,
+                table: None,
+            };
+            let resolved = blackhole.clone().resolve(None).unwrap();
+            assert_eq!(resolved.action, RouteAction::Blackhole);
+
+            // A single set may mix tun, indexed and device-less actions.
+            let mixed = RouteSet::from([
+                RouteSpec::for_tun("10.3.0.0/24".parse().unwrap()),
+                indexed,
+                blackhole,
+            ]);
+            let resolved: Vec<_> = mixed
+                .into_iter()
+                .map(|route| route.resolve(Some(3)).expect("every entry resolves"))
+                .collect();
+            assert_eq!(resolved.len(), 3);
+            assert_eq!(
+                resolved
+                    .iter()
+                    .filter(|route| matches!(
+                        &route.action,
+                        RouteAction::Unicast { dev, .. } if *dev == 3
+                    ))
+                    .count(),
+                1
+            );
+        }
+    }
+}

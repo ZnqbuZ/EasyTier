@@ -849,6 +849,155 @@ mod tests {
     use super::*;
 
     #[test]
+    fn forwarding_attributes_are_not_silently_ignored_for_route_equivalence() {
+        let direct = RouteMessageBuilder::new(libc::AF_INET6 as u8)
+            .destination("2001:db8:1::".parse().unwrap(), 64)
+            .oif(7)
+            .priority(65535)
+            .static_protocol()
+            .universe_scope()
+            .route_type(RouteType::Unicast)
+            .build();
+        assert!(direct.is_direct());
+        for kind in [5, 8, 9, 18, 21, 22, 30, 42] {
+            let mut changed = direct.clone();
+            changed.attributes.push(Attribute::new(kind, vec![0; 16]));
+            assert!(
+                !changed.is_direct(),
+                "unsupported forwarding attribute {kind}"
+            );
+        }
+        let mut changed = direct.clone();
+        changed.tos = 16;
+        assert!(!changed.is_direct());
+        let mut changed = direct;
+        changed.src_len = 64;
+        assert!(!changed.is_direct());
+    }
+
+    #[test]
+    fn supported_routes_allow_gateway_but_not_extra_forwarding_capabilities() {
+        let gateway: IpAddr = "2001:db8::1".parse().unwrap();
+        let routed = RouteMessageBuilder::new(libc::AF_INET6 as u8)
+            .destination("2001:db8:1::".parse().unwrap(), 64)
+            .oif(7)
+            .gateway(gateway)
+            .priority(1024)
+            .static_protocol()
+            .universe_scope()
+            .route_type(RouteType::Unicast)
+            .build();
+        assert!(routed.is_supported_route());
+        assert!(!routed.is_direct(), "is_direct keeps its old semantics");
+
+        // A source-prefix selection, preferred source, multipath, nexthop
+        // indirection, encapsulation or unknown attribute is never an equal
+        // complete route and must not be silently ignored.
+        for kind in [RTA_PREFSRC, RTA_SRC, 8, 9, 18, 21, 22, 30, 42] {
+            let mut changed = routed.clone();
+            changed.attributes.push(Attribute::new(kind, vec![0; 16]));
+            assert!(
+                !changed.is_supported_route(),
+                "unsupported forwarding attribute {kind}"
+            );
+        }
+        let mut changed = routed.clone();
+        changed.tos = 16;
+        assert!(!changed.is_supported_route());
+        let mut changed = routed;
+        changed.src_len = 64;
+        assert!(!changed.is_supported_route());
+    }
+
+    #[test]
+    fn route_gateway_round_trips_and_is_validated_by_the_whole_decode() {
+        let gateway: IpAddr = "192.0.2.1".parse().unwrap();
+        let message = RouteMessageBuilder::new(libc::AF_INET as u8)
+            .destination("198.18.0.0".parse().unwrap(), 24)
+            .oif(7)
+            .gateway(gateway)
+            .build();
+        let bytes = encode(&message);
+        let decoded = RouteMessage::from_bytes(&bytes).unwrap();
+        assert_eq!(decoded.gateway().unwrap(), Some(gateway));
+
+        let plain = RouteMessageBuilder::new(libc::AF_INET as u8)
+            .destination("198.18.0.0".parse().unwrap(), 24)
+            .build();
+        assert!(matches!(
+            RouteMessage::from_bytes(&encode(&plain)).unwrap().gateway(),
+            Ok(None)
+        ));
+        for (family, value) in [
+            (libc::AF_INET as u8, vec![0; 16]),
+            (libc::AF_INET as u8, vec![0; 2]),
+            // A v6 address inside a v4 route is a family mismatch.
+            (libc::AF_INET6 as u8, vec![0; 4]),
+        ] {
+            let mut changed = plain.clone();
+            changed.family = family;
+            changed.attributes.push(Attribute::new(RTA_GATEWAY, value));
+            let mut bytes = Vec::new();
+            changed.write_to(&mut bytes).unwrap();
+            assert!(RouteMessage::from_bytes(&bytes).is_err());
+        }
+
+        let mut duplicate = plain;
+        duplicate
+            .attributes
+            .push(Attribute::new(RTA_GATEWAY, ip_bytes(gateway)));
+        duplicate
+            .attributes
+            .push(Attribute::new(RTA_GATEWAY, ip_bytes(gateway)));
+        let mut bytes = Vec::new();
+        duplicate.write_to(&mut bytes).unwrap();
+        assert!(RouteMessage::from_bytes(&bytes).is_err());
+    }
+
+    #[test]
+    fn unreachable_route_type_round_trips() {
+        let message = RouteMessageBuilder::new(libc::AF_INET as u8)
+            .destination("198.18.0.0".parse().unwrap(), 24)
+            .route_type(RouteType::Unreachable)
+            .build();
+        assert_eq!(
+            RouteMessage::from_bytes(&encode(&message))
+                .unwrap()
+                .route_type(),
+            RouteType::Unreachable
+        );
+    }
+
+    #[test]
+    fn malformed_or_duplicate_route_keys_fail_the_whole_decode() {
+        let direct = RouteMessageBuilder::new(libc::AF_INET as u8)
+            .destination("198.18.0.0".parse().unwrap(), 24)
+            .oif(7)
+            .priority(65535)
+            .build();
+        for kind in [RTA_OIF, RTA_PRIORITY, RTA_TABLE, RTA_PREF, RTA_PREFSRC] {
+            let mut changed = direct.clone();
+            changed
+                .attributes
+                .retain(|attribute| attribute.kind != kind);
+            changed.attributes.push(Attribute::new(kind, vec![0; 2]));
+            let mut bytes = Vec::new();
+            changed.write_to(&mut bytes).unwrap();
+            assert!(
+                RouteMessage::from_bytes(&bytes).is_err(),
+                "malformed attribute {kind}"
+            );
+        }
+        let mut duplicate = direct;
+        duplicate
+            .attributes
+            .push(Attribute::new(RTA_OIF, 8_u32.to_ne_bytes()));
+        let mut bytes = Vec::new();
+        duplicate.write_to(&mut bytes).unwrap();
+        assert!(RouteMessage::from_bytes(&bytes).is_err());
+    }
+
+    #[test]
     fn link_decode_reads_nested_driver_kind_and_rejects_partial_attributes() {
         let mut bytes = vec![0; 16];
         bytes[4..8].copy_from_slice(&17_i32.to_ne_bytes());

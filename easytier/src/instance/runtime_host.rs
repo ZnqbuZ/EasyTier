@@ -375,6 +375,61 @@ mod tests {
         NativeInstanceRuntimeHost::new(global_ctx)
     }
 
+    #[tokio::test]
+    async fn cleanup_survives_cancellation_of_its_first_waiter() {
+        let global_ctx = Arc::new(GlobalCtx::new(TomlConfig::default()));
+        let host = runtime_host(global_ctx);
+        let permit = host.operation.lock().await;
+        let waiter_host = host.clone();
+        let waiter = tokio::spawn(async move { waiter_host.shutdown_runtime().await });
+        tokio::task::yield_now().await;
+        waiter.abort();
+        let _ = waiter.await;
+        drop(permit);
+        tokio::time::timeout(std::time::Duration::from_secs(3), host.shutdown_runtime())
+            .await
+            .unwrap();
+        assert_eq!(host.cleanup_result.borrow().as_ref(), Some(&Ok(())));
+    }
+
+    #[tokio::test]
+    async fn one_instance_shutdown_does_not_wait_for_another_instances_operation() {
+        let first = runtime_host(Arc::new(GlobalCtx::new(TomlConfig::default())));
+        let second = runtime_host(Arc::new(GlobalCtx::new(TomlConfig::default())));
+        let second_operation = second.operation.lock().await;
+
+        tokio::time::timeout(std::time::Duration::from_secs(3), first.shutdown_runtime())
+            .await
+            .expect("A's local shutdown must not wait for B's pending operation");
+        assert_eq!(first.cleanup_result.borrow().as_ref(), Some(&Ok(())));
+
+        drop(second_operation);
+        tokio::time::timeout(std::time::Duration::from_secs(3), second.shutdown_runtime())
+            .await
+            .expect("B can finish its own cleanup after the operation is released");
+        assert_eq!(second.cleanup_result.borrow().as_ref(), Some(&Ok(())));
+    }
+
+    #[cfg(not(mobile))]
+    #[tokio::test]
+    async fn desktop_route_context_exists_without_tun() {
+        let global_ctx = Arc::new(GlobalCtx::new(TomlConfig::default()));
+        let mut flags = global_ctx.get_flags();
+        flags.no_tun = true;
+        global_ctx.set_flags(flags);
+        let host = runtime_host(global_ctx);
+        let context = host
+            .route_context()
+            .expect("desktop instances own route inputs even with no_tun");
+        // Only an empty Additional slot: publishing Index declarations here
+        // would ask the real Host worker to modify the system routing table.
+        let slot = context
+            .handle
+            .open_slot(easytier_core::host::route::RouteSource::Additional)
+            .unwrap();
+        drop(slot);
+    }
+
     #[cfg(feature = "web-client")]
     fn runtime_config(config: &TomlConfig) -> CoreInstanceRuntimeConfig {
         let normalized = easytier_core::instance::CoreInstanceConfig::from_toml(config).unwrap();
@@ -440,6 +495,49 @@ mod tests {
         assert_eq!(global_ctx.get_ipv6(), Some("fd00::2/64".parse().unwrap()));
         assert!(global_ctx.get_flags().disable_relay_data);
         assert!(global_ctx.get_flags().prefer_peer_relay);
+    }
+
+    #[cfg(feature = "web-client")]
+    #[test]
+    fn static_sync_applies_actual_address_values() {
+        use easytier_core::{config::toml::ConfigLoader as _, instance::InstanceRuntimeHost as _};
+
+        let config = TomlConfig::default();
+        config.set_ipv4(Some("10.30.0.1/24".parse().unwrap()));
+        let global_ctx = Arc::new(GlobalCtx::new(config.clone()));
+        let runtime_host = runtime_host(global_ctx.clone());
+
+        runtime_host.synchronize_config(
+            &crate::proto::api::config::InstanceConfigPatch {
+                hostname: Some("renamed".to_owned()),
+                ..Default::default()
+            },
+            &runtime_config(&config),
+        );
+        assert_eq!(
+            global_ctx.get_ipv4(),
+            Some("10.30.0.1/24".parse().unwrap()),
+            "a hostname-only patch leaves the address unchanged"
+        );
+
+        runtime_host.synchronize_config(
+            &crate::proto::api::config::InstanceConfigPatch {
+                ipv4: Some("10.30.0.1/24".parse::<cidr::Ipv4Inet>().unwrap().into()),
+                ..Default::default()
+            },
+            &runtime_config(&config),
+        );
+        assert_eq!(global_ctx.get_ipv4(), Some("10.30.0.1/24".parse().unwrap()));
+
+        config.set_ipv4(None);
+        runtime_host.synchronize_config(
+            &crate::proto::api::config::InstanceConfigPatch {
+                ipv4: Some("10.99.0.1/24".parse::<cidr::Ipv4Inet>().unwrap().into()),
+                ..Default::default()
+            },
+            &runtime_config(&config),
+        );
+        assert_eq!(global_ctx.get_ipv4(), None);
     }
 
     #[cfg(feature = "web-client")]

@@ -377,4 +377,46 @@ pub(crate) fn list_instances_jni(mut env: JNIEnv, _class: JClass, max_length: ji
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
 
+    #[test]
+    fn positive_fd_requires_a_snapshot_and_detach_does_not() {
+        let snapshot = CString::new("00000000-0000-0000-0000-000000000001").unwrap();
+
+        assert!(snapshot_pointer(1, None).is_err());
+        assert_eq!(
+            snapshot_pointer(1, Some(&snapshot)).unwrap(),
+            snapshot.as_ptr()
+        );
+        assert!(snapshot_pointer(0, None).unwrap().is_null());
+        assert!(snapshot_pointer(-1, None).unwrap().is_null());
+        assert_eq!(
+            snapshot_pointer(0, Some(&snapshot)).unwrap(),
+            snapshot.as_ptr()
+        );
+    }
+
+    #[test]
+    fn ffi_string_conversion_rejects_null_and_invalid_utf8() {
+        assert!(
+            unsafe { take_ffi_string(ptr::null()) }
+                .unwrap_err()
+                .contains("null")
+        );
+
+        let valid = CString::new("{\"routes\":[]}").unwrap().into_raw();
+        assert_eq!(
+            unsafe { take_ffi_string(valid) }.unwrap(),
+            "{\"routes\":[]}"
+        );
+
+        let invalid = CString::new(vec![0xff, b'A']).unwrap().into_raw();
+        assert!(
+            unsafe { take_ffi_string(invalid) }
+                .unwrap_err()
+                .contains("invalid UTF-8")
+        );
+    }
+}

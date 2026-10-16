@@ -252,6 +252,51 @@ mod tests {
     use super::*;
     use crate::{common::global_ctx::GlobalCtxEvent, instance::test_instance::TestInstance};
 
+    #[cfg(not(mobile))]
+    #[tokio::test]
+    async fn cancelled_setup_keeps_the_nic_owned_until_explicit_stop() {
+        let instance = TestInstance::new_with_process_runtime(
+            TomlConfig::default(),
+            CoreProcessRuntime::new(),
+        );
+        let global = instance.get_global_ctx();
+        let state = TunNicState::empty();
+        let (_sender, receiver) = tokio::sync::mpsc::channel(1);
+        state
+            .install_receiver(HostPacketReceiver::new(receiver))
+            .unwrap();
+        let nic = NicCtx::new(
+            global.clone(),
+            instance.get_core_instance().packet_plane(),
+            state.receiver(),
+            Arc::new(Notify::new()),
+            TestInstance::current_shared_virtual_nic_registry(),
+            None,
+        )
+        .await
+        .unwrap();
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        assert!(
+            state
+                .configure(
+                    nic,
+                    &cancel,
+                    global,
+                    instance.get_core_instance().packet_plane(),
+                    DhcpAddresses::default()
+                )
+                .await
+                .is_err()
+        );
+        assert!(matches!(
+            *state.nic_ctx.lock().await,
+            Some(NicCtxContainer::Active { .. })
+        ));
+        state.stop().await.unwrap();
+        assert!(state.nic_ctx.lock().await.is_none());
+    }
+
     #[tokio::test]
     async fn stop_releases_packet_receiver_before_returning() {
         let state = TunNicState::empty();
@@ -260,7 +305,7 @@ mod tests {
             .install_receiver(HostPacketReceiver::new(receiver))
             .unwrap();
         let receiver = state.receiver();
-        state.drain().await;
+        state.drain().await.unwrap();
         // Let the drain acquire the receiver and block waiting for a packet.
         tokio::time::timeout(std::time::Duration::from_secs(5), async {
             while receiver.try_lock().is_ok() {
@@ -270,7 +315,7 @@ mod tests {
         .await
         .unwrap();
 
-        state.stop().await;
+        state.stop().await.unwrap();
         assert!(receiver.try_lock().is_ok());
     }
 
@@ -290,6 +335,7 @@ mod tests {
             global_ctx.clone(),
             cancel.clone(),
             TestInstance::current_shared_virtual_nic_registry(),
+            None,
         );
         let (_sender, receiver) = tokio::sync::mpsc::channel(1);
         runtime
@@ -342,6 +388,6 @@ mod tests {
         assert_eq!(outcome.actual, addresses);
         assert_eq!(global_ctx.get_ipv4(), addresses.ipv4);
         assert_eq!(global_ctx.get_ipv6(), addresses.ipv6);
-        runtime.shutdown().await;
+        runtime.shutdown().await.unwrap();
     }
 }

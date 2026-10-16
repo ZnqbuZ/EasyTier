@@ -286,4 +286,87 @@ pub(crate) fn collect_runtime_state() -> anyhow::Result<RuntimeAggregateState> {
     Ok(runtime_aggregate_state(instances, mobile_config))
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use easytier::proto::api::manage::NetworkConfig;
 
+    fn instance(
+        id: &str,
+        running: bool,
+        tun_required: bool,
+        tun_attached: bool,
+    ) -> RuntimeInstanceState {
+        let mut instance = runtime_instance_from_config_snapshot(
+            id.to_string(),
+            id.to_string(),
+            NetworkConfig {
+                dev_name: Some("tun0".to_string()),
+                ..Default::default()
+            },
+            running,
+        );
+        instance.tun_required = tun_required;
+        instance.tun_attached = tun_attached;
+        instance
+    }
+
+    #[test]
+    fn aggregate_uses_the_complete_controller_table_and_real_attachment_only() {
+        let complete = MobileTunConfig {
+            routes: vec![
+                "10.0.0.0/8".to_string(),
+                "10.0.0.0/16".to_string(),
+                "fd00::/64".to_string(),
+            ],
+            dns: Some("100.100.100.101".to_string()),
+            ..Default::default()
+        };
+        let state = runtime_aggregate_state(
+            vec![
+                instance("A", true, true, false),
+                instance("B", true, true, true),
+                instance("C", false, true, true),
+            ],
+            complete,
+        );
+
+        assert_eq!(
+            state.tun.aggregated_routes,
+            vec![
+                "10.0.0.0/8".to_string(),
+                "10.0.0.0/16".to_string(),
+                "fd00::/64".to_string()
+            ],
+            "routes must be the complete result in its original order, not re-aggregated"
+        );
+        assert_eq!(state.tun.dns_servers, vec!["100.100.100.101".to_string()]);
+        assert_eq!(
+            state.tun.attached_instance_ids,
+            vec!["B".to_string()],
+            "tun_required without actual attached evidence is not attached"
+        );
+        assert!(state.tun.active);
+        assert_eq!(state.running_instance_count, 2);
+
+        let json = serde_json::to_value(&state).unwrap();
+        assert!(json.get("Ok").is_none(), "state JSON must not wrap Result");
+        assert_eq!(
+            json["tun"]["aggregatedRoutes"],
+            serde_json::json!(["10.0.0.0/8", "10.0.0.0/16", "fd00::/64"])
+        );
+    }
+
+    #[cfg(not(target_env = "ohos"))]
+    #[test]
+    fn non_ohos_state_read_returns_an_error_instead_of_fake_empty_state() {
+        let error = match collect_runtime_state() {
+            Ok(_) => panic!("the non-OHOS branch cannot synthesize a complete table"),
+            Err(error) => error,
+        };
+        assert!(
+            error.to_string().contains("unavailable"),
+            "unexpected error: {error:#}"
+        );
+    }
+}

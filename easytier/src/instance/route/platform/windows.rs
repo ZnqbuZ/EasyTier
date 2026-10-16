@@ -266,4 +266,112 @@ impl RouteBackend for PlatformRouteBackend {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ::windows::Win32::Networking::WinSock::MIB_IPPROTO_LOCAL;
 
+    fn route(destination: &str, dev: u32, via: Option<&str>, metric: u32) -> RouteSpec<u32> {
+        RouteSpec {
+            destination: destination.parse().unwrap(),
+            action: RouteAction::Unicast {
+                dev,
+                via: via.map(|via| via.parse().unwrap()),
+            },
+            metric,
+        }
+    }
+
+    #[test]
+    fn direct_and_gateway_rows_carry_every_forwarding_field() {
+        for (destination, direct_next_hop, gateway) in [
+            ("10.0.0.0/24", "0.0.0.0", "192.0.2.1"),
+            ("2001:db8:1::/64", "::", "2001:db8::1"),
+        ] {
+            let direct = route(destination, 7, None, 100);
+            let expected = row(&direct).unwrap();
+            let direct_next_hop: IpAddr = direct_next_hop.parse().unwrap();
+            assert_eq!(expected.InterfaceIndex, 7);
+            assert_eq!(expected.Metric, 100);
+            assert_eq!(expected.Protocol, MIB_IPPROTO_NETMGMT);
+            assert_eq!(
+                expected.DestinationPrefix.PrefixLength,
+                direct.destination.network_length()
+            );
+            assert_eq!(
+                address(&expected.DestinationPrefix.Prefix),
+                Some(direct.destination.first_address())
+            );
+            assert_eq!(address(&expected.NextHop), Some(direct_next_hop));
+            assert!(same_row(&expected, &expected));
+
+            let routed = route(destination, 7, Some(gateway), 100);
+            let expected = row(&routed).unwrap();
+            assert_eq!(
+                address(&expected.NextHop),
+                Some(gateway.parse::<IpAddr>().unwrap())
+            );
+            assert!(same_row(&expected, &expected));
+        }
+    }
+
+    #[test]
+    fn complete_comparison_rejects_every_field_difference() {
+        let expected = row(&route("10.10.0.0/24", 7, Some("192.0.2.1"), 100)).unwrap();
+
+        let other_device = row(&route("10.10.0.0/24", 8, Some("192.0.2.1"), 100)).unwrap();
+        assert!(!same_row(&other_device, &expected));
+
+        let other_gateway = row(&route("10.10.0.0/24", 7, Some("192.0.2.2"), 100)).unwrap();
+        assert!(!same_row(&other_gateway, &expected));
+
+        let direct = row(&route("10.10.0.0/24", 7, None, 100)).unwrap();
+        assert!(
+            !same_row(&direct, &expected),
+            "a direct row cannot satisfy a gateway declaration"
+        );
+        assert!(
+            !same_row(&expected, &direct),
+            "a gateway row cannot satisfy a direct declaration"
+        );
+
+        let other_metric = row(&route("10.10.0.0/24", 7, Some("192.0.2.1"), 99)).unwrap();
+        assert!(!same_row(&other_metric, &expected));
+
+        let other_destination = row(&route("10.11.0.0/24", 7, Some("192.0.2.1"), 100)).unwrap();
+        assert!(!same_row(&other_destination, &expected));
+
+        let other_prefix = row(&route("10.10.0.0/23", 7, Some("192.0.2.1"), 100)).unwrap();
+        assert!(!same_row(&other_prefix, &expected));
+
+        let mut local = expected;
+        local.Protocol = MIB_IPPROTO_LOCAL;
+        assert!(
+            !same_row(&local, &expected),
+            "a non-static row is not this effect"
+        );
+    }
+
+    #[test]
+    fn invalid_parameters_are_rejected_before_comparison() {
+        for invalid in [
+            route("10.0.0.0/24", 0, None, 100),
+            route("10.0.0.0/24", 7, Some("2001:db8::1"), 100),
+            route("2001:db8::/64", 7, Some("192.0.2.1"), 100),
+        ] {
+            assert!(row(&invalid).is_err());
+        }
+    }
+
+    #[test]
+    fn unspecified_gateway_normalizes_to_the_direct_route() {
+        for (destination, unspecified) in [("10.20.0.0/24", "0.0.0.0"), ("2001:db8:20::/64", "::")]
+        {
+            let direct = row(&route(destination, 7, None, 100)).unwrap();
+            let explicit = row(&route(destination, 7, Some(unspecified), 100)).unwrap();
+            assert_eq!(address(&explicit.NextHop), address(&direct.NextHop));
+            assert!(same_row(&explicit, &direct));
+            assert!(same_row(&direct, &explicit));
+        }
+    }
+}

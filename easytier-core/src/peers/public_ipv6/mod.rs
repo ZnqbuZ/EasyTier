@@ -740,4 +740,124 @@ mod tests {
                 if message.contains("detected prefix")
         ));
     }
+    #[tokio::test]
+    async fn host_route_claim_tracks_complete_ipv6_state_with_explicit_default_metric() {
+        use crate::foundation::dirty::DirtyFlag;
+        use crate::host::route::{Registry, RouteSet, RouteSlot, RouteSource, RouteSpec};
+        let registry = Arc::new(Registry::new(Arc::new(DirtyFlag::new(false))));
+        let handle = registry.handle();
+        let peers = Arc::new(TestRouteControl {
+            my_peer_id: 1,
+            peers: Mutex::new(vec![
+                PublicIpv6PeerRouteInfo {
+                    peer_id: 1,
+                    inst_id: Some(uuid::Uuid::from_u128(1)),
+                    is_provider: false,
+                    prefix: None,
+                    lease: Some("2001:db8::123/64".parse().unwrap()),
+                    reachable: true,
+                },
+                PublicIpv6PeerRouteInfo {
+                    peer_id: 2,
+                    inst_id: Some(uuid::Uuid::from_u128(2)),
+                    is_provider: false,
+                    prefix: None,
+                    lease: Some("2001:db8:1::7/128".parse().unwrap()),
+                    reachable: true,
+                },
+                PublicIpv6PeerRouteInfo {
+                    peer_id: 3,
+                    inst_id: Some(uuid::Uuid::from_u128(3)),
+                    is_provider: false,
+                    prefix: None,
+                    lease: Some("2001:db8:2::7/128".parse().unwrap()),
+                    reachable: false,
+                },
+            ]),
+        });
+        let service = PublicIpv6Service::new(
+            Arc::new(TestRuntime::new(true)),
+            std::sync::Weak::new(),
+            peers.clone(),
+            Arc::new(TestSyncTrigger),
+        );
+        service.bind_host_routes(&handle).unwrap();
+        // (auto_proxy, additional) as declared in the two bound slots.
+        let declared = || {
+            service
+                .host_routes
+                .lock()
+                .as_ref()
+                .map(|(auto_proxy, additional)| {
+                    let read = |slot: &RouteSlot| slot.statuses().into_keys().collect::<RouteSet>();
+                    (read(auto_proxy), read(additional))
+                })
+                .unwrap_or_default()
+        };
+        let remote = "2001:db8:1::7/128".parse::<cidr::IpCidr>().unwrap();
+        let default_destination = "::/0".parse::<cidr::IpCidr>().unwrap();
+        // The metric field only exists on Linux/Windows desktop builds; the
+        // shadowing block keeps `mut` out of the other targets.
+        let default = {
+            let default = RouteSpec::for_tun(default_destination);
+            #[cfg(all(not(mobile), any(target_os = "linux", windows)))]
+            let default = {
+                let mut default = default;
+                default.metric = 5;
+                default
+            };
+            default
+        };
+
+        service.reconcile_runtime();
+        assert_eq!(
+            declared(),
+            (
+                RouteSet::from([RouteSpec::for_tun(remote)]),
+                RouteSet::from([default.clone()])
+            )
+        );
+        // The two slots are grouped by source, not merged into one set.
+        let published_by_source = |source| {
+            registry
+                .slots()
+                .into_iter()
+                .filter_map(|slot| slot.upgrade())
+                .find(|slot| slot.source() == source)
+                .map(|slot| slot.routes())
+                .unwrap_or_default()
+        };
+        assert_eq!(
+            published_by_source(RouteSource::AutoProxy),
+            RouteSet::from([RouteSpec::for_tun(remote)])
+        );
+        assert_eq!(
+            published_by_source(RouteSource::Additional),
+            RouteSet::from([default.clone()])
+        );
+
+        service.reconcile_runtime();
+        // Loss of our lease withdraws only the default; reachability changes
+        // replace the complete remote-prefix set, without delta replay.
+        peers.peers.lock().unwrap().retain(|info| info.peer_id != 1);
+        {
+            let mut peers = peers.peers.lock().unwrap();
+            peers[0].reachable = false;
+            peers[1].reachable = true;
+        }
+        service.reconcile_runtime();
+        assert_eq!(
+            declared(),
+            (
+                RouteSet::from([RouteSpec::for_tun("2001:db8:2::7/128".parse().unwrap())]),
+                RouteSet::new()
+            )
+        );
+        service.release_host_routes();
+        assert!(service.host_routes.lock().is_none());
+        assert!(
+            registry.slots().is_empty(),
+            "the released producer must leave no input for the registry"
+        );
+    }
 }

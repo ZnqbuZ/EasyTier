@@ -2965,7 +2965,7 @@ async fn foreign_network_advertises_listeners_for_direct_connect(
         .into_iter()
         .enumerate()
     {
-        network.create_namespace(
+        network.create_net_ns(
             name,
             &format!("10.81.0.{}/24", index + 1),
             &format!("fd81::{}/64", index + 1),
@@ -2973,7 +2973,7 @@ async fn foreign_network_advertises_listeners_for_direct_connect(
         network.add_to_bridge("br", name);
         let config = TomlConfigLoader::default();
         config.set_inst_name(name.to_owned());
-        config.set_netns(Some(network.namespace(name).to_owned()));
+        config.set_net_ns(Some(network.net_ns(name).to_owned()));
         config.set_network_identity(NetworkIdentity::new(
             if index < 2 {
                 "public-net"

@@ -130,4 +130,57 @@ impl DhcpHost for NativeDhcpHost {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::common::{config::TomlConfig, global_ctx::GlobalCtx};
+    use std::sync::Arc;
 
+    #[test]
+    fn route_inputs_are_invalidated_only_after_an_actual_address_change() {
+        let global_ctx = Arc::new(GlobalCtx::new(TomlConfig::default()));
+        let invalidations = std::cell::Cell::new(0);
+        let ipv4: cidr::Ipv4Inet = "10.9.0.7/24".parse().unwrap();
+
+        write_runtime_addresses(
+            &global_ctx,
+            || {
+                assert_eq!(
+                    global_ctx.get_ipv4(),
+                    Some(ipv4),
+                    "the actual value is written before invalidation"
+                );
+                invalidations.set(invalidations.get() + 1);
+            },
+            Some(Some(ipv4)),
+            None,
+        );
+        assert_eq!(global_ctx.get_ipv4(), Some(ipv4));
+        assert_eq!(invalidations.get(), 1);
+
+        write_runtime_addresses(
+            &global_ctx,
+            || invalidations.set(invalidations.get() + 1),
+            Some(Some(ipv4)),
+            None,
+        );
+        assert_eq!(invalidations.get(), 1, "an equal value is not a change");
+
+        write_runtime_addresses(
+            &global_ctx,
+            || invalidations.set(invalidations.get() + 1),
+            None,
+            None,
+        );
+        assert_eq!(invalidations.get(), 1, "an absent family is not written");
+
+        write_runtime_addresses(
+            &global_ctx,
+            || invalidations.set(invalidations.get() + 1),
+            Some(None),
+            None,
+        );
+        assert_eq!(global_ctx.get_ipv4(), None);
+        assert_eq!(invalidations.get(), 2, "clearing the address is a change");
+    }
+}

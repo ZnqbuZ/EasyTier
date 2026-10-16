@@ -581,4 +581,656 @@ impl RouteBackend for PlatformRouteBackend {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
 
+    fn route(destination: &str, dev: u32, via: Option<&str>) -> RouteSpec<u32> {
+        RouteSpec {
+            destination: destination.parse().unwrap(),
+            action: RouteAction::Unicast {
+                dev,
+                via: via.map(|via| via.parse().unwrap()),
+            },
+        }
+    }
+
+    fn encoded(route: &RouteSpec<u32>) -> Vec<u8> {
+        encode(route, libc::RTM_ADD as u8, 7).unwrap()
+    }
+
+    fn header_flags(message: &[u8]) -> i32 {
+        i32_at(message, 8).unwrap()
+    }
+
+    fn header_index(message: &[u8]) -> u16 {
+        u16::from_ne_bytes(message[4..6].try_into().unwrap())
+    }
+
+    fn header_addrs(message: &[u8]) -> i32 {
+        i32_at(message, 12).unwrap()
+    }
+
+    /// The wire address blocks in `RTA_*` bit order.
+    fn wire_addrs(message: &[u8]) -> Vec<&[u8]> {
+        let addrs = header_addrs(message) as u32;
+        let mut remaining = &message[HEADER..];
+        let mut blocks = Vec::new();
+        for bit in 0..32u32 {
+            if addrs & (1u32 << bit) == 0 {
+                continue;
+            }
+            let length = remaining[0] as usize;
+            let padded = aligned(length);
+            blocks.push(&remaining[..length]);
+            remaining = &remaining[padded..];
+        }
+        blocks
+    }
+
+    fn ipv4_sockaddr(ip: &str) -> Vec<u8> {
+        let octets = ip.parse::<Ipv4Addr>().unwrap().octets();
+        let mut bytes = vec![0; 16];
+        bytes[0] = 16;
+        bytes[1] = libc::AF_INET as u8;
+        bytes[4..8].copy_from_slice(&octets);
+        bytes
+    }
+
+    fn ipv6_sockaddr(ip: &str, scope: u32) -> Vec<u8> {
+        let octets = ip.parse::<Ipv6Addr>().unwrap().octets();
+        let mut bytes = vec![0; 28];
+        bytes[0] = 28;
+        bytes[1] = libc::AF_INET6 as u8;
+        bytes[8..24].copy_from_slice(&octets);
+        bytes[24..28].copy_from_slice(&scope.to_ne_bytes());
+        bytes
+    }
+
+    fn link(dev: u16) -> Vec<u8> {
+        link_sockaddr(dev as u32).to_vec()
+    }
+
+    /// A readback message with a synthetic header and the given address list.
+    fn message(flags: i32, dev: u16, addresses: &[(i32, &[u8])]) -> Vec<u8> {
+        let mut bytes = vec![0; HEADER];
+        bytes[2] = libc::RTM_VERSION as u8;
+        bytes[3] = libc::RTM_GET as u8;
+        bytes[4..6].copy_from_slice(&dev.to_ne_bytes());
+        bytes[8..12].copy_from_slice(&flags.to_ne_bytes());
+        let mut addrs = 0;
+        for &(bit, address) in addresses {
+            addrs |= bit;
+            append(&mut bytes, address);
+        }
+        bytes[12..16].copy_from_slice(&addrs.to_ne_bytes());
+        let length = u16::try_from(bytes.len()).unwrap();
+        bytes[..2].copy_from_slice(&length.to_ne_bytes());
+        bytes
+    }
+
+    fn direct_ipv4_message(destination: &str, dev: u16) -> Vec<u8> {
+        let destination = ipv4_sockaddr(destination);
+        let gateway = link(dev);
+        let mask = ipv4_sockaddr("255.255.255.0");
+        let ifp = link(dev);
+        message(
+            libc::RTF_UP | libc::RTF_STATIC,
+            dev,
+            &[
+                (libc::RTA_DST, &destination[..]),
+                (libc::RTA_GATEWAY, &gateway[..]),
+                (libc::RTA_NETMASK, &mask[..]),
+                (libc::RTA_IFP, &ifp[..]),
+            ],
+        )
+    }
+
+    #[test]
+    fn direct_routes_encode_the_interface_as_an_af_link_gateway() {
+        let bytes = encoded(&route("10.71.0.0/24", 7, None));
+        assert_eq!(bytes[2], libc::RTM_VERSION as u8);
+        assert_eq!(bytes[3], libc::RTM_ADD as u8);
+        assert_eq!(header_index(&bytes), 7);
+        assert_eq!(
+            header_flags(&bytes),
+            libc::RTF_UP | libc::RTF_STATIC,
+            "a direct prefix is up, static and not a host or gateway route"
+        );
+        assert_eq!(
+            header_addrs(&bytes),
+            libc::RTA_DST | libc::RTA_GATEWAY | libc::RTA_NETMASK | libc::RTA_IFP,
+            "no RTA_IFA is written for a direct route"
+        );
+        let blocks = wire_addrs(&bytes);
+        assert_eq!(blocks.len(), 4);
+        assert_eq!(
+            &blocks[0][..8],
+            &[16, libc::AF_INET as u8, 0, 0, 10, 71, 0, 0]
+        );
+        assert_eq!(blocks[1][0], 8);
+        assert_eq!(blocks[1][1], libc::AF_LINK as u8);
+        assert_eq!(u16::from_ne_bytes([blocks[1][2], blocks[1][3]]), 7);
+        assert_eq!(&blocks[2][4..8], &[255, 255, 255, 0]);
+        assert_eq!(blocks[3], blocks[1], "RTA_IFP names the same interface");
+
+        let host = encoded(&route("192.0.2.9/32", 7, None));
+        assert_ne!(header_flags(&host) & libc::RTF_HOST, 0);
+        assert_eq!(&wire_addrs(&host)[2][4..8], &[255; 4]);
+
+        let bytes = encoded(&route("2001:db8:71::/64", 7, None));
+        let flags = header_flags(&bytes);
+        assert_eq!(flags & libc::RTF_GATEWAY, 0);
+        assert_eq!(flags & libc::RTF_HOST, 0);
+        let blocks = wire_addrs(&bytes);
+        assert_eq!(blocks[0][0], 28);
+        assert_eq!(blocks[0][1], libc::AF_INET6 as u8);
+        assert_eq!(
+            &blocks[0][8..24],
+            &"2001:db8:71::".parse::<Ipv6Addr>().unwrap().octets()
+        );
+        assert_eq!(blocks[1][1], libc::AF_LINK as u8);
+        assert_eq!(&blocks[2][8..16], &[0xff; 8]);
+        assert_eq!(&blocks[2][16..24], &[0; 8]);
+    }
+
+    #[test]
+    fn gateway_routes_encode_a_same_family_gateway_and_flag() {
+        let bytes = encoded(&route("198.18.20.0/24", 7, Some("192.0.2.1")));
+        assert_eq!(
+            header_flags(&bytes),
+            libc::RTF_UP | libc::RTF_STATIC | libc::RTF_GATEWAY
+        );
+        let blocks = wire_addrs(&bytes);
+        assert_eq!(blocks[1][0], 16);
+        assert_eq!(blocks[1][1], libc::AF_INET as u8);
+        assert_eq!(&blocks[1][4..8], &[192, 0, 2, 1]);
+        assert_eq!(blocks[3][1], libc::AF_LINK as u8);
+        assert_eq!(header_index(&bytes), 7);
+
+        let bytes = encoded(&route("2001:db8:71::/64", 7, Some("2001:db8::1")));
+        assert_eq!(
+            header_flags(&bytes),
+            libc::RTF_UP | libc::RTF_STATIC | libc::RTF_GATEWAY
+        );
+        let blocks = wire_addrs(&bytes);
+        assert_eq!(blocks[1][0], 28);
+        assert_eq!(blocks[1][1], libc::AF_INET6 as u8);
+        assert_eq!(
+            &blocks[1][8..24],
+            &"2001:db8::1".parse::<Ipv6Addr>().unwrap().octets()
+        );
+        assert_eq!(
+            u32::from_ne_bytes(blocks[1][24..28].try_into().unwrap()),
+            0,
+            "a global gateway carries no interface scope"
+        );
+    }
+
+    #[test]
+    fn ipv6_link_local_gateway_carries_the_interface_scope() {
+        let bytes = encoded(&route("2001:db8:71::/64", 7, Some("fe80::1")));
+        assert_eq!(
+            header_flags(&bytes),
+            libc::RTF_UP | libc::RTF_STATIC | libc::RTF_GATEWAY
+        );
+        let blocks = wire_addrs(&bytes);
+        assert_eq!(blocks[1][0], 28);
+        assert_eq!(blocks[1][1], libc::AF_INET6 as u8);
+        assert_eq!(
+            &blocks[1][8..24],
+            &"fe80::1".parse::<Ipv6Addr>().unwrap().octets()
+        );
+        assert_eq!(
+            u32::from_ne_bytes(blocks[1][24..28].try_into().unwrap()),
+            7,
+            "the interface scope is sin6_scope_id"
+        );
+        assert_eq!(
+            &blocks[1][10..12],
+            &[0, 0],
+            "address bytes do not carry an embedded zone"
+        );
+    }
+
+    #[test]
+    fn unspecified_gateways_normalize_to_the_direct_route() {
+        for (destination, unspecified) in [("10.20.0.0/24", "0.0.0.0"), ("2001:db8:20::/64", "::")]
+        {
+            let direct = encoded(&route(destination, 7, None));
+            let explicit = encoded(&route(destination, 7, Some(unspecified)));
+            assert_eq!(explicit, direct);
+            assert_eq!(header_flags(&explicit) & libc::RTF_GATEWAY, 0);
+            let normalized = checked(&route(destination, 7, Some(unspecified))).unwrap();
+            assert!(matches!(
+                normalized.action,
+                RouteAction::Unicast { dev: 7, via: None }
+            ));
+        }
+    }
+
+    #[test]
+    fn input_errors_are_rejected_before_encoding() {
+        for invalid in [
+            route("10.0.0.0/24", 0, None),
+            route("10.0.0.0/24", u16::MAX as u32 + 1, None),
+            route("10.0.0.0/24", 7, Some("2001:db8::1")),
+            route("2001:db8::/64", 7, Some("192.0.2.1")),
+        ] {
+            assert!(checked(&invalid).is_err());
+            assert!(encode(&invalid, libc::RTM_ADD as u8, 1).is_err());
+        }
+        assert_eq!(
+            checked(&route("10.0.0.0/24", 0, None)).unwrap_err().kind(),
+            io::ErrorKind::InvalidInput
+        );
+        assert_eq!(
+            checked(&route("10.0.0.0/24", u16::MAX as u32 + 1, None))
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::Unsupported
+        );
+    }
+
+    #[test]
+    fn readback_rebuilds_the_complete_route() {
+        let decoded = decode(&direct_ipv4_message("10.1.0.0", 7))
+            .unwrap()
+            .unwrap();
+        assert_eq!(decoded, route("10.1.0.0/24", 7, None));
+        assert_ne!(decoded, route("10.1.0.0/24", 8, None));
+        assert_ne!(decoded, route("10.1.0.0/23", 7, None));
+        assert_ne!(decoded, route("10.1.0.0/24", 7, Some("192.0.2.1")));
+
+        // A host row carries no netmask; the prefix is the full width.
+        let destination = ipv4_sockaddr("192.0.2.9");
+        let gateway = link(7);
+        let ifp = link(7);
+        let host = message(
+            libc::RTF_UP | libc::RTF_STATIC | libc::RTF_HOST,
+            7,
+            &[
+                (libc::RTA_DST, &destination[..]),
+                (libc::RTA_GATEWAY, &gateway[..]),
+                (libc::RTA_IFP, &ifp[..]),
+            ],
+        );
+        assert_eq!(decode(&host).unwrap(), Some(route("192.0.2.9/32", 7, None)));
+
+        let destination = ipv4_sockaddr("10.1.0.0");
+        let gateway = ipv4_sockaddr("192.0.2.1");
+        let mask = ipv4_sockaddr("255.255.255.0");
+        let source = ipv4_sockaddr("192.0.2.9");
+        let routed = message(
+            libc::RTF_UP | libc::RTF_STATIC | libc::RTF_GATEWAY,
+            7,
+            &[
+                (libc::RTA_DST, &destination[..]),
+                (libc::RTA_GATEWAY, &gateway[..]),
+                (libc::RTA_NETMASK, &mask[..]),
+                (libc::RTA_IFP, &ifp[..]),
+                // RTA_IFA is the interface address, not a declared source.
+                (libc::RTA_IFA, &source[..]),
+            ],
+        );
+        let decoded = decode(&routed).unwrap().unwrap();
+        assert_eq!(decoded, route("10.1.0.0/24", 7, Some("192.0.2.1")));
+        assert_ne!(decoded, route("10.1.0.0/24", 7, Some("192.0.2.2")));
+        assert_ne!(decoded, route("10.1.0.0/24", 7, None));
+        assert_ne!(decoded, route("10.1.0.0/24", 8, Some("192.0.2.1")));
+
+        let destination = ipv6_sockaddr("2001:db8:71::", 0);
+        let gateway = ipv6_sockaddr("2001:db8::1", 0);
+        let mask = ipv6_sockaddr("ffff:ffff:ffff:ffff::", 0);
+        let routed = message(
+            libc::RTF_UP | libc::RTF_STATIC | libc::RTF_GATEWAY,
+            7,
+            &[
+                (libc::RTA_DST, &destination[..]),
+                (libc::RTA_GATEWAY, &gateway[..]),
+                (libc::RTA_NETMASK, &mask[..]),
+                (libc::RTA_IFP, &ifp[..]),
+            ],
+        );
+        assert_eq!(
+            decode(&routed).unwrap(),
+            Some(route("2001:db8:71::/64", 7, Some("2001:db8::1")))
+        );
+    }
+
+    #[test]
+    fn link_local_readback_accepts_scope_id_and_embedded_zone() {
+        let destination = ipv6_sockaddr("2001:db8:71::", 0);
+        let mask = ipv6_sockaddr("ffff:ffff:ffff:ffff::", 0);
+        let ifp = link(7);
+        let build = |gateway: Vec<u8>| {
+            message(
+                libc::RTF_UP | libc::RTF_STATIC | libc::RTF_GATEWAY,
+                7,
+                &[
+                    (libc::RTA_DST, &destination[..]),
+                    (libc::RTA_GATEWAY, &gateway[..]),
+                    (libc::RTA_NETMASK, &mask[..]),
+                    (libc::RTA_IFP, &ifp[..]),
+                ],
+            )
+        };
+        let expected = route("2001:db8:71::/64", 7, Some("fe80::1"));
+
+        let scoped = build(ipv6_sockaddr("fe80::1", 7));
+        assert_eq!(decode(&scoped).unwrap(), Some(expected.clone()));
+
+        let mut embedded = ipv6_sockaddr("fe80::1", 0);
+        embedded[10..12].copy_from_slice(&7u16.to_be_bytes());
+        assert_eq!(decode(&build(embedded)).unwrap(), Some(expected.clone()));
+
+        let mut both = ipv6_sockaddr("fe80::1", 7);
+        both[10..12].copy_from_slice(&7u16.to_be_bytes());
+        assert_eq!(decode(&build(both)).unwrap(), Some(expected));
+    }
+
+    #[test]
+    fn foreign_scopes_and_global_address_bytes_are_not_rewritten() {
+        let destination = ipv6_sockaddr("2001:db8:71::", 0);
+        let mask = ipv6_sockaddr("ffff:ffff:ffff:ffff::", 0);
+        let ifp = link(7);
+        let build = |gateway: Vec<u8>| {
+            message(
+                libc::RTF_UP | libc::RTF_STATIC | libc::RTF_GATEWAY,
+                7,
+                &[
+                    (libc::RTA_DST, &destination[..]),
+                    (libc::RTA_GATEWAY, &gateway[..]),
+                    (libc::RTA_NETMASK, &mask[..]),
+                    (libc::RTA_IFP, &ifp[..]),
+                ],
+            )
+        };
+
+        let foreign_scope = build(ipv6_sockaddr("fe80::1", 8));
+        assert_eq!(decode(&foreign_scope).unwrap(), None);
+
+        let mut foreign_zone = ipv6_sockaddr("fe80::1", 0);
+        foreign_zone[10..12].copy_from_slice(&8u16.to_be_bytes());
+        assert_eq!(decode(&build(foreign_zone)).unwrap(), None);
+
+        // A global address whose bytes 2..4 are non-zero (2001:0db8::/32)
+        // keeps every address byte.
+        let global = "2001:db8:1234::1";
+        assert_eq!(
+            decode(&build(ipv6_sockaddr(global, 0))).unwrap(),
+            Some(route("2001:db8:71::/64", 7, Some("2001:db8:1234::1")))
+        );
+    }
+
+    #[test]
+    fn compressed_netmasks_are_read_and_illegal_masks_rejected() {
+        let destination = ipv4_sockaddr("10.1.0.0");
+        let gateway = link(7);
+        let ifp = link(7);
+        let build = |mask: Vec<u8>| {
+            message(
+                libc::RTF_UP | libc::RTF_STATIC,
+                7,
+                &[
+                    (libc::RTA_DST, &destination[..]),
+                    (libc::RTA_GATEWAY, &gateway[..]),
+                    (libc::RTA_NETMASK, &mask[..]),
+                    (libc::RTA_IFP, &ifp[..]),
+                ],
+            )
+        };
+
+        // Shorter than a full sockaddr; missing trailing bytes are zero.
+        let compressed = vec![8, libc::AF_INET as u8, 0, 0, 255, 255, 255, 0];
+        assert_eq!(
+            decode(&build(compressed)).unwrap(),
+            Some(route("10.1.0.0/24", 7, None))
+        );
+
+        // A radix-compressed mask's header is not a sockaddr header. Its
+        // family byte carries no meaning, so both the AF_UNSPEC zero and an
+        // arbitrary 0xff still describe this destination's mask. A /24 drops
+        // the trailing zero octet, so `sa_len` is 7, not a full sockaddr.
+        for family_byte in [0, 0xff] {
+            let mask = vec![7, family_byte, 0, 0, 255, 255, 255];
+            assert_eq!(
+                decode(&build(mask)).unwrap(),
+                Some(route("10.1.0.0/24", 7, None)),
+                "a compressed IPv4 mask with family byte {family_byte:#x}"
+            );
+        }
+
+        // A default route compresses to a zero-length mask. The wire block
+        // still reserves its aligned placeholder, which the address walk must
+        // step over.
+        let empty_mask: Vec<u8> = Vec::new();
+        let default_destination = ipv4_sockaddr("0.0.0.0");
+        let default_v4 = message(
+            libc::RTF_UP | libc::RTF_STATIC,
+            7,
+            &[
+                (libc::RTA_DST, &default_destination[..]),
+                (libc::RTA_GATEWAY, &gateway[..]),
+                (libc::RTA_NETMASK, &empty_mask[..]),
+                (libc::RTA_IFP, &ifp[..]),
+            ],
+        );
+        // Destination (16 bytes) and the AF_LINK gateway (8 bytes) precede
+        // the mask block; a zero `sa_len` still occupies its aligned
+        // placeholder, so RTA_IFP starts after it.
+        let mask_at = HEADER + 16 + 8;
+        assert!(
+            default_v4[mask_at..mask_at + aligned(0)]
+                .iter()
+                .all(|&byte| byte == 0),
+            "the zero-length mask keeps its aligned placeholder"
+        );
+        let ifp_at = mask_at + aligned(0);
+        assert_eq!(&default_v4[ifp_at..ifp_at + 8], &link(7)[..]);
+        assert_eq!(
+            decode(&default_v4).unwrap(),
+            Some(route("0.0.0.0/0", 7, None))
+        );
+
+        let default_destination = ipv6_sockaddr("::", 0);
+        let default_v6 = message(
+            libc::RTF_UP | libc::RTF_STATIC,
+            7,
+            &[
+                (libc::RTA_DST, &default_destination[..]),
+                (libc::RTA_GATEWAY, &link(7)[..]),
+                (libc::RTA_NETMASK, &empty_mask[..]),
+                (libc::RTA_IFP, &ifp[..]),
+            ],
+        );
+        assert_eq!(decode(&default_v6).unwrap(), Some(route("::/0", 7, None)));
+
+        // An IPv6 /64 compressed mask: zero family byte, header-sized gap,
+        // then only the eight significant mask bytes. The omitted bytes are
+        // zero, so the destination family decides the address offset.
+        let mut compressed_v6 = vec![16, 0, 0, 0, 0, 0, 0, 0];
+        compressed_v6.extend_from_slice(&[0xff; 8]);
+        let compressed_destination = ipv6_sockaddr("2001:db8:71::", 0);
+        let routed = message(
+            libc::RTF_UP | libc::RTF_STATIC,
+            7,
+            &[
+                (libc::RTA_DST, &compressed_destination[..]),
+                (libc::RTA_GATEWAY, &link(7)[..]),
+                (libc::RTA_NETMASK, &compressed_v6[..]),
+                (libc::RTA_IFP, &ifp[..]),
+            ],
+        );
+        assert_eq!(
+            decode(&routed).unwrap(),
+            Some(route("2001:db8:71::/64", 7, None))
+        );
+
+        let non_contiguous = ipv4_sockaddr("255.0.255.0");
+        let error = decode(&build(non_contiguous)).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+
+        // A missing netmask is a malformed non-host row, not an absent route.
+        let rows = message(
+            libc::RTF_UP | libc::RTF_STATIC,
+            7,
+            &[
+                (libc::RTA_DST, &destination[..]),
+                (libc::RTA_GATEWAY, &gateway[..]),
+                (libc::RTA_IFP, &ifp[..]),
+            ],
+        );
+        assert!(decode(&rows).is_err());
+
+        // A netmask's own scope field is not route scope and is ignored.
+        let destination = ipv6_sockaddr("2001:db8:71::", 0);
+        let mask = ipv6_sockaddr("ffff:ffff:ffff:ffff::", 9);
+        let ifp = link(7);
+        let routed = message(
+            libc::RTF_UP | libc::RTF_STATIC,
+            7,
+            &[
+                (libc::RTA_DST, &destination[..]),
+                (libc::RTA_GATEWAY, &link(7)[..]),
+                (libc::RTA_NETMASK, &mask[..]),
+                (libc::RTA_IFP, &ifp[..]),
+            ],
+        );
+        assert_eq!(
+            decode(&routed).unwrap(),
+            Some(route("2001:db8:71::/64", 7, None))
+        );
+    }
+
+    #[test]
+    fn unsupported_rows_are_skipped() {
+        assert_eq!(decode(&message(libc::RTF_UP, 7, &[])).unwrap(), None);
+        assert_eq!(
+            decode(&message(
+                libc::RTF_UP | libc::RTF_STATIC | libc::RTF_REJECT,
+                7,
+                &[]
+            ))
+            .unwrap(),
+            None
+        );
+        assert_eq!(
+            decode(&message(
+                libc::RTF_UP | libc::RTF_STATIC | libc::RTF_BLACKHOLE,
+                7,
+                &[]
+            ))
+            .unwrap(),
+            None
+        );
+        #[cfg(target_os = "macos")]
+        assert_eq!(
+            decode(&message(
+                libc::RTF_UP | libc::RTF_STATIC | libc::RTF_IFSCOPE,
+                7,
+                &[]
+            ))
+            .unwrap(),
+            None
+        );
+
+        let link_destination = link(7);
+        let unknown_family = message(
+            libc::RTF_UP | libc::RTF_STATIC,
+            7,
+            &[(libc::RTA_DST, &link_destination[..])],
+        );
+        assert_eq!(decode(&unknown_family).unwrap(), None);
+
+        let destination = ipv4_sockaddr("10.1.0.0");
+        let mask = ipv4_sockaddr("255.255.255.0");
+        let ifp = link(7);
+        let ip_gateway = ipv4_sockaddr("192.0.2.1");
+        let direct_with_ip_gateway = message(
+            libc::RTF_UP | libc::RTF_STATIC,
+            7,
+            &[
+                (libc::RTA_DST, &destination[..]),
+                (libc::RTA_GATEWAY, &ip_gateway[..]),
+                (libc::RTA_NETMASK, &mask[..]),
+                (libc::RTA_IFP, &ifp[..]),
+            ],
+        );
+        assert_eq!(decode(&direct_with_ip_gateway).unwrap(), None);
+
+        let gateway_with_link = message(
+            libc::RTF_UP | libc::RTF_STATIC | libc::RTF_GATEWAY,
+            7,
+            &[
+                (libc::RTA_DST, &destination[..]),
+                (libc::RTA_GATEWAY, &ifp[..]),
+                (libc::RTA_NETMASK, &mask[..]),
+                (libc::RTA_IFP, &ifp[..]),
+            ],
+        );
+        assert_eq!(decode(&gateway_with_link).unwrap(), None);
+
+        assert_eq!(
+            decode(&message(libc::RTF_UP | libc::RTF_STATIC, 0, &[])).unwrap(),
+            None,
+            "a zero route index cannot name a device"
+        );
+    }
+
+    #[test]
+    fn truncated_or_malformed_messages_are_rejected() {
+        assert!(decode(&[]).is_err());
+
+        let mut wrong_version = message(libc::RTF_UP | libc::RTF_STATIC, 7, &[]);
+        wrong_version[2] = 0;
+        assert!(decode(&wrong_version).is_err());
+
+        // The destination claims fewer bytes than its address family needs.
+        let mut truncated = direct_ipv4_message("10.1.0.0", 7);
+        truncated[HEADER] = 2;
+        assert!(decode(&truncated).is_err());
+
+        // A gateway claims a family but carries no address bytes.
+        let destination = ipv4_sockaddr("10.1.0.0");
+        let short_gateway = vec![4, libc::AF_INET as u8, 0, 0];
+        let mask = ipv4_sockaddr("255.255.255.0");
+        let ifp = link(7);
+        let bytes = message(
+            libc::RTF_UP | libc::RTF_STATIC | libc::RTF_GATEWAY,
+            7,
+            &[
+                (libc::RTA_DST, &destination[..]),
+                (libc::RTA_GATEWAY, &short_gateway[..]),
+                (libc::RTA_NETMASK, &mask[..]),
+                (libc::RTA_IFP, &ifp[..]),
+            ],
+        );
+        assert!(decode(&bytes).is_err());
+
+        // An IPv6 gateway that stops before its scope field could hide a
+        // scoped next hop; it is truncated, not a global gateway.
+        let destination = ipv6_sockaddr("2001:db8:71::", 0);
+        let mask = ipv6_sockaddr("ffff:ffff:ffff:ffff::", 0);
+        let ifp = link(7);
+        let mut short_gateway = ipv6_sockaddr("2001:db8::1", 0);
+        short_gateway.truncate(24);
+        short_gateway[0] = 24;
+        let bytes = message(
+            libc::RTF_UP | libc::RTF_STATIC | libc::RTF_GATEWAY,
+            7,
+            &[
+                (libc::RTA_DST, &destination[..]),
+                (libc::RTA_GATEWAY, &short_gateway[..]),
+                (libc::RTA_NETMASK, &mask[..]),
+                (libc::RTA_IFP, &ifp[..]),
+            ],
+        );
+        assert!(decode(&bytes).is_err());
+
+        // The address list runs past the message.
+        let mut short = direct_ipv4_message("10.1.0.0", 7);
+        short.truncate(HEADER + 1);
+        assert!(decode(&short).is_err());
+    }
+}

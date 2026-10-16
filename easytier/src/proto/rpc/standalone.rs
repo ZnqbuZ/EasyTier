@@ -151,4 +151,46 @@ mod tests {
             listener_url.as_str()
         );
     }
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    #[ignore = "run inside an isolated user+network namespace"]
+    async fn net_ns_rpc_clients_and_servers_use_distinct_loopbacks() {
+        use crate::{
+            common::net_ns::tests::isolated_net_ns_for_test,
+            proto::{
+                magic_dns::MagicDnsServerRpcClientFactory, rpc_types::controller::BaseController,
+            },
+        };
+        let a = isolated_net_ns_for_test().unwrap();
+        let b = isolated_net_ns_for_test().unwrap();
+        let address = "127.0.0.1:49813".parse().unwrap();
+        let mut first =
+            StandAloneServer::new(super::net_ns_rpc_listener(a.clone(), address).unwrap());
+        let mut second =
+            StandAloneServer::new(super::net_ns_rpc_listener(b.clone(), address).unwrap());
+        first.serve().await.unwrap();
+        second.serve().await.unwrap();
+        let url: url::Url = "tcp://127.0.0.1:49813".parse().unwrap();
+        let mut ca = super::net_ns_rpc_client(a.clone(), url.clone()).unwrap();
+        let mut cb = super::net_ns_rpc_client(b.clone(), url.clone()).unwrap();
+        ca.scoped_client::<MagicDnsServerRpcClientFactory<BaseController>>(String::new())
+            .await
+            .unwrap();
+        cb.scoped_client::<MagicDnsServerRpcClientFactory<BaseController>>(String::new())
+            .await
+            .unwrap();
+        drop(first);
+        let mut next_a = super::net_ns_rpc_client(a, url.clone()).unwrap();
+        assert!(
+            next_a
+                .scoped_client::<MagicDnsServerRpcClientFactory<BaseController>>(String::new())
+                .await
+                .is_err()
+        );
+        let mut next_b = super::net_ns_rpc_client(b, url).unwrap();
+        next_b
+            .scoped_client::<MagicDnsServerRpcClientFactory<BaseController>>(String::new())
+            .await
+            .unwrap();
+    }
 }

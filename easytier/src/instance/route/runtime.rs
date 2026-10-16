@@ -284,4 +284,244 @@ impl easytier_core::peers::public_ipv6::PublicIpv6Host for NativePublicIpv6Host 
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{common::config::TomlConfig, utils::dirty::DirtyFlag};
+    use easytier_core::{
+        config::{
+            peers::PeerRuntimeSnapshot,
+            runtime::{CoreRuntimeConfig, CoreRuntimeConfigStore},
+        },
+        host::route::{RouteInputError, RouteSet, RouteSource, RouteSpec, RouteStatus},
+    };
+    use std::time::Duration;
+    use tokio::sync::Notify;
 
+    fn global_ctx() -> ArcGlobalCtx {
+        Arc::new(crate::common::global_ctx::GlobalCtx::new(
+            TomlConfig::default(),
+        ))
+    }
+
+    fn config_store() -> CoreRuntimeConfigStore {
+        CoreRuntimeConfigStore::new(
+            CoreRuntimeConfig::default(),
+            Arc::new(PeerRuntimeSnapshot::default()),
+        )
+    }
+
+    /// A controller without a worker: nothing removes the instance record, so
+    /// cleanup stays outstanding for the whole test.
+    fn runtime_without_worker(global: &ArcGlobalCtx) -> NativeRouteRuntime {
+        let net_ns = net_ns_services(&global.net_ns).unwrap();
+        let controller = RouteController::new(Arc::new(DirtyFlag::new(false)));
+        let run = global.key();
+        let owner = controller.open_instance(run).unwrap();
+        let handle = owner.handle();
+        let context = Arc::new(NativeRouteContext {
+            net_ns,
+            run,
+            name: global.get_flags().dev_name.clone(),
+            public_address: Arc::new(Mutex::new(None)),
+            handle,
+            controller,
+        });
+        NativeRouteRuntime {
+            owner: Mutex::new(Some(owner)),
+            context,
+        }
+    }
+
+    #[test]
+    fn releasing_the_native_root_closes_new_slots_and_keeps_old_slots_mutable() {
+        let global = global_ctx();
+        let runtime = runtime_without_worker(&global);
+        let context = runtime.context();
+        runtime.bind_config(config_store()).unwrap();
+        let slot = context.handle.open_slot(RouteSource::Additional).unwrap();
+
+        runtime.request_close();
+
+        assert!(
+            context.ensure_open().is_err(),
+            "the context must not keep the released registry alive"
+        );
+        assert!(
+            matches!(
+                context.handle.open_slot(RouteSource::Additional),
+                Err(RouteInputError::Closed)
+            ),
+            "a released root cannot open new inputs"
+        );
+        assert!(
+            runtime.bind_config(config_store()).is_err(),
+            "configuration binding requires a live root"
+        );
+
+        let declaration = RouteSpec::for_tun("10.44.0.0/24".parse().unwrap());
+        slot.set_routes(RouteSet::from([declaration.clone()]));
+        assert_eq!(
+            slot.statuses().get(&declaration),
+            Some(&RouteStatus::Pending { error: None }),
+            "an existing slot stays mutable after its root is gone"
+        );
+    }
+
+    #[test]
+    fn invalidate_input_marks_the_shared_range() {
+        let global = global_ctx();
+        let runtime = runtime_without_worker(&global);
+        let context = runtime.context();
+        context.reset_input_dirty();
+        assert!(!context.input_is_dirty());
+        context.invalidate_input();
+        assert!(
+            context.input_is_dirty(),
+            "an actual input change marks the shared route range"
+        );
+    }
+
+    #[test]
+    fn dropping_the_native_runtime_naturally_releases_the_registry_root() {
+        let global = global_ctx();
+        let context = {
+            let runtime = runtime_without_worker(&global);
+            runtime.context()
+        };
+
+        assert!(
+            context.ensure_open().is_err(),
+            "the owner field is the only strong root"
+        );
+        assert!(matches!(
+            context.handle.open_slot(RouteSource::Additional),
+            Err(RouteInputError::Closed)
+        ));
+    }
+
+    #[tokio::test]
+    async fn repeated_drain_never_reports_success_while_cleanup_is_still_owed() {
+        let global = global_ctx();
+        let runtime = runtime_without_worker(&global);
+
+        for attempt in 0..2 {
+            assert!(
+                tokio::time::timeout(Duration::from_millis(100), runtime.drain())
+                    .await
+                    .is_err(),
+                "drain attempt {attempt} must wait for real cleanup instead of \
+                 treating the released root as success"
+            );
+        }
+    }
+
+    #[cfg(all(feature = "tun", mobile))]
+    #[tokio::test]
+    async fn fd_replacement_invalidates_every_registration_on_the_same_nic() {
+        let global = global_ctx();
+        let runtime = runtime_without_worker(&global);
+        let context = runtime.context();
+        let controller = context.controller.clone();
+        let run_a = context.run;
+        let run_b = uuid::Uuid::new_v4();
+        let _owner_b = controller.open_instance(run_b).unwrap();
+        let mut nics = crate::instance::shared_virtual_nic::SharedVirtualNicRegistry::new();
+        let member_a = nics
+            .try_create_member(
+                "shared-mobile".into(),
+                context.config(1400),
+                run_a,
+                Arc::new(Notify::new()),
+            )
+            .unwrap();
+        let member_b = nics
+            .try_create_member(
+                "shared-mobile".into(),
+                context.config(1400),
+                run_b,
+                Arc::new(Notify::new()),
+            )
+            .unwrap();
+        for member in [&member_a, &member_b] {
+            let nic = member.shared_nic();
+            let mut guard = nic.lock().await;
+            guard
+                .attach_member_registration(member.member_id(), member.registration_id())
+                .await
+                .unwrap();
+        }
+        context.bind_member(&member_a).unwrap();
+        controller.bind_member(run_b, &member_b).unwrap();
+
+        assert!(controller.record_mobile_ready(
+            run_a,
+            &member_a,
+            std::collections::BTreeSet::from(["10.120.0.0/24".parse().unwrap()]),
+        ));
+        assert!(controller.record_mobile_ready(
+            run_b,
+            &member_b,
+            std::collections::BTreeSet::from(["10.121.0.0/24".parse().unwrap()]),
+        ));
+        context
+            .invalidate_shared_mobile_evidence(&member_a)
+            .await
+            .unwrap();
+        assert_eq!(
+            controller.mobile_installed_prefixes(run_a, member_a.registration_id()),
+            None
+        );
+        assert_eq!(
+            controller.mobile_installed_prefixes(run_b, member_b.registration_id()),
+            None,
+            "every registration on the replaced actual NIC loses its old evidence"
+        );
+    }
+
+    #[cfg(all(feature = "tun", not(mobile)))]
+    #[tokio::test]
+    async fn ready_rejects_stale_public_addresses_and_missing_devices() {
+        let global = global_ctx();
+        let runtime = runtime_without_worker(&global);
+        let context = runtime.context();
+        let mut nics = crate::instance::shared_virtual_nic::SharedVirtualNicRegistry::new();
+        let member = nics
+            .try_create_member(
+                "synthetic".into(),
+                context.config(1400),
+                context.run,
+                Arc::new(Notify::new()),
+            )
+            .unwrap();
+        context.bind_member(&member).unwrap();
+
+        #[cfg(feature = "public-ipv6-provider")]
+        let address: cidr::Ipv6Inet = "2001:db8::1/128".parse().unwrap();
+        #[cfg(feature = "public-ipv6-provider")]
+        {
+            context.public_address_changing(Some(address));
+            assert!(
+                !context.ready(&member, None).await.unwrap(),
+                "a callback from an older public address is not applied"
+            );
+        }
+        let error = context
+            .ready(&member, context.public_address())
+            .await
+            .expect_err("a member without a real device must not report ready");
+        assert!(
+            error.to_string().contains("interface name"),
+            "unexpected error: {error:#}"
+        );
+
+        runtime.request_close();
+        assert!(
+            context
+                .ready(&member, context.public_address())
+                .await
+                .is_err(),
+            "a closed root cannot confirm a binding"
+        );
+    }
+}

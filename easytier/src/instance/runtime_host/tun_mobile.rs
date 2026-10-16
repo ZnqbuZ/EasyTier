@@ -239,4 +239,124 @@ impl NativeTunRuntime {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use easytier_core::{config::toml::TomlConfig, process_runtime::CoreProcessRuntime};
 
+    use crate::instance::test_instance::TestInstance;
+
+    /// Cancellation after the real channel accepted a request must produce a
+    /// real "not executed" completion, not a silent channel drop.
+    #[tokio::test(flavor = "current_thread")]
+    async fn cancellation_after_enqueue_reports_not_executed() {
+        let instance = TestInstance::new_with_process_runtime(
+            TomlConfig::default(),
+            CoreProcessRuntime::new(),
+        );
+        let cancel = CancellationToken::new();
+        let runtime = NativeTunRuntime::new(
+            instance.get_global_ctx(),
+            cancel.clone(),
+            TestInstance::current_shared_virtual_nic_registry(),
+            None,
+        );
+        let (_sender, receiver) = mpsc::channel(1);
+        runtime
+            .install_packet_receiver(HostPacketReceiver::new(receiver))
+            .unwrap();
+        runtime
+            .prepare(instance.get_core_instance().packet_plane())
+            .await
+            .unwrap();
+
+        let mut attach =
+            Box::pin(runtime.attach_mobile_fd(0, false, None, std::collections::BTreeSet::new()));
+        assert!(
+            futures::poll!(attach.as_mut()).is_pending(),
+            "the request must really be enqueued before cancellation"
+        );
+        cancel.cancel();
+        let error = attach.await.unwrap_err().to_string();
+        assert!(
+            error.contains("not executed"),
+            "a queued request must receive the real unexecuted result: {error}"
+        );
+        runtime.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn install_failure_cleans_up_before_returning_the_error() {
+        let instance = TestInstance::new_with_process_runtime(
+            TomlConfig::default(),
+            CoreProcessRuntime::new(),
+        );
+        let cancel = CancellationToken::new();
+        let runtime = NativeTunRuntime::new(
+            instance.get_global_ctx(),
+            cancel,
+            TestInstance::current_shared_virtual_nic_registry(),
+            None,
+        );
+        let (_sender, receiver) = mpsc::channel(1);
+        runtime
+            .install_packet_receiver(HostPacketReceiver::new(receiver))
+            .unwrap();
+        runtime
+            .prepare(instance.get_core_instance().packet_plane())
+            .await
+            .unwrap();
+
+        let error = runtime
+            .attach_mobile_fd(1, false, None, std::collections::BTreeSet::new())
+            .await
+            .expect_err("an attachment without its claims must fail");
+        assert!(
+            error
+                .to_string()
+                .contains("installed configuration snapshot"),
+            "unexpected failure: {error:#}"
+        );
+        // The worker performed its NIC cleanup before the error completion and
+        // can still accept the local detach.
+        runtime
+            .attach_mobile_fd(0, false, None, std::collections::BTreeSet::new())
+            .await
+            .unwrap();
+        runtime.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn stopped_runtime_rejects_a_late_attachment() {
+        let instance = TestInstance::new_with_process_runtime(
+            TomlConfig::default(),
+            CoreProcessRuntime::new(),
+        );
+        let cancel = CancellationToken::new();
+        let runtime = NativeTunRuntime::new(
+            instance.get_global_ctx(),
+            cancel,
+            TestInstance::current_shared_virtual_nic_registry(),
+            None,
+        );
+        let (_sender, receiver) = mpsc::channel(1);
+        runtime
+            .install_packet_receiver(HostPacketReceiver::new(receiver))
+            .unwrap();
+        runtime
+            .prepare(instance.get_core_instance().packet_plane())
+            .await
+            .unwrap();
+        runtime.shutdown().await.unwrap();
+
+        let error = runtime
+            .attach_mobile_fd(0, false, None, std::collections::BTreeSet::new())
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("not running"),
+            "a late FD must be rejected without re-registering the old run: {error}"
+        );
+    }
+}
