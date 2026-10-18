@@ -1105,7 +1105,7 @@ impl NicCtx {
         peer_packet_receiver: Arc<Mutex<HostPacketReceiver>>,
         close_notifier: Arc<Notify>,
         registry: ArcSharedVirtualNicRegistry,
-    ) -> Self {
+    ) -> Result<Self, Error> {
         let nic_config = Self::virtual_nic_config(&global_ctx);
         #[cfg(mobile)]
         let nic_config = VirtualNicConfig {
@@ -1115,21 +1115,21 @@ impl NicCtx {
         };
         // Only an explicitly configured name opts into sharing.
         let backend = {
-            NicBackend::Shared(registry.lock().await.create_member(
+            NicBackend::Shared(registry.lock().await.try_create_member(
                 nic_config.dev_name.clone(),
                 nic_config,
                 global_ctx.run_key(),
                 close_notifier.clone(),
-            ))
+            )?)
         };
 
-        Self::new_with_backend(
+        Ok(Self::new_with_backend(
             global_ctx,
             packet_plane,
             peer_packet_receiver,
             close_notifier,
             backend,
-        )
+        ))
     }
 
     pub async fn ifname(&self) -> Option<String> {

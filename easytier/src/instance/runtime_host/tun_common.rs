@@ -168,7 +168,7 @@ impl NativeDhcpHost {
                     self.closed.clone(),
                     self.shared_virtual_nic_registry.clone(),
                 )
-                .await;
+                .await?;
                 tokio::select! {
                     _ = self.cancel.cancelled() => anyhow::bail!("instance is closing; DHCP update cancelled"),
                     result = nic.run(addresses.ipv4, addresses.ipv6) => result?,

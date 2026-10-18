@@ -240,7 +240,7 @@ impl SharedVirtualNic {
         }
     }
 
-    async fn invalidate_and_shutdown_dispatcher(&mut self) {
+    pub(crate) async fn invalidate_and_shutdown_dispatcher(&mut self) {
         self.mark_invalid();
         self.shutdown_dispatcher().await;
     }
@@ -531,7 +531,12 @@ impl Drop for SharedVirtualNicMemberRegistration {
         let member_id = self.member_id;
         let registration_id = self.registration_id;
 
-        shared_virtual_nic_runtime().spawn(async move {
+        let Ok(shared) = crate::host_runtime::native_host_runtime().shared_executor() else {
+            // Global shutdown already stopped the dispatcher and its actual I/O.
+            // Late registration destruction must not panic or restart a driver.
+            return;
+        };
+        shared.spawn(async move {
             let mut shared_nic = shared_nic.lock().await;
             if let Err(err) = shared_nic
                 .remove_member_registration_claims(member_id, registration_id)
@@ -798,6 +803,7 @@ impl SharedVirtualNicMember {
 #[derive(Default)]
 pub struct SharedVirtualNicRegistry {
     nics: BTreeMap<SharedVirtualNicRegistryKey, SharedVirtualNicRegistryEntry>,
+    closing: Arc<AtomicBool>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -868,6 +874,21 @@ impl SharedVirtualNicRegistry {
         Self::default()
     }
 
+    pub(crate) fn in_domain(closing: Arc<AtomicBool>) -> Self {
+        Self {
+            closing,
+            ..Self::default()
+        }
+    }
+
+    pub(crate) fn take_for_shutdown(&mut self) -> Vec<Arc<Mutex<SharedVirtualNic>>> {
+        self.closing.store(true, Ordering::Release);
+        std::mem::take(&mut self.nics)
+            .into_values()
+            .map(|entry| entry.nic)
+            .collect()
+    }
+
     #[cfg(test)]
     pub(crate) fn get(
         &self,
@@ -923,23 +944,38 @@ impl SharedVirtualNicRegistry {
             .expect("shared virtual nic registry entry should exist")
     }
 
-    pub fn create_member(
+    pub(crate) fn try_create_member(
         &mut self,
         dev_name: String,
         config: VirtualNicConfig,
         member_id: SharedVirtualNicMemberId,
         close_notifier: Arc<Notify>,
-    ) -> SharedVirtualNicMember {
+    ) -> Result<SharedVirtualNicMember, Error> {
+        if self.closing.load(Ordering::Acquire) {
+            return Err(anyhow::anyhow!("network namespace NIC admission is closed").into());
+        }
         let configured_mtu = config.mtu();
         let entry = self.get_or_create_entry(dev_name, config, member_id);
-        SharedVirtualNicMember::new(
+        Ok(SharedVirtualNicMember::new(
             member_id,
             configured_mtu,
             entry.nic(),
             close_notifier,
             entry.member_tunnel_table(),
             entry.lifetimes.clone(),
-        )
+        ))
+    }
+
+    #[cfg(test)]
+    pub fn create_member(
+        &mut self,
+        name: String,
+        config: VirtualNicConfig,
+        member: SharedVirtualNicMemberId,
+        closed: Arc<Notify>,
+    ) -> SharedVirtualNicMember {
+        self.try_create_member(name, config, member, closed)
+            .unwrap()
     }
 }
 
