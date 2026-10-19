@@ -563,7 +563,7 @@ mod tests {
     use crate::host::dns::{DnsQuery, DnsRecordResolver, DnsResolver, DnsSrvRecord};
     use crate::socket::BindConfig;
     use crate::socket::{
-        NetNamespace,
+        NetNS,
         tcp::{TcpConnectOptions, VirtualTcpSocket, VirtualTcpSocketFactory},
     };
 
@@ -723,12 +723,12 @@ mod tests {
     fn collector_keeps_udp_and_tcp_socket_contexts_separate() {
         let udp_context = SocketContext {
             socket_mark: Some(11),
-            netns: Some(NetNamespace::new("udp-instance")),
+            net_ns: Some(NetNS::from_host_reference("udp-instance")),
             ..SocketContext::default()
         };
         let tcp_context = SocketContext {
             socket_mark: Some(22),
-            netns: Some(NetNamespace::new("tcp-instance")),
+            net_ns: Some(NetNS::from_host_reference("tcp-instance")),
             ..SocketContext::default()
         };
         let collector = StunInfoCollector::new_with_socket_contexts(
@@ -750,7 +750,7 @@ mod tests {
         let runtime = Arc::new(MockRuntime::default());
         let context = SocketContext {
             socket_mark: Some(0),
-            netns: Some(NetNamespace::new("instance-a")),
+            net_ns: Some(NetNS::from_host_reference("instance-a")),
             ..SocketContext::default()
         };
         let collector = StunInfoCollector::new(
@@ -773,7 +773,11 @@ mod tests {
         assert_eq!(binds[0].context.ip_version, IpVersion::V4);
         assert_eq!(binds[0].context.socket_mark, Some(0));
         assert_eq!(
-            binds[0].context.netns.as_ref().map(|netns| netns.token()),
+            binds[0]
+                .context
+                .net_ns
+                .as_ref()
+                .map(|net_ns| net_ns.host_reference().unwrap()),
             Some("instance-a")
         );
     }

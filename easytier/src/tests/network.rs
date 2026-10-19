@@ -1,12 +1,13 @@
-use crate::common::netns::{NetNS, ROOT_NETNS_NAME};
+use crate::common::net_ns::ROOT_NET_NS_NAME;
+use easytier_core::socket::BindConfig;
 
-use super::{add_ns_to_bridge, create_netns, del_netns, run_network_command};
+use super::{add_ns_to_bridge, create_net_ns, del_net_ns, run_network_command};
 
 /// Owns one test's host links and namespaces. Keep this alive until its
 /// instances and background tasks have stopped, including on setup failures.
 pub(super) struct TestNetwork {
     directory: tempfile::TempDir,
-    namespaces: Vec<(&'static str, String)>,
+    net_ns: Vec<(&'static str, String)>,
     links: Vec<(&'static str, String)>,
 }
 
@@ -18,7 +19,7 @@ impl TestNetwork {
                 .rand_bytes(4)
                 .tempdir()
                 .unwrap(),
-            namespaces: Vec::new(),
+            net_ns: Vec::new(),
             links: Vec::new(),
         }
     }
@@ -27,35 +28,30 @@ impl TestNetwork {
         self.directory.path().file_name().unwrap().to_str().unwrap()
     }
 
-    pub(super) fn namespace(&self, name: &str) -> &str {
-        &self
-            .namespaces
-            .iter()
-            .find(|(key, _)| *key == name)
-            .unwrap()
-            .1
+    pub(super) fn net_ns(&self, name: &str) -> &str {
+        &self.net_ns.iter().find(|(key, _)| *key == name).unwrap().1
     }
 
     pub(super) fn link(&self, name: &str) -> &str {
         &self.links.iter().find(|(key, _)| *key == name).unwrap().1
     }
 
-    fn add_namespace(&mut self, name: &'static str) {
+    fn add_net_ns(&mut self, name: &'static str) {
         // veth_<namespace>_h must fit Linux's 15-byte interface name limit.
-        let actual = format!("{}{:02x}", self.prefix(), self.namespaces.len());
+        let actual = format!("{}{:02x}", self.prefix(), self.net_ns.len());
         assert!(actual.len() <= 8);
-        assert!(!self.namespaces.iter().any(|(key, _)| *key == name));
-        self.namespaces.push((name, actual));
+        assert!(!self.net_ns.iter().any(|(key, _)| *key == name));
+        self.net_ns.push((name, actual));
     }
 
-    pub(super) fn create_namespace(&mut self, name: &'static str, ipv4: &str, ipv6: &str) {
-        self.add_namespace(name);
-        create_netns(self.namespace(name), ipv4, ipv6);
+    pub(super) fn create_net_ns(&mut self, name: &'static str, ipv4: &str, ipv6: &str) {
+        self.add_net_ns(name);
+        create_net_ns(self.net_ns(name), ipv4, ipv6);
     }
 
-    pub(super) fn create_empty_namespace(&mut self, name: &'static str) {
-        self.add_namespace(name);
-        let actual = self.namespace(name);
+    pub(super) fn create_empty_net_ns(&mut self, name: &'static str) {
+        self.add_net_ns(name);
+        let actual = self.net_ns(name);
         run_network_command("ip", &["netns", "add", actual]);
         run_network_command(
             "ip",
@@ -75,76 +71,91 @@ impl TestNetwork {
         run_network_command("ip", &["link", "set", self.link(name), "up"]);
     }
 
-    pub(super) fn add_to_bridge(&self, bridge: &str, namespace: &str) {
-        add_ns_to_bridge(self.link(bridge), self.namespace(namespace));
+    pub(super) fn add_to_bridge(&self, bridge: &str, net_ns: &str) {
+        add_ns_to_bridge(self.link(bridge), self.net_ns(net_ns));
     }
 }
 
 impl Drop for TestNetwork {
     fn drop(&mut self) {
-        let _guard = NetNS::new(Some(ROOT_NETNS_NAME.to_owned())).guard();
-        for (_, namespace) in &self.namespaces {
-            del_netns(namespace);
-        }
-        for (_, link) in self.links.iter().rev() {
-            let _ = std::process::Command::new("ip")
-                .args(["link", "del", link])
-                .output();
-        }
+        crate::common::net_ns::tests::test_net_ns(Some(ROOT_NET_NS_NAME.to_owned()))
+            .run(|| {
+                for (_, net_ns) in &self.net_ns {
+                    del_net_ns(net_ns);
+                }
+                for (_, link) in self.links.iter().rev() {
+                    let _ = std::process::Command::new("ip")
+                        .args(["link", "del", link])
+                        .output();
+                }
+            })
+            .unwrap()
     }
 }
 
 #[test]
-fn nested_namespace_guard_restores_current_thread() {
+fn nested_net_ns_guard_restores_current_thread() {
     let mut network = TestNetwork::new();
-    network.create_empty_namespace("net_a");
-    network.create_empty_namespace("net_b");
-    let net_a = NetNS::new(Some(network.namespace("net_a").into()));
-    let net_b = NetNS::new(Some(network.namespace("net_b").into()));
+    network.create_empty_net_ns("net_a");
+    network.create_empty_net_ns("net_b");
+    let net_a = crate::common::net_ns::tests::test_net_ns(Some(network.net_ns("net_a").into()));
+    let net_b = crate::common::net_ns::tests::test_net_ns(Some(network.net_ns("net_b").into()));
     let current = || std::fs::read_link("/proc/thread-self/ns/net").unwrap();
     let original = current();
 
-    net_a.run(|| {
-        let expected = current();
-        assert_ne!(expected, original);
-        net_b.run(|| assert_ne!(current(), expected));
-        assert_eq!(current(), expected);
-    });
+    net_a
+        .run(|| {
+            let expected = current();
+            assert_ne!(expected, original);
+            net_b.run(|| assert_ne!(current(), expected)).unwrap();
+            assert_eq!(current(), expected);
+        })
+        .unwrap();
     assert_eq!(current(), original);
 }
 
 #[tokio::test]
-async fn async_namespace_restores_between_polls() {
+async fn bound_sockets_use_distinct_net_ns_without_switching_async_tasks() {
+    use easytier_core::socket::udp::{VirtualUdpSocket, VirtualUdpSocketFactory};
     let mut network = TestNetwork::new();
-    network.create_empty_namespace("net_a");
-    network.create_empty_namespace("net_b");
-    let net_a = NetNS::new(Some(network.namespace("net_a").into()));
-    let net_b = NetNS::new(Some(network.namespace("net_b").into()));
-    let current = || std::fs::read_link("/proc/thread-self/ns/net").unwrap();
-    let original = current();
-    let expected = net_a.run(current);
-
-    let mut future = Box::pin(net_a.run_async(|| async {
-        assert_eq!(current(), expected);
-        tokio::task::yield_now().await;
-        assert_eq!(current(), expected);
-    }));
-    assert!(futures::poll!(future.as_mut()).is_pending());
-    assert_eq!(current(), original);
-    net_b.run(|| assert_ne!(current(), expected));
-    future.await;
-    assert_eq!(current(), original);
-
-    let dropped_in = std::cell::RefCell::new(None);
-    let mut cancelled = Box::pin(net_a.run_async(|| async {
-        let _cleanup = guarden::guard::ContextGuard::new((), |_| {
-            *dropped_in.borrow_mut() = Some(current());
-        });
-        std::future::pending::<()>().await;
-    }));
-    assert!(futures::poll!(cancelled.as_mut()).is_pending());
-    assert_eq!(current(), original);
-    drop(cancelled);
-    assert_eq!(current(), original);
-    assert_eq!(*dropped_in.borrow(), Some(expected));
+    network.create_empty_net_ns("net_a");
+    network.create_empty_net_ns("net_b");
+    let a = crate::common::net_ns::tests::test_net_ns(Some(network.net_ns("net_a").into()));
+    let b = crate::common::net_ns::tests::test_net_ns(Some(network.net_ns("net_b").into()));
+    let original = crate::common::net_ns::current().unwrap();
+    let socket_a = crate::host_runtime::net_ns_services(&a)
+        .unwrap()
+        .bind_udp(BindConfig {
+            reuse_addr: Some(false),
+            bind_device: Some(String::new()),
+            local_addr: Some("0.0.0.0:0".parse().unwrap()),
+            ..BindConfig::default()
+        })
+        .await
+        .unwrap();
+    let address = socket_a.local_addr().unwrap();
+    let _socket_b = crate::host_runtime::net_ns_services(&b)
+        .unwrap()
+        .bind_udp(BindConfig {
+            reuse_addr: Some(false),
+            bind_device: Some(String::new()),
+            local_addr: Some(address),
+            ..BindConfig::default()
+        })
+        .await
+        .unwrap();
+    assert!(
+        crate::host_runtime::net_ns_services(&a)
+            .unwrap()
+            .bind_udp(BindConfig {
+                reuse_addr: Some(false),
+                bind_device: Some(String::new()),
+                local_addr: Some(address),
+                ..BindConfig::default()
+            })
+            .await
+            .is_err()
+    );
+    tokio::task::yield_now().await;
+    assert_eq!(original, crate::common::net_ns::current().unwrap());
 }

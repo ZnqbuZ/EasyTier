@@ -326,8 +326,7 @@ mod tests {
     #[tokio::test]
     async fn runtime_wireguard_upgraders_consume_core_udp_sessions(#[case] bind_addr: &str) {
         use crate::{
-            common::netns::NetNS, host_runtime::native_host_runtime,
-            socket::udp::new_runtime_udp_session_listener,
+            host_runtime::native_host_runtime, socket::udp::new_runtime_udp_session_listener,
         };
         use easytier_core::socket::BindConfig;
         use easytier_core::{
@@ -349,8 +348,8 @@ mod tests {
                 ..BindConfig::default()
             }),
             UdpSessionAcceptKind::Classified(UdpSessionProtocol::WireGuard),
-            NetNS::new(None),
-        );
+        )
+        .unwrap();
         listener.listen().await.unwrap();
         let remote_addr = listener.bound_socket().unwrap().local_addr().unwrap();
         let remote_url: url::Url = format!("wg://{remote_addr}").parse().unwrap();
@@ -407,8 +406,7 @@ mod tests {
     #[tokio::test]
     async fn runtime_quic_upgraders_consume_core_udp_sessions(#[case] bind_addr: &str) {
         use crate::{
-            common::netns::NetNS, host_runtime::native_host_runtime,
-            socket::udp::new_runtime_udp_session_listener,
+            host_runtime::native_host_runtime, socket::udp::new_runtime_udp_session_listener,
         };
         use easytier_core::socket::BindConfig;
         use easytier_core::{
@@ -433,8 +431,8 @@ mod tests {
                 ..BindConfig::default()
             }),
             UdpSessionAcceptKind::Classified(UdpSessionProtocol::Quic),
-            NetNS::new(None),
-        );
+        )
+        .unwrap();
         listener.listen().await.unwrap();
         let remote_addr = listener.bound_socket().unwrap().local_addr().unwrap();
         let remote_url: url::Url = format!("quic://{remote_addr}").parse().unwrap();

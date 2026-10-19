@@ -587,20 +587,56 @@ mod tests {
     }
 
     #[test]
-    fn runtime_dns_context_preserves_process_routing_inputs() {
+    fn runtime_dns_context_preserves_bound_domain_and_zero_mark() {
+        let net_ns = crate::common::net_ns::current().unwrap();
         let context = SocketContext {
             socket_mark: Some(0),
-            netns: Some(easytier_core::socket::NetNamespace::new("instance-a")),
+            net_ns: Some(net_ns.clone()),
             ..SocketContext::default()
         };
+        let actual = RuntimeDnsIoContext::from_socket_context(&context, &net_ns).unwrap();
+        assert_eq!(actual.net_ns.id(), net_ns.id());
+        assert_eq!(actual.socket_mark, Some(0));
+        let named = SocketContext {
+            net_ns: Some(easytier_core::socket::NetNS::from_host_reference(
+                "instance-a",
+            )),
+            ..SocketContext::default()
+        };
+        assert!(RuntimeDnsIoContext::from_socket_context(&named, &net_ns).is_err());
+    }
 
-        assert_eq!(
-            RuntimeDnsIoContext::from_socket_context(&context),
-            RuntimeDnsIoContext {
-                netns: Some("instance-a".to_owned()),
+    #[tokio::test]
+    async fn dns_literal_needs_no_resolver_socket_or_mark_capability() {
+        let net_ns = crate::common::net_ns::current().unwrap();
+        let resolver = RuntimeDnsResolver::in_net_ns(net_ns);
+        for address in ["127.0.0.1", "::1"] {
+            let context = SocketContext {
                 socket_mark: Some(0),
-            }
-        );
+                ..SocketContext::default()
+            };
+            assert_eq!(
+                resolver
+                    .resolve(DnsQuery::new(address, context))
+                    .await
+                    .unwrap(),
+                vec![address.parse::<IpAddr>().unwrap()]
+            );
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "run inside an isolated user+network namespace"]
+    fn non_default_domains_cannot_use_process_wide_nss() {
+        let host = crate::host_runtime::native_host_runtime();
+        let original = host.capture_default_net_ns().unwrap();
+        let other = crate::common::net_ns::tests::isolated_net_ns_for_test().unwrap();
+        assert!(host.is_process_default(&original).unwrap());
+        assert!(!host.is_process_default(&other).unwrap());
+        let context =
+            RuntimeDnsIoContext::from_socket_context(&SocketContext::default(), &other).unwrap();
+        assert!(RuntimeDnsResolver::requires_socket_dns(&context).unwrap());
     }
 
     #[tokio::test]

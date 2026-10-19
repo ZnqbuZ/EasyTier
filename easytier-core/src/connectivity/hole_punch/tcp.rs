@@ -1111,7 +1111,7 @@ mod tests {
         let bind_addr = "0.0.0.0:23333".parse().unwrap();
         let context = SocketContext {
             socket_mark: Some(0),
-            netns: Some(crate::socket::NetNamespace::new("test-netns")),
+            net_ns: Some(crate::socket::NetNS::from_host_reference("test-netns")),
             ..SocketContext::default()
         };
 
@@ -1128,9 +1128,9 @@ mod tests {
             options
                 .bind
                 .context
-                .netns
+                .net_ns
                 .as_ref()
-                .map(|netns| netns.token()),
+                .map(|net_ns| net_ns.host_reference().unwrap()),
             Some("test-netns")
         );
         assert!(options.bind.only_v6);

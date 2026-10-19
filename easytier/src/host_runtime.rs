@@ -570,7 +570,216 @@ impl DnsRecordResolver for NativeHostRuntime {
 
 #[cfg(test)]
 mod tests {
+    use crate::common::native_executor::NativeExecutor;
+
     use super::*;
+
+    impl NativeHostRuntime {
+        pub(crate) fn is_local_ip(&self, ip: &IpAddr, context: &SocketContext) -> bool {
+            self.net_ns(context)
+                .is_ok_and(|net_ns| net_ns.is_local_ip(ip, context))
+        }
+    }
+
+    #[tokio::test]
+    async fn terminal_shutdown_closes_domain_admission_before_stopping_the_executor() {
+        use std::time::Duration;
+        let host = Arc::new(NativeHostRuntime::new());
+        let net_ns = host.capture_default_net_ns().unwrap();
+        let shared = host.shared_executor().unwrap();
+        assert_eq!(
+            shared.metrics().num_workers(),
+            if cfg!(mobile) { 1 } else { 2 }
+        );
+        // Hold the asynchronous NIC directory, so the cleanup remains pending
+        // while checking the synchronous close boundary.
+        #[cfg(feature = "tun")]
+        let services = host.services(&net_ns).unwrap();
+        #[cfg(feature = "tun")]
+        let permit = services.nics.lock().await;
+        host.request_service_shutdown();
+        assert!(net_ns.ensure_open().is_err());
+        assert!(host.capture_default_net_ns().is_err());
+        assert!(host.shared_executor().is_ok());
+        #[cfg(feature = "tun")]
+        drop(permit);
+        tokio::time::timeout(Duration::from_secs(5), host.shutdown())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(host.shared_executor().is_err());
+        assert!(host.net_ns(&SocketContext::default()).is_err());
+        host.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn closed_domains_reject_new_native_io_through_every_bound_factory() {
+        let platform = PlatformNetNS::thread().unwrap();
+        let net_ns = NativeNetNSServices::new(NetNS::new(platform.id(), platform));
+        net_ns.request_service_shutdown();
+        let closing =
+            |error: anyhow::Error| assert!(error.to_string().contains("closing"), "{error:#}");
+        closing(
+            net_ns
+                .bind_tcp(TcpListenOptions::direct_connect(
+                    "127.0.0.1:0".parse().unwrap(),
+                ))
+                .await
+                .err()
+                .unwrap(),
+        );
+        closing(
+            net_ns
+                .bind_udp(BindConfig {
+                    reuse_addr: Some(false),
+                    ..BindConfig::default()
+                })
+                .await
+                .err()
+                .unwrap(),
+        );
+        closing(
+            net_ns
+                .local_addr_for_remote("127.0.0.1:9".parse().unwrap(), SocketContext::default())
+                .await
+                .err()
+                .unwrap(),
+        );
+        closing(
+            net_ns
+                .resolve(DnsQuery::new("127.0.0.1", SocketContext::default()))
+                .await
+                .err()
+                .unwrap(),
+        );
+        #[cfg(unix)]
+        closing(
+            net_ns
+                .connect_byte_stream(
+                    &url::Url::parse("unix:///tmp/easytier-closed-domain.sock").unwrap(),
+                )
+                .await
+                .err()
+                .unwrap(),
+        );
+    }
+
+    #[cfg(feature = "tun")]
+    #[tokio::test]
+    async fn terminal_cleanup_survives_the_shutdown_waiter_being_cancelled() {
+        let host = Arc::new(NativeHostRuntime::new());
+        let net_ns = host.capture_default_net_ns().unwrap();
+        let services = host.services(&net_ns).unwrap();
+        #[cfg(feature = "tun")]
+        let permit = services.nics.lock().await;
+        let waiting = host.clone();
+        let waiter = tokio::spawn(async move { waiting.shutdown().await });
+        tokio::task::yield_now().await;
+        waiter.abort();
+        let _ = waiter.await;
+        drop(permit);
+        tokio::time::timeout(std::time::Duration::from_secs(5), host.shutdown())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(host.shared_executor().is_err());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "run inside an isolated user+network namespace"]
+    fn process_default_is_not_the_first_callers_temporary_domain() {
+        let original = crate::common::net_ns::current().unwrap();
+        let temporary = crate::common::net_ns::tests::isolated_net_ns_for_test().unwrap();
+        temporary
+            .run(|| {
+                let host = NativeHostRuntime::new();
+                assert_ne!(
+                    crate::common::net_ns::current().unwrap().id(),
+                    original.id()
+                );
+                assert_eq!(host.capture_default_net_ns().unwrap().id(), original.id());
+            })
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn shared_reactor_survives_the_instance_that_first_initialized_it() {
+        use std::time::Duration;
+        let host = Arc::new(NativeHostRuntime::new());
+        let first = NativeExecutor::new(false, 1).unwrap();
+        let first_handle = first.handle();
+        let net_ns = net_ns_services(&crate::common::net_ns::current().unwrap()).unwrap();
+        let initialize_host = host.clone();
+        let socket = first_handle
+            .spawn(async move {
+                let shared = initialize_host.shared_executor().unwrap();
+                shared
+                    .spawn(async move {
+                        net_ns
+                            .run(|| {
+                                let socket = std::net::UdpSocket::bind("127.0.0.1:0")?;
+                                socket.set_nonblocking(true)?;
+                                tokio::net::UdpSocket::from_std(socket)
+                            })
+                            .unwrap()
+                            .unwrap()
+                    })
+                    .await
+                    .unwrap()
+            })
+            .await
+            .unwrap();
+        // Use a synchronous socket construction in the domain, and ensure the
+        // async resource was actually registered on the shared runtime.
+        let address = socket.local_addr().unwrap();
+        let shared_id = host.shared_executor().unwrap().id();
+        assert_ne!(shared_id, first_handle.id());
+        let first_task = first_handle.spawn(std::future::pending::<()>());
+        drop(first);
+        assert!(
+            tokio::time::timeout(Duration::from_secs(5), first_task)
+                .await
+                .unwrap()
+                .unwrap_err()
+                .is_cancelled()
+        );
+        let second = NativeExecutor::new(false, 1).unwrap();
+        let socket = Arc::new(socket);
+        let receive = socket.clone();
+        let receive = second.handle().spawn(async move {
+            let mut packet = [0; 32];
+            let length = receive.recv_from(&mut packet).await.unwrap().0;
+            packet[..length].to_vec()
+        });
+        let sender = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        sender
+            .send_to(b"after-first-runtime", address)
+            .await
+            .unwrap();
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(5), receive)
+                .await
+                .unwrap()
+                .unwrap(),
+            b"after-first-runtime"
+        );
+        assert_eq!(host.shared_executor().unwrap().id(), shared_id);
+        drop(socket);
+        let pending = host
+            .shared_executor()
+            .unwrap()
+            .spawn(std::future::pending::<()>());
+        host.request_executor_shutdown();
+        assert!(host.shared_executor().is_err());
+        assert!(
+            tokio::time::timeout(Duration::from_secs(5), pending)
+                .await
+                .unwrap()
+                .unwrap_err()
+                .is_cancelled()
+        );
+    }
 
     #[test]
     fn native_host_runtime_is_process_wide() {
@@ -579,10 +788,10 @@ mod tests {
 
     #[test]
     fn native_local_ip_probe_uses_process_runtime() {
-        assert!(native_host_runtime().is_local_ip(
-            &IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
-            &SocketContext::default(),
-        ));
+        assert!(
+            native_host_runtime()
+                .is_local_ip(&IpAddr::V4(Ipv4Addr::LOCALHOST), &SocketContext::default(),)
+        );
     }
 
     #[tokio::test]

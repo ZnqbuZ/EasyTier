@@ -149,7 +149,7 @@ impl<'a> Decoder<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::socket::NetNamespace;
+    use crate::socket::NetNS;
     use crate::socket::SocketContext;
 
     #[test]
@@ -159,7 +159,7 @@ mod tests {
             SocketContext {
                 ip_version: IpVersion::V6,
                 socket_mark: Some(0x01020304),
-                netns: Some(NetNamespace::new("netns0")),
+                net_ns: Some(NetNS::from_host_reference("netns0")),
             },
         );
         let encoded = encode_query(&query).unwrap();
@@ -176,7 +176,7 @@ mod tests {
             SocketContext {
                 ip_version: IpVersion::V4,
                 socket_mark: None,
-                netns: None,
+                net_ns: None,
             },
         ))
         .unwrap();

@@ -657,6 +657,24 @@ impl NetlinkEncode for NeighborMessage {
 mod tests {
     use super::*;
 
+    #[test]
+    fn link_decode_reads_nested_driver_kind_and_rejects_partial_attributes() {
+        let mut bytes = vec![0; 16];
+        bytes[4..8].copy_from_slice(&17_i32.to_ne_bytes());
+        bytes[8..12].copy_from_slice(&(libc::IFF_UP as u32).to_ne_bytes());
+        Attribute::new(3, b"et0\0").write_to(&mut bytes).unwrap();
+        let mut info = Vec::new();
+        Attribute::new(1, b"tun\0").write_to(&mut info).unwrap();
+        Attribute::new(18, info).write_to(&mut bytes).unwrap();
+        let link = LinkMessage::from_bytes(&bytes).unwrap();
+        assert_eq!(link.index, 17);
+        assert_eq!(link.name, "et0");
+        assert_eq!(link.kind.as_deref(), Some("tun"));
+        assert_eq!(link.flags, libc::IFF_UP as u32);
+        bytes.pop();
+        assert!(LinkMessage::from_bytes(&bytes).is_err());
+    }
+
     fn encode<T: NetlinkEncode>(message: &T) -> Vec<u8> {
         let mut bytes = Vec::new();
         message.write_to(&mut bytes).unwrap();
