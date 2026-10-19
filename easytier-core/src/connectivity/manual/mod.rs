@@ -335,8 +335,8 @@ impl ManualConnectorOptions {
         ip_version: IpVersion,
     ) -> SocketContext {
         let context = match transport {
-            ManualTransport::Tcp(_) => self.tcp_bind.context.clone(),
-            ManualTransport::Udp(_) => self.udp_bind.context.clone(),
+            ManualTransport::Tcp(_) => self.tcp_bind.effective_context(),
+            ManualTransport::Udp(_) => self.udp_bind.effective_context(),
             ManualTransport::ByteStream => SocketContext::default(),
         };
         SocketContext {

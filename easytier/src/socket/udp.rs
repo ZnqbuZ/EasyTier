@@ -142,7 +142,7 @@ impl VirtualUdpSocketFactory for RuntimeUdpSocketFactory {
     type Socket = RuntimeUdpSocket;
 
     async fn bind_udp(&self, options: BindConfig) -> anyhow::Result<Arc<Self::Socket>> {
-        let context = options.context.clone();
+        let context = options.effective_context();
         let socket = crate::socket::bind::<UdpSocket>(options).await?;
         Ok(Arc::new(RuntimeUdpSocket::new_with_context(
             Arc::new(socket),

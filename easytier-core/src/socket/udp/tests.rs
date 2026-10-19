@@ -41,6 +41,7 @@ fn session_connect_request_keeps_peer_scoped_udp_shape() {
     assert_eq!(
         request.bind,
         BindConfig {
+            namespace: None,
             context: SocketContext::default(),
             local_addr: Some(bind_addr),
             bind_device: None,

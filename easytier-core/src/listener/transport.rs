@@ -355,8 +355,12 @@ where
         let mut options = self.options.clone();
         if options.bind.local_addr.is_none() {
             options.bind.local_addr = Some(
-                resolve_listener_addr(&self.url, options.bind.context.clone(), self.dns.as_ref())
-                    .await?,
+                resolve_listener_addr(
+                    &self.url,
+                    options.bind.effective_context(),
+                    self.dns.as_ref(),
+                )
+                .await?,
             );
         }
         if let Some(local_addr) = options.bind.local_addr {
@@ -481,8 +485,12 @@ where
         let mut request = self.request.clone();
         if request.bind.local_addr.is_none() {
             request.bind.local_addr = Some(
-                resolve_listener_addr(&self.url, request.bind.context.clone(), self.dns.as_ref())
-                    .await?,
+                resolve_listener_addr(
+                    &self.url,
+                    request.bind.effective_context(),
+                    self.dns.as_ref(),
+                )
+                .await?,
             );
         }
         if let Some(local_addr) = request.bind.local_addr {

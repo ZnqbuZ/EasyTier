@@ -39,6 +39,9 @@ pub struct SocketContext {
 #[serde(default)]
 pub struct BindConfig {
     pub context: SocketContext,
+    /// Override the context namespace for this socket. None inherits
+    /// `context.netns`; if both are None, the host selects its default namespace.
+    pub namespace: Option<NetNamespace>,
     /// Request VPN bypass before bind/connect/listen. Local/TUN-facing callers
     /// opt out explicitly. Accepted TCP children inherit this requirement.
     #[educe(Default = true)]
@@ -51,6 +54,22 @@ pub struct BindConfig {
     pub reuse_addr: Option<bool>,
     pub reuse_port: bool,
     pub only_v6: bool,
+}
+
+impl BindConfig {
+    /// Apply this socket's namespace override without changing its other context.
+    /// Resolving an unspecified namespace to the host default is the host's job.
+    pub fn effective_context(&self) -> SocketContext {
+        SocketContext {
+            ip_version: self.context.ip_version,
+            socket_mark: self.context.socket_mark,
+            netns: self
+                .namespace
+                .as_ref()
+                .or(self.context.netns.as_ref())
+                .cloned(),
+        }
+    }
 }
 
 #[cfg(test)]

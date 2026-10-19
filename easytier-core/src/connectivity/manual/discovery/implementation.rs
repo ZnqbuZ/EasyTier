@@ -153,7 +153,7 @@ where
         default_port,
         SocketContext {
             ip_version: request.ip_version,
-            ..request.tcp_bind.context.clone()
+            ..request.tcp_bind.effective_context()
         },
         dns,
     )

@@ -466,8 +466,8 @@ where
         Arc::new(StunInfoCollector::new_with_socket_contexts(
             adapters.host.clone(),
             adapters.dns.clone(),
-            config.direct.udp_bind.context.clone(),
-            config.direct.tcp_bind.context.clone(),
+            config.direct.udp_bind.effective_context(),
+            config.direct.tcp_bind.effective_context(),
             config.stun.udp_servers.clone(),
             config.stun.tcp_servers.clone(),
             config.stun.udp_v6_servers.clone(),
@@ -726,7 +726,7 @@ where
                     stun.clone(),
                     udp_hole_punch_platform,
                     events.clone(),
-                    direct_options.udp_bind.context.clone(),
+                    direct_options.udp_bind.effective_context(),
                     protocol.clone(),
                 )
             });
@@ -734,7 +734,7 @@ where
             runtime_config.snapshot().as_ref(),
         )));
         #[cfg(feature = "wrapped-transport")]
-        let tcp_proxy_socket_context = direct_options.tcp_bind.context.clone();
+        let tcp_proxy_socket_context = direct_options.tcp_bind.effective_context();
         #[cfg(feature = "proxy-packet")]
         let packet_proxy = CoreProxyModule::new(
             peer_manager.clone(),
@@ -744,9 +744,9 @@ where
             runtime_config.clone(),
             proxy_cidr_table.clone(),
             tcp_proxy_socket_context.clone(),
-            direct_options.udp_bind.context.clone(),
+            direct_options.udp_bind.effective_context(),
             // Raw ICMP shares the datagram/network-layer routing context.
-            direct_options.udp_bind.context.clone(),
+            direct_options.udp_bind.effective_context(),
             icmp_proxy_host,
         );
         #[cfg(feature = "wrapped-transport")]
@@ -770,7 +770,7 @@ where
             peer_manager.clone(),
             wrapped_transport.as_ref(),
             host.clone(),
-            direct_options.tcp_bind.context.clone(),
+            direct_options.tcp_bind.effective_context(),
         );
         #[cfg(feature = "proxy-smoltcp-stack")]
         let data_plane_session = DataPlaneSession::new(&data_plane_runtime);
@@ -780,14 +780,14 @@ where
             data_plane_runtime.clone(),
             host.clone(),
             dns.clone(),
-            direct_options.tcp_bind.context.clone(),
+            direct_options.tcp_bind.effective_context(),
         );
         #[cfg(feature = "proxy-smoltcp-stack")]
         let port_forward_adapter = PortForwardAdapter::new(
             runtime_config.clone(),
             data_plane_runtime.clone(),
             host.clone(),
-            direct_options.tcp_bind.context.clone(),
+            direct_options.tcp_bind.effective_context(),
             events.clone(),
             instance_runtime.runtime_handle(),
         );
@@ -800,7 +800,7 @@ where
                     peer_manager.clone(),
                     host.clone(),
                     stun.clone(),
-                    direct_options.tcp_bind.context.clone(),
+                    direct_options.tcp_bind.effective_context(),
                     protocol.clone(),
                     Arc::new(crate::connectivity::protocol::CoreServerProtocolUpgrader::<
                         HostAcceptedTcpSocket<H>,

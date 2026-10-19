@@ -19,14 +19,14 @@ pub(crate) const TCP_SOCKET_RESULT_LEN: usize = 8 + SOCKET_ADDRESS_LEN * 2;
 pub(crate) const BOUND_SOCKET_RESULT_LEN: usize = 8 + SOCKET_ADDRESS_LEN;
 
 pub(crate) fn encode_tcp_connect_options(options: &TcpConnectOptions) -> io::Result<Vec<u8>> {
+    let context = options.bind.effective_context();
     let mut encoded = Vec::with_capacity(
-        76 + context_variable_len(&options.bind.context)
-            + bind_device_len(&options.bind.bind_device),
+        76 + context_variable_len(&context) + bind_device_len(&options.bind.bind_device),
     );
     encoded.push(OPTIONS_VERSION);
     encoded.extend_from_slice(&encode_socket_address(options.remote_addr));
     encode_optional_address(&mut encoded, options.bind.local_addr);
-    encode_context(&mut encoded, &options.bind.context)?;
+    encode_context(&mut encoded, &context)?;
     encoded.push(match options.bind.reuse_addr {
         None => 0,
         Some(false) => 1,
@@ -51,12 +51,13 @@ pub(crate) fn encode_tcp_connect_options(options: &TcpConnectOptions) -> io::Res
 }
 
 pub(crate) fn encode_udp_bind_options(options: &BindConfig) -> io::Result<Vec<u8>> {
+    let context = options.effective_context();
     let mut encoded = Vec::with_capacity(
-        48 + context_variable_len(&options.context) + bind_device_len(&options.bind_device),
+        48 + context_variable_len(&context) + bind_device_len(&options.bind_device),
     );
     encoded.push(UDP_OPTIONS_VERSION);
     encode_optional_address(&mut encoded, options.local_addr);
-    encode_context(&mut encoded, &options.context)?;
+    encode_context(&mut encoded, &context)?;
     encoded.push(match options.reuse_addr {
         None => 0,
         Some(false) => 1,
@@ -70,13 +71,13 @@ pub(crate) fn encode_udp_bind_options(options: &BindConfig) -> io::Result<Vec<u8
 }
 
 pub(crate) fn encode_tcp_listen_options(options: &TcpListenOptions) -> io::Result<Vec<u8>> {
+    let context = options.bind.effective_context();
     let mut encoded = Vec::with_capacity(
-        49 + context_variable_len(&options.bind.context)
-            + bind_device_len(&options.bind.bind_device),
+        49 + context_variable_len(&context) + bind_device_len(&options.bind.bind_device),
     );
     encoded.push(OPTIONS_VERSION);
     encode_optional_address(&mut encoded, options.bind.local_addr);
-    encode_context(&mut encoded, &options.bind.context)?;
+    encode_context(&mut encoded, &context)?;
     encoded.push(match options.bind.reuse_addr {
         None => 0,
         Some(false) => 1,

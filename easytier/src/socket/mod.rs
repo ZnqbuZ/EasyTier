@@ -93,14 +93,15 @@ impl Bindable for UdpSocket {
 /// Protection completes before bind/listen; namespace guards never cross an
 /// await. Failures drop the unbound socket instead of allowing early I/O.
 pub(crate) async fn bind<B: Bindable>(config: BindConfig) -> Result<B, TunnelError> {
+    let context = config.effective_context();
     let BindConfig {
-        context,
         need_protect,
         local_addr,
         bind_device,
         only_v6,
         reuse_addr,
         reuse_port,
+        ..
     } = config;
     let net_ns = NetNS::from_socket_context(&context);
     let socket_mark = context.socket_mark;

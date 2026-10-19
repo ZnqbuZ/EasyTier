@@ -154,8 +154,8 @@ impl Default for DirectConnectorOptions {
 impl DirectConnectorOptions {
     fn socket_context(&self, transport: DirectTransport, ip_version: IpVersion) -> SocketContext {
         let context = match transport {
-            DirectTransport::Tcp(_) => self.tcp_bind.context.clone(),
-            DirectTransport::Udp(_) => self.udp_bind.context.clone(),
+            DirectTransport::Tcp(_) => self.tcp_bind.effective_context(),
+            DirectTransport::Udp(_) => self.udp_bind.effective_context(),
         };
         SocketContext {
             ip_version,
@@ -257,7 +257,7 @@ where
                         self.data.host.clone(),
                         Some(Arc::downgrade(&self.data.peer_manager)),
                         self.data.running_listeners.clone(),
-                        self.data.options.udp_bind.context.clone(),
+                        self.data.options.udp_bind.effective_context(),
                         Some(self.data.stun.clone()),
                     ),
                 ),
@@ -282,7 +282,7 @@ where
                         self.data.host.clone(),
                         Some(Arc::downgrade(&self.data.peer_manager)),
                         self.data.running_listeners.clone(),
-                        self.data.options.udp_bind.context.clone(),
+                        self.data.options.udp_bind.effective_context(),
                         Some(self.data.stun.clone()),
                     ),
                 ),
@@ -297,7 +297,7 @@ where
         collect_address_observations(
             self.data.host.as_ref(),
             Some(self.data.peer_manager.as_ref()),
-            &self.data.options.udp_bind.context,
+            &self.data.options.udp_bind.effective_context(),
             false,
             Some(stun_info),
         )
@@ -488,7 +488,7 @@ where
     ) {
         let Ok(mut addrs) = resolve_mapped_listener_addrs(
             listener,
-            self.options.tcp_bind.context.clone(),
+            self.options.tcp_bind.effective_context(),
             self.dns.as_ref(),
         )
         .await
@@ -726,7 +726,7 @@ where
                 reuse_addr: Some(false),
                 context: SocketContext {
                     ip_version: IpVersion::V4,
-                    ..self.options.udp_bind.context.clone()
+                    ..self.options.udp_bind.effective_context()
                 },
                 local_addr: Some("0.0.0.0:0".parse().unwrap()),
                 ..BindConfig::default()
@@ -759,7 +759,7 @@ where
                 reuse_addr: Some(false),
                 context: SocketContext {
                     ip_version: IpVersion::V6,
-                    ..self.options.udp_bind.context.clone()
+                    ..self.options.udp_bind.effective_context()
                 },
                 local_addr: Some("[::]:0".parse().unwrap()),
                 ..BindConfig::default()

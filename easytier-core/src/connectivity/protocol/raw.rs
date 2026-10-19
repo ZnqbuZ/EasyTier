@@ -91,7 +91,7 @@ where
             TCP_DEFAULT_PORT,
             SocketContext {
                 ip_version: self.ip_version,
-                ..self.bind.context.clone()
+                ..self.bind.effective_context()
             },
             self.dns.as_ref(),
         )
@@ -253,7 +253,7 @@ where
             UDP_DEFAULT_PORT,
             SocketContext {
                 ip_version: self.ip_version,
-                ..self.bind.context.clone()
+                ..self.bind.effective_context()
             },
             self.dns.as_ref(),
         )

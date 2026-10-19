@@ -104,7 +104,7 @@ where
     }
 
     async fn bind_udp(&self, options: BindConfig) -> io::Result<Arc<HostUdpSocket>> {
-        let context = options.context.clone();
+        let context = options.effective_context();
         let result = self
             .runtime
             .run_operation(
@@ -443,6 +443,7 @@ mod tests {
         let io = Arc::new(TestHostIo::default());
         let (runtime, factory) = test_factory(io.clone());
         let options = BindConfig {
+            namespace: None,
             context: SocketContext {
                 socket_mark: Some(9),
                 ..SocketContext::default()
