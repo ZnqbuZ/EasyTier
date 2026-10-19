@@ -4,9 +4,7 @@ use std::{
 };
 
 #[cfg(any(feature = "wireguard", test))]
-use crate::common::netns::NetNS;
-#[cfg(any(feature = "wireguard", test))]
-use crate::host_runtime::{NativeHostRuntime, native_host_runtime};
+use crate::host_runtime::{NativeNetNSServices, native_host_runtime};
 use async_trait::async_trait;
 use easytier_core::socket::BindConfig;
 use easytier_core::socket::SocketContext;
@@ -15,27 +13,29 @@ use easytier_core::socket::udp::{
     UdpSocketSendMeta, VirtualUdpSocket, VirtualUdpSocketFactory,
 };
 #[cfg(any(feature = "wireguard", test))]
-use easytier_core::socket::{
-    NetNamespace,
-    udp::{UdpSessionAcceptKind, UdpSessionListenRequest, UdpSessionSocketListener},
+use easytier_core::socket::udp::{
+    UdpSessionAcceptKind, UdpSessionListenRequest, UdpSessionSocketListener,
 };
 use tokio::net::UdpSocket;
 
 use super::udp_src;
 
 #[cfg(any(feature = "wireguard", test))]
-pub(crate) type RuntimeUdpSessionSocketListener = UdpSessionSocketListener<NativeHostRuntime>;
+pub(crate) type RuntimeUdpSessionSocketListener = UdpSessionSocketListener<NativeNetNSServices>;
 
 #[cfg(any(feature = "wireguard", test))]
 pub(crate) fn new_runtime_udp_session_listener(
     url: url::Url,
-    mut request: UdpSessionListenRequest,
+    request: UdpSessionListenRequest,
     accept_kind: UdpSessionAcceptKind,
-    net_ns: NetNS,
-) -> RuntimeUdpSessionSocketListener {
-    request.bind.context.netns = net_ns.name().map(NetNamespace::new);
-    let runtime = native_host_runtime();
-    UdpSessionSocketListener::new_with_request(url, request, accept_kind, runtime)
+) -> std::io::Result<RuntimeUdpSessionSocketListener> {
+    let runtime = native_host_runtime().net_ns(&request.bind.context)?;
+    Ok(UdpSessionSocketListener::new_with_request(
+        url,
+        request,
+        accept_kind,
+        runtime,
+    ))
 }
 
 pub struct RuntimeUdpSocket {
@@ -141,7 +141,11 @@ impl RuntimeUdpSocketFactory {
 impl VirtualUdpSocketFactory for RuntimeUdpSocketFactory {
     type Socket = RuntimeUdpSocket;
 
-    async fn bind_udp(&self, options: BindConfig) -> anyhow::Result<Arc<Self::Socket>> {
+    async fn bind_udp(&self, mut options: BindConfig) -> anyhow::Result<Arc<Self::Socket>> {
+        if options.context.net_ns.is_none() {
+            options.context.net_ns =
+                Some(crate::host_runtime::native_host_runtime().capture_default_net_ns()?);
+        }
         let context = options.context.clone();
         let socket = crate::socket::bind::<UdpSocket>(options).await?;
         Ok(Arc::new(RuntimeUdpSocket::new_with_context(

@@ -23,7 +23,7 @@ use crate::{
         context::PeerRuntimeSnapshotInput,
         peer_manager::{PortablePeerManagerConfig, RouteAlgoType},
     },
-    socket::{NetNamespace, SocketContext},
+    socket::{NetNS, SocketContext},
     tunnel::encrypt::algorithm_is_available,
 };
 
@@ -41,6 +41,8 @@ const MAX_DIRECT_CONNS_PER_PEER_IN_FOREIGN_NETWORK: usize = 3;
 /// normalization path for both initial construction and runtime patching.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CoreInstanceHostConfig {
+    /// Host-bound runtime domain; never persisted as the configured namespace name.
+    pub net_ns: Option<NetNS>,
     pub hostname_fallback: Option<String>,
     pub host_routing: HostRoutingPolicy,
     pub force_exit_node: bool,
@@ -67,6 +69,7 @@ pub struct CoreInstanceHostConfig {
 impl Default for CoreInstanceHostConfig {
     fn default() -> Self {
         Self {
+            net_ns: None,
             hostname_fallback: None,
             host_routing: HostRoutingPolicy::default(),
             force_exit_node: false,
@@ -185,7 +188,7 @@ impl CoreInstanceConfig {
         let network_name = identity.network_name.clone();
         let socket_context = SocketContext {
             socket_mark: flags.socket_mark,
-            netns: config.get_netns().map(NetNamespace::new),
+            net_ns: host.net_ns.clone(),
             ..SocketContext::default()
         };
         let hostname = match config.get_hostname() {

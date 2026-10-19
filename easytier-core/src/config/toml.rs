@@ -35,8 +35,8 @@ pub trait ConfigLoader: Send + Sync {
     fn get_inst_name(&self) -> String;
     fn set_inst_name(&self, name: String);
 
-    fn get_netns(&self) -> Option<String>;
-    fn set_netns(&self, ns: Option<String>);
+    fn get_net_ns(&self) -> Option<String>;
+    fn set_net_ns(&self, ns: Option<String>);
 
     fn get_ipv4(&self) -> Option<cidr::Ipv4Inet>;
     fn set_ipv4(&self, addr: Option<cidr::Ipv4Inet>);
@@ -407,7 +407,8 @@ impl std::fmt::Debug for ManagedCredentialConfig {
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[cfg_attr(feature = "config-write", derive(Serialize))]
 struct Config {
-    netns: Option<String>,
+    #[serde(rename = "netns")]
+    net_ns: Option<String>,
     hostname: Option<String>,
     instance_name: Option<String>,
     instance_id: Option<uuid::Uuid>,
@@ -672,12 +673,12 @@ impl ConfigLoader for TomlConfig {
         self.config.lock().unwrap().hostname = name;
     }
 
-    fn get_netns(&self) -> Option<String> {
-        self.config.lock().unwrap().netns.clone()
+    fn get_net_ns(&self) -> Option<String> {
+        self.config.lock().unwrap().net_ns.clone()
     }
 
-    fn set_netns(&self, ns: Option<String>) {
-        self.config.lock().unwrap().netns = ns;
+    fn set_net_ns(&self, ns: Option<String>) {
+        self.config.lock().unwrap().net_ns = ns;
     }
 
     fn get_ipv4(&self) -> Option<cidr::Ipv4Inet> {

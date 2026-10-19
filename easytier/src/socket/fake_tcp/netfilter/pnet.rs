@@ -191,23 +191,23 @@ impl InterfaceWorker {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
-enum NetworkNamespaceId {
+enum NetNSId {
     #[cfg(target_os = "linux")]
     LinuxInode(u64),
     #[cfg(not(target_os = "linux"))]
     Unsupported,
 }
 
-type InterfaceWorkerKey = (NetworkNamespaceId, String);
+type InterfaceWorkerKey = (NetNSId, String);
 
 static INTERFACE_MANAGERS: Lazy<DashMap<InterfaceWorkerKey, Weak<InterfaceWorker>>> =
     Lazy::new(DashMap::new);
 
-fn current_network_namespace_id() -> Option<NetworkNamespaceId> {
+fn current_net_ns_id() -> Option<NetNSId> {
     #[cfg(target_os = "linux")]
     {
         match std::fs::metadata("/proc/thread-self/ns/net") {
-            Ok(metadata) => Some(NetworkNamespaceId::LinuxInode(metadata.ino())),
+            Ok(metadata) => Some(NetNSId::LinuxInode(metadata.ino())),
             Err(error) => {
                 tracing::warn!(
                     ?error,
@@ -219,12 +219,11 @@ fn current_network_namespace_id() -> Option<NetworkNamespaceId> {
     }
 
     #[cfg(not(target_os = "linux"))]
-    Some(NetworkNamespaceId::Unsupported)
+    Some(NetNSId::Unsupported)
 }
 
 fn get_or_create_worker(interface_name: &str) -> io::Result<Arc<InterfaceWorker>> {
-    let key = current_network_namespace_id()
-        .map(|namespace_id| (namespace_id, interface_name.to_owned()));
+    let key = current_net_ns_id().map(|net_ns_id| (net_ns_id, interface_name.to_owned()));
     // Check if we have an active worker
     if let Some(worker) = key
         .as_ref()

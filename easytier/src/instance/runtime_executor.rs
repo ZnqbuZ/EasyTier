@@ -1,60 +1,6 @@
-//! Native ownership and continuous driving of one instance's Tokio runtime.
+//! Instance-specific name for the native executor owner.
 
-use std::sync::mpsc;
-
-use tokio::{
-    runtime::{Builder, Handle},
-    sync::oneshot,
-};
-
-pub(super) struct NativeInstanceExecutor {
-    handle: Handle,
-    // Dropping the sender stops the driver, including on construction failure.
-    _shutdown: oneshot::Sender<()>,
-}
-
-impl NativeInstanceExecutor {
-    pub(super) fn new(multi_thread: bool, thread_count: u32) -> anyhow::Result<Self> {
-        let (ready_tx, ready_rx) = mpsc::sync_channel(1);
-        let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
-        std::thread::Builder::new()
-            .name("easytier-instance".to_owned())
-            .spawn(move || {
-                let mut builder = if multi_thread {
-                    let mut builder = Builder::new_multi_thread();
-                    builder.worker_threads(2.max(thread_count as usize));
-                    builder
-                } else {
-                    Builder::new_current_thread()
-                };
-                let runtime = match builder.enable_all().build() {
-                    Ok(runtime) => runtime,
-                    Err(error) => {
-                        let _ = ready_tx.send(Err(error));
-                        return;
-                    }
-                };
-                if ready_tx.send(Ok(runtime.handle().clone())).is_ok() {
-                    runtime.block_on(async {
-                        let _ = shutdown_rx.await;
-                    });
-                }
-                // Never block an instance worker waiting for its own shutdown.
-                // Blocking Host operations may finish after the owner is dropped.
-                runtime.shutdown_background();
-            })?;
-        let handle = ready_rx.recv()??;
-        Ok(Self {
-            handle,
-            _shutdown: shutdown_tx,
-        })
-    }
-
-    pub(super) fn handle(&self) -> Handle {
-        self.handle.clone()
-    }
-}
-
+pub(super) use crate::common::native_executor::NativeExecutor as NativeInstanceExecutor;
 #[cfg(test)]
 mod tests {
     use std::{future::pending, time::Duration};

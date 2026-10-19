@@ -1,32 +1,29 @@
 use std::{net::IpAddr, sync::Arc};
 
-use crate::{
-    common::global_ctx::ArcGlobalCtx,
-    host_runtime::{NativeHostRuntime, native_host_runtime},
-};
-use easytier_core::socket::SocketContext;
 use easytier_core::{
     connectivity::composite::{ConnectorEnvironment, ConnectorHostAdapter},
-    socket::NetNamespace,
+    socket::SocketContext,
 };
 
-pub type NativeInstanceHost = ConnectorHostAdapter<NativeHostRuntime, NativeInstanceEnvironment>;
+use crate::{common::global_ctx::ArcGlobalCtx, host_runtime::NativeNetNSServices};
+
+pub type NativeInstanceHost = ConnectorHostAdapter<NativeNetNSServices, NativeInstanceEnvironment>;
 
 /// Instance facts queried by portable connector policy.
 ///
 /// This Adapter never creates or operates sockets. Mechanical network I/O is
-/// owned by the process-wide [`NativeHostRuntime`] composed beside it.
+/// owned by the canonical [`easytier_core::net_ns::NetNS`] selected during composition.
 pub struct NativeInstanceEnvironment {
     global_ctx: ArcGlobalCtx,
-    runtime: Arc<NativeHostRuntime>,
+    runtime: Arc<NativeNetNSServices>,
     socket_context: SocketContext,
 }
 
 impl NativeInstanceEnvironment {
-    fn new(global_ctx: ArcGlobalCtx, runtime: Arc<NativeHostRuntime>) -> Self {
+    fn new(global_ctx: ArcGlobalCtx, runtime: Arc<NativeNetNSServices>) -> Self {
         let socket_context = SocketContext {
             socket_mark: global_ctx.get_flags().socket_mark,
-            netns: global_ctx.net_ns.name().map(NetNamespace::new),
+            net_ns: Some(global_ctx.net_ns.clone()),
             ..SocketContext::default()
         };
         Self {
@@ -38,7 +35,8 @@ impl NativeInstanceEnvironment {
 }
 
 pub(crate) fn native_instance_host(global_ctx: ArcGlobalCtx) -> Arc<NativeInstanceHost> {
-    let runtime = native_host_runtime();
+    let runtime = crate::host_runtime::net_ns_services(&global_ctx.net_ns)
+        .expect("native instance domain must be registered");
     Arc::new(ConnectorHostAdapter::new(
         runtime.clone(),
         Arc::new(NativeInstanceEnvironment::new(global_ctx, runtime)),

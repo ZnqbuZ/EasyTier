@@ -129,15 +129,15 @@ pub(super) struct NativeDhcpHost {
 
 impl NativeDhcpHost {
     pub(super) fn take_closed(&self) -> bool {
-        #[cfg(not(mobile))]
-        {
-            self.closed.notified().now_or_never().is_some()
-        }
-        #[cfg(mobile)]
-        {
-            // The mobile VPN owner recreates and attaches its interface in response
-            // to address events; desktop interface notifications do not apply here.
-            false
+        cfg_select! {
+            not(mobile) => {
+                self.closed.notified().now_or_never().is_some()
+            },
+            _ => {
+                // The mobile VPN owner recreates and attaches its interface in response
+                // to address events; desktop interface notifications do not apply here.
+                false
+            },
         }
     }
 
@@ -168,7 +168,7 @@ impl NativeDhcpHost {
                     self.closed.clone(),
                     self.shared_virtual_nic_registry.clone(),
                 )
-                .await;
+                .await?;
                 tokio::select! {
                     _ = self.cancel.cancelled() => anyhow::bail!("instance is closing; DHCP update cancelled"),
                     result = nic.run(addresses.ipv4, addresses.ipv6) => result?,

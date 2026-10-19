@@ -55,15 +55,4 @@ pub enum IpVersion {
     Both,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct NetNamespace(String);
-
-impl NetNamespace {
-    pub fn new(token: impl Into<String>) -> Self {
-        Self(token.into())
-    }
-
-    pub fn token(&self) -> &str {
-        &self.0
-    }
-}
+pub use crate::net_ns::NetNS;
