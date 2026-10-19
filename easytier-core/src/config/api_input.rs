@@ -173,13 +173,12 @@ pub(crate) fn merge_network_config_toml(
     // Normalize any camelCase aliases in original [flags] to their canonical field names
     // so each field appears at most once in the merged table.
     for field in Flags::flags() {
-        if let (Some(name), Some(json_name)) = (field.name.as_deref(), field.json_name.as_deref()) {
-            if name != json_name
+        if let (Some(name), Some(json_name)) = (field.name.as_deref(), field.json_name.as_deref())
+            && name != json_name
                 && let Some(val) = merged_flags.remove(json_name)
             {
                 merged_flags.entry(name.to_owned()).or_insert(val);
             }
-        }
     }
 
     // The keys a config form owns are the flags it offers a control for, which
