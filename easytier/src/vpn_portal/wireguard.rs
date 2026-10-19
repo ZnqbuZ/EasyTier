@@ -14,28 +14,29 @@ use std::{
     sync::{Arc, Mutex as StdMutex, RwLock, Weak},
 };
 
+use crate::{
+    common::global_ctx::ArcGlobalCtx,
+    host_runtime::{NativeHostRuntime, native_host_runtime},
+    socket::udp::RuntimeUdpSocket,
+};
 use anyhow::Context as _;
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use boringtun::x25519::{PublicKey, StaticSecret};
+use easytier_core::socket::BindConfig;
+use easytier_core::socket::SocketContext;
 use easytier_core::{
     config::toml::VpnPortalConfig,
     gateway::vpn_portal::{
         PortalClientConfig, PortalClientConfigPlan, PortalHost, PortalListener, PortalSession,
     },
     socket::{
-        ListenerConnectionCounter, NetNamespace, SocketContext, SocketListener,
-        udp::{UdpBindOptions, VirtualUdpSocket, VirtualUdpSocketFactory},
+        ListenerConnectionCounter, NetNamespace, SocketListener,
+        udp::{VirtualUdpSocket, VirtualUdpSocketFactory},
     },
 };
 use hkdf::Hkdf;
 use sha2::Sha256;
 use tokio::{sync::mpsc, task::JoinSet};
-
-use crate::{
-    common::global_ctx::ArcGlobalCtx,
-    host_runtime::{NativeHostRuntime, native_host_runtime},
-    socket::udp::RuntimeUdpSocket,
-};
 
 use self::engine::{DerivedClient, PortalEngine};
 
@@ -195,15 +196,18 @@ impl WireGuardPortalHost {
         address: SocketAddr,
         only_v6: bool,
     ) -> anyhow::Result<Arc<RuntimeUdpSocket>> {
-        let context = SocketContext::default()
-            .with_socket_mark(self.global_ctx.get_flags().socket_mark)
-            .with_netns(self.global_ctx.net_ns.name().map(NetNamespace::new));
+        let context = SocketContext {
+            socket_mark: self.global_ctx.get_flags().socket_mark,
+            netns: self.global_ctx.net_ns.name().map(NetNamespace::new),
+            ..SocketContext::default()
+        };
         runtime
-            .bind_udp(
-                UdpBindOptions::port_bound_listener(address)
-                    .with_context(context)
-                    .with_only_v6(only_v6),
-            )
+            .bind_udp(BindConfig {
+                local_addr: Some(address),
+                context,
+                only_v6,
+                ..BindConfig::default()
+            })
             .await
     }
 

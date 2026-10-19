@@ -22,6 +22,8 @@ use tokio_util::{
     task::AbortOnDropHandle,
 };
 
+use crate::socket::BindConfig;
+use crate::socket::SocketContext;
 use crate::{
     config::{gateway::PortForwardConfig, runtime::CoreRuntimeConfigStore},
     events::{CoreEvent, CoreEventSink},
@@ -31,12 +33,11 @@ use crate::{
         DataPlaneUdpSocket,
     },
     socket::{
-        SocketContext,
         tcp::{
             TcpListenOptions, TcpSocketPurpose, VirtualTcpListener, VirtualTcpListenerFactory,
             VirtualTcpSocket, VirtualTcpSocketFactory,
         },
-        udp::{UdpBindOptions, VirtualUdpSocket, VirtualUdpSocketFactory},
+        udp::{VirtualUdpSocket, VirtualUdpSocketFactory},
     },
 };
 
@@ -256,12 +257,13 @@ where
 
     async fn add_tcp_port_forward(&self, cfg: &PortForwardConfig) -> anyhow::Result<()> {
         let (bind_addr, dst_addr) = (cfg.bind_addr, cfg.dst_addr);
-        let options = TcpListenOptions::port_forward(bind_addr);
-        let bind = options
-            .bind
-            .clone()
-            .with_context(self.socket_context.clone());
-        let options = options.with_bind(bind);
+        let bind = BindConfig {
+            local_addr: Some(bind_addr),
+            need_protect: false,
+            context: self.socket_context.clone(),
+            ..BindConfig::default()
+        };
+        let options = TcpListenOptions::port_forward(bind_addr).with_bind(bind);
         let listener = self.host.bind_tcp(options.clone()).await?;
         tracing::info!(?bind_addr, ?dst_addr, "TCP port-forward listener bound");
         let cancel = CancellationToken::new();
@@ -326,9 +328,12 @@ where
         let forward = cfg.clone();
         let socket = self
             .host
-            .bind_udp(
-                UdpBindOptions::port_forward(bind_addr).with_context(self.socket_context.clone()),
-            )
+            .bind_udp(BindConfig {
+                need_protect: false,
+                local_addr: Some(bind_addr),
+                context: self.socket_context.clone(),
+                ..BindConfig::default()
+            })
             .await?;
         let cancel = CancellationToken::new();
         self.cancel_tokens
@@ -608,10 +613,14 @@ where
         if self.data_plane.is_local_virtual_ip(dst_addr.ip()) {
             let socket = self
                 .host
-                .bind_udp(
-                    UdpBindOptions::port_lease("0.0.0.0:0".parse().unwrap())
-                        .with_context(self.socket_context.clone()),
-                )
+                .bind_udp(BindConfig {
+                    bind_device: Some("".into()),
+                    reuse_addr: Some(false),
+                    need_protect: false,
+                    local_addr: Some("0.0.0.0:0".parse().unwrap()),
+                    context: self.socket_context.clone(),
+                    ..BindConfig::default()
+                })
                 .await?;
             Ok(Arc::new(PortForwardUdpFlow::Host(socket)))
         } else {

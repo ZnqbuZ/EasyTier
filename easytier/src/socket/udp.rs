@@ -1,30 +1,25 @@
 use std::{
-    net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4},
+    net::{IpAddr, SocketAddr},
     sync::Arc,
 };
 
+#[cfg(any(feature = "wireguard", test))]
+use crate::common::netns::NetNS;
+#[cfg(any(feature = "wireguard", test))]
+use crate::host_runtime::{NativeHostRuntime, native_host_runtime};
 use async_trait::async_trait;
+use easytier_core::socket::BindConfig;
+use easytier_core::socket::SocketContext;
+use easytier_core::socket::udp::{
+    MAX_UDP_DATAGRAM_SIZE, MAX_UDP_SESSION_DATAGRAM_SIZE, UdpSocketDatagram, UdpSocketRecvMeta,
+    UdpSocketSendMeta, VirtualUdpSocket, VirtualUdpSocketFactory,
+};
 #[cfg(any(feature = "wireguard", test))]
 use easytier_core::socket::{
     NetNamespace,
     udp::{UdpSessionAcceptKind, UdpSessionListenRequest, UdpSessionSocketListener},
 };
-use easytier_core::socket::{
-    SocketContext,
-    udp::{
-        MAX_UDP_DATAGRAM_SIZE, MAX_UDP_SESSION_DATAGRAM_SIZE, UdpBindOptions, UdpSocketDatagram,
-        UdpSocketPurpose, UdpSocketRecvMeta, UdpSocketSendMeta, VirtualUdpSocket,
-        VirtualUdpSocketFactory,
-    },
-};
 use tokio::net::UdpSocket;
-
-#[cfg(any(feature = "wireguard", test))]
-use crate::host_runtime::{NativeHostRuntime, native_host_runtime};
-use crate::{
-    common::netns::NetNS,
-    tunnel::common::{BindDev, bind},
-};
 
 use super::udp_src;
 
@@ -140,64 +135,18 @@ impl RuntimeUdpSocketFactory {
     pub(crate) fn new() -> Self {
         Self
     }
-
-    fn bind_device_for(&self, options: &UdpBindOptions) -> BindDev {
-        if let Some(bind_device) = &options.bind_device {
-            return BindDev::from(bind_device.as_str());
-        }
-
-        if matches!(
-            options.purpose,
-            UdpSocketPurpose::DirectConnect
-                | UdpSocketPurpose::PortBoundListener
-                | UdpSocketPurpose::PortForward
-        ) {
-            return BindDev::Auto;
-        }
-
-        BindDev::Disabled
-    }
-
-    fn reuse_addr_for(&self, options: &UdpBindOptions) -> bool {
-        options.reuse_addr
-            || (matches!(
-                options.purpose,
-                UdpSocketPurpose::PortBoundListener
-                    | UdpSocketPurpose::ProxyNat
-                    | UdpSocketPurpose::PortForward
-            ) && !cfg!(target_os = "windows"))
-    }
-}
-
-/// Creates a host-owned UDP socket, including any required protection, before
-/// it can be used by DNS, a route probe, or a virtual socket adapter.
-pub(crate) async fn create_udp_socket(options: &UdpBindOptions) -> anyhow::Result<UdpSocket> {
-    let factory = RuntimeUdpSocketFactory::new();
-    let bind_addr = options
-        .local_addr
-        .unwrap_or_else(|| SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0)));
-    Ok(bind::<UdpSocket>()
-        .addr(bind_addr)
-        .dev(factory.bind_device_for(options))
-        .net_ns(NetNS::from_socket_context(&options.context))
-        .only_v6(options.only_v6)
-        .reuse_addr(factory.reuse_addr_for(options))
-        .reuse_port(options.reuse_port)
-        .maybe_socket_mark(options.context.socket_mark)
-        .need_protect(options.need_protect)
-        .call()
-        .await?)
 }
 
 #[async_trait]
 impl VirtualUdpSocketFactory for RuntimeUdpSocketFactory {
     type Socket = RuntimeUdpSocket;
 
-    async fn bind_udp(&self, options: UdpBindOptions) -> anyhow::Result<Arc<Self::Socket>> {
-        let socket = create_udp_socket(&options).await?;
+    async fn bind_udp(&self, options: BindConfig) -> anyhow::Result<Arc<Self::Socket>> {
+        let context = options.context.clone();
+        let socket = crate::socket::bind::<UdpSocket>(options).await?;
         Ok(Arc::new(RuntimeUdpSocket::new_with_context(
             Arc::new(socket),
-            options.context,
+            context,
         )))
     }
 }
@@ -211,10 +160,88 @@ mod tests {
             send_v6_hole_punch_control_packet,
         },
     };
+    use std::net::Ipv4Addr;
 
     use crate::host_runtime::native_host_runtime;
 
     use super::*;
+
+    #[tokio::test]
+    async fn factory_honors_explicit_udp_reuse() {
+        let addr = "127.0.0.1:0".parse().unwrap();
+        for need_protect in [false, true] {
+            for reuse in [None, Some(false), Some(true)] {
+                let options = BindConfig {
+                    local_addr: Some(addr),
+                    bind_device: Some("".into()),
+                    need_protect,
+                    reuse_addr: reuse,
+                    ..BindConfig::default()
+                };
+                let socket = RuntimeUdpSocketFactory::new()
+                    .bind_udp(options)
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    socket2::SockRef::from(socket.socket.as_ref())
+                        .reuse_address()
+                        .unwrap(),
+                    reuse.unwrap_or(!cfg!(target_os = "windows"))
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn factory_reserves_udp_port_when_reuse_is_explicitly_disabled() {
+        let factory = RuntimeUdpSocketFactory::new();
+        let bind = BindConfig {
+            bind_device: Some("".into()),
+            reuse_addr: Some(false),
+            ..BindConfig::default()
+        };
+        let first = factory
+            .bind_udp(BindConfig {
+                local_addr: Some("127.0.0.1:0".parse().unwrap()),
+                ..bind.clone()
+            })
+            .await
+            .unwrap();
+        let address = first.local_addr().unwrap();
+        assert!(
+            factory
+                .bind_udp(BindConfig {
+                    local_addr: Some(address),
+                    ..bind
+                })
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn factory_uses_requested_family_without_an_explicit_local_address() {
+        for family in [
+            easytier_core::socket::IpVersion::V4,
+            easytier_core::socket::IpVersion::V6,
+        ] {
+            let socket = RuntimeUdpSocketFactory::new()
+                .bind_udp(BindConfig {
+                    reuse_addr: Some(false),
+                    context: easytier_core::socket::SocketContext {
+                        ip_version: family,
+                        ..SocketContext::default()
+                    },
+                    ..BindConfig::default()
+                })
+                .await
+                .unwrap();
+            assert_eq!(
+                socket.local_addr().unwrap().is_ipv6(),
+                family == easytier_core::socket::IpVersion::V6
+            );
+        }
+    }
 
     #[cfg(any(target_os = "linux", target_os = "android"))]
     #[tokio::test]
@@ -293,7 +320,10 @@ mod tests {
         let local_addr = SocketAddr::from(([0, 0, 0, 0], 0));
         let mut listener = new_runtime_udp_session_listener(
             "udp://0.0.0.0:0".parse().unwrap(),
-            UdpSessionListenRequest::new(UdpBindOptions::port_bound_listener(local_addr)),
+            UdpSessionListenRequest::new(BindConfig {
+                local_addr: Some(local_addr),
+                ..BindConfig::default()
+            }),
             UdpSessionAcceptKind::EasyTierMux,
             NetNS::new(None),
         );
@@ -328,7 +358,10 @@ mod tests {
         let local_addr = "[::]:0".parse().unwrap();
         let mut listener = new_runtime_udp_session_listener(
             "udp://[::]:0".parse().unwrap(),
-            UdpSessionListenRequest::new(UdpBindOptions::port_bound_listener(local_addr)),
+            UdpSessionListenRequest::new(BindConfig {
+                local_addr: Some(local_addr),
+                ..BindConfig::default()
+            }),
             UdpSessionAcceptKind::EasyTierMux,
             NetNS::new(None),
         );
@@ -357,63 +390,5 @@ mod tests {
         .await
         .expect("timeout waiting for v6 hole-punch packet")
         .unwrap();
-    }
-
-    #[test]
-    fn factory_interprets_bind_defaults_by_purpose() {
-        let listener_addr = SocketAddr::from(([0, 0, 0, 0], 11010));
-        let factory = RuntimeUdpSocketFactory::new();
-
-        assert!(matches!(
-            factory.bind_device_for(&UdpBindOptions::port_bound_listener(listener_addr)),
-            BindDev::Auto
-        ));
-        assert!(matches!(
-            factory.bind_device_for(&UdpBindOptions::direct_connect()),
-            BindDev::Auto
-        ));
-        assert!(matches!(
-            factory.bind_device_for(&UdpBindOptions::port_forward(listener_addr)),
-            BindDev::Auto
-        ));
-        assert!(matches!(
-            factory.bind_device_for(&UdpBindOptions::port_lease(listener_addr)),
-            BindDev::Disabled
-        ));
-        assert!(matches!(
-            factory.bind_device_for(&UdpBindOptions::hole_punch_control()),
-            BindDev::Disabled
-        ));
-        assert_eq!(
-            factory.reuse_addr_for(&UdpBindOptions::port_bound_listener(listener_addr)),
-            !cfg!(target_os = "windows")
-        );
-        assert!(!factory.reuse_addr_for(&UdpBindOptions::hole_punch_control()));
-        assert_eq!(
-            factory.reuse_addr_for(&UdpBindOptions::proxy_nat()),
-            !cfg!(target_os = "windows")
-        );
-        assert_eq!(
-            factory.reuse_addr_for(&UdpBindOptions::port_forward(listener_addr)),
-            !cfg!(target_os = "windows")
-        );
-        assert!(!factory.reuse_addr_for(&UdpBindOptions::port_lease(listener_addr)));
-    }
-
-    #[test]
-    fn factory_applies_listener_bind_device_option() {
-        let listener_addr = SocketAddr::from(([0, 0, 0, 0], 11010));
-        let factory = RuntimeUdpSocketFactory::new();
-        let options = UdpBindOptions::port_bound_listener(listener_addr)
-            .with_bind_device(Some("eth0".to_owned()));
-
-        match factory.bind_device_for(&options) {
-            BindDev::Custom(dev) => assert_eq!(dev, "eth0"),
-            bind_device => panic!("unexpected bind device: {bind_device:?}"),
-        }
-        assert!(matches!(
-            factory.bind_device_for(&UdpBindOptions::hole_punch_control()),
-            BindDev::Disabled
-        ));
     }
 }
