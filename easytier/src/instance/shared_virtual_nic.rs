@@ -1,3 +1,4 @@
+use easytier_core::netns::NetNS;
 use std::{
     collections::{BTreeMap, BTreeSet},
     net::{Ipv4Addr, Ipv6Addr},
@@ -314,23 +315,26 @@ impl SharedVirtualNic {
                 .await?;
         }
 
-        #[cfg(target_os = "linux")]
-        if !delta.ipv4_addresses.removed.is_empty() {
-            for route in &next_effective.ipv4_routes {
-                ignore_added_ifcfg_already_exists(
-                    add_shared_ipv4_route(&nic, route, next_ifcfg).await,
-                )?;
-            }
-        }
+        cfg_select! {
+            target_os = "linux" => {
+                if !delta.ipv4_addresses.removed.is_empty() {
+                    for route in &next_effective.ipv4_routes {
+                        ignore_added_ifcfg_already_exists(
+                            add_shared_ipv4_route(&nic, route, next_ifcfg).await,
+                        )?;
+                    }
+                }
 
-        #[cfg(target_os = "linux")]
-        if !delta.ipv6_addresses.removed.is_empty() {
-            for route in &next_effective.ipv6_routes {
-                ignore_added_ifcfg_already_exists(
-                    nic.add_ipv6_route_with_cost(route.address, route.prefix, route.cost)
-                        .await,
-                )?;
-            }
+                if !delta.ipv6_addresses.removed.is_empty() {
+                    for route in &next_effective.ipv6_routes {
+                        ignore_added_ifcfg_already_exists(
+                            nic.add_ipv6_route_with_cost(route.address, route.prefix, route.cost)
+                                .await,
+                        )?;
+                    }
+                }
+            },
+            _ => {},
         }
 
         Ok(())
@@ -803,7 +807,8 @@ impl SharedVirtualNicMember {
 #[derive(Default)]
 pub struct SharedVirtualNicRegistry {
     nics: BTreeMap<SharedVirtualNicRegistryKey, SharedVirtualNicRegistryEntry>,
-    closing: Arc<AtomicBool>,
+    closing: bool,
+    namespace: Option<NetNS>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -817,8 +822,10 @@ impl SharedVirtualNicRegistryKey {
         if dev_name.is_empty() {
             return Self::Anonymous(member);
         }
-        #[cfg(target_os = "windows")]
-        let dev_name = dev_name.to_lowercase();
+        let dev_name = cfg_select! {
+            target_os = "windows" => dev_name.to_lowercase(),
+            _ => dev_name,
+        };
         Self::Named(dev_name)
     }
 }
@@ -874,15 +881,15 @@ impl SharedVirtualNicRegistry {
         Self::default()
     }
 
-    pub(crate) fn in_domain(closing: Arc<AtomicBool>) -> Self {
+    pub(crate) fn in_domain(namespace: NetNS) -> Self {
         Self {
-            closing,
+            namespace: Some(namespace),
             ..Self::default()
         }
     }
 
     pub(crate) fn take_for_shutdown(&mut self) -> Vec<Arc<Mutex<SharedVirtualNic>>> {
-        self.closing.store(true, Ordering::Release);
+        self.closing = true;
         std::mem::take(&mut self.nics)
             .into_values()
             .map(|entry| entry.nic)
@@ -951,7 +958,7 @@ impl SharedVirtualNicRegistry {
         member_id: SharedVirtualNicMemberId,
         close_notifier: Arc<Notify>,
     ) -> Result<SharedVirtualNicMember, Error> {
-        if self.closing.load(Ordering::Acquire) {
+        if self.closing || self.namespace.as_ref().is_some_and(NetNS::is_closed) {
             return Err(anyhow::anyhow!("network namespace NIC admission is closed").into());
         }
         let configured_mtu = config.mtu();

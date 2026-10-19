@@ -59,14 +59,17 @@ pub(super) fn compose_native_core_instance(
         runtime_core_host_config()
     };
     let configured_namespace = toml_config.get_netns();
-    let namespace = crate::common::netns::NetNS::resolve_config(
-        if host_config.ignore_unsupported_config && !cfg!(target_os = "linux") {
-            None
-        } else {
-            configured_namespace.as_deref()
+    let namespace = crate::common::netns::resolve_config(cfg_select! {
+        target_os = "linux" => configured_namespace.as_deref(),
+        _ => {
+            if host_config.ignore_unsupported_config {
+                None
+            } else {
+                configured_namespace.as_deref()
+            }
         },
-    )?;
-    host_config.socket_namespace = Some(namespace.token());
+    })?;
+    host_config.socket_namespace = Some(namespace.clone());
     let normalized = CoreInstanceConfig::from_toml_with_host(&toml_config, &host_config)?;
     let global_ctx = Arc::new(GlobalCtx::new_with_runtime_config(
         toml_config.clone(),
@@ -171,18 +174,20 @@ impl CoreEventSink for GlobalCtx {
 fn runtime_wrapped_transport_engines(
     config: &easytier_core::instance::CoreInstanceHostConfig,
 ) -> WrappedTransportEngines {
-    #[cfg(feature = "kcp")]
-    let kcp = config
-        .kcp_enabled
-        .then(|| Arc::new(KcpProxyService::new()) as Arc<dyn WrappedTransportEngine>);
-    #[cfg(not(feature = "kcp"))]
-    let kcp = None;
-    #[cfg(feature = "quic")]
-    let quic = config
-        .quic_enabled
-        .then(|| Arc::new(QuicProxyService::new()) as Arc<dyn WrappedTransportEngine>);
-    #[cfg(not(feature = "quic"))]
-    let quic = None;
+    let kcp = cfg_select! {
+        feature = "kcp" => {
+            config.kcp_enabled
+                .then(|| Arc::new(KcpProxyService::new()) as Arc<dyn WrappedTransportEngine>)
+        },
+        _ => None,
+    };
+    let quic = cfg_select! {
+        feature = "quic" => {
+            config.quic_enabled
+                .then(|| Arc::new(QuicProxyService::new()) as Arc<dyn WrappedTransportEngine>)
+        },
+        _ => None,
+    };
 
     WrappedTransportEngines { kcp, quic }
 }
@@ -194,7 +199,8 @@ pub(crate) fn runtime_core_host_adapters(
     packet_sink: Arc<dyn PacketSink>,
 ) -> CoreHostAdapters<NativeInstanceHost> {
     let host = native_instance_host(global_ctx.clone());
-    let runtime_dns = global_ctx.net_ns.clone();
+    let runtime_dns = crate::host_runtime::namespace_services(&global_ctx.net_ns)
+        .expect("native instance domain must be registered");
     let adapters = CoreHostAdapters::new(host, runtime_dns, packet_sink, process_runtime);
     configure_runtime_core_host_adapters(global_ctx, adapters, runtime_core_host_config())
 }
@@ -206,7 +212,8 @@ pub(crate) fn runtime_core_host_adapters_with_packet_egress(
     packet_egress: Arc<dyn PacketEgressHost>,
 ) -> CoreHostAdapters<NativeInstanceHost> {
     let host = native_instance_host(global_ctx.clone());
-    let runtime_dns = global_ctx.net_ns.clone();
+    let runtime_dns = crate::host_runtime::namespace_services(&global_ctx.net_ns)
+        .expect("native instance domain must be registered");
     let adapters =
         CoreHostAdapters::new_with_packet_egress(host, runtime_dns, packet_egress, process_runtime);
     configure_runtime_core_host_adapters(global_ctx, adapters, runtime_core_host_config())
@@ -219,7 +226,8 @@ fn runtime_core_host_adapters_with_packet_egress_and_config(
     host_config: easytier_core::instance::CoreInstanceHostConfig,
 ) -> CoreHostAdapters<NativeInstanceHost> {
     let host = native_instance_host(global_ctx.clone());
-    let runtime_dns = global_ctx.net_ns.clone();
+    let runtime_dns = crate::host_runtime::namespace_services(&global_ctx.net_ns)
+        .expect("native instance domain must be registered");
     let adapters =
         CoreHostAdapters::new_with_packet_egress(host, runtime_dns, packet_egress, process_runtime);
     configure_runtime_core_host_adapters(global_ctx, adapters, host_config)
@@ -234,7 +242,7 @@ fn configure_runtime_core_host_adapters(
     adapters.replace_stun_provider(Arc::new(crate::common::stun::MockStunInfoCollector {
         udp_nat_type: crate::proto::common::NatType::Unknown,
     }));
-    host_config.socket_namespace = Some(global_ctx.net_ns.token());
+    host_config.socket_namespace = Some(global_ctx.net_ns.clone());
     adapters.config = host_config.clone();
     adapters.credential_storage = (!host_config.ignore_unsupported_config)
         .then(|| runtime_peer_credential_storage(&global_ctx))
@@ -298,7 +306,8 @@ pub(crate) fn runtime_one_shot_manual_connector(
 ) -> anyhow::Result<ManualTunnelConnector<NativeInstanceHost>> {
     let normalized = CoreInstanceConfig::from_toml_with_host(config, &runtime_core_host_config())?;
     let host = native_instance_host(global_ctx.clone());
-    let runtime_dns = global_ctx.net_ns.clone();
+    let runtime_dns = crate::host_runtime::namespace_services(&global_ctx.net_ns)
+        .expect("native instance domain must be registered");
     let dns: Arc<dyn DnsResolver> = runtime_dns.clone();
     let dns_records: Arc<dyn DnsRecordResolver> = runtime_dns;
     Ok(process_runtime.manual_connector(

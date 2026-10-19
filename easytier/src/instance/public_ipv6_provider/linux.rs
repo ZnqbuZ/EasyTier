@@ -611,7 +611,7 @@ fn cleanup_ndp_proxy_runtime(runtime: &mut NdpProxyRuntime, net_ns: &NetNS) -> b
 
 pub(super) struct RuntimePublicIpv6ProviderPlatform {
     global_ctx: std::sync::Weak<crate::common::global_ctx::GlobalCtx>,
-    net_ns: std::sync::Arc<NetNS>,
+    net_ns: NetNS,
     event_receiver: tokio::sync::Mutex<tokio::sync::broadcast::Receiver<GlobalCtxEvent>>,
     ndp_proxy: std::sync::Mutex<NdpProxyRuntime>,
 }
@@ -1308,7 +1308,7 @@ mod tests {
 
         assert!(super::cleanup_ndp_proxy_runtime(
             &mut runtime,
-            &crate::common::netns::NetNS::new(None)
+            &crate::common::netns::tests::test_namespace(None)
         ));
         assert!(
             !crate::common::ifcfg::list_ipv6_ndp_proxy(&wan_if)

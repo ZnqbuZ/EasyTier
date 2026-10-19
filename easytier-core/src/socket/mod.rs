@@ -10,6 +10,8 @@ pub mod ring;
 pub mod tcp;
 pub mod udp;
 
+pub use crate::netns::NetNS;
+
 /// Keep Rust constructors and deserialization consistent: host sockets normally
 /// need VPN bypass; local/TUN-facing endpoint constructors explicitly opt out.
 pub(crate) const fn default_need_protect() -> bool {
@@ -59,23 +61,10 @@ pub enum IpVersion {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct NetNamespace(String);
-
-impl NetNamespace {
-    pub fn new(token: impl Into<String>) -> Self {
-        Self(token.into())
-    }
-
-    pub fn token(&self) -> &str {
-        &self.0
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SocketContext {
     pub ip_version: IpVersion,
     pub socket_mark: Option<u32>,
-    pub netns: Option<NetNamespace>,
+    pub netns: Option<NetNS>,
 }
 
 impl SocketContext {
@@ -93,7 +82,7 @@ impl SocketContext {
         self
     }
 
-    pub fn with_netns(mut self, netns: Option<NetNamespace>) -> Self {
+    pub fn with_netns(mut self, netns: Option<NetNS>) -> Self {
         self.netns = netns;
         self
     }

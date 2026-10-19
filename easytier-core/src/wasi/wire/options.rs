@@ -166,7 +166,12 @@ fn encode_context(encoded: &mut Vec<u8>, context: &SocketContext) -> io::Result<
         IpVersion::Both => 2,
     });
     encode_mark(encoded, context.socket_mark);
-    let netns = context.netns.as_ref().map(|netns| netns.token().as_bytes());
+    let netns = context
+        .netns
+        .as_ref()
+        .map(|netns| netns.host_reference())
+        .transpose()?
+        .map(str::as_bytes);
     encoded.push(u8::from(netns.is_some()));
     let length = u32::try_from(netns.map_or(0, <[u8]>::len))
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "netns token is too long"))?;
@@ -201,12 +206,12 @@ fn context_variable_len(context: &SocketContext) -> usize {
     context
         .netns
         .as_ref()
-        .map_or(0, |netns| netns.token().len())
+        .map_or(0, |netns| netns.host_reference().map_or(0, str::len))
 }
 
 #[cfg(test)]
 mod tests {
-    use crate::socket::{NetNamespace, tcp::TcpBindOptions};
+    use crate::socket::{NetNS, tcp::TcpBindOptions};
 
     use super::*;
 
@@ -272,7 +277,7 @@ mod tests {
             SocketContext::default()
                 .with_ip_version(IpVersion::V6)
                 .with_socket_mark(Some(0))
-                .with_netns(Some(NetNamespace::new("instance-a"))),
+                .with_netns(Some(NetNS::from_host_reference("instance-a"))),
         );
         let encoded = encode_tcp_connect_options(
             &TcpConnectOptions::direct_connect("[2001:db8::2]:11013".parse().unwrap())

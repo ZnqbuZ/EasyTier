@@ -11,7 +11,7 @@ use crate::common::{
     error::Error,
     global_ctx::{ArcGlobalCtx, GlobalCtxEvent},
     ifcfg::{IfConfiger, IfConfiguerTrait},
-    netns::{NetNS, PlatformNamespace},
+    netns::NetNS,
 };
 
 use easytier_core::{
@@ -246,15 +246,15 @@ impl AsyncWrite for TunAsyncWrite {
 pub struct VirtualNicConfig {
     dev_name: String,
     mtu: u32,
-    net_ns: PlatformNamespace,
+    net_ns: NetNS,
 }
 
 impl VirtualNicConfig {
-    pub fn new(dev_name: String, mtu: u32, net_ns: std::sync::Arc<NetNS>) -> Self {
+    pub fn new(dev_name: String, mtu: u32, net_ns: NetNS) -> Self {
         Self {
             dev_name,
             mtu,
-            net_ns: net_ns.platform().clone(),
+            net_ns: net_ns.clone(),
         }
     }
 
@@ -299,7 +299,7 @@ impl VirtualNic {
     }
 
     pub fn new(config: VirtualNicConfig) -> Self {
-        let ifcfg = Box::new(crate::common::ifcfg::in_namespace(config.net_ns.clone()));
+        let ifcfg = Box::new(IfConfiger::new(config.net_ns.clone()));
         Self {
             config,
             ifname: None,
@@ -643,11 +643,14 @@ impl VirtualNic {
     pub async fn create_dev(&mut self) -> Result<Box<dyn Tunnel>, Error> {
         let dev = self.create_tun().await?;
 
-        #[cfg(not(target_os = "freebsd"))]
-        let ifname = dev.tun_name()?;
-
-        #[cfg(target_os = "freebsd")]
-        let mut ifname = dev.tun_name()?;
+        cfg_select! {
+            target_os = "freebsd" => {
+                let mut ifname = dev.tun_name()?;
+            },
+            _ => {
+                let ifname = dev.tun_name()?;
+            },
+        }
         self.ifcfg.wait_interface_show(ifname.as_str()).await?;
 
         // FreeBSD TUN interface rename functionality
@@ -877,7 +880,7 @@ impl VirtualNic {
     }
 
     pub fn get_ifcfg(&self) -> IfConfiger {
-        crate::common::ifcfg::in_namespace(self.config.net_ns.clone())
+        IfConfiger::new(self.config.net_ns.clone())
     }
 }
 
@@ -1110,7 +1113,7 @@ impl NicCtx {
         #[cfg(mobile)]
         let nic_config = VirtualNicConfig {
             dev_name: String::new(),
-            net_ns: global_ctx.net_ns.platform().clone(),
+            net_ns: global_ctx.net_ns.clone(),
             ..nic_config
         };
         // Only an explicitly configured name opts into sharing.
@@ -1811,7 +1814,7 @@ mod tests {
 
         use super::{IfConfiger, NicBackend, VirtualNicConfig};
         use crate::{
-            common::{global_ctx::GlobalCtxEvent, ifcfg::IfConfiguerTrait, netns::NetNS},
+            common::{global_ctx::GlobalCtxEvent, ifcfg::IfConfiguerTrait},
             instance::{
                 composition::{NativeCoreInstance, runtime_core_host_adapters},
                 config::test_core_instance_config,
@@ -1832,7 +1835,7 @@ mod tests {
                 .args(["netns", "del", &namespace])
                 .status();
         }
-        let net_ns = NetNS::new(Some(namespace.clone()));
+        let net_ns = crate::common::netns::tests::test_namespace(Some(namespace.clone()));
         // Avoid DAD probes and use an unowned source to test destination claims.
         {
             net_ns
@@ -1842,7 +1845,7 @@ mod tests {
                     std::fs::write("/proc/sys/net/ipv6/conf/default/addr_gen_mode", "1").unwrap();
                 })
                 .unwrap();
-            let ifcfg = crate::common::ifcfg::in_namespace(net_ns.platform().clone());
+            let ifcfg = IfConfiger::new(net_ns.clone());
             ifcfg.set_link_status("lo", true).await.unwrap();
             ifcfg
                 .add_ipv6_ip("lo", "fdff::1".parse().unwrap(), 128)

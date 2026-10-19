@@ -225,7 +225,7 @@ mod tests {
     use tokio::sync::Mutex as TokioMutex;
 
     use super::*;
-    use crate::{packet::new_hole_punch_packet, socket::NetNamespace};
+    use crate::{packet::new_hole_punch_packet, socket::NetNS};
 
     impl<R> UdpSocketArray<R>
     where
@@ -357,7 +357,7 @@ mod tests {
         let runtime = Arc::new(MockFactory::new());
         let context = SocketContext::default()
             .with_socket_mark(Some(0))
-            .with_netns(Some(NetNamespace::new("instance-a")));
+            .with_netns(Some(NetNS::from_host_reference("instance-a")));
         let array = UdpSocketArray::new_with_context(2, runtime.clone(), context.clone());
 
         array.start().await.unwrap();

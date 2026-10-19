@@ -8,6 +8,7 @@ pub mod instance;
 pub mod listener;
 #[cfg(feature = "management-rpc")]
 pub mod management;
+pub mod netns;
 pub mod packet;
 pub mod peers;
 pub mod process_runtime;

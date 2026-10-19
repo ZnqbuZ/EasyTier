@@ -2535,6 +2535,7 @@ dependencies = [
  "derive_more",
  "easytier-core",
  "easytier-proto",
+ "educe",
  "encoding",
  "flume 0.12.0",
  "forwarded-header-value",
@@ -2543,6 +2544,7 @@ dependencies = [
  "git-version",
  "globwalk 0.9.1",
  "guarden",
+ "hashbrown 0.15.5",
  "hickory-client",
  "hickory-proto",
  "hickory-resolver",
@@ -2660,6 +2662,7 @@ dependencies = [
  "crossbeam-utils",
  "dashmap",
  "easytier-proto",
+ "equivalent",
  "futures",
  "getrandom 0.2.17",
  "getrandom 0.3.4",
@@ -2992,6 +2995,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "educe"
+version = "0.8.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1ebdb1f8f8d2815bbe7b369a7da10343c82026a4503b68bd1279ba557611e96d"
+dependencies = [
+ "enum-ordinalize",
+ "proc-macro2",
+ "quote",
+ "syn 3.0.6",
+]
+
+[[package]]
 name = "either"
 version = "1.18.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3162,6 +3177,26 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.119",
+]
+
+[[package]]
+name = "enum-ordinalize"
+version = "4.4.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "89dd01549b09589510cf0647475075d12071456586d70f5c75c98ae2a5537677"
+dependencies = [
+ "enum-ordinalize-derive",
+]
+
+[[package]]
+name = "enum-ordinalize-derive"
+version = "4.4.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a65863d15a4ce2888bd2f0f543cc963d3879c3a022c8ee43f6141d479a3ac815"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 3.0.6",
 ]
 
 [[package]]

@@ -120,7 +120,7 @@ mod tests {
         connectivity::stun::{TcpNatTypeDetector, UdpNatTypeDetector},
         packet::stun::Attribute,
         socket::SocketListener,
-        socket::{NetNamespace, udp::VirtualUdpSocketFactory},
+        socket::{NetNS, udp::VirtualUdpSocketFactory},
     };
     use stun_codec::rfc5389::{attributes::XorMappedAddress, methods::BINDING};
     use stun_codec::{Message, MessageClass, MessageDecoder, MessageEncoder};
@@ -140,7 +140,7 @@ mod tests {
     async fn runtime_collector_starts_with_native_runtime() {
         let context = SocketContext::default()
             .with_socket_mark(Some(0))
-            .with_netns(Some(NetNamespace::new("instance-a")));
+            .with_netns(Some(NetNS::from_host_reference("instance-a")));
         let collector = runtime_stun_info_collector(context);
 
         assert_eq!(

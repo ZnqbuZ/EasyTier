@@ -208,8 +208,7 @@ async fn send_http_request_inner(
 ) -> Result<Bytes, HttpTransportError> {
     let stream = connect_tcp_in_namespace(
         TcpConnectOptions::direct_connect(addr),
-        &crate::common::netns::PlatformNamespace::current()
-            .map_err(easytier_core::tunnel::TunnelError::from)?,
+        &crate::common::netns::current().map_err(easytier_core::tunnel::TunnelError::from)?,
     )
     .await?;
     let (mut sender, connection) = http1::handshake(TokioIo::new(stream)).await?;

@@ -20,7 +20,7 @@ use tokio::sync::{Semaphore, mpsc, watch};
 use crate::{
     packet::stun::{Attribute, ChangeRequest, u32_to_tid},
     packet::{UDP_TUNNEL_HEADER_SIZE, UdpPacketType, hole_punch_packet_tid},
-    socket::{IpVersion, NetNamespace, SocketContext, SocketListener},
+    socket::{IpVersion, NetNS, SocketContext, SocketListener},
 };
 
 use super::{layer::*, packet::*, session::*, virtual_socket::*, *};
@@ -2219,7 +2219,7 @@ async fn v4_hole_punch_control_sender_uses_factory_socket() {
     let dst_addr = SocketAddrV4::new(Ipv4Addr::new(192, 0, 2, 1), 11010);
     let context = SocketContext::default()
         .with_socket_mark(Some(0))
-        .with_netns(Some(NetNamespace::new("instance-a")));
+        .with_netns(Some(NetNS::from_host_reference("instance-a")));
 
     send_v4_hole_punch_control_packet(&factory, context.clone(), 22020, dst_addr)
         .await
@@ -2258,7 +2258,7 @@ async fn v6_hole_punch_control_sender_uses_factory_socket() {
     };
     let context = SocketContext::default()
         .with_socket_mark(Some(0))
-        .with_netns(Some(NetNamespace::new("instance-a")));
+        .with_netns(Some(NetNS::from_host_reference("instance-a")));
 
     send_v6_hole_punch_control_packet(
         &factory,

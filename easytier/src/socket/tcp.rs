@@ -22,7 +22,7 @@ use tokio::{
 };
 
 use crate::{
-    common::netns::PlatformNamespace,
+    common::netns::NetNS,
     socket_protector::protect_native_socket,
     tunnel::common::{BindDev, apply_socket_mark, bind},
 };
@@ -229,7 +229,7 @@ fn bind_dev_from_options(options: &TcpBindOptions, local_addr_was_defaulted: boo
 async fn bind_tcp_socket(
     remote_addr: SocketAddr,
     bind_options: &TcpBindOptions,
-    namespace: &PlatformNamespace,
+    namespace: &NetNS,
 ) -> Result<TcpSocket, TunnelError> {
     let (bind_addr, local_addr_was_defaulted) = match bind_options.local_addr {
         Some(addr) => (addr, false),
@@ -256,13 +256,13 @@ pub(crate) async fn create_tcp_socket(
     bind_options: &TcpBindOptions,
 ) -> Result<TcpSocket, TunnelError> {
     let namespace = crate::host_runtime::native_host_runtime().namespace(&bind_options.context)?;
-    create_tcp_socket_in_namespace(remote_addr, bind_options, namespace.platform()).await
+    create_tcp_socket_in_namespace(remote_addr, bind_options, &namespace).await
 }
 
 pub(crate) async fn create_tcp_socket_in_namespace(
     remote_addr: SocketAddr,
     bind_options: &TcpBindOptions,
-    namespace: &PlatformNamespace,
+    namespace: &NetNS,
 ) -> Result<TcpSocket, TunnelError> {
     namespace.validate_context(&bind_options.context)?;
     if must_bind_before_connect(bind_options) {
@@ -311,12 +311,12 @@ pub(crate) async fn bind_tcp_listener(
     options: TcpListenOptions,
 ) -> Result<RuntimeTcpListener, TunnelError> {
     let namespace = crate::host_runtime::native_host_runtime().namespace(&options.bind.context)?;
-    bind_tcp_listener_in_namespace(options, namespace.platform()).await
+    bind_tcp_listener_in_namespace(options, &namespace).await
 }
 
 pub(crate) async fn bind_tcp_listener_in_namespace(
     options: TcpListenOptions,
-    namespace: &PlatformNamespace,
+    namespace: &NetNS,
 ) -> Result<RuntimeTcpListener, TunnelError> {
     let purpose = options.purpose;
     let mut bind_options = options.bind;
@@ -341,12 +341,12 @@ pub(crate) async fn connect_tcp(
     options: TcpConnectOptions,
 ) -> Result<RuntimeTcpSocket, TunnelError> {
     let namespace = crate::host_runtime::native_host_runtime().namespace(&options.bind.context)?;
-    connect_tcp_in_namespace(options, namespace.platform()).await
+    connect_tcp_in_namespace(options, &namespace).await
 }
 
 pub(crate) async fn connect_tcp_in_namespace(
     options: TcpConnectOptions,
-    namespace: &PlatformNamespace,
+    namespace: &NetNS,
 ) -> Result<RuntimeTcpSocket, TunnelError> {
     let remote_addr = options.remote_addr;
     let purpose = options.purpose;

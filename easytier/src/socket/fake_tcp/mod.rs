@@ -18,9 +18,7 @@ use tokio::{
 
 use easytier_core::{socket::tcp::VirtualTcpSocket, tunnel::TunnelError};
 
-#[cfg(test)]
 use crate::common::netns::NetNS;
-use crate::common::netns::PlatformNamespace;
 
 use self::netfilter::create_tun;
 use self::packet::MacAddr;
@@ -87,7 +85,7 @@ async fn create_tun_off_runtime(
     interface_name: String,
     src_addr: Option<SocketAddr>,
     dst_addr: SocketAddr,
-    net_ns: PlatformNamespace,
+    net_ns: NetNS,
 ) -> Result<Arc<dyn stack::Tun>, TunnelError> {
     let result = tokio::task::spawn_blocking(move || {
         net_ns.run(|| create_tun(&interface_name, src_addr, dst_addr))
@@ -98,7 +96,7 @@ async fn create_tun_off_runtime(
 }
 
 pub(crate) struct FakeTcpSocketListener {
-    namespace: PlatformNamespace,
+    namespace: NetNS,
     context: easytier_core::socket::SocketContext,
     addr: url::Url,
     os_listener: Option<tokio::net::TcpListener>,
@@ -121,7 +119,7 @@ impl std::fmt::Debug for FakeTcpSocketListener {
 impl FakeTcpSocketListener {
     pub(crate) fn new(
         addr: url::Url,
-        namespace: PlatformNamespace,
+        namespace: NetNS,
         context: easytier_core::socket::SocketContext,
     ) -> Self {
         FakeTcpSocketListener {
@@ -461,7 +459,7 @@ async fn connect_socket_with_cache(
     remote_addr: SocketAddr,
     socket_mark: Option<u32>,
     ip_to_if_name: &IpToIfNameCache,
-    net_ns: PlatformNamespace,
+    net_ns: NetNS,
 ) -> Result<FakeTcpSocket, TunnelError> {
     let (local_addr, interface_name, mac, os_socket) = net_ns.run(|| {
         let local_ip = get_local_ip_for_destination(remote_addr.ip())
@@ -520,7 +518,7 @@ async fn connect_socket_with_cache(
 pub(crate) async fn connect_socket(
     remote_addr: SocketAddr,
     socket_mark: Option<u32>,
-    net_ns: PlatformNamespace,
+    net_ns: NetNS,
 ) -> Result<FakeTcpSocket, TunnelError> {
     connect_socket_with_cache(remote_addr, socket_mark, &IpToIfNameCache::new(), net_ns).await
 }
@@ -544,7 +542,7 @@ mod tests {
 
             let mut listener = FakeTcpSocketListener::new(
                 "faketcp://0.0.0.0:31011".parse().unwrap(),
-                NetNS::new(None).platform().clone(),
+                crate::common::netns::tests::test_namespace(None).clone(),
                 easytier_core::socket::SocketContext::default(),
             );
             listener.listen().await.unwrap();
@@ -562,7 +560,7 @@ mod tests {
             let mut socket = connect_socket(
                 "127.0.0.1:31011".parse().unwrap(),
                 None,
-                NetNS::new(None).platform().clone(),
+                crate::common::netns::tests::test_namespace(None).clone(),
             )
             .await
             .unwrap();

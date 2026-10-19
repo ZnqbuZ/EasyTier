@@ -517,7 +517,7 @@ type ConnSender = tokio::sync::mpsc::UnboundedSender<Box<dyn Tunnel>>;
 type ConnReceiver = tokio::sync::mpsc::UnboundedReceiver<Box<dyn Tunnel>>;
 
 pub struct WgTunnelListener {
-    namespace: std::io::Result<Arc<NetNS>>,
+    namespace: std::io::Result<NetNS>,
     addr: url::Url,
     session_listener: Option<Arc<RuntimeUdpSessionSocketListener>>,
     socket_mark: Option<u32>,
@@ -545,7 +545,7 @@ impl WgTunnelListener {
     pub fn new(addr: url::Url, config: WgConfig) -> Self {
         let (conn_send, conn_recv) = unbounded_channel();
         WgTunnelListener {
-            namespace: NetNS::current(),
+            namespace: crate::common::netns::current(),
             addr,
             session_listener: None,
             socket_mark: None,
@@ -654,7 +654,7 @@ impl WgTunnelListener {
         let local_addr = crate::common::dns::socket_addrs_in_namespace(
             &self.addr,
             11010,
-            namespace.platform().clone(),
+            namespace.clone(),
             context,
         )
         .await

@@ -13,19 +13,26 @@ use crate::common::global_ctx::ArcGlobalCtx;
 mod dhcp;
 mod event_journal;
 mod implementation;
-#[cfg(feature = "tun")]
-mod magic_dns;
-#[cfg(feature = "tun")]
-mod tun_common;
-#[cfg(not(feature = "tun"))]
-#[path = "runtime_host/tun_disabled.rs"]
-mod tun_runtime;
-#[cfg(all(feature = "tun", not(mobile)))]
-#[path = "runtime_host/tun_desktop.rs"]
-mod tun_runtime;
-#[cfg(all(feature = "tun", mobile))]
-#[path = "runtime_host/tun_mobile.rs"]
-mod tun_runtime;
+cfg_select! {
+    not(feature = "tun") => {
+        #[path = "runtime_host/tun_disabled.rs"]
+        mod tun_runtime;
+    },
+    _ => {
+        mod magic_dns;
+        mod tun_common;
+        cfg_select! {
+            mobile => {
+                #[path = "runtime_host/tun_mobile.rs"]
+                mod tun_runtime;
+            },
+            _ => {
+                #[path = "runtime_host/tun_desktop.rs"]
+                mod tun_runtime;
+            },
+        }
+    },
+}
 
 use super::runtime_executor::NativeInstanceExecutor;
 use event_journal::EventJournal;
@@ -57,7 +64,10 @@ impl NativeInstanceRuntimeHost {
             global_ctx.clone(),
             cancel.clone(),
             #[cfg(feature = "tun")]
-            global_ctx.net_ns.nics.clone(),
+            crate::host_runtime::namespace_services(&global_ctx.net_ns)
+                .expect("native instance domain must be registered")
+                .nics
+                .clone(),
         );
         let event_journal = EventJournal::new(&global_ctx);
         Arc::new(Self {

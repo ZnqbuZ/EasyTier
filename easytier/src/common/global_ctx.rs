@@ -84,7 +84,7 @@ pub struct GlobalCtx {
     pub id: uuid::Uuid,
     instance_run_key: uuid::Uuid,
     pub config: Box<dyn ConfigLoader>,
-    pub net_ns: std::sync::Arc<NetNS>,
+    pub net_ns: NetNS,
     pub network: NetworkIdentity,
 
     event_bus: EventBus,
@@ -121,8 +121,11 @@ impl PublicIpv6Host for GlobalCtx {
     ) -> HashSet<Ipv6Addr> {
         let context = SocketContext::default()
             .with_socket_mark(self.get_flags().socket_mark)
-            .with_netns(Some(self.net_ns.token()));
-        let ip_list = self.net_ns.collect_ip_addrs(&context).await;
+            .with_netns(Some(self.net_ns.clone()));
+        let ip_list = crate::host_runtime::namespace_services(&self.net_ns)
+            .expect("native instance domain must be registered")
+            .collect_ip_addrs(&context)
+            .await;
         let mut reserved = HashSet::new();
         reserved.extend(
             ip_list
@@ -154,7 +157,7 @@ impl GlobalCtx {
         config_fs: impl ConfigLoader + 'static,
         runtime: &CoreInstanceConfig,
         host: &CoreInstanceHostConfig,
-        namespace: std::sync::Arc<NetNS>,
+        namespace: NetNS,
     ) -> Self {
         let runtime = CoreInstanceRuntimeConfig {
             services: runtime.connectivity.runtime.clone(),
@@ -173,12 +176,12 @@ impl GlobalCtx {
         config_fs: impl ConfigLoader + 'static,
         runtime: Option<&CoreInstanceRuntimeConfig>,
         runtime_endpoint_protocols: Option<HashSet<String>>,
-        namespace: Option<std::sync::Arc<NetNS>>,
+        namespace: Option<NetNS>,
     ) -> Self {
         let id = config_fs.get_id();
         let network = config_fs.get_network_identity();
         let net_ns = namespace.unwrap_or_else(|| {
-            NetNS::resolve_config(config_fs.get_netns().as_deref())
+            crate::common::netns::resolve_config(config_fs.get_netns().as_deref())
                 .expect("resolve native network namespace")
         });
         let hostname = runtime
@@ -516,7 +519,7 @@ pub mod tests {
             config.clone(),
             &normalized,
             &host,
-            NetNS::current().unwrap(),
+            crate::common::netns::current().unwrap(),
         );
 
         assert_eq!(config.get_mapped_listeners().len(), 2);

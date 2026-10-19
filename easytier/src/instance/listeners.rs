@@ -1,20 +1,24 @@
-use std::fmt::Debug;
+use std::fmt::{self, Debug};
 
 use async_trait::async_trait;
 use easytier_core::listener::{
     ExternalListenerFactory, ExternalListenerRequest, transport::AcceptedTransport,
 };
+#[cfg(any(unix, feature = "faketcp"))]
+use easytier_core::socket::SocketContext;
 use easytier_core::socket::SocketListener;
 
 use crate::common::netns::NetNS;
+#[cfg(feature = "faketcp")]
+use crate::socket::fake_tcp::FakeTcpSocketListener;
 use crate::socket::tcp::RuntimeTcpSocket;
 
 pub(crate) struct RuntimeExternalListenerFactory {
-    namespace: std::sync::Arc<NetNS>,
+    namespace: NetNS,
 }
 
 impl RuntimeExternalListenerFactory {
-    pub(crate) fn new(namespace: std::sync::Arc<NetNS>) -> Self {
+    pub(crate) fn new(namespace: NetNS) -> Self {
         Self { namespace }
     }
 }
@@ -57,8 +61,8 @@ impl ExternalListenerFactory<AcceptedTransport<RuntimeTcpSocket>>
 struct RuntimeUnixStreamListener {
     url: url::Url,
     inner: Option<tokio::net::UnixListener>,
-    namespace: std::sync::Arc<NetNS>,
-    context: easytier_core::socket::SocketContext,
+    namespace: NetNS,
+    context: SocketContext,
 }
 
 #[cfg(unix)]
@@ -67,15 +71,11 @@ impl RuntimeUnixStreamListener {
     fn new(url: url::Url) -> Self {
         Self::new_in_namespace(
             url,
-            NetNS::current().unwrap(),
-            easytier_core::socket::SocketContext::default(),
+            crate::common::netns::current().unwrap(),
+            SocketContext::default(),
         )
     }
-    fn new_in_namespace(
-        url: url::Url,
-        namespace: std::sync::Arc<NetNS>,
-        context: easytier_core::socket::SocketContext,
-    ) -> Self {
+    fn new_in_namespace(url: url::Url, namespace: NetNS, context: SocketContext) -> Self {
         Self {
             url,
             inner: None,
@@ -96,7 +96,7 @@ fn unix_stream_remote_url(remote_addr: tokio::net::unix::SocketAddr) -> url::Url
 
 #[cfg(unix)]
 impl Debug for RuntimeUnixStreamListener {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("RuntimeUnixStreamListener")
             .field("url", &self.url)
@@ -149,24 +149,16 @@ impl Drop for RuntimeUnixStreamListener {
 
 #[cfg(feature = "faketcp")]
 struct RuntimeFakeTcpSocketListener {
-    net_ns: std::sync::Arc<NetNS>,
-    inner: crate::socket::fake_tcp::FakeTcpSocketListener,
-    context: easytier_core::socket::SocketContext,
+    net_ns: NetNS,
+    inner: FakeTcpSocketListener,
+    context: SocketContext,
 }
 
 #[cfg(feature = "faketcp")]
 impl RuntimeFakeTcpSocketListener {
-    fn new(
-        url: url::Url,
-        net_ns: std::sync::Arc<NetNS>,
-        context: easytier_core::socket::SocketContext,
-    ) -> Self {
+    fn new(url: url::Url, net_ns: NetNS, context: SocketContext) -> Self {
         Self {
-            inner: crate::socket::fake_tcp::FakeTcpSocketListener::new(
-                url,
-                net_ns.platform().clone(),
-                context.clone(),
-            ),
+            inner: FakeTcpSocketListener::new(url, net_ns.clone(), context.clone()),
             net_ns,
             context,
         }
@@ -175,7 +167,7 @@ impl RuntimeFakeTcpSocketListener {
 
 #[cfg(feature = "faketcp")]
 impl Debug for RuntimeFakeTcpSocketListener {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("RuntimeFakeTcpSocketListener")
             .field("url", &SocketListener::local_url(&self.inner))
@@ -215,7 +207,7 @@ mod tests {
 
     #[test]
     fn external_listener_capabilities_follow_native_build() {
-        let factory = RuntimeExternalListenerFactory::new(NetNS::current().unwrap());
+        let factory = RuntimeExternalListenerFactory::new(crate::common::netns::current().unwrap());
 
         assert_eq!(
             factory.supports_scheme("faketcp"),

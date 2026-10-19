@@ -2002,7 +2002,7 @@ mod tests {
         SharedVirtualNicDispatcher,
         mpsc::UnboundedSender<SharedVirtualNicControl>,
     ) {
-        use crate::{common::netns::NetNS, instance::virtual_nic::VirtualNicConfig};
+        use crate::instance::virtual_nic::VirtualNicConfig;
 
         let (tun_stream, tun_sink) = tunnel.split();
         let (control_sender, control_receiver) = mpsc::unbounded_channel();
@@ -2012,7 +2012,7 @@ mod tests {
                 nic: Arc::new(Mutex::new(VirtualNic::new(VirtualNicConfig::new(
                     String::new(),
                     1300,
-                    NetNS::new(None),
+                    crate::common::netns::tests::test_namespace(None),
                 )))),
                 tun_fd: -1,
             }),
@@ -3111,10 +3111,7 @@ mod tests {
     #[tokio::test]
     async fn cancelled_member_updates_finish_before_registration_cleanup() {
         use super::super::{SharedVirtualNic, SharedVirtualNicMember};
-        use crate::{
-            common::{ifcfg::IfConfiguerTrait, netns::NetNS},
-            instance::virtual_nic::VirtualNicConfig,
-        };
+        use crate::{common::ifcfg::IfConfiguerTrait, instance::virtual_nic::VirtualNicConfig};
 
         #[derive(Clone)]
         struct PausingIfConfiger {
@@ -3215,7 +3212,7 @@ mod tests {
                 let mut shared_nic = SharedVirtualNic::new(VirtualNicConfig::new(
                     String::new(),
                     1500,
-                    NetNS::new(None),
+                    crate::common::netns::tests::test_namespace(None),
                 ));
                 {
                     let mut nic = shared_nic.nic.lock().await;

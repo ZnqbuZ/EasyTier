@@ -1,4 +1,4 @@
-use crate::common::netns::{NetNS, ROOT_NETNS_NAME};
+use crate::common::netns::ROOT_NETNS_NAME;
 
 use super::{add_ns_to_bridge, create_netns, del_netns, run_network_command};
 
@@ -82,7 +82,7 @@ impl TestNetwork {
 
 impl Drop for TestNetwork {
     fn drop(&mut self) {
-        NetNS::new(Some(ROOT_NETNS_NAME.to_owned()))
+        crate::common::netns::tests::test_namespace(Some(ROOT_NETNS_NAME.to_owned()))
             .run(|| {
                 for (_, namespace) in &self.namespaces {
                     del_netns(namespace);
@@ -102,8 +102,10 @@ fn nested_namespace_guard_restores_current_thread() {
     let mut network = TestNetwork::new();
     network.create_empty_namespace("net_a");
     network.create_empty_namespace("net_b");
-    let net_a = NetNS::new(Some(network.namespace("net_a").into()));
-    let net_b = NetNS::new(Some(network.namespace("net_b").into()));
+    let net_a =
+        crate::common::netns::tests::test_namespace(Some(network.namespace("net_a").into()));
+    let net_b =
+        crate::common::netns::tests::test_namespace(Some(network.namespace("net_b").into()));
     let current = || std::fs::read_link("/proc/thread-self/ns/net").unwrap();
     let original = current();
 
@@ -124,28 +126,29 @@ async fn bound_sockets_use_distinct_namespaces_without_switching_async_tasks() {
     let mut network = TestNetwork::new();
     network.create_empty_namespace("net_a");
     network.create_empty_namespace("net_b");
-    let a = NetNS::new(Some(network.namespace("net_a").into()));
-    let b = NetNS::new(Some(network.namespace("net_b").into()));
-    let original = NetNS::current().unwrap();
-    let socket_a = a
+    let a = crate::common::netns::tests::test_namespace(Some(network.namespace("net_a").into()));
+    let b = crate::common::netns::tests::test_namespace(Some(network.namespace("net_b").into()));
+    let original = crate::common::netns::current().unwrap();
+    let socket_a = crate::host_runtime::namespace_services(&a)
+        .unwrap()
         .bind_udp(
             UdpBindOptions::direct_connect().with_local_addr(Some("0.0.0.0:0".parse().unwrap())),
         )
         .await
         .unwrap();
     let address = socket_a.local_addr().unwrap();
-    let _socket_b = b
+    let _socket_b = crate::host_runtime::namespace_services(&b)
+        .unwrap()
         .bind_udp(UdpBindOptions::direct_connect().with_local_addr(Some(address)))
         .await
         .unwrap();
     assert!(
-        a.bind_udp(UdpBindOptions::direct_connect().with_local_addr(Some(address)))
+        crate::host_runtime::namespace_services(&a)
+            .unwrap()
+            .bind_udp(UdpBindOptions::direct_connect().with_local_addr(Some(address)))
             .await
             .is_err()
     );
     tokio::task::yield_now().await;
-    assert!(std::sync::Arc::ptr_eq(
-        &original,
-        &NetNS::current().unwrap()
-    ));
+    assert_eq!(original, crate::common::netns::current().unwrap());
 }

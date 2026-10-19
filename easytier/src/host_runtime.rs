@@ -1,7 +1,7 @@
 use std::{
-    collections::HashMap,
-    io,
-    net::{IpAddr, SocketAddr, SocketAddrV4, SocketAddrV6},
+    fmt, io,
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6},
+    ops::Deref,
     sync::{
         Arc, Mutex, OnceLock,
         atomic::{AtomicBool, Ordering},
@@ -21,12 +21,16 @@ use easytier_core::{
         udp::{PreferredIpv6Source, UdpBindOptions, VirtualUdpSocketFactory},
     },
 };
-use tokio::sync::watch;
+use hashbrown::HashSet;
+#[cfg(feature = "tun")]
+use tokio::sync::Mutex as AsyncMutex;
+use tokio::{runtime::Handle, sync::watch};
 
 use crate::{
     common::{
+        dns::RuntimeDnsResolver,
         native_executor::NativeExecutor,
-        netns::{NetNS, NetNsId, PlatformNamespace},
+        netns::{NetNS, PlatformNamespace},
         network::{collect_interfaces, collect_local_ip_addrs},
     },
     proto::peer_rpc::GetIpListResponse,
@@ -36,13 +40,76 @@ use crate::{
     },
 };
 
+#[cfg(feature = "tun")]
+use crate::instance::shared_virtual_nic::{ArcSharedVirtualNicRegistry, SharedVirtualNicRegistry};
+
+/// Native services attached to one shared Core namespace handle.
+/// Cloning a NetNS retains its platform resource, not this service owner.
+#[derive(educe::Educe)]
+#[educe(PartialEq, Eq, Hash)]
+pub struct NativeNamespaceServices {
+    namespace: NetNS,
+    #[educe(PartialEq(ignore), Hash(ignore))]
+    dns: RuntimeDnsResolver,
+    #[cfg(feature = "tun")]
+    #[educe(PartialEq(ignore), Hash(ignore))]
+    pub(crate) nics: ArcSharedVirtualNicRegistry,
+}
+
+impl fmt::Debug for NativeNamespaceServices {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("NativeNamespaceServices")
+            .field("namespace", &self.namespace)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Deref for NativeNamespaceServices {
+    type Target = NetNS;
+    fn deref(&self) -> &NetNS {
+        &self.namespace
+    }
+}
+
+impl NativeNamespaceServices {
+    fn new(namespace: NetNS) -> Self {
+        Self {
+            dns: RuntimeDnsResolver::in_namespace(namespace.clone()),
+            #[cfg(feature = "tun")]
+            nics: Arc::new(AsyncMutex::new(SharedVirtualNicRegistry::in_domain(
+                namespace.clone(),
+            ))),
+            namespace,
+        }
+    }
+
+    fn request_service_shutdown(&self) {
+        self.namespace.close();
+    }
+
+    async fn wait_services_stopped(&self) -> anyhow::Result<()> {
+        #[cfg(feature = "tun")]
+        {
+            let nics = self.nics.lock().await.take_for_shutdown();
+            for nic in nics {
+                nic.lock().await.invalidate_and_shutdown_dispatcher().await;
+            }
+        }
+        Ok(())
+    }
+}
+
+pub(crate) fn namespace_services(namespace: &NetNS) -> io::Result<Arc<NativeNamespaceServices>> {
+    native_host_runtime().services(namespace)
+}
+
 /// Process-wide directory and owner of native services.
 /// Instance I/O uses a capability bound to one canonical NetNS.
 #[derive(Debug)]
 pub struct NativeHostRuntime {
-    namespaces: Mutex<HashMap<NetNsId, Arc<NetNS>>>,
+    namespaces: Mutex<HashSet<Arc<NativeNamespaceServices>>>,
     default_platform: io::Result<PlatformNamespace>,
-    default_namespace: OnceLock<Arc<NetNS>>,
+    default_namespace: OnceLock<NetNS>,
     shared: OnceLock<Result<NativeExecutor, String>>,
     shared_initialization: Mutex<()>,
     closing: AtomicBool,
@@ -61,7 +128,7 @@ pub(crate) fn native_host_runtime() -> Arc<NativeHostRuntime> {
 impl NativeHostRuntime {
     fn new() -> Self {
         Self {
-            namespaces: Mutex::new(HashMap::new()),
+            namespaces: Mutex::new(HashSet::new()),
             default_platform: PlatformNamespace::process_default(),
             default_namespace: OnceLock::new(),
             shared: OnceLock::new(),
@@ -72,7 +139,7 @@ impl NativeHostRuntime {
         }
     }
 
-    pub(crate) fn shared_executor(&self) -> io::Result<tokio::runtime::Handle> {
+    pub(crate) fn shared_executor(&self) -> io::Result<Handle> {
         if self.executor_stopping.load(Ordering::Acquire) {
             return Err(io::Error::other("native host runtime is closing"));
         }
@@ -132,7 +199,7 @@ impl NativeHostRuntime {
             .namespaces
             .lock()
             .unwrap()
-            .values()
+            .iter()
             .cloned()
             .collect::<Vec<_>>();
         for namespace in &namespaces {
@@ -153,7 +220,7 @@ impl NativeHostRuntime {
                             namespace
                                 .wait_services_stopped()
                                 .await
-                                .map_err(|error| format!("{}: {error:#}", namespace.id()))
+                                .map_err(|error| format!("{:?}: {error:#}", namespace.id()))
                         })
                         .collect::<FuturesUnordered<_>>();
                     let mut errors = Vec::new();
@@ -181,25 +248,36 @@ impl NativeHostRuntime {
         }
     }
 
-    pub(crate) fn intern_namespace(&self, platform: PlatformNamespace) -> io::Result<Arc<NetNS>> {
+    pub(crate) fn intern_namespace(&self, platform: PlatformNamespace) -> io::Result<NetNS> {
         if self.closing.load(Ordering::Acquire) {
             return Err(io::Error::other("native host runtime is closing"));
         }
-        let candidate = Arc::new(NetNS::from_platform(platform));
-        let namespace = {
-            let mut entries = self.namespaces.lock().unwrap();
-            if self.closing.load(Ordering::Acquire) {
-                return Err(io::Error::other("native host runtime is closing"));
-            }
-            entries
-                .entry(candidate.id())
-                .or_insert_with(|| candidate.clone())
-                .clone()
-        };
-        Ok(namespace)
+        let candidate = NetNS::new(platform.id(), platform);
+        let mut entries = self.namespaces.lock().unwrap();
+        if self.closing.load(Ordering::Acquire) {
+            return Err(io::Error::other("native host runtime is closing"));
+        }
+        let services = entries.get_or_insert_with(&candidate, |namespace| {
+            Arc::new(NativeNamespaceServices::new(namespace.clone()))
+        });
+        Ok(services.namespace.clone())
     }
 
-    pub(crate) fn capture_default_namespace(&self) -> io::Result<Arc<NetNS>> {
+    fn services(&self, namespace: &NetNS) -> io::Result<Arc<NativeNamespaceServices>> {
+        self.namespaces
+            .lock()
+            .unwrap()
+            .get(namespace)
+            .cloned()
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::NotFound,
+                    "network namespace is not registered with this native Host",
+                )
+            })
+    }
+
+    pub(crate) fn capture_default_namespace(&self) -> io::Result<NetNS> {
         if self.closing.load(Ordering::Acquire) {
             return Err(io::Error::other("native host runtime is closing"));
         }
@@ -215,65 +293,58 @@ impl NativeHostRuntime {
         Ok(self.default_namespace.get().unwrap().clone())
     }
 
-    pub(crate) fn is_process_default(&self, namespace: &PlatformNamespace) -> io::Result<bool> {
+    pub(crate) fn is_process_default(&self, namespace: &NetNS) -> io::Result<bool> {
         self.default_platform
             .as_ref()
-            .map(|default| default.id() == namespace.id())
+            .map(|default| Some(default.id()) == namespace.id())
             .map_err(|error| io::Error::new(error.kind(), error.to_string()))
     }
 
-    /// Resolve only an already-interned runtime identity. Never reopen a name.
-    pub(crate) fn namespace(&self, context: &SocketContext) -> io::Result<Arc<NetNS>> {
+    /// Resolve an existing shared handle; names and wire references never select
+    /// or reopen a native namespace here.
+    pub(crate) fn namespace(
+        &self,
+        context: &SocketContext,
+    ) -> io::Result<Arc<NativeNamespaceServices>> {
         if self.closing.load(Ordering::Acquire) {
             return Err(io::Error::other("native host runtime is closing"));
         }
-        let Some(token) = &context.netns else {
-            return self.capture_default_namespace();
-        };
-        let id = NetNsId::from_token(token.token())?;
-        self.namespaces
-            .lock()
-            .unwrap()
-            .get(&id)
-            .cloned()
-            .ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::NotFound,
-                    "native network namespace is not registered",
-                )
-            })
+        match &context.netns {
+            Some(namespace) => self.services(namespace),
+            None => self.services(&self.capture_default_namespace()?),
+        }
     }
 }
 
 #[async_trait]
-impl VirtualTcpSocketFactory for NetNS {
+impl VirtualTcpSocketFactory for NativeNamespaceServices {
     type Socket = RuntimeTcpSocket;
 
     async fn connect_tcp(&self, options: TcpConnectOptions) -> anyhow::Result<Self::Socket> {
         self.validate_context(&options.bind.context)?;
-        #[cfg(feature = "faketcp")]
         if options.purpose == TcpSocketPurpose::FakeTcp {
-            let remote_addr = options.remote_addr;
-            let socket_mark = options.bind.context.socket_mark;
-            let net_ns = self.platform().clone();
-            let socket =
-                crate::socket::fake_tcp::connect_socket(remote_addr, socket_mark, net_ns).await?;
-            return Ok(RuntimeTcpSocket::from_fake_tcp(socket));
+            cfg_select! {
+                feature = "faketcp" => {
+                    let remote_addr = options.remote_addr;
+                    let socket_mark = options.bind.context.socket_mark;
+                    let net_ns = self.namespace.clone();
+                    let socket = crate::socket::fake_tcp::connect_socket(remote_addr, socket_mark, net_ns).await?;
+                    return Ok(RuntimeTcpSocket::from_fake_tcp(socket));
+                },
+                _ => {
+                    anyhow::bail!("FakeTCP socket support is disabled")
+                },
+            }
         }
 
-        #[cfg(not(feature = "faketcp"))]
-        if options.purpose == TcpSocketPurpose::FakeTcp {
-            anyhow::bail!("FakeTCP socket support is disabled")
-        }
-
-        crate::socket::tcp::connect_tcp_in_namespace(options, self.platform())
+        crate::socket::tcp::connect_tcp_in_namespace(options, &self.namespace)
             .await
             .map_err(anyhow::Error::from)
     }
 }
 
 #[async_trait]
-impl ConnectorRuntime for NetNS {
+impl ConnectorRuntime for NativeNamespaceServices {
     async fn connect_byte_stream(
         &self,
         url: &url::Url,
@@ -305,29 +376,25 @@ impl ConnectorRuntime for NetNS {
     ) -> anyhow::Result<SocketAddr> {
         self.validate_context(&context)?;
         let bind_addr = match remote_addr {
-            SocketAddr::V4(_) => {
-                SocketAddr::V4(SocketAddrV4::new(std::net::Ipv4Addr::UNSPECIFIED, 0))
-            }
-            SocketAddr::V6(_) => {
-                SocketAddr::V6(SocketAddrV6::new(std::net::Ipv6Addr::UNSPECIFIED, 0, 0, 0))
-            }
+            SocketAddr::V4(_) => SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0)),
+            SocketAddr::V6(_) => SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, 0, 0, 0)),
         };
         let options = UdpBindOptions::default()
             .with_context(context)
             .with_local_addr(Some(bind_addr));
         let socket =
-            crate::socket::udp::create_udp_socket_in_namespace(&options, self.platform()).await?;
+            crate::socket::udp::create_udp_socket_in_namespace(&options, &self.namespace).await?;
         socket.connect(remote_addr).await?;
         Ok(socket.local_addr()?)
     }
 
     async fn preferred_ipv6_source(
         &self,
-        ip: std::net::Ipv6Addr,
+        ip: Ipv6Addr,
         context: SocketContext,
     ) -> Option<PreferredIpv6Source> {
         self.validate_context(&context).ok()?;
-        collect_interfaces(self.platform().clone(), false)
+        collect_interfaces(self.namespace.clone(), false)
             .await
             .into_iter()
             .find(|interface| {
@@ -346,11 +413,11 @@ impl ConnectorRuntime for NetNS {
         if self.validate_context(context).is_err() {
             return GetIpListResponse::default();
         }
-        collect_local_ip_addrs(self.platform().clone()).await
+        collect_local_ip_addrs(self.namespace.clone()).await
     }
 }
 
-impl NetNS {
+impl NativeNamespaceServices {
     pub(crate) fn is_local_ip(&self, ip: &IpAddr, context: &SocketContext) -> bool {
         self.validate_context(context).is_ok()
             && self
@@ -360,24 +427,24 @@ impl NetNS {
 }
 
 #[async_trait]
-impl VirtualTcpListenerFactory for NetNS {
+impl VirtualTcpListenerFactory for NativeNamespaceServices {
     type Listener = RuntimeTcpListener;
 
     async fn bind_tcp(&self, options: TcpListenOptions) -> anyhow::Result<Arc<Self::Listener>> {
         self.validate_context(&options.bind.context)?;
         Ok(Arc::new(
-            crate::socket::tcp::bind_tcp_listener_in_namespace(options, self.platform()).await?,
+            crate::socket::tcp::bind_tcp_listener_in_namespace(options, &self.namespace).await?,
         ))
     }
 }
 
 #[async_trait]
-impl VirtualUdpSocketFactory for NetNS {
+impl VirtualUdpSocketFactory for NativeNamespaceServices {
     type Socket = RuntimeUdpSocket;
 
     async fn bind_udp(&self, options: UdpBindOptions) -> anyhow::Result<Arc<Self::Socket>> {
         self.validate_context(&options.context)?;
-        let socket = RuntimeUdpSocketFactory::in_namespace(self.platform().clone())
+        let socket = RuntimeUdpSocketFactory::in_namespace(self.namespace.clone())
             .bind_udp(options)
             .await?;
         #[cfg(target_os = "windows")]
@@ -387,7 +454,7 @@ impl VirtualUdpSocketFactory for NetNS {
 }
 
 #[async_trait]
-impl DnsResolver for NetNS {
+impl DnsResolver for NativeNamespaceServices {
     async fn resolve(&self, query: DnsQuery) -> anyhow::Result<Vec<IpAddr>> {
         self.ensure_open()?;
         self.dns.resolve(query).await
@@ -395,7 +462,7 @@ impl DnsResolver for NetNS {
 }
 
 #[async_trait]
-impl DnsRecordResolver for NetNS {
+impl DnsRecordResolver for NativeNamespaceServices {
     async fn resolve_txt(&self, query: DnsQuery) -> anyhow::Result<String> {
         self.ensure_open()?;
         self.dns.resolve_txt(query).await
@@ -439,7 +506,7 @@ impl ConnectorRuntime for NativeHostRuntime {
         &self,
         url: &url::Url,
     ) -> anyhow::Result<ConnectedByteStream<RuntimeTcpSocket>> {
-        self.capture_default_namespace()?
+        self.services(&self.capture_default_namespace()?)?
             .connect_byte_stream(url)
             .await
     }
@@ -454,7 +521,7 @@ impl ConnectorRuntime for NativeHostRuntime {
     }
     async fn preferred_ipv6_source(
         &self,
-        ip: std::net::Ipv6Addr,
+        ip: Ipv6Addr,
         context: SocketContext,
     ) -> Option<PreferredIpv6Source> {
         self.namespace(&context)
@@ -470,13 +537,6 @@ impl ConnectorRuntime for NativeHostRuntime {
                 GetIpListResponse::default()
             }
         }
-    }
-}
-#[cfg(test)]
-impl NativeHostRuntime {
-    pub(crate) fn is_local_ip(&self, ip: &IpAddr, context: &SocketContext) -> bool {
-        self.namespace(context)
-            .is_ok_and(|namespace| namespace.is_local_ip(ip, context))
     }
 }
 #[async_trait]
@@ -499,6 +559,13 @@ impl DnsRecordResolver for NativeHostRuntime {
 mod tests {
     use super::*;
 
+    impl NativeHostRuntime {
+        pub(crate) fn is_local_ip(&self, ip: &IpAddr, context: &SocketContext) -> bool {
+            self.namespace(context)
+                .is_ok_and(|namespace| namespace.is_local_ip(ip, context))
+        }
+    }
+
     #[tokio::test]
     async fn terminal_shutdown_closes_domain_admission_before_stopping_the_executor() {
         use std::time::Duration;
@@ -508,7 +575,9 @@ mod tests {
         // Hold the asynchronous NIC directory, so the cleanup remains pending
         // while checking the synchronous close boundary.
         #[cfg(feature = "tun")]
-        let permit = namespace.nics.lock().await;
+        let services = host.services(&namespace).unwrap();
+        #[cfg(feature = "tun")]
+        let permit = services.nics.lock().await;
         host.request_service_shutdown();
         assert!(namespace.ensure_open().is_err());
         assert!(host.capture_default_namespace().is_err());
@@ -526,7 +595,8 @@ mod tests {
 
     #[tokio::test]
     async fn closed_domains_reject_new_native_io_through_every_bound_factory() {
-        let namespace = NetNS::from_platform(PlatformNamespace::current().unwrap());
+        let platform = PlatformNamespace::current().unwrap();
+        let namespace = NativeNamespaceServices::new(NetNS::new(platform.id(), platform));
         namespace.request_service_shutdown();
         let closing =
             |error: anyhow::Error| assert!(error.to_string().contains("closing"), "{error:#}");
@@ -577,7 +647,9 @@ mod tests {
     async fn terminal_cleanup_survives_the_shutdown_waiter_being_cancelled() {
         let host = Arc::new(NativeHostRuntime::new());
         let namespace = host.capture_default_namespace().unwrap();
-        let permit = namespace.nics.lock().await;
+        let services = host.services(&namespace).unwrap();
+        #[cfg(feature = "tun")]
+        let permit = services.nics.lock().await;
         let waiting = host.clone();
         let waiter = tokio::spawn(async move { waiting.shutdown().await });
         tokio::task::yield_now().await;
@@ -595,12 +667,12 @@ mod tests {
     #[test]
     #[ignore = "run inside an isolated user+network namespace"]
     fn process_default_is_not_the_first_callers_temporary_domain() {
-        let original = NetNS::current().unwrap();
-        let temporary = crate::common::netns::isolated_namespace_for_test().unwrap();
+        let original = crate::common::netns::current().unwrap();
+        let temporary = crate::common::netns::tests::isolated_namespace_for_test().unwrap();
         temporary
             .run(|| {
                 let host = NativeHostRuntime::new();
-                assert_ne!(NetNS::current().unwrap().id(), original.id());
+                assert_ne!(crate::common::netns::current().unwrap().id(), original.id());
                 assert_eq!(
                     host.capture_default_namespace().unwrap().id(),
                     original.id()
@@ -615,7 +687,7 @@ mod tests {
         let host = Arc::new(NativeHostRuntime::new());
         let first = NativeExecutor::new(false, 1).unwrap();
         let first_handle = first.handle();
-        let namespace = NetNS::current().unwrap();
+        let namespace = namespace_services(&crate::common::netns::current().unwrap()).unwrap();
         let initialize_host = host.clone();
         let socket = first_handle
             .spawn(async move {
@@ -681,10 +753,10 @@ mod tests {
 
     #[test]
     fn native_local_ip_probe_uses_process_runtime() {
-        assert!(native_host_runtime().is_local_ip(
-            &IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
-            &SocketContext::default(),
-        ));
+        assert!(
+            native_host_runtime()
+                .is_local_ip(&IpAddr::V4(Ipv4Addr::LOCALHOST), &SocketContext::default(),)
+        );
     }
 
     #[tokio::test]

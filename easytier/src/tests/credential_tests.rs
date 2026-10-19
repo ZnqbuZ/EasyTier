@@ -795,7 +795,9 @@ async fn credential_peer_reconnects_to_admin_with_portal_client_online() {
     let (server_public, client_private) =
         test_wireguard_keys(&portal_config, "portal-client").unwrap();
     {
-        let net_ns = crate::common::netns::NetNS::new(Some(network.namespace("ns_c4").to_owned()));
+        let net_ns = crate::common::netns::tests::test_namespace(Some(
+            network.namespace("ns_c4").to_owned(),
+        ));
         run_wireguard_client(
             &net_ns,
             &wireguard_ifname("wg0"),

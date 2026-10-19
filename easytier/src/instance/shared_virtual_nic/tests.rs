@@ -1,6 +1,6 @@
 use std::sync::Mutex as StdMutex;
 
-use crate::common::{ifcfg::IfConfiguerTrait, netns::NetNS};
+use crate::common::ifcfg::IfConfiguerTrait;
 
 use super::*;
 
@@ -74,7 +74,11 @@ async fn idle_shared_nic_releases_name_while_registry_remains_alive() {
 }
 
 fn virtual_nic_config(mtu: u32, netns: Option<&str>) -> VirtualNicConfig {
-    VirtualNicConfig::new("et0".to_owned(), mtu, NetNS::new(netns.map(str::to_owned)))
+    VirtualNicConfig::new(
+        "et0".to_owned(),
+        mtu,
+        crate::common::netns::tests::test_namespace(netns.map(str::to_owned)),
+    )
 }
 
 fn address_claims(ip: &str) -> SharedIfConfigClaims {

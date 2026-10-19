@@ -26,7 +26,6 @@ use crate::{
         config::{ConfigLoader, TomlConfigLoader},
         error::Error,
         global_ctx::GlobalCtxEvent,
-        netns::NetNS,
         stun::MockStunInfoCollector,
     },
     instance::test_instance::TestInstance as Instance,
@@ -286,7 +285,7 @@ deny 0-65535 0.0.0.0/0 0-65535
 
 async fn tcp_connect_in_ns(netns: &'static str, ip: Ipv4Addr, port: u16) -> anyhow::Result<()> {
     tokio::task::spawn_blocking(move || {
-        NetNS::new(Some(netns.to_owned())).run(|| {
+        crate::common::netns::tests::test_namespace(Some(netns.to_owned())).run(|| {
             tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
@@ -820,7 +819,7 @@ async fn query_mappings(
     expected_external_ip: Ipv4Addr,
 ) -> Result<Vec<PortMappingEntry>, Error> {
     tokio::task::spawn_blocking(move || {
-        NetNS::new(Some(query_netns.to_owned())).run(|| {
+        crate::common::netns::tests::test_namespace(Some(query_netns.to_owned())).run(|| {
         tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()

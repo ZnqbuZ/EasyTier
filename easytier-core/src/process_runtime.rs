@@ -151,7 +151,7 @@ mod tests {
         host::dns::{DnsQuery, DnsRecordResolver, DnsSrvRecord},
         packet::ZCPacket,
         socket::{
-            IpVersion, NetNamespace, SocketContext,
+            IpVersion, NetNS, SocketContext,
             tcp::{TcpConnectOptions, VirtualTcpSocket},
             udp::{UdpBindOptions, VirtualUdpSocket, VirtualUdpSocketFactory},
         },
@@ -373,7 +373,7 @@ mod tests {
         let dns_context = SocketContext::new()
             .with_ip_version(IpVersion::V6)
             .with_socket_mark(Some(42))
-            .with_netns(Some(NetNamespace::new("discovery-netns")));
+            .with_netns(Some(NetNS::from_host_reference("discovery-netns")));
         let connector = runtime.manual_connector(
             Arc::new(TestHost),
             Arc::new(TestDns),

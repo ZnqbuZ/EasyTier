@@ -252,8 +252,8 @@ pub async fn drop_insts(insts: Vec<Instance>) {
 }
 
 pub async fn ping_test(from_netns: &str, target_ip: &str, payload_size: Option<usize>) -> bool {
-    use crate::common::netns::{NetNS, ROOT_NETNS_NAME};
-    let namespace = NetNS::new(Some(ROOT_NETNS_NAME.to_owned()));
+    use crate::common::netns::ROOT_NETNS_NAME;
+    let namespace = crate::common::netns::tests::test_namespace(Some(ROOT_NETNS_NAME.to_owned()));
     let mut child = namespace
         .run(|| {
             tokio::process::Command::new("ip")

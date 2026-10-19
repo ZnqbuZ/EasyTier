@@ -18,27 +18,32 @@ use easytier_core::socket::{
 };
 use tokio::net::UdpSocket;
 
-#[cfg(any(feature = "wireguard", test))]
-use crate::common::netns::NetNS;
 use crate::{
-    common::netns::PlatformNamespace,
+    common::netns::NetNS,
     tunnel::common::{BindDev, bind},
 };
 
 use super::udp_src;
 
 #[cfg(any(feature = "wireguard", test))]
-pub(crate) type RuntimeUdpSessionSocketListener = UdpSessionSocketListener<NetNS>;
+pub(crate) type RuntimeUdpSessionSocketListener =
+    UdpSessionSocketListener<crate::host_runtime::NativeNamespaceServices>;
 
 #[cfg(any(feature = "wireguard", test))]
 pub(crate) fn new_runtime_udp_session_listener(
     url: url::Url,
     mut request: UdpSessionListenRequest,
     accept_kind: UdpSessionAcceptKind,
-    net_ns: std::sync::Arc<NetNS>,
+    net_ns: NetNS,
 ) -> RuntimeUdpSessionSocketListener {
-    request.bind.context.netns = Some(net_ns.token());
-    UdpSessionSocketListener::new_with_request(url, request, accept_kind, net_ns)
+    request.bind.context.netns = Some(net_ns.clone());
+    UdpSessionSocketListener::new_with_request(
+        url,
+        request,
+        accept_kind,
+        crate::host_runtime::namespace_services(&net_ns)
+            .expect("native listener domain must be registered"),
+    )
 }
 
 pub struct RuntimeUdpSocket {
@@ -133,16 +138,16 @@ impl VirtualUdpSocket for RuntimeUdpSocket {
 
 #[derive(Debug, Clone)]
 pub(crate) struct RuntimeUdpSocketFactory {
-    namespace: PlatformNamespace,
+    namespace: NetNS,
 }
 
 impl RuntimeUdpSocketFactory {
     #[cfg(any(feature = "upnp", test))]
     pub(crate) fn new() -> Self {
-        Self::in_namespace(PlatformNamespace::current().expect("capture UDP factory namespace"))
+        Self::in_namespace(crate::common::netns::current().expect("capture UDP factory namespace"))
     }
 
-    pub(crate) fn in_namespace(namespace: PlatformNamespace) -> Self {
+    pub(crate) fn in_namespace(namespace: NetNS) -> Self {
         Self { namespace }
     }
 
@@ -179,12 +184,12 @@ impl RuntimeUdpSocketFactory {
 #[cfg(test)]
 pub(crate) async fn create_udp_socket(options: &UdpBindOptions) -> anyhow::Result<UdpSocket> {
     let namespace = crate::host_runtime::native_host_runtime().namespace(&options.context)?;
-    create_udp_socket_in_namespace(options, namespace.platform()).await
+    create_udp_socket_in_namespace(options, &namespace).await
 }
 
 pub(crate) async fn create_udp_socket_in_namespace(
     options: &UdpBindOptions,
-    namespace: &PlatformNamespace,
+    namespace: &NetNS,
 ) -> anyhow::Result<UdpSocket> {
     namespace.validate_context(&options.context)?;
     let factory = RuntimeUdpSocketFactory::in_namespace(namespace.clone());
@@ -310,7 +315,7 @@ mod tests {
             "udp://0.0.0.0:0".parse().unwrap(),
             UdpSessionListenRequest::new(UdpBindOptions::port_bound_listener(local_addr)),
             UdpSessionAcceptKind::EasyTierMux,
-            NetNS::new(None),
+            crate::common::netns::tests::test_namespace(None),
         );
         listener.listen().await.unwrap();
 
@@ -345,7 +350,7 @@ mod tests {
             "udp://[::]:0".parse().unwrap(),
             UdpSessionListenRequest::new(UdpBindOptions::port_bound_listener(local_addr)),
             UdpSessionAcceptKind::EasyTierMux,
-            NetNS::new(None),
+            crate::common::netns::tests::test_namespace(None),
         );
         listener.listen().await.unwrap();
 

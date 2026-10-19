@@ -22,7 +22,7 @@ use crate::{
         context::PeerRuntimeSnapshotInput,
         peer_manager::{PortablePeerManagerConfig, RouteAlgoType},
     },
-    socket::{NetNamespace, SocketContext, tcp::TcpBindOptions, udp::UdpBindOptions},
+    socket::{NetNS, SocketContext, tcp::TcpBindOptions, udp::UdpBindOptions},
     tunnel::encrypt::algorithm_is_available,
 };
 
@@ -41,7 +41,7 @@ const MAX_DIRECT_CONNS_PER_PEER_IN_FOREIGN_NETWORK: usize = 3;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CoreInstanceHostConfig {
     /// Host-bound runtime domain; never persisted as the configured namespace name.
-    pub socket_namespace: Option<NetNamespace>,
+    pub socket_namespace: Option<NetNS>,
     pub hostname_fallback: Option<String>,
     pub host_routing: HostRoutingPolicy,
     pub force_exit_node: bool,
@@ -187,11 +187,7 @@ impl CoreInstanceConfig {
         let network_name = identity.network_name.clone();
         let socket_context = SocketContext::default()
             .with_socket_mark(flags.socket_mark)
-            .with_netns(
-                host.socket_namespace
-                    .clone()
-                    .or_else(|| config.get_netns().map(NetNamespace::new)),
-            );
+            .with_netns(host.socket_namespace.clone());
         let hostname = match config.get_hostname() {
             hostname if !hostname.is_empty() => hostname,
             _ => host.hostname_fallback.clone().unwrap_or_default(),
@@ -424,7 +420,7 @@ mod tests {
         use super::*;
         let config = TomlConfig::default();
         config.set_netns(Some("configured-namespace".to_owned()));
-        let token = NetNamespace::new("opaque-host-domain");
+        let token = NetNS::from_host_reference("opaque-host-domain");
         let host = CoreInstanceHostConfig {
             socket_namespace: Some(token.clone()),
             ..Default::default()

@@ -10,17 +10,17 @@ use easytier_core::{
 };
 use socket2::Socket;
 
-use crate::common::netns::{NetNS, PlatformNamespace};
+use crate::common::netns::NetNS;
 
 #[derive(Debug)]
 pub(crate) struct RuntimeIcmpProxyHost {
-    namespace: PlatformNamespace,
+    namespace: NetNS,
 }
 
 impl RuntimeIcmpProxyHost {
-    pub(crate) fn new(namespace: Arc<NetNS>) -> Self {
+    pub(crate) fn new(namespace: NetNS) -> Self {
         Self {
-            namespace: namespace.platform().clone(),
+            namespace: namespace.clone(),
         }
     }
     fn create_raw_socket(&self, context: &SocketContext) -> Result<Socket, std::io::Error> {

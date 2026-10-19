@@ -5,25 +5,26 @@ use easytier_core::{
     socket::SocketContext,
 };
 
-use crate::{common::global_ctx::ArcGlobalCtx, common::netns::NetNS};
+use crate::{common::global_ctx::ArcGlobalCtx, host_runtime::NativeNamespaceServices};
 
-pub type NativeInstanceHost = ConnectorHostAdapter<NetNS, NativeInstanceEnvironment>;
+pub type NativeInstanceHost =
+    ConnectorHostAdapter<NativeNamespaceServices, NativeInstanceEnvironment>;
 
 /// Instance facts queried by portable connector policy.
 ///
 /// This Adapter never creates or operates sockets. Mechanical network I/O is
-/// owned by the canonical [`NetNS`] selected during composition.
+/// owned by the canonical [`easytier_core::netns::NetNS`] selected during composition.
 pub struct NativeInstanceEnvironment {
     global_ctx: ArcGlobalCtx,
-    runtime: Arc<NetNS>,
+    runtime: Arc<NativeNamespaceServices>,
     socket_context: SocketContext,
 }
 
 impl NativeInstanceEnvironment {
-    fn new(global_ctx: ArcGlobalCtx, runtime: Arc<NetNS>) -> Self {
+    fn new(global_ctx: ArcGlobalCtx, runtime: Arc<NativeNamespaceServices>) -> Self {
         let socket_context = SocketContext::default()
             .with_socket_mark(global_ctx.get_flags().socket_mark)
-            .with_netns(Some(global_ctx.net_ns.token()));
+            .with_netns(Some(global_ctx.net_ns.clone()));
         Self {
             global_ctx,
             runtime,
@@ -33,7 +34,8 @@ impl NativeInstanceEnvironment {
 }
 
 pub(crate) fn native_instance_host(global_ctx: ArcGlobalCtx) -> Arc<NativeInstanceHost> {
-    let runtime = global_ctx.net_ns.clone();
+    let runtime = crate::host_runtime::namespace_services(&global_ctx.net_ns)
+        .expect("native instance domain must be registered");
     Arc::new(ConnectorHostAdapter::new(
         runtime.clone(),
         Arc::new(NativeInstanceEnvironment::new(global_ctx, runtime)),

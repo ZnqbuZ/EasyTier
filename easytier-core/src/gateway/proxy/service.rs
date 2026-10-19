@@ -508,14 +508,18 @@ mod tests {
     fn udp_proxy_bind_options_preserve_the_datagram_context() {
         let context = SocketContext::default()
             .with_socket_mark(Some(73))
-            .with_netns(Some(crate::socket::NetNamespace::new("udp-proxy")));
+            .with_netns(Some(crate::socket::NetNS::from_host_reference("udp-proxy")));
 
         let options = udp_proxy_bind_options(context);
 
         assert_eq!(options.context.ip_version, IpVersion::V4);
         assert_eq!(options.context.socket_mark, Some(73));
         assert_eq!(
-            options.context.netns.as_ref().map(|netns| netns.token()),
+            options
+                .context
+                .netns
+                .as_ref()
+                .map(|netns| netns.host_reference().unwrap()),
             Some("udp-proxy")
         );
         assert_eq!(

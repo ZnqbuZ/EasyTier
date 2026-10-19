@@ -33,7 +33,10 @@ impl TestInstance {
 
     #[cfg(feature = "tun")]
     pub fn current_shared_virtual_nic_registry() -> ArcSharedVirtualNicRegistry {
-        crate::common::netns::NetNS::current().unwrap().nics.clone()
+        crate::host_runtime::namespace_services(&crate::common::netns::current().unwrap())
+            .unwrap()
+            .nics
+            .clone()
     }
 
     pub fn new_with_process_runtime_and_stun_provider(

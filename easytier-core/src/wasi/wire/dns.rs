@@ -11,7 +11,9 @@ pub(crate) fn encode_query(query: &DnsQuery) -> io::Result<Vec<u8>> {
         .context
         .netns
         .as_ref()
-        .map(|netns| netns.token().as_bytes());
+        .map(|netns| netns.host_reference())
+        .transpose()?
+        .map(str::as_bytes);
     let host_len = encoded_len("DNS host", host.len())?;
     let netns_len = encoded_len("DNS netns token", netns.map_or(0, <[u8]>::len))?;
     let mut encoded = Vec::with_capacity(16 + host.len() + netns.map_or(0, <[u8]>::len));
@@ -146,7 +148,7 @@ impl<'a> Decoder<'a> {
 
 #[cfg(test)]
 mod tests {
-    use crate::socket::{NetNamespace, SocketContext};
+    use crate::socket::{NetNS, SocketContext};
 
     use super::*;
 
@@ -157,7 +159,7 @@ mod tests {
             SocketContext {
                 ip_version: IpVersion::V6,
                 socket_mark: Some(0x01020304),
-                netns: Some(NetNamespace::new("netns0")),
+                netns: Some(NetNS::from_host_reference("netns0")),
             },
         );
         let encoded = encode_query(&query).unwrap();
