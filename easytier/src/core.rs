@@ -1392,30 +1392,47 @@ async fn run_main(mut cli: Cli) -> anyhow::Result<()> {
     #[cfg(not(unix))]
     let sigterm = std::future::pending::<()>();
 
-    tokio::select! {
+    let wait_result = tokio::select! {
         _ = manager.wait() => {
-            let infos = manager.collect_network_infos().await?;
-            let mut errors = String::new();
-            for (instance_id, info) in infos {
-                if let Some(error) = info.error_msg {
-                    if errors.is_empty() {
-                        errors.push_str("some instances stopped with errors:");
+            match manager.collect_network_infos().await {
+                Ok(infos) => {
+                    let mut errors = String::new();
+                    for (instance_id, info) in infos {
+                        if let Some(error) = info.error_msg {
+                            if errors.is_empty() { errors.push_str("some instances stopped with errors:"); }
+                            write!(errors, "\n{instance_id}: {error}").unwrap();
+                        }
                     }
-                    write!(errors, "\n{instance_id}: {error}").unwrap();
-                }
-            }
-            if !errors.is_empty() {
-                return Err(anyhow::anyhow!(errors));
+                    if errors.is_empty() { Ok(()) } else { Err(anyhow::anyhow!(errors)) }
+                },
+                Err(error) => Err(error),
             }
         }
         _ = tokio::signal::ctrl_c() => {
             log::info!("ctrl-c received, exiting...");
+            Ok(())
         }
 
         _ = sigterm, if cfg!(unix) => {
             log::warn!("terminate signal received, exiting...");
+            Ok(())
         }
+    };
+    let stopped = manager
+        .delete_network_instances(manager.instance_ids())
+        .await;
+    let native = crate::instance::factory::shutdown_native_services().await;
+    let mut errors = Vec::new();
+    if let Err(error) = wait_result {
+        errors.push(format!("{error:#}"));
     }
+    if let Err(error) = stopped {
+        errors.push(format!("instance cleanup: {error:#}"));
+    }
+    if let Err(error) = native {
+        errors.push(format!("native cleanup: {error:#}"));
+    }
+    anyhow::ensure!(errors.is_empty(), "{}", errors.join("; "));
     Ok(())
 }
 

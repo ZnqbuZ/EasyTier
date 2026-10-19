@@ -1,6 +1,7 @@
 use crate::common::ifcfg::win::types::{RouteDataIpv4, RouteDataIpv6};
 
 use super::win::luid::InterfaceLuid;
+use crate::common::net_ns::NetNS;
 use async_trait::async_trait;
 use cidr::{Ipv4Inet, Ipv6Inet};
 use std::{
@@ -22,8 +23,13 @@ use winreg::{
 };
 
 use super::{Error, IfConfiguerTrait};
-#[derive(Default)]
-pub struct WindowsIfConfiger {}
+pub struct WindowsIfConfiger;
+
+impl WindowsIfConfiger {
+    pub fn new(_net_ns: NetNS) -> Self {
+        Self
+    }
+}
 
 fn ignore_removed_not_found(result: Result<(), u32>) -> Result<(), u32> {
     match result {

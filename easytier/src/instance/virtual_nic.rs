@@ -11,7 +11,7 @@ use crate::common::{
     error::Error,
     global_ctx::{ArcGlobalCtx, GlobalCtxEvent},
     ifcfg::{IfConfiger, IfConfiguerTrait},
-    netns::NetNS,
+    net_ns::NetNS,
 };
 
 use easytier_core::{
@@ -254,16 +254,12 @@ impl VirtualNicConfig {
         Self {
             dev_name,
             mtu,
-            net_ns,
+            net_ns: net_ns.clone(),
         }
     }
 
     pub fn mtu(&self) -> u32 {
         self.mtu
-    }
-
-    pub fn net_ns_name(&self) -> Option<String> {
-        self.net_ns.name()
     }
 }
 
@@ -303,10 +299,11 @@ impl VirtualNic {
     }
 
     pub fn new(config: VirtualNicConfig) -> Self {
+        let ifcfg = Box::new(IfConfiger::new(config.net_ns.clone()));
         Self {
             config,
             ifname: None,
-            ifcfg: Box::new(IfConfiger::default()),
+            ifcfg,
             #[cfg(target_os = "windows")]
             name_reservation: None,
         }
@@ -592,8 +589,7 @@ impl VirtualNic {
 
         config.up();
 
-        let _g = self.config.net_ns.guard();
-        Ok(tun::create(&config)?)
+        Ok(self.config.net_ns.run(|| tun::create(&config))??)
     }
 
     #[cfg(any(mobile, all(test, unix)))]
@@ -644,11 +640,14 @@ impl VirtualNic {
     pub async fn create_dev(&mut self) -> Result<Box<dyn Tunnel>, Error> {
         let dev = self.create_tun().await?;
 
-        #[cfg(not(target_os = "freebsd"))]
-        let ifname = dev.tun_name()?;
-
-        #[cfg(target_os = "freebsd")]
-        let mut ifname = dev.tun_name()?;
+        cfg_select! {
+            target_os = "freebsd" => {
+                let mut ifname = dev.tun_name()?;
+            },
+            _ => {
+                let ifname = dev.tun_name()?;
+            },
+        }
         self.ifcfg.wait_interface_show(ifname.as_str()).await?;
 
         // FreeBSD TUN interface rename functionality
@@ -692,7 +691,6 @@ impl VirtualNic {
 
         {
             // set mtu by ourselves, rust-tun does not handle it correctly on windows
-            let _g = self.config.net_ns.guard();
             self.ifcfg.set_mtu(ifname.as_str(), self.config.mtu).await?;
         }
 
@@ -752,7 +750,6 @@ impl VirtualNic {
     }
 
     pub async fn link_up(&self) -> Result<(), Error> {
-        let _g = self.config.net_ns.guard();
         self.ifcfg.set_link_status(self.ifname(), true).await?;
         Ok(())
     }
@@ -778,7 +775,6 @@ impl VirtualNic {
         cost: Option<i32>,
         source_hint: Option<Ipv4Addr>,
     ) -> Result<(), Error> {
-        let _g = self.config.net_ns.guard();
         self.ifcfg
             .add_ipv4_route_with_source_hint(self.ifname(), address, cidr, cost, source_hint)
             .await?;
@@ -786,7 +782,6 @@ impl VirtualNic {
     }
 
     pub async fn remove_route(&self, address: Ipv4Addr, cidr: u8) -> Result<(), Error> {
-        let _g = self.config.net_ns.guard();
         self.ifcfg
             .remove_ipv4_route(self.ifname(), address, cidr)
             .await?;
@@ -800,7 +795,6 @@ impl VirtualNic {
         cost: Option<i32>,
         source_hint: Option<Ipv4Addr>,
     ) -> Result<(), Error> {
-        let _g = self.config.net_ns.guard();
         self.ifcfg
             .remove_ipv4_route_with_cost_and_source_hint(
                 self.ifname(),
@@ -823,7 +817,6 @@ impl VirtualNic {
         cidr: u8,
         cost: Option<i32>,
     ) -> Result<(), Error> {
-        let _g = self.config.net_ns.guard();
         self.ifcfg
             .add_ipv6_route(self.ifname(), address, cidr, cost)
             .await?;
@@ -831,7 +824,6 @@ impl VirtualNic {
     }
 
     pub async fn remove_ipv6_route(&self, address: Ipv6Addr, cidr: u8) -> Result<(), Error> {
-        let _g = self.config.net_ns.guard();
         self.ifcfg
             .remove_ipv6_route(self.ifname(), address, cidr)
             .await?;
@@ -839,19 +831,16 @@ impl VirtualNic {
     }
 
     pub async fn remove_ip(&self, ip: Option<Ipv4Inet>) -> Result<(), Error> {
-        let _g = self.config.net_ns.guard();
         self.ifcfg.remove_ip(self.ifname(), ip).await?;
         Ok(())
     }
 
     pub async fn remove_ipv6(&self, ip: Option<Ipv6Inet>) -> Result<(), Error> {
-        let _g = self.config.net_ns.guard();
         self.ifcfg.remove_ipv6(self.ifname(), ip).await?;
         Ok(())
     }
 
     pub async fn add_ip(&self, ip: Ipv4Addr, cidr: i32) -> Result<(), Error> {
-        let _g = self.config.net_ns.guard();
         self.ifcfg
             .add_ipv4_ip(self.ifname(), ip, cidr as u8)
             .await?;
@@ -859,7 +848,6 @@ impl VirtualNic {
     }
 
     pub async fn add_ipv6(&self, ip: Ipv6Addr, cidr: i32) -> Result<(), Error> {
-        let _g = self.config.net_ns.guard();
         self.ifcfg
             .add_ipv6_ip(self.ifname(), ip, cidr as u8)
             .await?;
@@ -867,7 +855,6 @@ impl VirtualNic {
     }
 
     pub async fn set_mtu(&self, mtu: u32) -> Result<(), Error> {
-        let _g = self.config.net_ns.guard();
         self.ifcfg.set_mtu(self.ifname(), mtu).await?;
         Ok(())
     }
@@ -890,7 +877,7 @@ impl VirtualNic {
     }
 
     pub fn get_ifcfg(&self) -> IfConfiger {
-        IfConfiger::default()
+        IfConfiger::new(self.config.net_ns.clone())
     }
 }
 
@@ -1118,33 +1105,31 @@ impl NicCtx {
         peer_packet_receiver: Arc<Mutex<HostPacketReceiver>>,
         close_notifier: Arc<Notify>,
         registry: ArcSharedVirtualNicRegistry,
-    ) -> Self {
+    ) -> Result<Self, Error> {
         let nic_config = Self::virtual_nic_config(&global_ctx);
         #[cfg(mobile)]
         let nic_config = VirtualNicConfig {
             dev_name: String::new(),
-            net_ns: NetNS::new(None),
+            net_ns: global_ctx.net_ns.clone(),
             ..nic_config
         };
         // Only an explicitly configured name opts into sharing.
-        let backend = if cfg!(mobile) || !global_ctx.get_flags().dev_name.is_empty() {
-            NicBackend::Shared(registry.lock().await.create_member(
+        let backend = {
+            NicBackend::Shared(registry.lock().await.try_create_member(
                 nic_config.dev_name.clone(),
                 nic_config,
-                global_ctx.get_id(),
+                global_ctx.key(),
                 close_notifier.clone(),
-            ))
-        } else {
-            NicBackend::Dedicated(Arc::new(Mutex::new(VirtualNic::new(nic_config))))
+            )?)
         };
 
-        Self::new_with_backend(
+        Ok(Self::new_with_backend(
             global_ctx,
             packet_plane,
             peer_packet_receiver,
             close_notifier,
             backend,
-        )
+        ))
     }
 
     pub async fn ifname(&self) -> Option<String> {

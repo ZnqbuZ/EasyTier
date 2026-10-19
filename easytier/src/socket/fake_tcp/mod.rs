@@ -13,15 +13,15 @@ use std::{
 };
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, ReadBuf},
-    net::TcpStream,
+    net::{TcpListener, TcpStream},
 };
 
 use easytier_core::{
-    socket::tcp::VirtualTcpSocket,
-    tunnel::{IpVersion, TunnelError},
+    socket::{BindConfig, SocketContext, tcp::VirtualTcpSocket},
+    tunnel::TunnelError,
 };
 
-use crate::{common::netns::NetNS, tunnel::FromUrl};
+use crate::common::net_ns::NetNS;
 
 use self::netfilter::create_tun;
 use self::packet::MacAddr;
@@ -91,15 +91,17 @@ async fn create_tun_off_runtime(
     dst_addr: SocketAddr,
     net_ns: NetNS,
 ) -> Result<Arc<dyn stack::Tun>, TunnelError> {
-    tokio::task::spawn_blocking(move || {
+    let result = tokio::task::spawn_blocking(move || {
         net_ns.run(|| create_tun(&interface_name, src_addr, dst_addr))
     })
     .await
-    .map_err(|e| TunnelError::InternalError(format!("faketcp create_tun task failed: {e}")))?
-    .map_err(Into::into)
+    .map_err(|e| TunnelError::InternalError(format!("faketcp create_tun task failed: {e}")))??;
+    result.map_err(Into::into)
 }
 
 pub(crate) struct FakeTcpSocketListener {
+    net_ns: NetNS,
+    context: SocketContext,
     addr: url::Url,
     os_listener: Option<tokio::net::TcpListener>,
     // interface_name -> fake tcp stack
@@ -119,8 +121,10 @@ impl std::fmt::Debug for FakeTcpSocketListener {
 }
 
 impl FakeTcpSocketListener {
-    pub(crate) fn new(addr: url::Url) -> Self {
+    pub(crate) fn new(addr: url::Url, net_ns: NetNS, context: SocketContext) -> Self {
         FakeTcpSocketListener {
+            net_ns,
+            context,
             addr,
             os_listener: None,
             stack_map: DashMap::new(),
@@ -136,8 +140,9 @@ impl FakeTcpSocketListener {
                         tracing::warn!("accept fail with local_addr error");
                         continue;
                     };
-                    let Some((interface_name, mac)) =
-                        self.ip_to_ifname.get_ifname(&local_addr.ip())
+                    let Some((interface_name, mac)) = self
+                        .net_ns
+                        .run(|| self.ip_to_ifname.get_ifname(&local_addr.ip()))?
                     else {
                         tracing::warn!("accept fail with interface_name error");
                         continue;
@@ -193,7 +198,7 @@ impl FakeTcpSocketListener {
             interface_name.to_string(),
             None,
             local_socket_addr,
-            NetNS::new(None),
+            self.net_ns.clone(),
         )
         .await?;
         tracing::info!(
@@ -383,8 +388,26 @@ impl FakeTcpSocketListener {
 
     async fn listen_socket(&mut self) -> Result<(), TunnelError> {
         let port = self.addr.port().unwrap_or(0);
-        let bind_addr = SocketAddr::from_url(self.addr.clone(), IpVersion::Both).await?;
-        let os_listener = tokio::net::TcpListener::bind(bind_addr).await?;
+        let bind_addr = crate::common::dns::socket_addrs_in_net_ns(
+            &self.addr,
+            port,
+            self.net_ns.clone(),
+            self.context.clone(),
+        )
+        .await
+        .map_err(|error| TunnelError::Anyhow(error.into()))?
+        .into_iter()
+        .next()
+        .ok_or_else(|| TunnelError::InvalidAddr(self.addr.to_string()))?;
+        let os_listener = crate::socket::bind::<TcpListener>(BindConfig {
+            local_addr: Some(bind_addr),
+            context: SocketContext {
+                net_ns: Some(self.net_ns.clone()),
+                ..self.context.clone()
+            },
+            ..BindConfig::default()
+        })
+        .await?;
         tracing::info!(port, "FakeTcpSocketListener listening");
         self.os_listener = Some(os_listener);
         Ok(())
@@ -456,7 +479,7 @@ async fn connect_socket_with_cache(
                     "Failed to get interface name".into(),
                 ))?;
         Ok::<_, TunnelError>((local_addr, interface_name, mac, os_socket))
-    })?;
+    })??;
 
     let tun = create_tun_off_runtime(interface_name, Some(remote_addr), local_addr, net_ns).await?;
     let stack = stack::Stack::new(tun, mac);

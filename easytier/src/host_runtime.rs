@@ -1,12 +1,42 @@
+use easytier_core::socket::BindConfig;
 use std::{
-    net::{IpAddr, SocketAddr, SocketAddrV4, SocketAddrV6},
-    sync::{Arc, OnceLock},
+    fmt, io,
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6},
+    ops::Deref,
+    sync::{
+        Arc, Mutex, OnceLock,
+        atomic::{AtomicBool, Ordering},
+    },
+};
+
+use async_trait::async_trait;
+use easytier_core::{
+    connectivity::{composite::ConnectorRuntime, transport::ConnectedByteStream},
+    host::dns::{DnsQuery, DnsRecordResolver, DnsResolver, DnsSrvRecord},
+    socket::{
+        SocketContext,
+        tcp::{
+            TcpConnectOptions, TcpListenOptions, TcpSocketPurpose, VirtualTcpListenerFactory,
+            VirtualTcpSocketFactory,
+        },
+        udp::{PreferredIpv6Source, VirtualUdpSocketFactory},
+    },
+};
+use guarden::guard;
+use guarden::guard::boxed::BoxSyncGuard;
+use hashbrown::HashSet;
+#[cfg(feature = "tun")]
+use tokio::sync::Mutex as AsyncMutex;
+use tokio::{
+    net::UdpSocket,
+    runtime::{Builder, Handle},
+    sync::watch,
 };
 
 use crate::{
     common::{
         dns::RuntimeDnsResolver,
-        netns::NetNS,
+        net_ns::{NetNS, PlatformNetNS},
         network::{collect_interfaces, collect_local_ip_addrs},
     },
     proto::peer_rpc::GetIpListResponse,
@@ -15,62 +45,302 @@ use crate::{
         udp::{RuntimeUdpSocket, RuntimeUdpSocketFactory},
     },
 };
-use async_trait::async_trait;
-use easytier_core::socket::BindConfig;
-use easytier_core::socket::SocketContext;
-use easytier_core::{
-    connectivity::{composite::ConnectorRuntime, transport::ConnectedByteStream},
-    host::dns::{DnsQuery, DnsRecordResolver, DnsResolver, DnsSrvRecord},
-    socket::{
-        tcp::{
-            TcpConnectOptions, TcpListenOptions, TcpSocketPurpose, VirtualTcpListenerFactory,
-            VirtualTcpSocketFactory,
-        },
-        udp::{PreferredIpv6Source, VirtualUdpSocketFactory},
-    },
-};
 
-/// Process-wide native implementation of the host capabilities consumed by core.
-///
-/// Instance-specific policy is carried by each request's socket context so a
-/// process-wide service never captures one instance's namespace or mark.
-#[derive(Debug)]
-pub struct NativeHostRuntime {
-    udp_sockets: RuntimeUdpSocketFactory,
+#[cfg(feature = "tun")]
+use crate::instance::shared_virtual_nic::{ArcSharedVirtualNicRegistry, SharedVirtualNicRegistry};
+
+/// Native services attached to one shared Core namespace handle.
+/// Cloning a NetNS retains its platform resource, not this service owner.
+#[derive(educe::Educe)]
+#[educe(PartialEq, Eq, Hash)]
+pub struct NativeNetNSServices {
+    net_ns: NetNS,
+    #[educe(PartialEq(ignore), Hash(ignore))]
     dns: RuntimeDnsResolver,
+    #[cfg(feature = "tun")]
+    #[educe(PartialEq(ignore), Hash(ignore))]
+    pub(crate) nics: ArcSharedVirtualNicRegistry,
+}
+
+impl fmt::Debug for NativeNetNSServices {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("NativeNetNSServices")
+            .field("net_ns", &self.net_ns)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Deref for NativeNetNSServices {
+    type Target = NetNS;
+    fn deref(&self) -> &NetNS {
+        &self.net_ns
+    }
+}
+
+impl NativeNetNSServices {
+    fn new(net_ns: NetNS) -> Self {
+        Self {
+            dns: RuntimeDnsResolver::in_net_ns(net_ns.clone()),
+            #[cfg(feature = "tun")]
+            nics: Arc::new(AsyncMutex::new(SharedVirtualNicRegistry::in_domain(
+                net_ns.clone(),
+            ))),
+            net_ns,
+        }
+    }
+
+    fn request_service_shutdown(&self) {
+        self.net_ns.close();
+    }
+
+    async fn wait_services_stopped(&self) -> anyhow::Result<()> {
+        #[cfg(feature = "tun")]
+        {
+            let nics = self.nics.lock().await.take_for_shutdown();
+            for nic in nics {
+                nic.lock().await.invalidate_and_shutdown_dispatcher().await;
+            }
+        }
+        Ok(())
+    }
+}
+
+pub(crate) fn net_ns_services(net_ns: &NetNS) -> io::Result<Arc<NativeNetNSServices>> {
+    native_host_runtime().services(net_ns)
+}
+
+/// Process-wide directory and owner of native services.
+/// Instance I/O uses a capability bound to one canonical NetNS.
+#[derive(educe::Educe)]
+#[educe(Debug)]
+pub struct NativeHostRuntime {
+    net_ns: Mutex<HashSet<Arc<NativeNetNSServices>>>,
+    default_platform: io::Result<PlatformNetNS>,
+    default_net_ns: OnceLock<NetNS>,
+    shared: OnceLock<Result<Handle, String>>,
+    #[educe(Debug(ignore))]
+    guard: Mutex<Option<BoxSyncGuard<()>>>,
+    closing: AtomicBool,
+    executor_stopping: AtomicBool,
+    shutdown_result: watch::Sender<Option<Result<(), Arc<str>>>>,
 }
 
 static NATIVE_HOST_RUNTIME: OnceLock<Arc<NativeHostRuntime>> = OnceLock::new();
 
 pub(crate) fn native_host_runtime() -> Arc<NativeHostRuntime> {
     NATIVE_HOST_RUNTIME
-        .get_or_init(|| {
-            Arc::new(NativeHostRuntime {
-                udp_sockets: RuntimeUdpSocketFactory::new(),
-                dns: RuntimeDnsResolver::new(),
-            })
-        })
+        .get_or_init(|| Arc::new(NativeHostRuntime::new()))
         .clone()
 }
 
+impl NativeHostRuntime {
+    fn new() -> Self {
+        Self {
+            net_ns: Mutex::new(HashSet::new()),
+            default_platform: PlatformNetNS::process(),
+            default_net_ns: OnceLock::new(),
+            shared: OnceLock::new(),
+            guard: Mutex::new(None),
+            closing: AtomicBool::new(false),
+            executor_stopping: AtomicBool::new(false),
+            shutdown_result: watch::channel(None).0,
+        }
+    }
+
+    pub(crate) fn shared_executor(&self) -> io::Result<Handle> {
+        if self.executor_stopping.load(Ordering::Acquire) {
+            return Err(io::Error::other("native host runtime is closing"));
+        }
+        let result = if let Some(shared) = self.shared.get() {
+            shared
+        } else {
+            let mut guard = self.guard.lock().unwrap();
+            if self.executor_stopping.load(Ordering::Acquire) {
+                return Err(io::Error::other("native host runtime is closing"));
+            }
+            self.shared.get_or_init(|| {
+                let runtime = Builder::new_multi_thread()
+                    .worker_threads(if cfg!(mobile) { 1 } else { 2 })
+                    .thread_name("easytier-shared")
+                    .enable_all()
+                    .build()
+                    .map_err(|error| error.to_string())?;
+                let handle = runtime.handle().clone();
+                *guard = Some(guard!(runtime.shutdown_background()).boxed());
+                Ok(handle)
+            })
+        };
+        result
+            .as_ref()
+            .cloned()
+            .map_err(|error| io::Error::other(error.clone()))
+    }
+
+    // Called only after domain services have completed physical cleanup.
+    pub(crate) fn request_executor_shutdown(&self) {
+        self.closing.store(true, Ordering::Release);
+        self.executor_stopping.store(true, Ordering::Release);
+        let guard = self.guard.lock().unwrap().take();
+        // Task destruction may access the Host again; release the owner lock first.
+        drop(guard);
+    }
+
+    pub(crate) async fn shutdown(self: &Arc<Self>) -> anyhow::Result<()> {
+        self.request_service_shutdown();
+        let mut result = self.shutdown_result.subscribe();
+        let outcome = loop {
+            if let Some(result) = result.borrow_and_update().clone() {
+                break result;
+            }
+            result
+                .changed()
+                .await
+                .map_err(|_| anyhow::anyhow!("native shutdown result disappeared"))?;
+        };
+        outcome.map_err(|error| anyhow::anyhow!("{error}"))
+    }
+
+    fn request_service_shutdown(self: &Arc<Self>) {
+        if self.closing.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let net_ns = self
+            .net_ns
+            .lock()
+            .unwrap()
+            .iter()
+            .cloned()
+            .collect::<Vec<_>>();
+        for net_ns in &net_ns {
+            net_ns.request_service_shutdown();
+        }
+        let host = self.clone();
+        let interrupted = guarden::guard!([host = host.clone()] {
+            host.request_executor_shutdown();
+            host.shutdown_result.send_replace(Some(Err("native service shutdown was interrupted".into())));
+        });
+        match self.shared_executor() {
+            Ok(shared) => {
+                shared.spawn(async move {
+                    use futures::stream::{FuturesUnordered, StreamExt};
+                    let mut pending = net_ns
+                        .into_iter()
+                        .map(|net_ns| async move {
+                            net_ns
+                                .wait_services_stopped()
+                                .await
+                                .map_err(|error| format!("{:?}: {error:#}", net_ns.id()))
+                        })
+                        .collect::<FuturesUnordered<_>>();
+                    let mut errors = Vec::new();
+                    while let Some(result) = pending.next().await {
+                        if let Err(error) = result {
+                            errors.push(error);
+                        }
+                    }
+                    let outcome = if errors.is_empty() {
+                        Ok(())
+                    } else {
+                        Err(errors.join("; ").into())
+                    };
+                    host.request_executor_shutdown();
+                    host.shutdown_result.send_replace(Some(outcome));
+                    let _ = interrupted.defuse();
+                });
+            }
+            Err(error) => {
+                self.request_executor_shutdown();
+                self.shutdown_result
+                    .send_replace(Some(Err(error.to_string().into())));
+                let _ = interrupted.defuse();
+            }
+        }
+    }
+
+    pub(crate) fn intern_net_ns(&self, platform: PlatformNetNS) -> io::Result<NetNS> {
+        if self.closing.load(Ordering::Acquire) {
+            return Err(io::Error::other("native host runtime is closing"));
+        }
+        let candidate = NetNS::new(platform.id(), platform);
+        let mut entries = self.net_ns.lock().unwrap();
+        if self.closing.load(Ordering::Acquire) {
+            return Err(io::Error::other("native host runtime is closing"));
+        }
+        let services = entries.get_or_insert_with(&candidate, |net_ns| {
+            Arc::new(NativeNetNSServices::new(net_ns.clone()))
+        });
+        Ok(services.net_ns.clone())
+    }
+
+    fn services(&self, net_ns: &NetNS) -> io::Result<Arc<NativeNetNSServices>> {
+        self.net_ns
+            .lock()
+            .unwrap()
+            .get(net_ns)
+            .cloned()
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::NotFound,
+                    "network namespace is not registered with this native Host",
+                )
+            })
+    }
+
+    pub(crate) fn capture_default_net_ns(&self) -> io::Result<NetNS> {
+        if self.closing.load(Ordering::Acquire) {
+            return Err(io::Error::other("native host runtime is closing"));
+        }
+        if let Some(net_ns) = self.default_net_ns.get() {
+            return Ok(net_ns.clone());
+        }
+        let platform = self
+            .default_platform
+            .as_ref()
+            .map_err(|error| io::Error::new(error.kind(), error.to_string()))?;
+        let candidate = self.intern_net_ns(platform.clone())?;
+        let _ = self.default_net_ns.set(candidate);
+        Ok(self.default_net_ns.get().unwrap().clone())
+    }
+
+    pub(crate) fn is_process_default(&self, net_ns: &NetNS) -> io::Result<bool> {
+        self.default_platform
+            .as_ref()
+            .map(|default| Some(default.id()) == net_ns.id())
+            .map_err(|error| io::Error::new(error.kind(), error.to_string()))
+    }
+
+    /// Resolve an existing shared handle; names and wire references never select
+    /// or reopen a native namespace here.
+    pub(crate) fn net_ns(&self, context: &SocketContext) -> io::Result<Arc<NativeNetNSServices>> {
+        if self.closing.load(Ordering::Acquire) {
+            return Err(io::Error::other("native host runtime is closing"));
+        }
+        match &context.net_ns {
+            Some(net_ns) => self.services(net_ns),
+            None => self.services(&self.capture_default_net_ns()?),
+        }
+    }
+}
+
 #[async_trait]
-impl VirtualTcpSocketFactory for NativeHostRuntime {
+impl VirtualTcpSocketFactory for NativeNetNSServices {
     type Socket = RuntimeTcpSocket;
 
-    async fn connect_tcp(&self, options: TcpConnectOptions) -> anyhow::Result<Self::Socket> {
-        #[cfg(feature = "faketcp")]
+    async fn connect_tcp(&self, mut options: TcpConnectOptions) -> anyhow::Result<Self::Socket> {
+        self.prepare_bind(&mut options.bind)?;
         if options.purpose == TcpSocketPurpose::FakeTcp {
-            let remote_addr = options.remote_addr;
-            let socket_mark = options.bind.context.socket_mark;
-            let net_ns = NetNS::from_socket_context(&options.bind.context);
-            let socket =
-                crate::socket::fake_tcp::connect_socket(remote_addr, socket_mark, net_ns).await?;
-            return Ok(RuntimeTcpSocket::from_fake_tcp(socket));
-        }
-
-        #[cfg(not(feature = "faketcp"))]
-        if options.purpose == TcpSocketPurpose::FakeTcp {
-            anyhow::bail!("FakeTCP socket support is disabled")
+            cfg_select! {
+                feature = "faketcp" => {
+                    let remote_addr = options.remote_addr;
+                    let socket_mark = options.bind.context.socket_mark;
+                    let net_ns = self.net_ns.clone();
+                    let socket = crate::socket::fake_tcp::connect_socket(remote_addr, socket_mark, net_ns).await?;
+                    return Ok(RuntimeTcpSocket::from_fake_tcp(socket));
+                },
+                _ => {
+                    anyhow::bail!("FakeTCP socket support is disabled")
+                },
+            }
         }
 
         crate::socket::tcp::connect_tcp(options)
@@ -80,14 +350,16 @@ impl VirtualTcpSocketFactory for NativeHostRuntime {
 }
 
 #[async_trait]
-impl ConnectorRuntime for NativeHostRuntime {
+impl ConnectorRuntime for NativeNetNSServices {
     async fn connect_byte_stream(
         &self,
         url: &url::Url,
     ) -> anyhow::Result<ConnectedByteStream<RuntimeTcpSocket>> {
+        self.ensure_open()?;
         #[cfg(unix)]
         if url.scheme() == "unix" {
-            let stream = tokio::net::UnixStream::connect(url.path()).await?;
+            let socket = self.run(tokio::net::UnixSocket::new_stream)??;
+            let stream = socket.connect(url.path()).await?;
             let local_url = stream
                 .local_addr()
                 .ok()
@@ -109,32 +381,28 @@ impl ConnectorRuntime for NativeHostRuntime {
         context: SocketContext,
     ) -> anyhow::Result<SocketAddr> {
         let bind_addr = match remote_addr {
-            SocketAddr::V4(_) => {
-                SocketAddr::V4(SocketAddrV4::new(std::net::Ipv4Addr::UNSPECIFIED, 0))
-            }
-            SocketAddr::V6(_) => {
-                SocketAddr::V6(SocketAddrV6::new(std::net::Ipv6Addr::UNSPECIFIED, 0, 0, 0))
-            }
+            SocketAddr::V4(_) => SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0)),
+            SocketAddr::V6(_) => SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, 0, 0, 0)),
         };
-        let socket = crate::socket::bind::<tokio::net::UdpSocket>(BindConfig {
-            local_addr: Some(bind_addr),
-            bind_device: Some("".into()),
-            context,
+        let mut options = BindConfig {
             reuse_addr: Some(false),
-            need_protect: true,
+            context,
+            local_addr: Some(bind_addr),
             ..BindConfig::default()
-        })
-        .await?;
+        };
+        self.prepare_bind(&mut options)?;
+        let socket = crate::socket::bind::<UdpSocket>(options).await?;
         socket.connect(remote_addr).await?;
         Ok(socket.local_addr()?)
     }
 
     async fn preferred_ipv6_source(
         &self,
-        ip: std::net::Ipv6Addr,
+        ip: Ipv6Addr,
         context: SocketContext,
     ) -> Option<PreferredIpv6Source> {
-        collect_interfaces(NetNS::from_socket_context(&context), false)
+        self.validate_context(&context).ok()?;
+        collect_interfaces(self.net_ns.clone(), false)
             .await
             .into_iter()
             .find(|interface| {
@@ -150,22 +418,37 @@ impl ConnectorRuntime for NativeHostRuntime {
     }
 
     async fn collect_ip_addrs(&self, context: &SocketContext) -> GetIpListResponse {
-        collect_local_ip_addrs(NetNS::from_socket_context(context)).await
+        if self.validate_context(context).is_err() {
+            return GetIpListResponse::default();
+        }
+        collect_local_ip_addrs(self.net_ns.clone()).await
     }
 }
 
-impl NativeHostRuntime {
+impl NativeNetNSServices {
+    fn prepare_bind(&self, config: &mut BindConfig) -> io::Result<()> {
+        self.validate_context(&config.context)?;
+        config
+            .context
+            .net_ns
+            .get_or_insert_with(|| self.net_ns.clone());
+        Ok(())
+    }
+
     pub(crate) fn is_local_ip(&self, ip: &IpAddr, context: &SocketContext) -> bool {
-        NetNS::from_socket_context(context)
-            .run(|| std::net::UdpSocket::bind(format!("{ip}:0")).is_ok())
+        self.validate_context(context).is_ok()
+            && self
+                .run(|| std::net::UdpSocket::bind(SocketAddr::new(*ip, 0)).is_ok())
+                .unwrap_or(false)
     }
 }
 
 #[async_trait]
-impl VirtualTcpListenerFactory for NativeHostRuntime {
+impl VirtualTcpListenerFactory for NativeNetNSServices {
     type Listener = RuntimeTcpListener;
 
-    async fn bind_tcp(&self, options: TcpListenOptions) -> anyhow::Result<Arc<Self::Listener>> {
+    async fn bind_tcp(&self, mut options: TcpListenOptions) -> anyhow::Result<Arc<Self::Listener>> {
+        self.prepare_bind(&mut options.bind)?;
         Ok(Arc::new(
             crate::socket::tcp::bind_tcp_listener(options).await?,
         ))
@@ -173,11 +456,12 @@ impl VirtualTcpListenerFactory for NativeHostRuntime {
 }
 
 #[async_trait]
-impl VirtualUdpSocketFactory for NativeHostRuntime {
+impl VirtualUdpSocketFactory for NativeNetNSServices {
     type Socket = RuntimeUdpSocket;
 
-    async fn bind_udp(&self, options: BindConfig) -> anyhow::Result<Arc<Self::Socket>> {
-        let socket = self.udp_sockets.bind_udp(options).await?;
+    async fn bind_udp(&self, mut options: BindConfig) -> anyhow::Result<Arc<Self::Socket>> {
+        self.prepare_bind(&mut options)?;
+        let socket = RuntimeUdpSocketFactory::new().bind_udp(options).await?;
         #[cfg(target_os = "windows")]
         crate::arch::windows::disable_connection_reset(socket.socket().as_ref())?;
         Ok(socket)
@@ -185,20 +469,102 @@ impl VirtualUdpSocketFactory for NativeHostRuntime {
 }
 
 #[async_trait]
-impl DnsResolver for NativeHostRuntime {
+impl DnsResolver for NativeNetNSServices {
     async fn resolve(&self, query: DnsQuery) -> anyhow::Result<Vec<IpAddr>> {
+        self.ensure_open()?;
         self.dns.resolve(query).await
     }
 }
 
 #[async_trait]
-impl DnsRecordResolver for NativeHostRuntime {
+impl DnsRecordResolver for NativeNetNSServices {
     async fn resolve_txt(&self, query: DnsQuery) -> anyhow::Result<String> {
+        self.ensure_open()?;
         self.dns.resolve_txt(query).await
     }
 
     async fn resolve_srv(&self, query: DnsQuery) -> anyhow::Result<Vec<DnsSrvRecord>> {
+        self.ensure_open()?;
         self.dns.resolve_srv(query).await
+    }
+}
+
+// Standalone process-level convenience APIs route to existing pinned capabilities.
+#[async_trait]
+impl VirtualTcpSocketFactory for NativeHostRuntime {
+    type Socket = RuntimeTcpSocket;
+    async fn connect_tcp(&self, options: TcpConnectOptions) -> anyhow::Result<Self::Socket> {
+        self.net_ns(&options.bind.context)?
+            .connect_tcp(options)
+            .await
+    }
+}
+#[async_trait]
+impl VirtualTcpListenerFactory for NativeHostRuntime {
+    type Listener = RuntimeTcpListener;
+    async fn bind_tcp(&self, options: TcpListenOptions) -> anyhow::Result<Arc<Self::Listener>> {
+        self.net_ns(&options.bind.context)?.bind_tcp(options).await
+    }
+}
+#[async_trait]
+impl VirtualUdpSocketFactory for NativeHostRuntime {
+    type Socket = RuntimeUdpSocket;
+    async fn bind_udp(&self, options: BindConfig) -> anyhow::Result<Arc<Self::Socket>> {
+        self.net_ns(&options.context)?.bind_udp(options).await
+    }
+}
+#[async_trait]
+impl ConnectorRuntime for NativeHostRuntime {
+    async fn connect_byte_stream(
+        &self,
+        url: &url::Url,
+    ) -> anyhow::Result<ConnectedByteStream<RuntimeTcpSocket>> {
+        self.services(&self.capture_default_net_ns()?)?
+            .connect_byte_stream(url)
+            .await
+    }
+    async fn local_addr_for_remote(
+        &self,
+        remote: SocketAddr,
+        context: SocketContext,
+    ) -> anyhow::Result<SocketAddr> {
+        self.net_ns(&context)?
+            .local_addr_for_remote(remote, context)
+            .await
+    }
+    async fn preferred_ipv6_source(
+        &self,
+        ip: Ipv6Addr,
+        context: SocketContext,
+    ) -> Option<PreferredIpv6Source> {
+        self.net_ns(&context)
+            .ok()?
+            .preferred_ipv6_source(ip, context)
+            .await
+    }
+    async fn collect_ip_addrs(&self, context: &SocketContext) -> GetIpListResponse {
+        match self.net_ns(context) {
+            Ok(net_ns) => net_ns.collect_ip_addrs(context).await,
+            Err(error) => {
+                tracing::warn!(%error, "invalid namespace for interface collection");
+                GetIpListResponse::default()
+            }
+        }
+    }
+}
+#[async_trait]
+impl DnsResolver for NativeHostRuntime {
+    async fn resolve(&self, query: DnsQuery) -> anyhow::Result<Vec<IpAddr>> {
+        self.net_ns(&query.context)?.resolve(query).await
+    }
+}
+#[async_trait]
+impl DnsRecordResolver for NativeHostRuntime {
+    async fn resolve_txt(&self, query: DnsQuery) -> anyhow::Result<String> {
+        self.net_ns(&query.context)?.resolve_txt(query).await
+    }
+    async fn resolve_srv(&self, query: DnsQuery) -> anyhow::Result<Vec<DnsSrvRecord>> {
+        self.net_ns(&query.context)?.resolve_srv(query).await
     }
 }
 

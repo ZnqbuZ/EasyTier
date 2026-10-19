@@ -13,11 +13,12 @@ use std::{collections::HashMap, fmt, net::SocketAddr, time::Duration};
 use std::net::IpAddr;
 
 use bytes::Bytes;
-use easytier_core::socket::BindConfig;
 use easytier_core::socket::{
+    BindConfig, SocketContext,
     tcp::TcpConnectOptions,
     udp::{VirtualUdpSocket, VirtualUdpSocketFactory},
 };
+use easytier_core::tunnel::TunnelError;
 use http_body_util::{BodyExt as _, Full, Limited};
 use hyper::{
     Method, Request,
@@ -104,6 +105,10 @@ pub(crate) async fn search_gateway(options: SearchOptions) -> Result<Gateway, Se
 
 async fn search_gateway_inner(options: SearchOptions) -> Result<Gateway, SearchError> {
     let bind_options = BindConfig {
+        context: SocketContext {
+            net_ns: Some(crate::common::net_ns::current().map_err(SearchError::Io)?),
+            ..SocketContext::default()
+        },
         reuse_addr: Some(false),
         local_addr: Some(options.bind_addr),
         ..BindConfig::default()
@@ -211,7 +216,16 @@ async fn send_http_request_inner(
     soap_action: Option<&str>,
     body: String,
 ) -> Result<Bytes, HttpTransportError> {
-    let stream = connect_tcp(TcpConnectOptions::direct_connect(addr)).await?;
+    let stream = connect_tcp(
+        TcpConnectOptions::direct_connect(addr).with_bind(BindConfig {
+            context: SocketContext {
+                net_ns: Some(crate::common::net_ns::current().map_err(TunnelError::from)?),
+                ..SocketContext::default()
+            },
+            ..BindConfig::default()
+        }),
+    )
+    .await?;
     let (mut sender, connection) = http1::handshake(TokioIo::new(stream)).await?;
     let body = Bytes::from(body);
     let mut request = Request::builder()
