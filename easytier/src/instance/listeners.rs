@@ -1,16 +1,27 @@
-use std::fmt::Debug;
+use std::fmt::{self, Debug};
 
 use async_trait::async_trait;
 use easytier_core::listener::{
     ExternalListenerFactory, ExternalListenerRequest, transport::AcceptedTransport,
 };
+#[cfg(any(unix, feature = "faketcp"))]
+use easytier_core::socket::SocketContext;
 use easytier_core::socket::SocketListener;
 
+use crate::common::net_ns::NetNS;
 #[cfg(feature = "faketcp")]
-use crate::common::netns::NetNS;
+use crate::socket::fake_tcp::FakeTcpSocketListener;
 use crate::socket::tcp::RuntimeTcpSocket;
 
-pub(crate) struct RuntimeExternalListenerFactory;
+pub(crate) struct RuntimeExternalListenerFactory {
+    net_ns: NetNS,
+}
+
+impl RuntimeExternalListenerFactory {
+    pub(crate) fn new(net_ns: NetNS) -> Self {
+        Self { net_ns }
+    }
+}
 
 impl ExternalListenerFactory<AcceptedTransport<RuntimeTcpSocket>>
     for RuntimeExternalListenerFactory
@@ -32,10 +43,15 @@ impl ExternalListenerFactory<AcceptedTransport<RuntimeTcpSocket>>
             #[cfg(feature = "faketcp")]
             "faketcp" => Box::new(RuntimeFakeTcpSocketListener::new(
                 request.url,
-                NetNS::from_socket_context(&request.socket_context),
+                self.net_ns.clone(),
+                request.socket_context,
             )),
             #[cfg(unix)]
-            "unix" => Box::new(RuntimeUnixStreamListener::new(request.url)),
+            "unix" => Box::new(RuntimeUnixStreamListener::new_in_net_ns(
+                request.url,
+                self.net_ns.clone(),
+                request.socket_context,
+            )),
             scheme => unreachable!("core requested unsupported external listener: {scheme}"),
         }
     }
@@ -45,12 +61,27 @@ impl ExternalListenerFactory<AcceptedTransport<RuntimeTcpSocket>>
 struct RuntimeUnixStreamListener {
     url: url::Url,
     inner: Option<tokio::net::UnixListener>,
+    net_ns: NetNS,
+    context: SocketContext,
 }
 
 #[cfg(unix)]
 impl RuntimeUnixStreamListener {
+    #[cfg(test)]
     fn new(url: url::Url) -> Self {
-        Self { url, inner: None }
+        Self::new_in_net_ns(
+            url,
+            crate::common::net_ns::current().unwrap(),
+            SocketContext::default(),
+        )
+    }
+    fn new_in_net_ns(url: url::Url, net_ns: NetNS, context: SocketContext) -> Self {
+        Self {
+            url,
+            inner: None,
+            net_ns,
+            context,
+        }
     }
 }
 
@@ -65,7 +96,7 @@ fn unix_stream_remote_url(remote_addr: tokio::net::unix::SocketAddr) -> url::Url
 
 #[cfg(unix)]
 impl Debug for RuntimeUnixStreamListener {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("RuntimeUnixStreamListener")
             .field("url", &self.url)
@@ -81,7 +112,11 @@ impl SocketListener for RuntimeUnixStreamListener {
 
     async fn listen(&mut self) -> anyhow::Result<()> {
         if self.inner.is_none() {
-            self.inner = Some(tokio::net::UnixListener::bind(self.url.path())?);
+            self.net_ns.validate_context(&self.context)?;
+            self.inner = Some(
+                self.net_ns
+                    .run(|| tokio::net::UnixListener::bind(self.url.path()))??,
+            );
         }
         Ok(())
     }
@@ -115,22 +150,24 @@ impl Drop for RuntimeUnixStreamListener {
 #[cfg(feature = "faketcp")]
 struct RuntimeFakeTcpSocketListener {
     net_ns: NetNS,
-    inner: crate::socket::fake_tcp::FakeTcpSocketListener,
+    inner: FakeTcpSocketListener,
+    context: SocketContext,
 }
 
 #[cfg(feature = "faketcp")]
 impl RuntimeFakeTcpSocketListener {
-    fn new(url: url::Url, net_ns: NetNS) -> Self {
+    fn new(url: url::Url, net_ns: NetNS, context: SocketContext) -> Self {
         Self {
+            inner: FakeTcpSocketListener::new(url, net_ns.clone(), context.clone()),
             net_ns,
-            inner: crate::socket::fake_tcp::FakeTcpSocketListener::new(url),
+            context,
         }
     }
 }
 
 #[cfg(feature = "faketcp")]
 impl Debug for RuntimeFakeTcpSocketListener {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("RuntimeFakeTcpSocketListener")
             .field("url", &SocketListener::local_url(&self.inner))
@@ -144,7 +181,7 @@ impl SocketListener for RuntimeFakeTcpSocketListener {
     type Accepted = AcceptedTransport<RuntimeTcpSocket>;
 
     async fn listen(&mut self) -> anyhow::Result<()> {
-        let _guard = self.net_ns.guard();
+        self.net_ns.validate_context(&self.context)?;
         SocketListener::listen(&mut self.inner).await?;
         Ok(())
     }
@@ -170,7 +207,8 @@ mod tests {
 
     #[test]
     fn external_listener_capabilities_follow_native_build() {
-        let factory = RuntimeExternalListenerFactory;
+        let factory =
+            RuntimeExternalListenerFactory::new(crate::common::net_ns::current().unwrap());
 
         assert_eq!(
             factory.supports_scheme("faketcp"),

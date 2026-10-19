@@ -19,14 +19,13 @@ use easytier_core::{
 use tempfile::TempDir;
 
 use super::{
-    InstanceTestExt as _, create_netns, del_netns, drop_insts, get_host_veth_name, ping_test,
+    InstanceTestExt as _, create_net_ns, del_net_ns, drop_insts, get_host_veth_name, ping_test,
 };
 use crate::{
     common::{
         config::{ConfigLoader, TomlConfigLoader},
         error::Error,
         global_ctx::GlobalCtxEvent,
-        netns::NetNS,
         stun::MockStunInfoCollector,
     },
     instance::test_instance::TestInstance as Instance,
@@ -194,7 +193,7 @@ impl Drop for DualGatewayUpnpIntegrationEnv {
 
 #[derive(Clone)]
 struct GatewayBackedStunCollector {
-    netns: &'static str,
+    net_ns: &'static str,
     client_ip: Ipv4Addr,
     external_ip: Ipv4Addr,
 }
@@ -213,7 +212,7 @@ impl StunInfoProvider for GatewayBackedStunCollector {
     }
 
     async fn get_udp_port_mapping(&self, local_port: u16) -> anyhow::Result<SocketAddr> {
-        Ok(query_udp_mapping(self.netns, self.external_ip, self.client_ip, local_port).await?)
+        Ok(query_udp_mapping(self.net_ns, self.external_ip, self.client_ip, local_port).await?)
     }
 
     async fn get_tcp_port_mapping(&self, local_port: u16) -> anyhow::Result<SocketAddr> {
@@ -231,7 +230,7 @@ impl StunSocketMapper<crate::socket::udp::RuntimeUdpSocket> for GatewayBackedStu
     ) -> anyhow::Result<SocketAddr> {
         use easytier_core::socket::udp::VirtualUdpSocket as _;
         Ok(query_udp_mapping(
-            self.netns,
+            self.net_ns,
             self.external_ip,
             self.client_ip,
             udp.local_addr()?.port(),
@@ -284,25 +283,26 @@ deny 0-65535 0.0.0.0/0 0-65535
     Ok(conf_path)
 }
 
-async fn tcp_connect_in_ns(netns: &'static str, ip: Ipv4Addr, port: u16) -> anyhow::Result<()> {
+async fn tcp_connect_in_ns(net_ns: &'static str, ip: Ipv4Addr, port: u16) -> anyhow::Result<()> {
     tokio::task::spawn_blocking(move || {
-        let _g = NetNS::new(Some(netns.to_owned())).guard();
-        tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .context("build runtime for tcp connect in netns")?
-            .block_on(async move {
-                tokio::net::TcpStream::connect((ip, port))
-                    .await
-                    .map(|_| ())
-                    .context("tcp connect in netns")
-            })
+        crate::common::net_ns::tests::test_net_ns(Some(net_ns.to_owned())).run(|| {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .context("build runtime for tcp connect in netns")?
+                .block_on(async move {
+                    tokio::net::TcpStream::connect((ip, port))
+                        .await
+                        .map(|_| ())
+                        .context("tcp connect in netns")
+                })
+        })?
     })
     .await
     .context("join tcp connect in netns task")?
 }
 
-fn create_empty_netns(name: &str) -> anyhow::Result<()> {
+fn create_empty_net_ns(name: &str) -> anyhow::Result<()> {
     run_cmd("ip", &["netns", "add", name])?;
     run_cmd(
         "ip",
@@ -311,21 +311,21 @@ fn create_empty_netns(name: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn run_cmd_in_netns<S: AsRef<OsStr>>(netns: &str, cmd: S, args: &[&str]) -> anyhow::Result<()> {
+fn run_cmd_in_net_ns<S: AsRef<OsStr>>(net_ns: &str, cmd: S, args: &[&str]) -> anyhow::Result<()> {
     let cmd = cmd.as_ref();
     let cmd_str = cmd
         .to_str()
         .ok_or_else(|| anyhow!("non-utf8 command path: {}", Path::new(cmd).display()))?;
-    let mut full_args = vec!["netns", "exec", netns, cmd_str];
+    let mut full_args = vec!["netns", "exec", net_ns, cmd_str];
     full_args.extend_from_slice(args);
     run_cmd("ip", &full_args)
 }
 
 fn create_dual_gateway_test_net() -> anyhow::Result<()> {
-    create_netns(DUAL_NS_A, &format!("{DUAL_CLIENT_A_IP}/24"), "fd20::2/64");
-    create_netns(DUAL_NS_C, &format!("{DUAL_CLIENT_C_IP}/24"), "fd21::2/64");
-    create_empty_netns(DUAL_GW_NS_A)?;
-    create_empty_netns(DUAL_GW_NS_C)?;
+    create_net_ns(DUAL_NS_A, &format!("{DUAL_CLIENT_A_IP}/24"), "fd20::2/64");
+    create_net_ns(DUAL_NS_C, &format!("{DUAL_CLIENT_C_IP}/24"), "fd21::2/64");
+    create_empty_net_ns(DUAL_GW_NS_A)?;
+    create_empty_net_ns(DUAL_GW_NS_C)?;
 
     run_cmd(
         "ip",
@@ -348,12 +348,12 @@ fn create_dual_gateway_test_net() -> anyhow::Result<()> {
         ],
     )?;
 
-    run_cmd_in_netns(
+    run_cmd_in_net_ns(
         DUAL_GW_NS_A,
         "ip",
         &["link", "add", "name", DUAL_LAN_A_BRIDGE, "type", "bridge"],
     )?;
-    run_cmd_in_netns(
+    run_cmd_in_net_ns(
         DUAL_GW_NS_C,
         "ip",
         &["link", "add", "name", DUAL_LAN_C_BRIDGE, "type", "bridge"],
@@ -363,7 +363,7 @@ fn create_dual_gateway_test_net() -> anyhow::Result<()> {
         &["link", "add", "name", DUAL_WAN_BRIDGE, "type", "bridge"],
     )?;
 
-    run_cmd_in_netns(
+    run_cmd_in_net_ns(
         DUAL_GW_NS_A,
         "ip",
         &[
@@ -374,7 +374,7 @@ fn create_dual_gateway_test_net() -> anyhow::Result<()> {
             DUAL_LAN_A_BRIDGE,
         ],
     )?;
-    run_cmd_in_netns(
+    run_cmd_in_net_ns(
         DUAL_GW_NS_C,
         "ip",
         &[
@@ -385,7 +385,7 @@ fn create_dual_gateway_test_net() -> anyhow::Result<()> {
             DUAL_LAN_C_BRIDGE,
         ],
     )?;
-    run_cmd_in_netns(
+    run_cmd_in_net_ns(
         DUAL_GW_NS_A,
         "ip",
         &[
@@ -396,7 +396,7 @@ fn create_dual_gateway_test_net() -> anyhow::Result<()> {
             DUAL_LAN_A_BRIDGE,
         ],
     )?;
-    run_cmd_in_netns(
+    run_cmd_in_net_ns(
         DUAL_GW_NS_C,
         "ip",
         &[
@@ -444,7 +444,7 @@ fn create_dual_gateway_test_net() -> anyhow::Result<()> {
         "ip",
         &["link", "set", DUAL_WAN_IF_C_PEER, "master", DUAL_WAN_BRIDGE],
     )?;
-    run_cmd_in_netns(
+    run_cmd_in_net_ns(
         DUAL_GW_NS_A,
         "ip",
         &[
@@ -455,7 +455,7 @@ fn create_dual_gateway_test_net() -> anyhow::Result<()> {
             DUAL_WAN_IF_A,
         ],
     )?;
-    run_cmd_in_netns(
+    run_cmd_in_net_ns(
         DUAL_GW_NS_C,
         "ip",
         &[
@@ -469,37 +469,37 @@ fn create_dual_gateway_test_net() -> anyhow::Result<()> {
     run_cmd("ip", &["link", "set", DUAL_WAN_BRIDGE, "up"])?;
     run_cmd("ip", &["link", "set", DUAL_WAN_IF_A_PEER, "up"])?;
     run_cmd("ip", &["link", "set", DUAL_WAN_IF_C_PEER, "up"])?;
-    run_cmd_in_netns(
+    run_cmd_in_net_ns(
         DUAL_GW_NS_A,
         "ip",
         &["link", "set", DUAL_LAN_A_BRIDGE, "up"],
     )?;
-    run_cmd_in_netns(
+    run_cmd_in_net_ns(
         DUAL_GW_NS_A,
         "ip",
         &["link", "set", get_host_veth_name(DUAL_NS_A), "up"],
     )?;
-    run_cmd_in_netns(DUAL_GW_NS_A, "ip", &["link", "set", DUAL_WAN_IF_A, "up"])?;
-    run_cmd_in_netns(
+    run_cmd_in_net_ns(DUAL_GW_NS_A, "ip", &["link", "set", DUAL_WAN_IF_A, "up"])?;
+    run_cmd_in_net_ns(
         DUAL_GW_NS_C,
         "ip",
         &["link", "set", DUAL_LAN_C_BRIDGE, "up"],
     )?;
-    run_cmd_in_netns(
+    run_cmd_in_net_ns(
         DUAL_GW_NS_C,
         "ip",
         &["link", "set", get_host_veth_name(DUAL_NS_C), "up"],
     )?;
-    run_cmd_in_netns(DUAL_GW_NS_C, "ip", &["link", "set", DUAL_WAN_IF_C, "up"])?;
+    run_cmd_in_net_ns(DUAL_GW_NS_C, "ip", &["link", "set", DUAL_WAN_IF_C, "up"])?;
 
-    setup_gateway_iptables_rules_in_netns(
+    setup_gateway_iptables_rules_in_net_ns(
         DUAL_GW_NS_A,
         DUAL_WAN_IF_A,
         DUAL_LAN_A_BRIDGE,
         "MINIUPNPD_A",
         "MINIUPNPD_A-POSTROUTING",
     )?;
-    setup_gateway_iptables_rules_in_netns(
+    setup_gateway_iptables_rules_in_net_ns(
         DUAL_GW_NS_C,
         DUAL_WAN_IF_C,
         DUAL_LAN_C_BRIDGE,
@@ -539,20 +539,20 @@ fn create_dual_gateway_test_net() -> anyhow::Result<()> {
             "veth_upnp2_c_g",
         ],
     )?;
-    run_cmd_in_netns(DUAL_GW_NS_A, "sysctl", &["-w", "net.ipv4.ip_forward=1"])?;
-    run_cmd_in_netns(DUAL_GW_NS_C, "sysctl", &["-w", "net.ipv4.ip_forward=1"])?;
+    run_cmd_in_net_ns(DUAL_GW_NS_A, "sysctl", &["-w", "net.ipv4.ip_forward=1"])?;
+    run_cmd_in_net_ns(DUAL_GW_NS_C, "sysctl", &["-w", "net.ipv4.ip_forward=1"])?;
     Ok(())
 }
 
 fn cleanup_dual_gateway_test_net() {
-    cleanup_gateway_iptables_rules_in_netns(
+    cleanup_gateway_iptables_rules_in_net_ns(
         DUAL_GW_NS_A,
         DUAL_WAN_IF_A,
         DUAL_LAN_A_BRIDGE,
         "MINIUPNPD_A",
         "MINIUPNPD_A-POSTROUTING",
     );
-    cleanup_gateway_iptables_rules_in_netns(
+    cleanup_gateway_iptables_rules_in_net_ns(
         DUAL_GW_NS_C,
         DUAL_WAN_IF_C,
         DUAL_LAN_C_BRIDGE,
@@ -560,10 +560,10 @@ fn cleanup_dual_gateway_test_net() {
         "MINIUPNPD_C-POSTROUTING",
     );
 
-    del_netns(DUAL_NS_A);
-    del_netns(DUAL_NS_C);
-    del_netns(DUAL_GW_NS_A);
-    del_netns(DUAL_GW_NS_C);
+    del_net_ns(DUAL_NS_A);
+    del_net_ns(DUAL_NS_C);
+    del_net_ns(DUAL_GW_NS_A);
+    del_net_ns(DUAL_GW_NS_C);
     for iface in [DUAL_WAN_BRIDGE, DUAL_WAN_IF_A_PEER, DUAL_WAN_IF_C_PEER] {
         let _ = Command::new("ip").args(["link", "del", iface]).output();
     }
@@ -573,15 +573,15 @@ fn cleanup_miniupnpd_processes() {
     let _ = Command::new("pkill").args(["-x", "miniupnpd"]).output();
 }
 
-fn setup_gateway_iptables_rules_in_netns(
-    netns: &str,
+fn setup_gateway_iptables_rules_in_net_ns(
+    net_ns: &str,
     ext_if: &str,
     lan_bridge: &str,
     chain_name: &str,
     postrouting_chain_name: &str,
 ) -> anyhow::Result<()> {
-    cleanup_gateway_iptables_rules_in_netns(
-        netns,
+    cleanup_gateway_iptables_rules_in_net_ns(
+        net_ns,
         ext_if,
         lan_bridge,
         chain_name,
@@ -589,9 +589,9 @@ fn setup_gateway_iptables_rules_in_netns(
     );
     let iptables = find_iptables_legacy_bin()?;
 
-    run_cmd_in_netns(netns, &iptables, &["-t", "nat", "-N", chain_name])?;
-    run_cmd_in_netns(
-        netns,
+    run_cmd_in_net_ns(net_ns, &iptables, &["-t", "nat", "-N", chain_name])?;
+    run_cmd_in_net_ns(
+        net_ns,
         &iptables,
         &[
             "-t",
@@ -604,13 +604,13 @@ fn setup_gateway_iptables_rules_in_netns(
             chain_name,
         ],
     )?;
-    run_cmd_in_netns(
-        netns,
+    run_cmd_in_net_ns(
+        net_ns,
         &iptables,
         &["-t", "nat", "-N", postrouting_chain_name],
     )?;
-    run_cmd_in_netns(
-        netns,
+    run_cmd_in_net_ns(
+        net_ns,
         &iptables,
         &[
             "-t",
@@ -623,9 +623,9 @@ fn setup_gateway_iptables_rules_in_netns(
             postrouting_chain_name,
         ],
     )?;
-    run_cmd_in_netns(netns, &iptables, &["-t", "mangle", "-N", chain_name])?;
-    run_cmd_in_netns(
-        netns,
+    run_cmd_in_net_ns(net_ns, &iptables, &["-t", "mangle", "-N", chain_name])?;
+    run_cmd_in_net_ns(
+        net_ns,
         &iptables,
         &[
             "-t",
@@ -638,16 +638,16 @@ fn setup_gateway_iptables_rules_in_netns(
             chain_name,
         ],
     )?;
-    run_cmd_in_netns(netns, &iptables, &["-N", chain_name])?;
-    run_cmd_in_netns(
-        netns,
+    run_cmd_in_net_ns(net_ns, &iptables, &["-N", chain_name])?;
+    run_cmd_in_net_ns(
+        net_ns,
         &iptables,
         &[
             "-A", "FORWARD", "-i", ext_if, "!", "-o", ext_if, "-j", chain_name,
         ],
     )?;
-    run_cmd_in_netns(
-        netns,
+    run_cmd_in_net_ns(
+        net_ns,
         &iptables,
         &[
             "-A", "FORWARD", "-i", lan_bridge, "-o", ext_if, "-j", "ACCEPT",
@@ -656,8 +656,8 @@ fn setup_gateway_iptables_rules_in_netns(
     Ok(())
 }
 
-fn cleanup_gateway_iptables_rules_in_netns(
-    netns: &str,
+fn cleanup_gateway_iptables_rules_in_net_ns(
+    net_ns: &str,
     ext_if: &str,
     lan_bridge: &str,
     chain_name: &str,
@@ -667,8 +667,8 @@ fn cleanup_gateway_iptables_rules_in_netns(
         return;
     };
 
-    let _ = run_cmd_in_netns(
-        netns,
+    let _ = run_cmd_in_net_ns(
+        net_ns,
         &iptables,
         &[
             "-t",
@@ -681,8 +681,8 @@ fn cleanup_gateway_iptables_rules_in_netns(
             chain_name,
         ],
     );
-    let _ = run_cmd_in_netns(
-        netns,
+    let _ = run_cmd_in_net_ns(
+        net_ns,
         &iptables,
         &[
             "-t",
@@ -695,8 +695,8 @@ fn cleanup_gateway_iptables_rules_in_netns(
             postrouting_chain_name,
         ],
     );
-    let _ = run_cmd_in_netns(
-        netns,
+    let _ = run_cmd_in_net_ns(
+        net_ns,
         &iptables,
         &[
             "-t",
@@ -709,33 +709,33 @@ fn cleanup_gateway_iptables_rules_in_netns(
             chain_name,
         ],
     );
-    let _ = run_cmd_in_netns(
-        netns,
+    let _ = run_cmd_in_net_ns(
+        net_ns,
         &iptables,
         &[
             "-D", "FORWARD", "-i", ext_if, "!", "-o", ext_if, "-j", chain_name,
         ],
     );
-    let _ = run_cmd_in_netns(
-        netns,
+    let _ = run_cmd_in_net_ns(
+        net_ns,
         &iptables,
         &[
             "-D", "FORWARD", "-i", lan_bridge, "-o", ext_if, "-j", "ACCEPT",
         ],
     );
-    let _ = run_cmd_in_netns(netns, &iptables, &["-F", chain_name]);
-    let _ = run_cmd_in_netns(netns, &iptables, &["-X", chain_name]);
-    let _ = run_cmd_in_netns(netns, &iptables, &["-t", "mangle", "-F", chain_name]);
-    let _ = run_cmd_in_netns(netns, &iptables, &["-t", "mangle", "-X", chain_name]);
-    let _ = run_cmd_in_netns(netns, &iptables, &["-t", "nat", "-F", chain_name]);
-    let _ = run_cmd_in_netns(netns, &iptables, &["-t", "nat", "-X", chain_name]);
-    let _ = run_cmd_in_netns(
-        netns,
+    let _ = run_cmd_in_net_ns(net_ns, &iptables, &["-F", chain_name]);
+    let _ = run_cmd_in_net_ns(net_ns, &iptables, &["-X", chain_name]);
+    let _ = run_cmd_in_net_ns(net_ns, &iptables, &["-t", "mangle", "-F", chain_name]);
+    let _ = run_cmd_in_net_ns(net_ns, &iptables, &["-t", "mangle", "-X", chain_name]);
+    let _ = run_cmd_in_net_ns(net_ns, &iptables, &["-t", "nat", "-F", chain_name]);
+    let _ = run_cmd_in_net_ns(net_ns, &iptables, &["-t", "nat", "-X", chain_name]);
+    let _ = run_cmd_in_net_ns(
+        net_ns,
         &iptables,
         &["-t", "nat", "-F", postrouting_chain_name],
     );
-    let _ = run_cmd_in_netns(
-        netns,
+    let _ = run_cmd_in_net_ns(
+        net_ns,
         &iptables,
         &["-t", "nat", "-X", postrouting_chain_name],
     );
@@ -815,11 +815,11 @@ fn find_iptables_legacy_bin() -> anyhow::Result<PathBuf> {
 }
 
 async fn query_mappings(
-    query_netns: &'static str,
+    query_net_ns: &'static str,
     expected_external_ip: Ipv4Addr,
 ) -> Result<Vec<PortMappingEntry>, Error> {
     tokio::task::spawn_blocking(move || {
-        let _g = NetNS::new(Some(query_netns.to_owned())).guard();
+        crate::common::net_ns::tests::test_net_ns(Some(query_net_ns.to_owned())).run(|| {
         tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -862,6 +862,7 @@ async fn query_mappings(
 
                 Ok(entries)
             })
+        })?
     })
     .await
     .context("join test igd query task")
@@ -870,12 +871,12 @@ async fn query_mappings(
 }
 
 async fn query_udp_mapping(
-    query_netns: &'static str,
+    query_net_ns: &'static str,
     expected_external_ip: Ipv4Addr,
     client_ip: Ipv4Addr,
     local_port: u16,
 ) -> Result<SocketAddr, Error> {
-    let entries = query_mappings(query_netns, expected_external_ip).await?;
+    let entries = query_mappings(query_net_ns, expected_external_ip).await?;
     let client_ip = client_ip.to_string();
     let entry = entries
         .into_iter()
@@ -889,13 +890,13 @@ async fn query_udp_mapping(
 
 fn create_test_instance_config(
     inst_name: &str,
-    netns: Option<&str>,
+    net_ns: Option<&str>,
     ipv4: &str,
     ipv6: &str,
 ) -> TomlConfigLoader {
     let config = TomlConfigLoader::default();
     config.set_inst_name(inst_name.to_owned());
-    config.set_netns(netns.map(ToOwned::to_owned));
+    config.set_net_ns(net_ns.map(ToOwned::to_owned));
     config.set_ipv4(Some(ipv4.parse().unwrap()));
     config.set_ipv6(Some(ipv6.parse().unwrap()));
     config.set_listeners(vec!["udp://0.0.0.0:11010".parse().unwrap()]);
@@ -904,14 +905,14 @@ fn create_test_instance_config(
 
 fn create_test_instance_with_process_runtime(
     inst_name: &str,
-    netns: Option<&str>,
+    net_ns: Option<&str>,
     ipv4: &str,
     ipv6: &str,
     stun_collector: Box<dyn StunSocketMapper<crate::socket::udp::RuntimeUdpSocket>>,
     configure_flags: impl FnOnce(&mut crate::common::config::Flags),
     process_runtime: Arc<CoreProcessRuntime>,
 ) -> Instance {
-    let config = create_test_instance_config(inst_name, netns, ipv4, ipv6);
+    let config = create_test_instance_config(inst_name, net_ns, ipv4, ipv6);
     let mut flags = config.get_flags();
     flags.disable_tcp_hole_punching = true;
     configure_flags(&mut flags);
@@ -1015,7 +1016,7 @@ async fn instances_build_direct_connection_via_upnp_udp_hole_punch() {
         "10.144.200.1/24",
         "fd20::1/64",
         Box::new(GatewayBackedStunCollector {
-            netns: DUAL_NS_A,
+            net_ns: DUAL_NS_A,
             client_ip: DUAL_CLIENT_A_IP,
             external_ip: DUAL_EXTERNAL_A_IP,
         }),
@@ -1042,7 +1043,7 @@ async fn instances_build_direct_connection_via_upnp_udp_hole_punch() {
         "10.144.200.3/24",
         "fd20::3/64",
         Box::new(GatewayBackedStunCollector {
-            netns: DUAL_NS_C,
+            net_ns: DUAL_NS_C,
             client_ip: DUAL_CLIENT_C_IP,
             external_ip: DUAL_EXTERNAL_C_IP,
         }),

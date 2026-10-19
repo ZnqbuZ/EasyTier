@@ -79,7 +79,7 @@ impl NativeTunRuntime {
             closed,
             shared_virtual_nic_registry,
         )
-        .await;
+        .await?;
         let claims = match claims {
             Some(claims) => claims,
             None => NicCtx::mobile_tun_claims(&global_ctx, &packet_plane).await,

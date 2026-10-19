@@ -9,25 +9,30 @@ use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
 use crate::common::global_ctx::ArcGlobalCtx;
-#[cfg(feature = "tun")]
-use crate::instance::shared_virtual_nic::ArcSharedVirtualNicRegistry;
 
 mod dhcp;
 mod event_journal;
 mod implementation;
-#[cfg(feature = "tun")]
-mod magic_dns;
-#[cfg(feature = "tun")]
-mod tun_common;
-#[cfg(not(feature = "tun"))]
-#[path = "runtime_host/tun_disabled.rs"]
-mod tun_runtime;
-#[cfg(all(feature = "tun", not(mobile)))]
-#[path = "runtime_host/tun_desktop.rs"]
-mod tun_runtime;
-#[cfg(all(feature = "tun", mobile))]
-#[path = "runtime_host/tun_mobile.rs"]
-mod tun_runtime;
+cfg_select! {
+    not(feature = "tun") => {
+        #[path = "runtime_host/tun_disabled.rs"]
+        mod tun_runtime;
+    },
+    _ => {
+        mod magic_dns;
+        mod tun_common;
+        cfg_select! {
+            mobile => {
+                #[path = "runtime_host/tun_mobile.rs"]
+                mod tun_runtime;
+            },
+            _ => {
+                #[path = "runtime_host/tun_desktop.rs"]
+                mod tun_runtime;
+            },
+        }
+    },
+}
 
 use super::runtime_executor::NativeInstanceExecutor;
 use event_journal::EventJournal;
@@ -46,21 +51,12 @@ pub(crate) struct NativeInstanceRuntimeHost {
 
 impl NativeInstanceRuntimeHost {
     #[cfg(test)]
-    pub(crate) fn new(
-        global_ctx: ArcGlobalCtx,
-        #[cfg(feature = "tun")] shared_virtual_nic_registry: ArcSharedVirtualNicRegistry,
-    ) -> Arc<Self> {
-        Self::new_with_executor(
-            global_ctx,
-            #[cfg(feature = "tun")]
-            shared_virtual_nic_registry,
-            None,
-        )
+    pub(crate) fn new(global_ctx: ArcGlobalCtx) -> Arc<Self> {
+        Self::new_with_executor(global_ctx, None)
     }
 
     pub(super) fn new_with_executor(
         global_ctx: ArcGlobalCtx,
-        #[cfg(feature = "tun")] shared_virtual_nic_registry: ArcSharedVirtualNicRegistry,
         executor: Option<NativeInstanceExecutor>,
     ) -> Arc<Self> {
         let cancel = CancellationToken::new();
@@ -68,7 +64,10 @@ impl NativeInstanceRuntimeHost {
             global_ctx.clone(),
             cancel.clone(),
             #[cfg(feature = "tun")]
-            shared_virtual_nic_registry,
+            crate::host_runtime::net_ns_services(&global_ctx.net_ns)
+                .expect("native instance domain must be registered")
+                .nics
+                .clone(),
         );
         let event_journal = EventJournal::new(&global_ctx);
         Arc::new(Self {
@@ -198,13 +197,7 @@ mod tests {
     };
 
     fn runtime_host(global_ctx: ArcGlobalCtx) -> Arc<NativeInstanceRuntimeHost> {
-        NativeInstanceRuntimeHost::new(
-            global_ctx,
-            #[cfg(feature = "tun")]
-            Arc::new(tokio::sync::Mutex::new(
-                crate::instance::shared_virtual_nic::SharedVirtualNicRegistry::new(),
-            )),
-        )
+        NativeInstanceRuntimeHost::new(global_ctx)
     }
 
     #[cfg(feature = "web-client")]

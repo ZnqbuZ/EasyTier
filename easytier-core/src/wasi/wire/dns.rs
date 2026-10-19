@@ -7,14 +7,16 @@ const DNS_WIRE_VERSION: u8 = 1;
 
 pub(crate) fn encode_query(query: &DnsQuery) -> io::Result<Vec<u8>> {
     let host = query.host.as_bytes();
-    let netns = query
+    let net_ns = query
         .context
-        .netns
+        .net_ns
         .as_ref()
-        .map(|netns| netns.token().as_bytes());
+        .map(|net_ns| net_ns.host_reference())
+        .transpose()?
+        .map(str::as_bytes);
     let host_len = encoded_len("DNS host", host.len())?;
-    let netns_len = encoded_len("DNS netns token", netns.map_or(0, <[u8]>::len))?;
-    let mut encoded = Vec::with_capacity(16 + host.len() + netns.map_or(0, <[u8]>::len));
+    let net_ns_len = encoded_len("DNS netns token", net_ns.map_or(0, <[u8]>::len))?;
+    let mut encoded = Vec::with_capacity(16 + host.len() + net_ns.map_or(0, <[u8]>::len));
     encoded.push(DNS_WIRE_VERSION);
     encoded.push(match query.context.ip_version {
         IpVersion::V4 => 4,
@@ -23,10 +25,10 @@ pub(crate) fn encode_query(query: &DnsQuery) -> io::Result<Vec<u8>> {
     });
     encoded.push(u8::from(query.context.socket_mark.is_some()));
     encoded.extend_from_slice(&query.context.socket_mark.unwrap_or_default().to_be_bytes());
-    encoded.push(u8::from(netns.is_some()));
-    encoded.extend_from_slice(&netns_len.to_be_bytes());
-    if let Some(netns) = netns {
-        encoded.extend_from_slice(netns);
+    encoded.push(u8::from(net_ns.is_some()));
+    encoded.extend_from_slice(&net_ns_len.to_be_bytes());
+    if let Some(net_ns) = net_ns {
+        encoded.extend_from_slice(net_ns);
     }
     encoded.extend_from_slice(&host_len.to_be_bytes());
     encoded.extend_from_slice(host);
@@ -147,7 +149,7 @@ impl<'a> Decoder<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::socket::NetNamespace;
+    use crate::socket::NetNS;
     use crate::socket::SocketContext;
 
     #[test]
@@ -157,7 +159,7 @@ mod tests {
             SocketContext {
                 ip_version: IpVersion::V6,
                 socket_mark: Some(0x01020304),
-                netns: Some(NetNamespace::new("netns0")),
+                net_ns: Some(NetNS::from_host_reference("netns0")),
             },
         );
         let encoded = encode_query(&query).unwrap();
@@ -174,7 +176,7 @@ mod tests {
             SocketContext {
                 ip_version: IpVersion::V4,
                 socket_mark: None,
-                netns: None,
+                net_ns: None,
             },
         ))
         .unwrap();

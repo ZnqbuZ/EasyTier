@@ -11,7 +11,7 @@ use easytier_core::connectivity::hole_punch::port_mapping::{
     UdpPortMappingLifecycle, UdpPortMappingPlatform,
 };
 
-use crate::common::{netns::NetNS, upnp};
+use crate::common::{net_ns::NetNS, upnp};
 
 struct RuntimeUdpHolePunchPlatform {
     net_ns: NetNS,

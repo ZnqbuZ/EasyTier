@@ -633,7 +633,7 @@ mod tests {
                 SocketContext {
                     ip_version: IpVersion::V4,
                     socket_mark: Some(9),
-                    netns: None,
+                    net_ns: None,
                 }
             )]
         );
@@ -791,7 +791,7 @@ mod tests {
         let record_context = SocketContext {
             ip_version: IpVersion::V6,
             socket_mark: Some(17),
-            netns: None,
+            net_ns: None,
         };
         let resolver = CoreManualEndpointResolver::new(
             host,
@@ -903,7 +903,7 @@ mod tests {
                 SocketContext {
                     ip_version: IpVersion::V4,
                     socket_mark: Some(23),
-                    netns: None,
+                    net_ns: None,
                 }
             )]
         );

@@ -80,7 +80,7 @@ impl NativeTunRuntime {
                 }
                 nic_state.stop().await;
                 let closed = Arc::new(Notify::new());
-                let mut nic = NicCtx::new(
+                let nic = NicCtx::new(
                     global_ctx.clone(),
                     packet_plane.clone(),
                     receiver.clone(),
@@ -88,6 +88,15 @@ impl NativeTunRuntime {
                     shared_virtual_nic_registry.clone(),
                 )
                 .await;
+                let mut nic = match nic {
+                    Ok(nic) => nic,
+                    Err(error) => {
+                        if let Some(output) = output.take() {
+                            let _ = output.send(Err(error));
+                        }
+                        return;
+                    }
+                };
                 let result = tokio::select! {
                     biased;
                     _ = cancel.cancelled() => {
