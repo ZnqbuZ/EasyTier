@@ -1715,18 +1715,14 @@ mod tests {
         use easytier_core::process_runtime::CoreProcessRuntime;
 
         let process = CoreProcessRuntime::new();
-        let registry = TestInstance::new_shared_virtual_nic_registry();
+        let registry = TestInstance::current_shared_virtual_nic_registry();
         let new_instance = |config: TomlConfigLoader| {
             if let Some(dev_name) = dev_name {
                 let mut flags = config.get_flags();
                 flags.dev_name = dev_name.to_owned();
                 config.set_flags(flags);
             }
-            TestInstance::new_with_process_runtime_and_shared_virtual_nic_registry(
-                config,
-                process.clone(),
-                registry.clone(),
-            )
+            TestInstance::new_with_process_runtime(config, process.clone())
         };
         let config =
             TomlConfigLoader::new_from_str("ipv4 = \"198.18.26.1/30\"\nlisteners = []").unwrap();
@@ -1815,7 +1811,7 @@ mod tests {
 
         use super::{IfConfiger, NicBackend, VirtualNicConfig};
         use crate::{
-            common::{global_ctx::GlobalCtxEvent, ifcfg::IfConfiguerTrait, netns::NetNS},
+            common::{global_ctx::GlobalCtxEvent, ifcfg::IfConfiguerTrait},
             instance::{
                 composition::{NativeCoreInstance, runtime_core_host_adapters},
                 config::test_core_instance_config,
@@ -1823,27 +1819,30 @@ mod tests {
             },
         };
 
-        let namespace = format!("mobile-{}", uuid::Uuid::new_v4());
+        let net_ns = format!("mobile-{}", uuid::Uuid::new_v4());
         assert!(
             Command::new("ip")
-                .args(["netns", "add", &namespace])
+                .args(["netns", "add", &net_ns])
                 .status()
                 .unwrap()
                 .success()
         );
         guarden::defer! {
             let _ = Command::new("ip")
-                .args(["netns", "del", &namespace])
+                .args(["netns", "del", &net_ns])
                 .status();
         }
-        let net_ns = NetNS::new(Some(namespace.clone()));
+        let net_ns = crate::common::net_ns::tests::test_net_ns(Some(net_ns.clone()));
         // Avoid DAD probes and use an unowned source to test destination claims.
         {
-            let _guard = net_ns.guard();
-            std::fs::write("/proc/sys/net/ipv6/conf/default/accept_dad", "0").unwrap();
-            // Keep automatic link-local traffic out of the member packet streams.
-            std::fs::write("/proc/sys/net/ipv6/conf/default/addr_gen_mode", "1").unwrap();
-            let ifcfg = IfConfiger::default();
+            net_ns
+                .run(|| {
+                    std::fs::write("/proc/sys/net/ipv6/conf/default/accept_dad", "0").unwrap();
+                    // Keep automatic link-local traffic out of the member packet streams.
+                    std::fs::write("/proc/sys/net/ipv6/conf/default/addr_gen_mode", "1").unwrap();
+                })
+                .unwrap();
+            let ifcfg = IfConfiger::new(net_ns.clone());
             ifcfg.set_link_status("lo", true).await.unwrap();
             ifcfg
                 .add_ipv6_ip("lo", "fdff::1".parse().unwrap(), 128)
@@ -1889,12 +1888,13 @@ mod tests {
             net_ns
                 .run(|| IfConfiger::list_addresses(&ifname))
                 .unwrap()
+                .unwrap()
                 .contains(&"fd00::1/64".parse().unwrap())
         );
         // Linux completes IPv6 address activation asynchronously, even without DAD probes.
         tokio::time::timeout(Duration::from_secs(5), async {
             loop {
-                match net_ns.run(|| UdpSocket::bind("[fd00::1]:0")) {
+                match net_ns.run(|| UdpSocket::bind("[fd00::1]:0")).unwrap() {
                     Ok(_) => break,
                     Err(err) if err.kind() == std::io::ErrorKind::AddrNotAvailable => {
                         tokio::time::sleep(Duration::from_millis(10)).await;
@@ -1930,9 +1930,12 @@ mod tests {
                 loop {
                     // Do not race an updater's OS change and dispatcher publication.
                     let guard = shared_nic.lock().await;
-                    let sent = net_ns.run(|| {
-                        UdpSocket::bind((source, 0))?.send_to(b"mobile-ipv6", (destination, 12345))
-                    });
+                    let sent = net_ns
+                        .run(|| {
+                            UdpSocket::bind((source, 0))?
+                                .send_to(b"mobile-ipv6", (destination, 12345))
+                        })
+                        .unwrap();
                     drop(guard);
                     if sent.is_ok() {
                         break;

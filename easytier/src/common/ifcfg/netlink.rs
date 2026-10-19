@@ -614,6 +614,12 @@ impl IfConfiguerTrait for NetlinkIfConfiger {
 
 #[cfg(test)]
 mod tests {
+    impl super::NetlinkIfConfiger {
+        fn mtu(name: &str) -> Result<u32, super::Error> {
+            Self::mtu_op(name, nix::libc::SIOCGIFMTU, 0)
+        }
+    }
+
     use super::*;
     use std::process::Command;
 
@@ -698,7 +704,7 @@ mod tests {
     #[tokio::test]
     async fn addr_test() {
         let _prepare_env = PrepareEnv::new();
-        let ifcfg = NetlinkIfConfiger {};
+        let ifcfg = NetlinkIfConfiger::new(crate::common::net_ns::tests::test_net_ns(None));
         tokio::time::sleep(std::time::Duration::from_secs(1)).await;
         ifcfg
             .add_ipv4_ip(DUMMY_IFACE_NAME, "10.44.44.4".parse().unwrap(), 24)
@@ -741,7 +747,7 @@ mod tests {
         let _prepare_env = PrepareEnv::new();
         let ret = NetlinkIfConfiger::list_routes().unwrap();
 
-        let ifcfg = NetlinkIfConfiger {};
+        let ifcfg = NetlinkIfConfiger::new(crate::common::net_ns::tests::test_net_ns(None));
         println!("{:?}", ret);
 
         ifcfg.set_link_status(DUMMY_IFACE_NAME, true).await.unwrap();
@@ -775,7 +781,7 @@ mod tests {
     async fn remove_ipv4_route_with_source_hint_keeps_other_metric() {
         let iface = test_iface_name("rm");
         let _link = ScopedDummyLink::new(&iface);
-        let ifcfg = NetlinkIfConfiger {};
+        let ifcfg = NetlinkIfConfiger::new(crate::common::net_ns::tests::test_net_ns(None));
         let address = "10.231.1.1".parse().unwrap();
         let destination = "10.99.0.0".parse().unwrap();
 
@@ -885,7 +891,7 @@ mod tests {
     async fn ipv6_route_remove_test() {
         let iface = test_iface_name("rr");
         let _link = ScopedDummyLink::new(&iface);
-        let ifcfg = NetlinkIfConfiger {};
+        let ifcfg = NetlinkIfConfiger::new(crate::common::net_ns::tests::test_net_ns(None));
         let route_addr = "2001:db8:200::".parse::<std::net::Ipv6Addr>().unwrap();
 
         ifcfg

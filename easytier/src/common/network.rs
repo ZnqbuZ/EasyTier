@@ -595,15 +595,17 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[tokio::test]
-    async fn namespace_operation_does_not_migrate_between_os_threads() {
-        let (before, after) = run_in_namespace(NetNS::new(None), || async {
-            let before = std::thread::current().id();
-            tokio::task::yield_now().await;
-            (before, std::thread::current().id())
-        })
-        .await;
+    async fn bound_interface_query_does_not_change_the_callers_net_ns() {
+        let net_ns = crate::common::net_ns::current().unwrap();
+        let expected = net_ns.id();
+        assert!(!collect_interfaces(net_ns, false).await.is_empty());
+        assert_eq!(crate::common::net_ns::current().unwrap().id(), expected);
+    }
 
-        assert_eq!(before, after);
+    #[cfg(all(target_os = "linux", not(mobile)))]
+    #[test]
+    fn interface_classification_queries_the_current_net_ns_without_sysfs() {
+        assert!(!read_link_interfaces().unwrap().is_empty());
     }
 }
 

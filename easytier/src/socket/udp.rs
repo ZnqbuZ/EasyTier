@@ -413,8 +413,8 @@ mod tests {
                 ..BindConfig::default()
             }),
             UdpSessionAcceptKind::EasyTierMux,
-            NetNS::new(None),
-        );
+        )
+        .unwrap();
         listener.listen().await.unwrap();
 
         let receiver = UdpSocket::bind("127.0.0.1:0").await.unwrap();
@@ -451,8 +451,8 @@ mod tests {
                 ..BindConfig::default()
             }),
             UdpSessionAcceptKind::EasyTierMux,
-            NetNS::new(None),
-        );
+        )
+        .unwrap();
         listener.listen().await.unwrap();
 
         let receiver = UdpSocket::bind("[::]:0").await.unwrap();

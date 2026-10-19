@@ -208,7 +208,7 @@ fn context_variable_len(context: &SocketContext) -> io::Result<usize> {
 #[cfg(test)]
 mod tests {
     use crate::socket::BindConfig;
-    use crate::socket::NetNamespace;
+    use crate::socket::NetNS;
 
     use super::*;
 
@@ -304,12 +304,12 @@ mod tests {
     }
 
     #[test]
-    fn encodes_socket_context_netns_and_zero_mark() {
+    fn encodes_socket_context_net_ns_and_zero_mark() {
         let bind = BindConfig {
             context: SocketContext {
                 ip_version: IpVersion::V6,
                 socket_mark: Some(0),
-                netns: Some(NetNamespace::new("instance-a")),
+                net_ns: Some(NetNS::from_host_reference("instance-a")),
             },
             ..BindConfig::default()
         };

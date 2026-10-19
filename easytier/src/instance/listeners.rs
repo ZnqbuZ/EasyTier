@@ -207,7 +207,8 @@ mod tests {
 
     #[test]
     fn external_listener_capabilities_follow_native_build() {
-        let factory = RuntimeExternalListenerFactory;
+        let factory =
+            RuntimeExternalListenerFactory::new(crate::common::net_ns::current().unwrap());
 
         assert_eq!(
             factory.supports_scheme("faketcp"),

@@ -479,7 +479,7 @@ mod tests {
     #[ignore = "requires Administrator privileges and wintun.dll"]
     async fn test_interface_firewall_rules() {
         use crate::{
-            common::netns::NetNS,
+            common::net_ns::NetNS,
             instance::virtual_nic::{VirtualNic, VirtualNicConfig},
         };
         use windows::Win32::System::Ole::{
@@ -490,7 +490,7 @@ mod tests {
         let mut nic = VirtualNic::new(VirtualNicConfig::new(
             test_interface.to_owned(),
             1500,
-            NetNS::new(None),
+            crate::common::net_ns::tests::test_net_ns(None),
         ));
         let _tunnel = nic.create_dev().await.unwrap();
         guarden::defer! {

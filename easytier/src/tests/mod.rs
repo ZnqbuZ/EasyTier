@@ -63,7 +63,7 @@ pub fn get_host_veth_name(net_ns: &str) -> &str {
     Box::leak(format!("veth_{}_h", net_ns).into_boxed_str())
 }
 
-pub fn del_netns(name: &str) {
+pub fn del_net_ns(name: &str) {
     // del veth host
     let _ = std::process::Command::new("ip")
         .args(["link", "del", get_host_veth_name(name)])
@@ -90,7 +90,7 @@ fn run_network_command(program: &str, args: &[&str]) {
     );
 }
 
-pub fn create_netns(name: &str, ipv4: &str, ipv6: &str) {
+pub fn create_net_ns(name: &str, ipv4: &str, ipv6: &str) {
     // create netns
     run_network_command("ip", &["netns", "add", name]);
 
@@ -251,27 +251,31 @@ pub async fn drop_insts(insts: Vec<Instance>) {
     while set.join_next().await.is_some() {}
 }
 
-pub async fn ping_test(from_netns: &str, target_ip: &str, payload_size: Option<usize>) -> bool {
-    use crate::common::netns::{NetNS, ROOT_NETNS_NAME};
-    let _g = NetNS::new(Some(ROOT_NETNS_NAME.to_owned())).guard();
-    let code = tokio::process::Command::new("ip")
-        .args([
-            "netns",
-            "exec",
-            from_netns,
-            "ping",
-            "-c",
-            "1",
-            "-s",
-            payload_size.unwrap_or(56).to_string().as_str(),
-            "-W",
-            "1",
-            target_ip.to_string().as_str(),
-        ])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .await
+pub async fn ping_test(from_net_ns: &str, target_ip: &str, payload_size: Option<usize>) -> bool {
+    use crate::common::net_ns::ROOT_NET_NS_NAME;
+    let net_ns = crate::common::net_ns::tests::test_net_ns(Some(ROOT_NET_NS_NAME.to_owned()));
+    let mut child = net_ns
+        .run(|| {
+            tokio::process::Command::new("ip")
+                .args([
+                    "netns",
+                    "exec",
+                    from_net_ns,
+                    "ping",
+                    "-c",
+                    "1",
+                    "-s",
+                    payload_size.unwrap_or(56).to_string().as_str(),
+                    "-W",
+                    "1",
+                    target_ip.to_string().as_str(),
+                ])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+        })
+        .unwrap()
         .unwrap();
+    let code = child.wait().await.unwrap();
     code.code().unwrap() == 0
 }

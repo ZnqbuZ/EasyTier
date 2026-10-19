@@ -537,8 +537,11 @@ mod tests {
                 }
             }
 
-            let mut listener =
-                FakeTcpSocketListener::new("faketcp://0.0.0.0:31011".parse().unwrap());
+            let mut listener = FakeTcpSocketListener::new(
+                "faketcp://0.0.0.0:31011".parse().unwrap(),
+                crate::common::net_ns::tests::test_net_ns(None).clone(),
+                SocketContext::default(),
+            );
             listener.listen().await.unwrap();
             let (server_ready_tx, server_ready_rx) = tokio::sync::oneshot::channel();
 
@@ -551,10 +554,13 @@ mod tests {
                 socket.write_all(b"pong").await.unwrap();
             });
 
-            let mut socket =
-                connect_socket("127.0.0.1:31011".parse().unwrap(), None, NetNS::new(None))
-                    .await
-                    .unwrap();
+            let mut socket = connect_socket(
+                "127.0.0.1:31011".parse().unwrap(),
+                None,
+                crate::common::net_ns::tests::test_net_ns(None).clone(),
+            )
+            .await
+            .unwrap();
             server_ready_rx.await.unwrap();
             socket.write_all(b"ping").await.unwrap();
             let mut response = [0; 4];

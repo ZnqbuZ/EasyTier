@@ -197,13 +197,7 @@ mod tests {
     };
 
     fn runtime_host(global_ctx: ArcGlobalCtx) -> Arc<NativeInstanceRuntimeHost> {
-        NativeInstanceRuntimeHost::new(
-            global_ctx,
-            #[cfg(feature = "tun")]
-            Arc::new(tokio::sync::Mutex::new(
-                crate::instance::shared_virtual_nic::SharedVirtualNicRegistry::new(),
-            )),
-        )
+        NativeInstanceRuntimeHost::new(global_ctx)
     }
 
     #[cfg(feature = "web-client")]

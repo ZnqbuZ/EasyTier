@@ -3,12 +3,12 @@ use std::{net::Ipv4Addr, process::Command, sync::Arc, time::Duration};
 use easytier_core::{config::PeerId, process_runtime::CoreProcessRuntime};
 
 use super::{
-    InstanceTestExt as _, create_netns, del_netns, drop_insts, network::TestNetwork, ping_test,
+    InstanceTestExt as _, create_net_ns, del_net_ns, drop_insts, network::TestNetwork, ping_test,
 };
 use crate::{
     common::{
         config::{ConfigLoader, NetworkIdentity, TomlConfigLoader},
-        netns::{NetNS, ROOT_NETNS_NAME},
+        net_ns::ROOT_NET_NS_NAME,
     },
     instance::{
         shared_virtual_nic::{ArcSharedVirtualNicRegistry, SharedIpv4Route},
@@ -23,23 +23,17 @@ const WAIT: Duration = Duration::from_secs(10);
 #[derive(Clone)]
 struct SharedTestRuntime {
     process: Arc<CoreProcessRuntime>,
-    registry: ArcSharedVirtualNicRegistry,
 }
 
 impl SharedTestRuntime {
     fn new() -> Self {
         Self {
             process: CoreProcessRuntime::new(),
-            registry: Instance::new_shared_virtual_nic_registry(),
         }
     }
 
     fn instance(&self, config: TomlConfigLoader) -> Instance {
-        Instance::new_with_process_runtime_and_shared_virtual_nic_registry(
-            config,
-            self.process.clone(),
-            self.registry.clone(),
-        )
+        Instance::new_with_process_runtime(config, self.process.clone())
     }
 }
 
@@ -47,7 +41,7 @@ fn test_config(
     instance_name: &str,
     network_name: &str,
     network_secret: &str,
-    netns: Option<&str>,
+    net_ns: Option<&str>,
     dev_name: Option<&str>,
     ipv4: &str,
 ) -> TomlConfigLoader {
@@ -57,7 +51,7 @@ fn test_config(
         network_name.to_owned(),
         network_secret.to_owned(),
     ));
-    config.set_netns(netns.map(str::to_owned));
+    config.set_net_ns(net_ns.map(str::to_owned));
     config.set_ipv4(Some(ipv4.parse().unwrap()));
     config.set_ipv6(None);
     config.set_dhcp(false);
@@ -79,22 +73,22 @@ fn short_name(prefix: &str) -> String {
     format!("{prefix}{:04x}", rand::random::<u16>())
 }
 
-struct TestNetnsGuard {
+struct TestNetNSGuard {
     name: String,
 }
 
-impl TestNetnsGuard {
+impl TestNetNSGuard {
     fn new(name: String, ipv4: &str, ipv6: &str) -> Self {
         let guard = Self { name };
-        del_netns(&guard.name);
-        create_netns(&guard.name, ipv4, ipv6);
+        del_net_ns(&guard.name);
+        create_net_ns(&guard.name, ipv4, ipv6);
         guard
     }
 }
 
-impl Drop for TestNetnsGuard {
+impl Drop for TestNetNSGuard {
     fn drop(&mut self) {
-        del_netns(&self.name);
+        del_net_ns(&self.name);
     }
 }
 
@@ -105,9 +99,9 @@ struct ProxyLab {
 impl ProxyLab {
     fn new() -> Self {
         let mut network = TestNetwork::new();
-        network.create_namespace("source", "10.1.1.1/24", "fd11::1/64");
-        network.create_namespace("owner", "10.1.2.3/24", "fd12::3/64");
-        network.create_namespace("target", "10.1.2.4/24", "fd12::4/64");
+        network.create_net_ns("source", "10.1.1.1/24", "fd11::1/64");
+        network.create_net_ns("owner", "10.1.2.3/24", "fd12::3/64");
+        network.create_net_ns("target", "10.1.2.4/24", "fd12::4/64");
         network.create_bridge("bridge");
         network.add_to_bridge("bridge", "owner");
         network.add_to_bridge("bridge", "target");
@@ -162,36 +156,42 @@ async fn wait_proxy_route_absent(instance: &Instance, peer_id: PeerId, proxy_cid
 }
 
 fn ipv4_route_exists_in_ns(ns: &str, needle: &str) -> bool {
-    let _root = NetNS::new(Some(ROOT_NETNS_NAME.to_owned())).guard();
-    let output = Command::new("ip")
-        .args(["netns", "exec", ns, "ip", "route", "show"])
-        .output()
-        .unwrap();
-    assert!(
-        output.status.success(),
-        "failed to list IPv4 routes in {ns}: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .any(|line| line.contains(needle))
+    crate::common::net_ns::tests::test_net_ns(Some(ROOT_NET_NS_NAME.to_owned()))
+        .run(|| {
+            let output = Command::new("ip")
+                .args(["netns", "exec", ns, "ip", "route", "show"])
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "failed to list IPv4 routes in {ns}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            String::from_utf8_lossy(&output.stdout)
+                .lines()
+                .any(|line| line.contains(needle))
+        })
+        .unwrap()
 }
 
 fn tun_ifindex(ns: &str, dev_name: &str) -> Option<u64> {
-    let _root = NetNS::new(Some(ROOT_NETNS_NAME.to_owned())).guard();
-    let mut command = Command::new("ip");
-    if ns != ROOT_NETNS_NAME {
-        command.args(["-n", ns]);
-    }
-    let output = command
-        .args(["-j", "link", "show", "dev", dev_name])
-        .output()
-        .unwrap();
-    if !output.status.success() {
-        return None;
-    }
-    let links: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-    links[0]["ifindex"].as_u64()
+    crate::common::net_ns::tests::test_net_ns(Some(ROOT_NET_NS_NAME.to_owned()))
+        .run(|| {
+            let mut command = Command::new("ip");
+            if ns != ROOT_NET_NS_NAME {
+                command.args(["-n", ns]);
+            }
+            let output = command
+                .args(["-j", "link", "show", "dev", dev_name])
+                .output()
+                .unwrap();
+            if !output.status.success() {
+                return None;
+            }
+            let links: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+            links[0]["ifindex"].as_u64()
+        })
+        .unwrap()
 }
 
 #[cfg(feature = "proxy-cidr-monitor")]
@@ -238,10 +238,15 @@ async fn failed_claim_update_closes_all_members_and_allows_recreation() {
     };
     use tokio::sync::Notify;
 
-    let netns = TestNetnsGuard::new(short_name("svf"), "10.233.1.2/24", "fd43::2/64");
+    let net_ns = TestNetNSGuard::new(short_name("svf"), "10.233.1.2/24", "fd43::2/64");
     let dev_name = test_dev_name();
-    let config =
-        || VirtualNicConfig::new(dev_name.clone(), 1400, NetNS::new(Some(netns.name.clone())));
+    let config = || {
+        VirtualNicConfig::new(
+            dev_name.clone(),
+            1400,
+            crate::common::net_ns::tests::test_net_ns(Some(net_ns.name.clone())),
+        )
+    };
     let mut registry = SharedVirtualNicRegistry::new();
     let first_closed = Arc::new(Notify::new());
     let second_closed = Arc::new(Notify::new());
@@ -266,7 +271,7 @@ async fn failed_claim_update_closes_all_members_and_allows_recreation() {
         .unwrap();
     let destination = "10.233.90.0".parse().unwrap();
     first.add_route(destination, 24).await.unwrap();
-    assert!(ipv4_route_exists_in_ns(&netns.name, "10.233.90.0/24"));
+    assert!(ipv4_route_exists_in_ns(&net_ns.name, "10.233.90.0/24"));
 
     // An externally configured, better source makes the address add fail only
     // after the existing route has been removed to update its preferred source.
@@ -274,7 +279,7 @@ async fn failed_claim_update_closes_all_members_and_allows_recreation() {
         .args([
             "netns",
             "exec",
-            &netns.name,
+            &net_ns.name,
             "ip",
             "addr",
             "add",
@@ -322,14 +327,14 @@ async fn failed_claim_update_closes_all_members_and_allows_recreation() {
         .unwrap();
     replacement.add_route(destination, 24).await.unwrap();
     assert!(ipv4_route_exists_in_ns(
-        &netns.name,
+        &net_ns.name,
         &format!("10.233.90.0/24 dev {dev_name} proto static src 10.233.97.1")
     ));
 
     drop((first_tunnel, second_tunnel, replacement_tunnel));
     drop((first, second, replacement));
     wait_for_condition(
-        || async { !ipv4_route_exists_in_ns(&netns.name, "10.233.90.0/24") },
+        || async { !ipv4_route_exists_in_ns(&net_ns.name, "10.233.90.0/24") },
         WAIT,
     )
     .await;
@@ -342,8 +347,8 @@ async fn shared_tun_survives_creator_executor_shutdown() {
     use crate::instance::factory::native_instance_manager_with_runtime;
     use easytier_core::instance::manager::ConfigFileControl;
 
-    let local_ns = TestNetnsGuard::new(short_name("sve"), "10.234.1.2/24", "fd44::2/64");
-    let peer_ns = TestNetnsGuard::new(short_name("svp"), "10.234.2.2/24", "fd45::2/64");
+    let local_ns = TestNetNSGuard::new(short_name("sve"), "10.234.1.2/24", "fd44::2/64");
+    let peer_ns = TestNetNSGuard::new(short_name("svp"), "10.234.2.2/24", "fd45::2/64");
     let dev_name = test_dev_name();
     let peer_dev = test_dev_name();
     let manager = native_instance_manager_with_runtime(tokio::runtime::Handle::current());
@@ -412,8 +417,9 @@ async fn shared_tun_survives_creator_executor_shutdown() {
     .await;
 
     let bind = |ns: &str, address: &str| {
-        let socket =
-            NetNS::new(Some(ns.to_owned())).run(|| std::net::UdpSocket::bind(address).unwrap());
+        let socket = crate::common::net_ns::tests::test_net_ns(Some(ns.to_owned()))
+            .run(|| std::net::UdpSocket::bind(address).unwrap())
+            .unwrap();
         socket.set_nonblocking(true).unwrap();
         tokio::net::UdpSocket::from_std(socket).unwrap()
     };
@@ -477,10 +483,15 @@ fn shared_tun_claim_cleanup_outlives_member_runtime() {
     };
     use tokio::{runtime::Builder, sync::Notify};
 
-    let netns = TestNetnsGuard::new(short_name("svc"), "10.235.1.2/24", "fd46::2/64");
+    let net_ns = TestNetNSGuard::new(short_name("svc"), "10.235.1.2/24", "fd46::2/64");
     let dev_name = test_dev_name();
-    let config =
-        || VirtualNicConfig::new(dev_name.clone(), 1400, NetNS::new(Some(netns.name.clone())));
+    let config = || {
+        VirtualNicConfig::new(
+            dev_name.clone(),
+            1400,
+            crate::common::net_ns::tests::test_net_ns(Some(net_ns.name.clone())),
+        )
+    };
     let mut registry = SharedVirtualNicRegistry::new();
     let first = registry.create_member(
         dev_name.clone(),
@@ -517,8 +528,8 @@ fn shared_tun_claim_cleanup_outlives_member_runtime() {
             .unwrap();
         tunnel
     });
-    assert!(ipv4_route_exists_in_ns(&netns.name, "10.245.90.0/24"));
-    let original_index = tun_ifindex(&netns.name, &dev_name).unwrap();
+    assert!(ipv4_route_exists_in_ns(&net_ns.name, "10.245.90.0/24"));
+    let original_index = tun_ifindex(&net_ns.name, &dev_name).unwrap();
     let shared_nic = first.shared_nic();
     let guard = observer_runtime.block_on(shared_nic.lock());
     member_runtime.block_on(async {
@@ -531,11 +542,11 @@ fn shared_tun_claim_cleanup_outlives_member_runtime() {
 
     observer_runtime.block_on(async {
         wait_for_condition(
-            || async { !ipv4_route_exists_in_ns(&netns.name, "10.245.90.0/24") },
+            || async { !ipv4_route_exists_in_ns(&net_ns.name, "10.245.90.0/24") },
             WAIT,
         )
         .await;
-        assert_eq!(tun_ifindex(&netns.name, &dev_name), Some(original_index));
+        assert_eq!(tun_ifindex(&net_ns.name, &dev_name), Some(original_index));
         // Reusing the departed member's address also proves its claims were released.
         second
             .add_ip("10.245.1.1".parse().unwrap(), 24)
@@ -545,7 +556,7 @@ fn shared_tun_claim_cleanup_outlives_member_runtime() {
     // The final registration can be dropped without any entered Tokio runtime.
     drop((second_tunnel, second));
     observer_runtime.block_on(wait_for_condition(
-        || async { tun_ifindex(&netns.name, &dev_name).is_none() },
+        || async { tun_ifindex(&net_ns.name, &dev_name).is_none() },
         WAIT,
     ));
 }
@@ -554,17 +565,17 @@ fn shared_tun_claim_cleanup_outlives_member_runtime() {
 #[case::static_ipv4(false)]
 #[case::with_dhcpv6(true)]
 #[tokio::test]
-async fn same_namespace_members_share_tun_across_independent_networks(#[case] dhcpv6: bool) {
+async fn same_net_ns_members_share_tun_across_independent_networks(#[case] dhcpv6: bool) {
     let dev_name = test_dev_name();
     let mut network = TestNetwork::new();
     // Nextest runs each case in its own process, so their shared TUNs must
     // also have separate namespaces to avoid competing routes for the same IPs.
-    network.create_empty_namespace("shared");
-    network.create_namespace("first_peer", "10.231.1.2/24", "fd31::2/64");
-    network.create_namespace("second_peer", "10.231.2.2/24", "fd32::2/64");
-    let shared_ns = network.namespace("shared");
-    let first_peer_ns = network.namespace("first_peer");
-    let second_peer_ns = network.namespace("second_peer");
+    network.create_empty_net_ns("shared");
+    network.create_net_ns("first_peer", "10.231.1.2/24", "fd31::2/64");
+    network.create_net_ns("second_peer", "10.231.2.2/24", "fd32::2/64");
+    let shared_ns = network.net_ns("shared");
+    let first_peer_ns = network.net_ns("first_peer");
+    let second_peer_ns = network.net_ns("second_peer");
     let runtime = SharedTestRuntime::new();
 
     let first_config = test_config(
@@ -716,7 +727,7 @@ async fn runtime_proxy_patch_adds_and_removes_os_route() {
         "shared_patch_source",
         "shared_patch_network",
         "shared_patch_secret",
-        Some(lab.network.namespace("source")),
+        Some(lab.network.net_ns("source")),
         Some(&source_dev),
         "10.144.244.1/24",
     ));
@@ -724,7 +735,7 @@ async fn runtime_proxy_patch_adds_and_removes_os_route() {
         "shared_patch_destination",
         "shared_patch_network",
         "shared_patch_secret",
-        Some(lab.network.namespace("owner")),
+        Some(lab.network.net_ns("owner")),
         Some(&destination_dev),
         "10.144.244.2/24",
     ));
@@ -747,7 +758,7 @@ async fn runtime_proxy_patch_adds_and_removes_os_route() {
     )
     .await;
     assert!(!ipv4_route_exists_in_ns(
-        lab.network.namespace("source"),
+        lab.network.net_ns("source"),
         &format!("{PROXY_CIDR} dev {source_dev}")
     ));
 
@@ -756,7 +767,7 @@ async fn runtime_proxy_patch_adds_and_removes_os_route() {
     wait_for_condition(
         || async {
             ipv4_route_exists_in_ns(
-                lab.network.namespace("source"),
+                lab.network.net_ns("source"),
                 &format!("{PROXY_CIDR} dev {source_dev}"),
             )
         },
@@ -769,7 +780,7 @@ async fn runtime_proxy_patch_adds_and_removes_os_route() {
     wait_for_condition(
         || async {
             !ipv4_route_exists_in_ns(
-                lab.network.namespace("source"),
+                lab.network.net_ns("source"),
                 &format!("{PROXY_CIDR} dev {source_dev}"),
             )
         },
@@ -805,12 +816,14 @@ async fn wait_shared_magic_dns_record(
         || async {
             // Let the kernel select the source from the shared route, rather
             // than binding to the server and hiding a client-owned route.
-            let Ok(socket) = NetNS::new(Some(ns.to_owned())).run(|| {
-                let socket = std::net::UdpSocket::bind("0.0.0.0:0")?;
-                socket.connect((MAGIC_DNS_FAKE_IP, 53))?;
-                socket.set_nonblocking(true)?;
-                tokio::net::UdpSocket::from_std(socket)
-            }) else {
+            let Ok(Ok(socket)) = crate::common::net_ns::tests::test_net_ns(Some(ns.to_owned()))
+                .run(|| {
+                    let socket = std::net::UdpSocket::bind("0.0.0.0:0")?;
+                    socket.connect((MAGIC_DNS_FAKE_IP, 53))?;
+                    socket.set_nonblocking(true)?;
+                    tokio::net::UdpSocket::from_std(socket)
+                })
+            else {
                 return false;
             };
             let source = socket.local_addr().unwrap().ip();
@@ -842,14 +855,14 @@ async fn wait_shared_magic_dns_record(
 async fn magic_dns_route_follows_serving_member_and_takeover() {
     use crate::instance::dns_server::MAGIC_DNS_FAKE_IP;
 
-    let netns = TestNetnsGuard::new(short_name("svd"), "10.232.1.2/24", "fd42::2/64");
+    let net_ns = TestNetNSGuard::new(short_name("svd"), "10.232.1.2/24", "fd42::2/64");
     let dev_name = test_dev_name();
     let runtime = SharedTestRuntime::new();
     let first_config = test_config(
         "shared_dns_first",
         "shared_dns_network",
         "shared_dns_secret",
-        Some(&netns.name),
+        Some(&net_ns.name),
         Some(&dev_name),
         "10.144.243.1/24",
     );
@@ -864,7 +877,7 @@ async fn magic_dns_route_follows_serving_member_and_takeover() {
         "shared_dns_second",
         "shared_dns_network",
         "shared_dns_secret",
-        Some(&netns.name),
+        Some(&net_ns.name),
         Some(&dev_name),
         "10.144.242.2/24",
     );
@@ -877,7 +890,7 @@ async fn magic_dns_route_follows_serving_member_and_takeover() {
     first.run().await.unwrap();
     wait_tun_ready(&first, &dev_name).await;
     wait_shared_magic_dns_record(
-        &netns.name,
+        &net_ns.name,
         "shared-dns-first.et.net.",
         "10.144.243.1",
         "10.144.243.1",
@@ -889,7 +902,7 @@ async fn magic_dns_route_follows_serving_member_and_takeover() {
     // Resolving the second member also waits for its client to connect and
     // publish, ensuring its failed server election has already completed.
     wait_shared_magic_dns_record(
-        &netns.name,
+        &net_ns.name,
         "shared-dns-second.et.net.",
         "10.144.243.1",
         "10.144.242.2",
@@ -897,20 +910,38 @@ async fn magic_dns_route_follows_serving_member_and_takeover() {
     .await;
     let route = SharedIpv4Route::new(MAGIC_DNS_FAKE_IP.parse::<Ipv4Addr>().unwrap(), 32, None);
     assert_eq!(
-        shared_route_owner_count(&runtime.registry, &dev_name, &route).await,
+        shared_route_owner_count(
+            &crate::host_runtime::net_ns_services(
+                &crate::common::net_ns::open(&net_ns.name).unwrap()
+            )
+            .unwrap()
+            .nics,
+            &dev_name,
+            &route
+        )
+        .await,
         1
     );
 
     drop_insts(vec![first]).await;
     wait_shared_magic_dns_record(
-        &netns.name,
+        &net_ns.name,
         "shared-dns-second.et.net.",
         "10.144.242.2",
         "10.144.242.2",
     )
     .await;
     assert_eq!(
-        shared_route_owner_count(&runtime.registry, &dev_name, &route).await,
+        shared_route_owner_count(
+            &crate::host_runtime::net_ns_services(
+                &crate::common::net_ns::open(&net_ns.name).unwrap()
+            )
+            .unwrap()
+            .nics,
+            &dev_name,
+            &route
+        )
+        .await,
         1
     );
 
@@ -920,7 +951,7 @@ async fn magic_dns_route_follows_serving_member_and_takeover() {
         "shared_dns_observer",
         "shared_dns_network",
         "shared_dns_secret",
-        Some(&netns.name),
+        Some(&net_ns.name),
         Some(&dev_name),
         "10.144.244.3/24",
     ));
@@ -930,9 +961,19 @@ async fn magic_dns_route_follows_serving_member_and_takeover() {
     drop_insts(vec![second]).await;
     wait_for_condition(
         || async {
-            shared_route_owner_count(&runtime.registry, &dev_name, &route).await == 0
+            shared_route_owner_count(
+                &crate::host_runtime::net_ns_services(
+                    &crate::common::net_ns::open(&net_ns.name).unwrap(),
+                )
+                .unwrap()
+                .nics,
+                &dev_name,
+                &route,
+            )
+            .await
+                == 0
                 && !ipv4_route_exists_in_ns(
-                    &netns.name,
+                    &net_ns.name,
                     &format!("{MAGIC_DNS_FAKE_IP} dev {dev_name}"),
                 )
         },

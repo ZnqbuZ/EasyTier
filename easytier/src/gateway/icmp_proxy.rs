@@ -163,7 +163,7 @@ mod tests {
                 let mut sockets = Vec::new();
                 for _ in 0..30 {
                     sockets.push(
-                        RuntimeIcmpProxyHost
+                        RuntimeIcmpProxyHost::new(crate::common::net_ns::tests::test_net_ns(None))
                             .open_icmp_v4(SocketContext::default())
                             .await
                             .unwrap(),

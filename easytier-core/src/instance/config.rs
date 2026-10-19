@@ -435,6 +435,36 @@ impl CoreInstanceConfig {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn bound_net_ns_is_runtime_context_and_preserves_the_configured_name() {
+        use super::*;
+        let config = TomlConfig::default();
+        config.set_net_ns(Some("configured-namespace".to_owned()));
+        let token = NetNS::from_host_reference("opaque-host-domain");
+        let host = CoreInstanceHostConfig {
+            net_ns: Some(token.clone()),
+            ..Default::default()
+        };
+        let parsed = CoreInstanceConfig::from_toml_with_host(&config, &host).unwrap();
+        assert_eq!(
+            parsed.connectivity.manual.tcp_bind.context.net_ns,
+            Some(token.clone())
+        );
+        assert_eq!(
+            parsed.connectivity.direct.udp_bind.context.net_ns,
+            Some(token.clone())
+        );
+        assert_eq!(
+            parsed
+                .connectivity
+                .endpoint_discovery
+                .dns_record_context
+                .net_ns,
+            Some(token)
+        );
+        assert_eq!(config.get_net_ns().as_deref(), Some("configured-namespace"));
+    }
+
     use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 
     use super::*;

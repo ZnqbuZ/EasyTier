@@ -121,4 +121,19 @@ impl NetNSBackend for PlatformNetNS {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
 
+    #[test]
+    fn rejects_wrong_net_ns_type_and_path_names() {
+        let error = PlatformNetNS::at(Path::new("/proc/thread-self/ns/mnt")).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        for name in ["", ".", "..", "/tmp/test", "a/b"] {
+            assert_eq!(
+                PlatformNetNS::open(name).unwrap_err().kind(),
+                io::ErrorKind::InvalidInput
+            );
+        }
+    }
+}
