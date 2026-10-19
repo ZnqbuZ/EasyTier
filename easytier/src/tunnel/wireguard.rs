@@ -8,7 +8,6 @@ use std::{
 
 use quanta::Instant;
 
-use super::FromUrl;
 use crate::{
     common::{netns::NetNS, shrink_dashmap},
     proto::common::TunnelInfo,
@@ -27,7 +26,7 @@ use crossbeam::atomic::AtomicCell;
 use dashmap::DashMap;
 use easytier_core::socket::{BindConfig, SocketContext};
 use easytier_core::tunnel::ring::create_ring_tunnel_pair;
-use easytier_core::tunnel::{IpVersion, Tunnel, TunnelError, ZCPacketSink, ZCPacketStream};
+use easytier_core::tunnel::{Tunnel, TunnelError, ZCPacketSink, ZCPacketStream};
 use easytier_core::{
     connectivity::transport::ConnectedUdpSession,
     packet::{PEER_MANAGER_HEADER_SIZE, WG_TUNNEL_HEADER_SIZE, ZCPacket, ZCPacketType},
@@ -519,6 +518,7 @@ type ConnSender = tokio::sync::mpsc::UnboundedSender<Box<dyn Tunnel>>;
 type ConnReceiver = tokio::sync::mpsc::UnboundedReceiver<Box<dyn Tunnel>>;
 
 pub struct WgTunnelListener {
+    namespace: std::io::Result<NetNS>,
     addr: url::Url,
     session_listener: Option<Arc<RuntimeUdpSessionSocketListener>>,
     socket_mark: Option<u32>,
@@ -546,6 +546,7 @@ impl WgTunnelListener {
     pub fn new(addr: url::Url, config: WgConfig) -> Self {
         let (conn_send, conn_recv) = unbounded_channel();
         WgTunnelListener {
+            namespace: crate::common::netns::current(),
             addr,
             session_listener: None,
             socket_mark: None,
@@ -645,8 +646,27 @@ impl WgTunnelListener {
             return Ok(());
         }
 
-        let local_addr = SocketAddr::from_url(self.addr.clone(), IpVersion::Both).await?;
+        let namespace = self
+            .namespace
+            .as_ref()
+            .map_err(|error| TunnelError::InternalError(error.to_string()))?;
+        let context = SocketContext {
+            socket_mark: self.socket_mark,
+            ..SocketContext::default()
+        };
+        let local_addr = crate::common::dns::socket_addrs_in_namespace(
+            &self.addr,
+            11010,
+            namespace.clone(),
+            context.clone(),
+        )
+        .await
+        .map_err(|error| TunnelError::Anyhow(error.into()))?
+        .into_iter()
+        .next()
+        .ok_or_else(|| TunnelError::InvalidAddr(self.addr.to_string()))?;
         let bind = BindConfig {
+            namespace: Some(namespace.clone()),
             local_addr: Some(local_addr),
             context: SocketContext {
                 socket_mark: self.socket_mark,
@@ -660,8 +680,7 @@ impl WgTunnelListener {
             self.addr.clone(),
             UdpSessionListenRequest::new(bind),
             UdpSessionAcceptKind::Classified(UdpSessionProtocol::WireGuard),
-            NetNS::new(None),
-        );
+        )?;
         easytier_core::socket::SocketListener::listen(&mut session_listener).await?;
         let session_listener = Arc::new(session_listener);
 

@@ -680,8 +680,8 @@ mod tests {
     use futures::{SinkExt, StreamExt};
 
     use crate::{
-        common::netns::NetNS, host_runtime::native_host_runtime,
-        socket::udp::new_runtime_udp_session_listener, tunnel::tests::_tunnel_echo_server,
+        host_runtime::native_host_runtime, socket::udp::new_runtime_udp_session_listener,
+        tunnel::tests::_tunnel_echo_server,
     };
 
     use super::*;
@@ -702,8 +702,8 @@ mod tests {
                     },
                 ),
                 UdpSessionAcceptKind::Classified(UdpSessionProtocol::Quic),
-                NetNS::new(None),
-            );
+            )
+            .unwrap();
             listener.listen().await.unwrap();
             let remote_addr = listener.bound_socket().unwrap().local_addr().unwrap();
             let local_url = listener.local_url();

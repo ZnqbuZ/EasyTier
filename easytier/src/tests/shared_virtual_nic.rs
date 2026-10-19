@@ -8,7 +8,7 @@ use super::{
 use crate::{
     common::{
         config::{ConfigLoader, NetworkIdentity, TomlConfigLoader},
-        netns::{NetNS, ROOT_NETNS_NAME},
+        netns::ROOT_NETNS_NAME,
     },
     instance::{
         shared_virtual_nic::{ArcSharedVirtualNicRegistry, SharedIpv4Route},
@@ -23,23 +23,17 @@ const WAIT: Duration = Duration::from_secs(10);
 #[derive(Clone)]
 struct SharedTestRuntime {
     process: Arc<CoreProcessRuntime>,
-    registry: ArcSharedVirtualNicRegistry,
 }
 
 impl SharedTestRuntime {
     fn new() -> Self {
         Self {
             process: CoreProcessRuntime::new(),
-            registry: Instance::new_shared_virtual_nic_registry(),
         }
     }
 
     fn instance(&self, config: TomlConfigLoader) -> Instance {
-        Instance::new_with_process_runtime_and_shared_virtual_nic_registry(
-            config,
-            self.process.clone(),
-            self.registry.clone(),
-        )
+        Instance::new_with_process_runtime(config, self.process.clone())
     }
 }
 
@@ -162,36 +156,42 @@ async fn wait_proxy_route_absent(instance: &Instance, peer_id: PeerId, proxy_cid
 }
 
 fn ipv4_route_exists_in_ns(ns: &str, needle: &str) -> bool {
-    let _root = NetNS::new(Some(ROOT_NETNS_NAME.to_owned())).guard();
-    let output = Command::new("ip")
-        .args(["netns", "exec", ns, "ip", "route", "show"])
-        .output()
-        .unwrap();
-    assert!(
-        output.status.success(),
-        "failed to list IPv4 routes in {ns}: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .any(|line| line.contains(needle))
+    crate::common::netns::tests::test_namespace(Some(ROOT_NETNS_NAME.to_owned()))
+        .run(|| {
+            let output = Command::new("ip")
+                .args(["netns", "exec", ns, "ip", "route", "show"])
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "failed to list IPv4 routes in {ns}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            String::from_utf8_lossy(&output.stdout)
+                .lines()
+                .any(|line| line.contains(needle))
+        })
+        .unwrap()
 }
 
 fn tun_ifindex(ns: &str, dev_name: &str) -> Option<u64> {
-    let _root = NetNS::new(Some(ROOT_NETNS_NAME.to_owned())).guard();
-    let mut command = Command::new("ip");
-    if ns != ROOT_NETNS_NAME {
-        command.args(["-n", ns]);
-    }
-    let output = command
-        .args(["-j", "link", "show", "dev", dev_name])
-        .output()
-        .unwrap();
-    if !output.status.success() {
-        return None;
-    }
-    let links: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-    links[0]["ifindex"].as_u64()
+    crate::common::netns::tests::test_namespace(Some(ROOT_NETNS_NAME.to_owned()))
+        .run(|| {
+            let mut command = Command::new("ip");
+            if ns != ROOT_NETNS_NAME {
+                command.args(["-n", ns]);
+            }
+            let output = command
+                .args(["-j", "link", "show", "dev", dev_name])
+                .output()
+                .unwrap();
+            if !output.status.success() {
+                return None;
+            }
+            let links: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+            links[0]["ifindex"].as_u64()
+        })
+        .unwrap()
 }
 
 #[cfg(feature = "proxy-cidr-monitor")]
@@ -240,8 +240,13 @@ async fn failed_claim_update_closes_all_members_and_allows_recreation() {
 
     let netns = TestNetnsGuard::new(short_name("svf"), "10.233.1.2/24", "fd43::2/64");
     let dev_name = test_dev_name();
-    let config =
-        || VirtualNicConfig::new(dev_name.clone(), 1400, NetNS::new(Some(netns.name.clone())));
+    let config = || {
+        VirtualNicConfig::new(
+            dev_name.clone(),
+            1400,
+            crate::common::netns::tests::test_namespace(Some(netns.name.clone())),
+        )
+    };
     let mut registry = SharedVirtualNicRegistry::new();
     let first_closed = Arc::new(Notify::new());
     let second_closed = Arc::new(Notify::new());
@@ -412,8 +417,9 @@ async fn shared_tun_survives_creator_executor_shutdown() {
     .await;
 
     let bind = |ns: &str, address: &str| {
-        let socket =
-            NetNS::new(Some(ns.to_owned())).run(|| std::net::UdpSocket::bind(address).unwrap());
+        let socket = crate::common::netns::tests::test_namespace(Some(ns.to_owned()))
+            .run(|| std::net::UdpSocket::bind(address).unwrap())
+            .unwrap();
         socket.set_nonblocking(true).unwrap();
         tokio::net::UdpSocket::from_std(socket).unwrap()
     };
@@ -479,8 +485,13 @@ fn shared_tun_claim_cleanup_outlives_member_runtime() {
 
     let netns = TestNetnsGuard::new(short_name("svc"), "10.235.1.2/24", "fd46::2/64");
     let dev_name = test_dev_name();
-    let config =
-        || VirtualNicConfig::new(dev_name.clone(), 1400, NetNS::new(Some(netns.name.clone())));
+    let config = || {
+        VirtualNicConfig::new(
+            dev_name.clone(),
+            1400,
+            crate::common::netns::tests::test_namespace(Some(netns.name.clone())),
+        )
+    };
     let mut registry = SharedVirtualNicRegistry::new();
     let first = registry.create_member(
         dev_name.clone(),
@@ -805,12 +816,14 @@ async fn wait_shared_magic_dns_record(
         || async {
             // Let the kernel select the source from the shared route, rather
             // than binding to the server and hiding a client-owned route.
-            let Ok(socket) = NetNS::new(Some(ns.to_owned())).run(|| {
-                let socket = std::net::UdpSocket::bind("0.0.0.0:0")?;
-                socket.connect((MAGIC_DNS_FAKE_IP, 53))?;
-                socket.set_nonblocking(true)?;
-                tokio::net::UdpSocket::from_std(socket)
-            }) else {
+            let Ok(Ok(socket)) = crate::common::netns::tests::test_namespace(Some(ns.to_owned()))
+                .run(|| {
+                    let socket = std::net::UdpSocket::bind("0.0.0.0:0")?;
+                    socket.connect((MAGIC_DNS_FAKE_IP, 53))?;
+                    socket.set_nonblocking(true)?;
+                    tokio::net::UdpSocket::from_std(socket)
+                })
+            else {
                 return false;
             };
             let source = socket.local_addr().unwrap().ip();
@@ -897,7 +910,16 @@ async fn magic_dns_route_follows_serving_member_and_takeover() {
     .await;
     let route = SharedIpv4Route::new(MAGIC_DNS_FAKE_IP.parse::<Ipv4Addr>().unwrap(), 32, None);
     assert_eq!(
-        shared_route_owner_count(&runtime.registry, &dev_name, &route).await,
+        shared_route_owner_count(
+            &crate::host_runtime::namespace_services(
+                &crate::common::netns::open(&netns.name).unwrap()
+            )
+            .unwrap()
+            .nics,
+            &dev_name,
+            &route
+        )
+        .await,
         1
     );
 
@@ -910,7 +932,16 @@ async fn magic_dns_route_follows_serving_member_and_takeover() {
     )
     .await;
     assert_eq!(
-        shared_route_owner_count(&runtime.registry, &dev_name, &route).await,
+        shared_route_owner_count(
+            &crate::host_runtime::namespace_services(
+                &crate::common::netns::open(&netns.name).unwrap()
+            )
+            .unwrap()
+            .nics,
+            &dev_name,
+            &route
+        )
+        .await,
         1
     );
 
@@ -930,7 +961,17 @@ async fn magic_dns_route_follows_serving_member_and_takeover() {
     drop_insts(vec![second]).await;
     wait_for_condition(
         || async {
-            shared_route_owner_count(&runtime.registry, &dev_name, &route).await == 0
+            shared_route_owner_count(
+                &crate::host_runtime::namespace_services(
+                    &crate::common::netns::open(&netns.name).unwrap(),
+                )
+                .unwrap()
+                .nics,
+                &dev_name,
+                &route,
+            )
+            .await
+                == 0
                 && !ipv4_route_exists_in_ns(
                     &netns.name,
                     &format!("{MAGIC_DNS_FAKE_IP} dev {dev_name}"),

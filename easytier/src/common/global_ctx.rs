@@ -8,7 +8,7 @@ use arc_swap::ArcSwap;
 use async_trait::async_trait;
 use easytier_core::connectivity::composite::ConnectorRuntime as _;
 use easytier_core::peers::public_ipv6::PublicIpv6Host;
-use easytier_core::socket::NetNamespace;
+use easytier_core::socket::SocketContext;
 use easytier_core::tunnel::effective_encryption_uses_xor;
 use easytier_core::{
     config::{PeerId, peers::PeerRuntimeSnapshot, runtime::CoreInstanceRuntimeConfig},
@@ -24,7 +24,6 @@ use crate::proto::api::config::InstanceConfigPatch;
 use crate::proto::api::instance::PeerConnInfo;
 use crate::proto::common::PortForwardConfigPb;
 use crossbeam::atomic::AtomicCell;
-use easytier_core::socket::SocketContext;
 
 #[derive(Debug, Clone, PartialEq)]
 #[cfg_attr(feature = "management", derive(serde::Serialize, serde::Deserialize))]
@@ -83,6 +82,7 @@ pub type EventBusSubscriber = tokio::sync::broadcast::Receiver<GlobalCtxEvent>;
 pub struct GlobalCtx {
     pub inst_name: String,
     pub id: uuid::Uuid,
+    instance_run_key: uuid::Uuid,
     pub config: Box<dyn ConfigLoader>,
     pub net_ns: NetNS,
     pub network: NetworkIdentity,
@@ -104,7 +104,7 @@ impl std::fmt::Debug for GlobalCtx {
         f.debug_struct("GlobalCtx")
             .field("inst_name", &self.inst_name)
             .field("id", &self.id)
-            .field("net_ns", &self.net_ns.name())
+            .field("net_ns", &self.net_ns.id())
             .field("event_bus", &"EventBus")
             .field("ipv4", &self.cached_ipv4)
             .finish()
@@ -121,10 +121,11 @@ impl PublicIpv6Host for GlobalCtx {
     ) -> HashSet<Ipv6Addr> {
         let context = SocketContext {
             socket_mark: self.get_flags().socket_mark,
-            netns: self.net_ns.name().map(NetNamespace::new),
+            netns: Some(self.net_ns.clone()),
             ..SocketContext::default()
         };
-        let ip_list = crate::host_runtime::native_host_runtime()
+        let ip_list = crate::host_runtime::namespace_services(&self.net_ns)
+            .expect("native instance domain must be registered")
             .collect_ip_addrs(&context)
             .await;
         let mut reserved = HashSet::new();
@@ -147,14 +148,18 @@ impl PublicIpv6Host for GlobalCtx {
 }
 
 impl GlobalCtx {
+    pub(crate) fn run_key(&self) -> uuid::Uuid {
+        self.instance_run_key
+    }
     pub fn new(config_fs: impl ConfigLoader + 'static) -> Self {
-        Self::new_inner(config_fs, None, None)
+        Self::new_inner(config_fs, None, None, None)
     }
 
     pub(crate) fn new_with_runtime_config(
         config_fs: impl ConfigLoader + 'static,
         runtime: &CoreInstanceConfig,
         host: &CoreInstanceHostConfig,
+        namespace: NetNS,
     ) -> Self {
         let runtime = CoreInstanceRuntimeConfig {
             services: runtime.connectivity.runtime.clone(),
@@ -166,17 +171,21 @@ impl GlobalCtx {
                 .map(|protocol| protocol.to_ascii_lowercase())
                 .collect()
         });
-        Self::new_inner(config_fs, Some(&runtime), protocols)
+        Self::new_inner(config_fs, Some(&runtime), protocols, Some(namespace))
     }
 
     fn new_inner(
         config_fs: impl ConfigLoader + 'static,
         runtime: Option<&CoreInstanceRuntimeConfig>,
         runtime_endpoint_protocols: Option<HashSet<String>>,
+        namespace: Option<NetNS>,
     ) -> Self {
         let id = config_fs.get_id();
         let network = config_fs.get_network_identity();
-        let net_ns = NetNS::new(config_fs.get_netns());
+        let net_ns = namespace.unwrap_or_else(|| {
+            crate::common::netns::resolve_config(config_fs.get_netns().as_deref())
+                .expect("resolve native network namespace")
+        });
         let hostname = runtime
             .and_then(|runtime| runtime.peer.runtime.core.node.hostname.clone())
             .unwrap_or_else(|| match config_fs.get_hostname() {
@@ -200,6 +209,7 @@ impl GlobalCtx {
         GlobalCtx {
             inst_name: config_fs.get_inst_name(),
             id,
+            instance_run_key: uuid::Uuid::new_v4(),
             config: Box::new(config_fs),
             net_ns: net_ns.clone(),
             network,
@@ -507,7 +517,12 @@ pub mod tests {
             easytier_core::instance::CoreInstanceConfig::from_toml_with_host(&config, &host)
                 .unwrap();
 
-        let global_ctx = GlobalCtx::new_with_runtime_config(config.clone(), &normalized, &host);
+        let global_ctx = GlobalCtx::new_with_runtime_config(
+            config.clone(),
+            &normalized,
+            &host,
+            crate::common::netns::current().unwrap(),
+        );
 
         assert_eq!(config.get_mapped_listeners().len(), 2);
         assert_eq!(global_ctx.runtime_mapped_listeners().len(), 1);

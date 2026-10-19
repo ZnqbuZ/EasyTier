@@ -475,7 +475,7 @@ mod tests {
         let mut nic = VirtualNic::new(VirtualNicConfig::new(
             test_interface.to_owned(),
             1500,
-            NetNS::new(None),
+            crate::common::netns::tests::test_namespace(None),
         ));
         let _tunnel = nic.create_dev().await.unwrap();
         guarden::defer! {

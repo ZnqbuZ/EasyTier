@@ -252,7 +252,7 @@ pub(crate) mod tests {
     }
 
     async fn _tunnel_pingpong_netns<L, C>(
-        mut listener: L,
+        listener: L,
         connector: C,
         l_netns: NetNS,
         c_netns: NetNS,
@@ -260,10 +260,14 @@ pub(crate) mod tests {
         timeout: std::time::Duration,
     ) -> anyhow::Result<()>
     where
-        L: SocketListener<Accepted = Box<dyn Tunnel>> + Sync + 'static,
-        C: TunnelDialer,
+        L: FnOnce(NetNS) -> Box<dyn SocketListener<Accepted = Box<dyn Tunnel>> + Sync>
+            + Send
+            + 'static,
+        C: FnOnce(NetNS) -> Box<dyn TunnelDialer> + Send + 'static,
     {
-        tokio::time::timeout(timeout, l_netns.run_async(|| listener.listen()))
+        let mut listener = listener(l_netns);
+        let connector = connector(c_netns);
+        tokio::time::timeout(timeout, listener.listen())
             .await
             .context("listener setup timed out")?
             .context("listener setup failed")?;
@@ -278,7 +282,7 @@ pub(crate) mod tests {
             _tunnel_echo_server(ret, false).await
         }));
 
-        let tunnel = tokio::time::timeout(timeout, c_netns.run_async(|| connector.connect()))
+        let tunnel = tokio::time::timeout(timeout, connector.connect())
             .await
             .context("connect timed out")?
             .context("connect failed")?;
@@ -338,8 +342,10 @@ pub(crate) mod tests {
         timeout: std::time::Duration,
     ) -> Result<(), anyhow::Error>
     where
-        L: SocketListener<Accepted = Box<dyn Tunnel>> + Sync + 'static,
-        C: TunnelDialer,
+        L: FnOnce(NetNS) -> Box<dyn SocketListener<Accepted = Box<dyn Tunnel>> + Sync>
+            + Send
+            + 'static,
+        C: FnOnce(NetNS) -> Box<dyn TunnelDialer> + Send + 'static,
     {
         // Each phase has its own deadline; connection setup must not consume
         // the echo or shutdown budget. Dropping the caller cancels both tasks.
@@ -370,19 +376,20 @@ pub(crate) mod tests {
     }
 
     pub(crate) async fn _tunnel_bench_netns<L, C>(
-        mut listener: L,
+        listener: L,
         connector: C,
         netns_l: NetNS,
         netns_c: NetNS,
     ) -> usize
     where
-        L: SocketListener<Accepted = Box<dyn Tunnel>> + Sync + 'static,
-        C: TunnelDialer,
+        L: FnOnce(NetNS) -> Box<dyn SocketListener<Accepted = Box<dyn Tunnel>> + Sync>
+            + Send
+            + 'static,
+        C: FnOnce(NetNS) -> Box<dyn TunnelDialer> + Send + 'static,
     {
-        {
-            let _g = netns_l.guard();
-            listener.listen().await.unwrap();
-        }
+        let mut listener = listener(netns_l);
+        let connector = connector(netns_c);
+        listener.listen().await.unwrap();
 
         let bps = Arc::new(AtomicU64::new(0));
         let bps_clone = bps.clone();
@@ -407,10 +414,7 @@ pub(crate) mod tests {
             }
         });
 
-        let tunnel = {
-            let _g = netns_c.guard();
-            connector.connect().await.unwrap()
-        };
+        let tunnel = connector.connect().await.unwrap();
 
         let (_recv, mut send) = tunnel.split();
 

@@ -35,6 +35,8 @@ name = "packet_bytes_extraction"
 harness = false
 
 [dependencies]
+educe.workspace = true
+hashbrown.workspace = true
 easytier-core.workspace = true
 easytier-proto = { workspace = true, features = ["api", "core"] }
 git-version = "0.3.9"

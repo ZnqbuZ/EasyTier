@@ -1,4 +1,9 @@
-use std::{collections::BTreeSet, net::Ipv4Addr};
+use std::{
+    collections::BTreeSet,
+    net::{Ipv4Addr, Ipv6Addr},
+};
+
+use crate::common::netns::NetNS;
 
 use super::{
     Error, IfConfiguerTrait, cidr_to_subnet_mask, ignore_removed_shell_cmd_not_found, run_shell_cmd,
@@ -7,12 +12,17 @@ use async_trait::async_trait;
 use cidr::{Ipv4Inet, Ipv6Inet};
 use tokio::sync::Mutex;
 
-#[derive(Default)]
 pub struct MacIfConfiger {
     configured_ipv4: Mutex<BTreeSet<Ipv4Inet>>,
 }
 
 impl MacIfConfiger {
+    pub fn new(_namespace: NetNS) -> Self {
+        Self {
+            configured_ipv4: Mutex::new(BTreeSet::new()),
+        }
+    }
+
     fn build_add_ipv4_cmd(name: &str, addr: Ipv4Inet, has_configured_ipv4: bool) -> String {
         let address = addr.address();
         if has_configured_ipv4 {
@@ -139,7 +149,7 @@ impl IfConfiguerTrait for MacIfConfiger {
     async fn add_ipv6_ip(
         &self,
         name: &str,
-        address: std::net::Ipv6Addr,
+        address: Ipv6Addr,
         cidr_prefix: u8,
     ) -> Result<(), Error> {
         run_shell_cmd(format!("ifconfig {} inet6 {}/{} add", name, address, cidr_prefix).as_str())
@@ -161,7 +171,7 @@ impl IfConfiguerTrait for MacIfConfiger {
     async fn add_ipv6_route(
         &self,
         name: &str,
-        address: std::net::Ipv6Addr,
+        address: Ipv6Addr,
         cidr_prefix: u8,
         cost: Option<i32>,
     ) -> Result<(), Error> {
@@ -182,7 +192,7 @@ impl IfConfiguerTrait for MacIfConfiger {
     async fn remove_ipv6_route(
         &self,
         name: &str,
-        address: std::net::Ipv6Addr,
+        address: Ipv6Addr,
         cidr_prefix: u8,
     ) -> Result<(), Error> {
         run_delete_shell_cmd(

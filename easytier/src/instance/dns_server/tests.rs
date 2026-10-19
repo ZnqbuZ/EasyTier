@@ -78,7 +78,8 @@ pub async fn prepare_env_with_tld_dns_zone(
             crate::instance::shared_virtual_nic::SharedVirtualNicRegistry::new(),
         )),
     )
-    .await;
+    .await
+    .unwrap();
     virtual_nic.run(Some(tun_ip), None).await.unwrap();
 
     (ctx, core_instance, virtual_nic)

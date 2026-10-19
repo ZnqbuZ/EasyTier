@@ -18,6 +18,7 @@ use easytier_core::socket::{
     tcp::TcpConnectOptions,
     udp::{VirtualUdpSocket, VirtualUdpSocketFactory},
 };
+use easytier_core::tunnel::TunnelError;
 use http_body_util::{BodyExt as _, Full, Limited};
 use hyper::{
     Method, Request,
@@ -104,6 +105,7 @@ pub(crate) async fn search_gateway(options: SearchOptions) -> Result<Gateway, Se
 
 async fn search_gateway_inner(options: SearchOptions) -> Result<Gateway, SearchError> {
     let bind_options = BindConfig {
+        namespace: Some(crate::common::netns::current().map_err(SearchError::Io)?),
         reuse_addr: Some(false),
         local_addr: Some(options.bind_addr),
         ..BindConfig::default()
@@ -211,7 +213,13 @@ async fn send_http_request_inner(
     soap_action: Option<&str>,
     body: String,
 ) -> Result<Bytes, HttpTransportError> {
-    let stream = connect_tcp(TcpConnectOptions::direct_connect(addr)).await?;
+    let stream = connect_tcp(
+        TcpConnectOptions::direct_connect(addr).with_bind(BindConfig {
+            namespace: Some(crate::common::netns::current().map_err(TunnelError::from)?),
+            ..BindConfig::default()
+        }),
+    )
+    .await?;
     let (mut sender, connection) = http1::handshake(TokioIo::new(stream)).await?;
     let body = Bytes::from(body);
     let mut request = Request::builder()
