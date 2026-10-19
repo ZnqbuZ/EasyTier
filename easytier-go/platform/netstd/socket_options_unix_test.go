@@ -3,11 +3,49 @@
 package netstd
 
 import (
+	"context"
 	"net"
 	"testing"
 
 	"github.com/easytier/easytier/easytier-go/platform"
+	"golang.org/x/sys/unix"
 )
+
+func TestUDPReuseAddrHonorsExplicitFalseAndTrue(t *testing.T) {
+	for _, reuse := range []*bool{nil, boolPtr(false), boolPtr(true)} {
+		socket, err := (SocketFactory{}).BindUDP(context.Background(), platform.BindConfig{
+			LocalAddr: sourceAddr(0), ReuseAddr: reuse, BindDevice: strPtr(""),
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		raw, err := socket.(*net.UDPConn).SyscallConn()
+		if err != nil {
+			socket.Close()
+			t.Fatal(err)
+		}
+		actual := 0
+		var optionErr error
+		if err := raw.Control(func(fd uintptr) { actual, optionErr = unix.GetsockoptInt(int(fd), unix.SOL_SOCKET, unix.SO_REUSEADDR) }); err != nil {
+			socket.Close()
+			t.Fatal(err)
+		}
+		socket.Close()
+		if optionErr != nil {
+			t.Fatal(optionErr)
+		}
+		expected := 1
+		if reuse != nil && !*reuse {
+			expected = 0
+		}
+		if actual != expected {
+			t.Fatalf("SO_REUSEADDR = %d, want %d", actual, expected)
+		}
+	}
+}
+
+func boolPtr(value bool) *bool    { return &value }
+func strPtr(value string) *string { return &value }
 
 func TestSocketFactoryUsesNativeTCPReuseAddrDefault(t *testing.T) {
 	firstServer := listenTCP4(t)
@@ -17,16 +55,16 @@ func TestSocketFactoryUsesNativeTCPReuseAddrDefault(t *testing.T) {
 	sourcePort := unusedTCP4Port(t)
 
 	reuse := true
-	first := connectTCP(t, firstServer, platform.TCPBindOptions{
+	first := connectTCP(t, firstServer, platform.BindConfig{
 		Context:   platform.SocketContext{IPVersion: platform.IPVersionV4},
-		LocalAddr: &net.TCPAddr{IP: net.IPv4zero, Port: sourcePort},
+		LocalAddr: sourceAddr(sourcePort),
 		ReuseAddr: &reuse,
 	}, platform.TCPConnectSTUNProbe)
 	defer first.Close()
 
-	second := connectTCP(t, secondServer, platform.TCPBindOptions{
+	second := connectTCP(t, secondServer, platform.BindConfig{
 		Context:   platform.SocketContext{IPVersion: platform.IPVersionV4},
-		LocalAddr: &net.TCPAddr{IP: net.IPv4zero, Port: sourcePort},
+		LocalAddr: sourceAddr(sourcePort),
 		OnlyV6:    true,
 	}, platform.TCPConnectHolePunch)
 	defer second.Close()
