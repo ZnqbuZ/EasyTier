@@ -22,25 +22,13 @@ pub(crate) struct NativeRouteContext {
     name: String,
     public_address: Mutex<Option<cidr::Ipv6Inet>>,
     pub(crate) handle: RouteHandle,
+    controller: RouteController,
 }
 
 impl NativeRouteContext {
-    fn controller(&self) -> anyhow::Result<Arc<tokio::sync::Mutex<RouteController>>> {
-        self.net_ns
-            .existing_route_controller()
-            .ok_or_else(|| anyhow::anyhow!("native route controller is unavailable"))
-    }
-
     pub(crate) fn ensure_open(&self) -> anyhow::Result<()> {
         self.net_ns.ensure_open()?;
-        let controller = self.controller()?;
-        for _ in 0..100 {
-            if let Ok(ctrl) = controller.try_lock() {
-                return ctrl.ensure_instance_open(self.run);
-            }
-            std::thread::sleep(Duration::from_millis(1));
-        }
-        anyhow::bail!("native route controller is busy")
+        self.controller.ensure_instance_open(self.run)
     }
 
     pub(crate) fn config(&self, mtu: u32) -> VirtualNicConfig {
@@ -72,21 +60,15 @@ impl NativeRouteContext {
             name: ifname,
             ifindex,
         };
-        let controller = self.controller()?;
-        let mut ctrl = controller.lock().await;
-        ctrl.set_interface(Some(info));
-        ctrl.set_instance_default_device(&self.run, Some(epoch));
+        self.controller.set_interface(Some(info));
+        self.controller.set_instance_default_device(&self.run, Some(epoch));
         Ok(Some(epoch))
     }
 
     #[cfg(mobile)]
     pub(crate) fn external_routes(&self) -> anyhow::Result<easytier_core::host::route::RouteSet> {
         self.ensure_open()?;
-        let controller = self.controller()?;
-        let ctrl = controller
-            .try_lock()
-            .map_err(|_| anyhow::anyhow!("native route controller is busy"))?;
-        let routes = ctrl.effective_routes_for_instance(&self.run);
+        let routes = self.controller.effective_routes_for_instance(&self.run);
         for route in &routes {
             super::validate_tun_spec(route).map_err(anyhow::Error::msg)?;
         }
@@ -100,11 +82,7 @@ impl NativeRouteContext {
         prefixes: std::collections::BTreeSet<cidr::IpCidr>,
     ) -> anyhow::Result<()> {
         self.ensure_open()?;
-        let controller = self.controller()?;
-        let mut ctrl = controller
-            .try_lock()
-            .map_err(|_| anyhow::anyhow!("native route controller is busy"))?;
-        ctrl.acknowledge_external(epoch, prefixes);
+        self.controller.acknowledge_external(epoch, prefixes);
         Ok(())
     }
 
@@ -117,28 +95,17 @@ impl NativeRouteContext {
         let mut current = self.public_address.lock();
         if *current != address {
             *current = address;
-            if let Ok(controller) = self.controller()
-                && let Ok(mut ctrl) = controller.try_lock()
-            {
-                ctrl.invalidate_instance(&self.run);
-            }
+            self.controller.invalidate_instance(&self.run);
         }
     }
 
     pub(crate) async fn unready(&self, _member: &SharedVirtualNicMember) {
-        if let Ok(controller) = self.controller() {
-            let mut ctrl = controller.lock().await;
-            ctrl.set_interface(None);
-            ctrl.set_instance_default_device(&self.run, None);
-        }
+        self.controller.set_interface(None);
+        self.controller.set_instance_default_device(&self.run, None);
     }
 
     pub(crate) fn abandon(&self, reason: Arc<str>) {
-        if let Ok(controller) = self.controller()
-            && let Ok(mut ctrl) = controller.try_lock()
-        {
-            ctrl.abandon_instance(self.run, reason);
-        }
+        self.controller.abandon_instance(self.run, reason);
     }
 }
 
@@ -153,26 +120,15 @@ impl NativeRouteRuntime {
         let run = global_ctx.key();
         let name = global_ctx.get_flags().dev_name.clone();
         let controller = net_ns.route_controller()?;
-        let mut ctrl = {
-            let mut acquired = None;
-            for _ in 0..100 {
-                if let Ok(guard) = controller.try_lock() {
-                    acquired = Some(guard);
-                    break;
-                }
-                std::thread::sleep(Duration::from_millis(1));
-            }
-            acquired.ok_or_else(|| anyhow::anyhow!("native route controller is busy"))?
-        };
-        let owner = ctrl.open_instance(run, name.clone())?;
+        let owner = controller.open_instance(run, name.clone())?;
         let handle = owner.handle();
-        drop(ctrl);
         let context = Arc::new(NativeRouteContext {
             net_ns,
             run,
             name,
             public_address: Mutex::new(None),
             handle,
+            controller,
         });
         Ok(Self {
             owner: Mutex::new(Some(owner)),
@@ -323,12 +279,7 @@ async fn wait_for_cleanup(owner: &mut InstanceRoutes, stall: Duration) -> anyhow
 #[cfg(test)]
 mod tests {
     use super::*;
-    use easytier_core::{
-        config::{peers::PeerRuntimeSnapshot, runtime::CoreRuntimeConfig},
-        host::route::{RouteDemand, RouteSet},
-    };
-    use futures::FutureExt;
-    use std::collections::BTreeMap;
+    use easytier_core::config::{peers::PeerRuntimeSnapshot, runtime::CoreRuntimeConfig};
 
     #[cfg(feature = "public-ipv6-provider")]
     #[tokio::test]
@@ -370,58 +321,6 @@ mod tests {
         runtime.drain().await.unwrap();
     }
 
-    #[tokio::test(start_paused = true)]
-    async fn watchdog_does_not_treat_repeated_unknown_presence_as_progress() {
-        let mut owner = InstanceRoutes::new(Arc::new(|| {}));
-        owner.request_close();
-        let inputs = owner.inputs();
-        let snapshot = inputs.snapshot();
-        inputs.publish_feedback(
-            &snapshot,
-            InstanceRouteStatus::Draining { remaining: Some(1) },
-            BTreeMap::new(),
-        );
-        let cleanup = wait_for_cleanup(&mut owner, Duration::from_secs(1));
-        tokio::pin!(cleanup);
-        assert!(cleanup.as_mut().now_or_never().is_none());
-        tokio::time::advance(Duration::from_millis(500)).await;
-        inputs.publish_feedback(
-            &snapshot,
-            InstanceRouteStatus::Draining { remaining: Some(1) },
-            BTreeMap::new(),
-        );
-        assert!(cleanup.as_mut().now_or_never().is_none());
-        tokio::time::advance(Duration::from_millis(501)).await;
-        assert!(cleanup.now_or_never().unwrap().is_err());
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn real_retirement_extends_the_stall_deadline_without_a_total_time_limit() {
-        let mut owner = InstanceRoutes::new(Arc::new(|| {}));
-        owner.request_close();
-        let inputs = owner.inputs();
-        let snapshot = inputs.snapshot();
-        inputs.publish_feedback(
-            &snapshot,
-            InstanceRouteStatus::Draining { remaining: Some(2) },
-            BTreeMap::new(),
-        );
-        let cleanup = wait_for_cleanup(&mut owner, Duration::from_secs(1));
-        tokio::pin!(cleanup);
-        assert!(cleanup.as_mut().now_or_never().is_none());
-        tokio::time::advance(Duration::from_millis(750)).await;
-        inputs.publish_feedback(
-            &snapshot,
-            InstanceRouteStatus::Draining { remaining: Some(1) },
-            BTreeMap::new(),
-        );
-        assert!(cleanup.as_mut().now_or_never().is_none());
-        tokio::time::advance(Duration::from_millis(750)).await;
-        assert!(cleanup.as_mut().now_or_never().is_none());
-        inputs.publish_feedback(&snapshot, InstanceRouteStatus::Drained, BTreeMap::new());
-        cleanup.await.unwrap();
-    }
-
     #[tokio::test]
     async fn native_owner_binds_config_then_closes_without_context_keeping_authority_alive() {
         let global = Arc::new(crate::common::global_ctx::GlobalCtx::new(
@@ -441,12 +340,6 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(context.ensure_open().is_err());
-        assert!(
-            context
-                .handle
-                .publish(RouteDemand::Additional(RouteSet::new()))
-                .is_err()
-        );
     }
 
     #[tokio::test]
@@ -455,21 +348,8 @@ mod tests {
             crate::common::config::TomlConfig::default(),
         ));
         let runtime = NativeRouteRuntime::new(&global).unwrap();
-        let weak = Arc::downgrade(&runtime.owner.lock().as_ref().unwrap().inputs());
         let context = runtime.context();
         drop(runtime);
-        assert!(
-            context
-                .handle
-                .publish(RouteDemand::Additional(RouteSet::new()))
-                .is_err()
-        );
-        tokio::time::timeout(Duration::from_secs(3), async {
-            while weak.upgrade().is_some() {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .unwrap();
+        assert!(context.ensure_open().is_err());
     }
 }

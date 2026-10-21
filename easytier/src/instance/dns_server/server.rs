@@ -76,10 +76,12 @@ pub fn build_authority(domain: &str, records: &[Record]) -> Result<InMemoryAutho
 }
 
 impl Server {
+    #[allow(dead_code)]
     pub fn new(config: RunConfig) -> Self {
         Self::try_new(config).unwrap()
     }
 
+    #[allow(dead_code)]
     fn try_new(config: RunConfig) -> Result<Self> {
         Self::in_net_ns(config, crate::common::net_ns::current()?, None)
     }

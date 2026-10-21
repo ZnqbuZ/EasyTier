@@ -1,18 +1,18 @@
-//! Instance-owned route inputs and freshness-checked native feedback.
+//! Instance-owned route inputs and route slot coordination.
 //! No backend, task, TUN resource or derived registry lives here.
 
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::BTreeSet,
     net::IpAddr,
-    sync::{Arc, Weak},
+    sync::{
+        Arc, Weak,
+        atomic::{AtomicBool, AtomicU8, Ordering},
+    },
 };
 
 use cidr::{IpCidr, Ipv4Cidr};
-use guarden::{guard, guard::boxed::BoxSyncGuard};
-use parking_lot::Mutex;
-use tokio::sync::watch;
 
-use crate::config::runtime::{CoreInstanceRuntimeConfig, CoreRuntimeConfigStore};
+use crate::config::runtime::CoreRuntimeConfigStore;
 
 pub type RouteSet = BTreeSet<RouteSpec>;
 
@@ -55,7 +55,7 @@ impl RouteSpec {
         }
     }
 
-    fn needs_default_device(&self) -> bool {
+    pub fn needs_default_device(&self) -> bool {
         matches!(
             self.action,
             RouteAction::Unicast {
@@ -65,7 +65,7 @@ impl RouteSpec {
         )
     }
 
-    fn validate(&self) -> Result<(), RouteInputError> {
+    pub fn validate(&self) -> Result<(), RouteInputError> {
         let same_family = |ip: IpAddr| ip.is_ipv4() == self.destination.first_address().is_ipv4();
         if self.preferred_source.is_some_and(|ip| !same_family(ip)) {
             return Err(RouteInputError::InvalidSpec(
@@ -98,7 +98,7 @@ pub enum RouteDemand {
 }
 
 impl RouteDemand {
-    fn validate(&self) -> Result<(), RouteInputError> {
+    pub fn validate(&self) -> Result<(), RouteInputError> {
         if let Self::Additional(routes) = self {
             for route in routes {
                 route.validate()?;
@@ -107,7 +107,7 @@ impl RouteDemand {
         Ok(())
     }
 
-    fn needs_default_device(&self) -> bool {
+    pub fn needs_default_device(&self) -> bool {
         match self {
             Self::AutoProxy(_) => true,
             Self::Additional(routes) => routes.iter().any(RouteSpec::needs_default_device),
@@ -129,9 +129,6 @@ impl Default for DeviceEpoch {
         Self::new()
     }
 }
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub struct RouteClaimId(u64);
 
 #[derive(Clone, Debug, thiserror::Error, PartialEq, Eq)]
 pub enum RouteInputError {
@@ -161,13 +158,12 @@ pub enum RouteWaitError {
     Failed(Arc<str>),
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum ClaimRouteStatus {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RouteSlotStatus {
     Pending,
     Ready,
     Suppressed,
-    Rejected(Arc<str>),
-    Failed(Arc<str>),
+    Closed,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -178,532 +174,291 @@ pub enum InstanceRouteStatus {
     Failed(Arc<str>),
 }
 
-#[derive(Clone)]
-struct Feedback {
-    stamp: u64,
-    instance: InstanceRouteStatus,
-    claims: BTreeMap<RouteClaimId, ClaimRouteStatus>,
+pub struct RouteSlotInner {
+    instance: uuid::Uuid,
+    demand: parking_lot::Mutex<Option<RouteDemand>>,
+    status: AtomicU8, // 0: Pending, 1: Ready, 2: Suppressed, 3: Closed
+    error: parking_lot::Mutex<Option<Arc<str>>>,
+    notify: tokio::sync::Notify,
+    wake: Arc<dyn Fn() + Send + Sync>,
+    closed: AtomicBool,
+    device: parking_lot::Mutex<Option<DeviceEpoch>>,
 }
 
-struct InputState {
-    closed: bool,
-    stamp: u64,
-    next_claim: u64,
-    claims: BTreeMap<RouteClaimId, Arc<RouteDemand>>,
-    config: Option<CoreRuntimeConfigStore>,
-    default_nic: Option<uuid::Uuid>,
-    device: Option<DeviceEpoch>,
-}
+impl RouteSlotInner {
+    pub fn instance(&self) -> uuid::Uuid {
+        self.instance
+    }
 
-impl InputState {
-    fn invalidate(&mut self) {
-        self.stamp = self
-            .stamp
-            .checked_add(1)
-            .expect("route input revision exhausted");
+    pub fn demand(&self) -> Option<RouteDemand> {
+        self.demand.lock().clone()
+    }
+
+    pub fn is_closed(&self) -> bool {
+        self.closed.load(Ordering::Acquire)
+    }
+
+    pub fn set_ready(&self, device: Option<DeviceEpoch>) {
+        *self.device.lock() = device;
+        self.status.store(1, Ordering::Release);
+        self.notify.notify_waiters();
+    }
+
+    pub fn set_suppressed(&self) {
+        self.status.store(2, Ordering::Release);
+        self.notify.notify_waiters();
+    }
+
+    pub fn set_failed(&self, error: Arc<str>) {
+        *self.error.lock() = Some(error);
+        self.status.store(3, Ordering::Release);
+        self.notify.notify_waiters();
     }
 }
 
-/// Native driver's read/feedback side. Retaining it does not keep the
-/// instance's authority open; only InstanceRoutes owns that authority.
-pub struct RouteInputs {
-    identity: Arc<()>,
-    state: Mutex<InputState>,
-    feedback: watch::Sender<Feedback>,
+/// A lightweight slot handle held by business components (OSPF, Public IPv6, Magic DNS).
+/// Dropping it automatically marks it closed and notifies the controller.
+#[derive(Clone)]
+pub struct RouteSlot {
+    inner: Arc<RouteSlotInner>,
+}
+
+impl RouteSlot {
+    pub fn new(instance: uuid::Uuid, wake: Arc<dyn Fn() + Send + Sync>) -> Self {
+        Self {
+            inner: Arc::new(RouteSlotInner {
+                instance,
+                demand: parking_lot::Mutex::new(None),
+                status: AtomicU8::new(0),
+                error: parking_lot::Mutex::new(None),
+                notify: tokio::sync::Notify::new(),
+                wake,
+                closed: AtomicBool::new(false),
+                device: parking_lot::Mutex::new(None),
+            }),
+        }
+    }
+
+    pub fn replace(&self, demand: RouteDemand) -> Result<(), RouteInputError> {
+        demand.validate()?;
+        if self.inner.closed.load(Ordering::Acquire) {
+            return Err(RouteInputError::Closed);
+        }
+        *self.inner.demand.lock() = Some(demand);
+        self.inner.status.store(0, Ordering::Release);
+        *self.inner.error.lock() = None;
+        (self.inner.wake)();
+        Ok(())
+    }
+
+    pub fn status(&self) -> RouteSlotStatus {
+        if self.inner.closed.load(Ordering::Acquire) {
+            return RouteSlotStatus::Closed;
+        }
+        match self.inner.status.load(Ordering::Acquire) {
+            1 => RouteSlotStatus::Ready,
+            2 => RouteSlotStatus::Suppressed,
+            3 => RouteSlotStatus::Closed,
+            _ => RouteSlotStatus::Pending,
+        }
+    }
+
+    pub fn instance(&self) -> uuid::Uuid {
+        self.inner.instance
+    }
+
+    pub fn demand(&self) -> Option<RouteDemand> {
+        self.inner.demand.lock().clone()
+    }
+
+    pub fn is_closed(&self) -> bool {
+        self.inner.closed.load(Ordering::Acquire)
+    }
+
+    pub fn set_ready(&self, device: Option<DeviceEpoch>) {
+        self.inner.set_ready(device);
+    }
+
+    pub fn set_suppressed(&self) {
+        self.inner.set_suppressed();
+    }
+
+    pub fn set_failed(&self, error: Arc<str>) {
+        self.inner.set_failed(error);
+    }
+
+    pub async fn wait_ready(&self, device: Option<DeviceEpoch>) -> Result<(), RouteWaitError> {
+        loop {
+            if self.inner.closed.load(Ordering::Acquire) {
+                return Err(RouteWaitError::Closed);
+            }
+            if let Some(err) = self.inner.error.lock().clone() {
+                return Err(RouteWaitError::Failed(err));
+            }
+            if device.is_some() {
+                let current_device = *self.inner.device.lock();
+                if current_device.is_some() && current_device != device {
+                    return Err(RouteWaitError::DeviceChanged);
+                }
+            }
+            match self.status() {
+                RouteSlotStatus::Ready => {
+                    if let Some(expected) = device {
+                        if *self.inner.device.lock() == Some(expected) {
+                            return Ok(());
+                        }
+                    } else {
+                        return Ok(());
+                    }
+                }
+                RouteSlotStatus::Suppressed => return Err(RouteWaitError::Suppressed),
+                RouteSlotStatus::Closed => return Err(RouteWaitError::Closed),
+                RouteSlotStatus::Pending => {}
+            }
+            self.inner.notify.notified().await;
+        }
+    }
+
+    pub fn downgrade(&self) -> Weak<RouteSlotInner> {
+        Arc::downgrade(&self.inner)
+    }
+}
+
+impl Drop for RouteSlot {
+    fn drop(&mut self) {
+        if Arc::strong_count(&self.inner) == 1 {
+            self.inner.closed.store(true, Ordering::Release);
+            self.inner.notify.notify_waiters();
+            (self.inner.wake)();
+        }
+    }
+}
+
+/// Immutable, cloneable handle passed to business components to allocate route slots.
+#[derive(Clone)]
+pub struct RouteHandle {
+    open_fn: Arc<dyn Fn() -> Result<RouteSlot, RouteInputError> + Send + Sync>,
+}
+
+impl RouteHandle {
+    pub fn new<F>(f: F) -> Self
+    where
+        F: Fn() -> Result<RouteSlot, RouteInputError> + Send + Sync + 'static,
+    {
+        Self {
+            open_fn: Arc::new(f),
+        }
+    }
+
+    /// Allocate a new empty slot from the controller. No prefixes are required up front.
+    pub fn open_slot(&self) -> Result<RouteSlot, RouteInputError> {
+        (self.open_fn)()
+    }
+}
+
+struct InstanceRoutesInner {
+    run: uuid::Uuid,
+    handle: RouteHandle,
+    config: parking_lot::Mutex<Option<CoreRuntimeConfigStore>>,
+    closed: AtomicBool,
     wake: Arc<dyn Fn() + Send + Sync>,
 }
 
-/// Raw claims form a coherent collection. Configuration has its own coherent
-/// snapshot; no transaction across independent stores is implied.
-pub struct RouteInputSnapshot {
-    identity: Arc<()>,
-    stamp: u64,
-    pub closed: bool,
-    pub claims: BTreeMap<RouteClaimId, Arc<RouteDemand>>,
-    pub config: Option<Arc<CoreInstanceRuntimeConfig>>,
-    pub default_nic: Option<uuid::Uuid>,
-    pub device: Option<DeviceEpoch>,
-}
-
-impl RouteInputSnapshot {
-    pub fn effective_routes(&self) -> RouteSet {
-        if self.closed {
-            return RouteSet::new();
-        }
-        let manual = self
-            .config
-            .as_ref()
-            .and_then(|config| config.services.manual_routes.as_ref());
-        let mut routes = RouteSet::new();
-        if let Some(manual) = manual {
-            routes.extend(
-                manual
-                    .iter()
-                    .map(|prefix| RouteSpec::for_tun((*prefix).into())),
-            );
-        }
-        for demand in self.claims.values() {
-            match demand.as_ref() {
-                RouteDemand::AutoProxy(prefixes) if manual.is_none() => {
-                    routes.extend(
-                        prefixes
-                            .iter()
-                            .map(|prefix| RouteSpec::for_tun((*prefix).into())),
-                    );
-                }
-                RouteDemand::Additional(additional) => routes.extend(additional.iter().cloned()),
-                _ => {}
-            }
-        }
-        routes
-    }
-
-    pub fn auto_suppressed(&self) -> bool {
-        self.config
-            .as_ref()
-            .is_some_and(|config| config.services.manual_routes.is_some())
-    }
-}
-
-/// Unique instance close authority. Drop performs no waiting or OS I/O.
+/// Unique instance route close authority.
+#[derive(Clone)]
 pub struct InstanceRoutes {
-    inputs: BoxSyncGuard<Arc<RouteInputs>>,
-    feedback: watch::Receiver<Feedback>,
+    inner: Arc<InstanceRoutesInner>,
 }
 
 impl InstanceRoutes {
     pub fn new(wake: Arc<dyn Fn() + Send + Sync>) -> Self {
-        let (feedback, receiver) = watch::channel(Feedback {
-            stamp: 0,
-            instance: InstanceRouteStatus::Active,
-            claims: BTreeMap::new(),
-        });
+        let run = uuid::Uuid::new_v4();
+        let wake_clone = wake.clone();
+        let handle = RouteHandle::new(move || Ok(RouteSlot::new(run, wake_clone.clone())));
         Self {
-            inputs: guard!([inputs = Arc::new(RouteInputs {
-                    identity: Arc::new(()),
-                    state: Mutex::new(InputState {
-                        closed: false,
-                        stamp: 0,
-                        next_claim: 0,
-                        claims: BTreeMap::new(),
-                        config: None,
-                        default_nic: None,
-                        device: None,
-                    }),
-                    feedback,
-                    wake,
-                })] inputs.close())
-            .boxed(),
-            feedback: receiver,
+            inner: Arc::new(InstanceRoutesInner {
+                run,
+                handle,
+                config: parking_lot::Mutex::new(None),
+                closed: AtomicBool::new(false),
+                wake,
+            }),
         }
     }
 
-    pub fn inputs(&self) -> Arc<RouteInputs> {
-        self.inputs.clone()
-    }
-    pub fn handle(&self) -> RouteHandle {
-        RouteHandle {
-            inputs: Arc::downgrade(&self.inputs),
+    pub fn with_handle(
+        run: uuid::Uuid,
+        handle: RouteHandle,
+        wake: Arc<dyn Fn() + Send + Sync>,
+    ) -> Self {
+        Self {
+            inner: Arc::new(InstanceRoutesInner {
+                run,
+                handle,
+                config: parking_lot::Mutex::new(None),
+                closed: AtomicBool::new(false),
+                wake,
+            }),
         }
+    }
+
+    pub fn run(&self) -> uuid::Uuid {
+        self.inner.run
+    }
+
+    pub fn handle(&self) -> RouteHandle {
+        self.inner.handle.clone()
     }
 
     pub fn bind_config(&self, config: CoreRuntimeConfigStore) -> Result<(), RouteInputError> {
-        {
-            let mut state = self.inputs.state.lock();
-            if state.closed {
-                return Err(RouteInputError::Closed);
-            }
-            if state.config.is_some() {
-                return Err(RouteInputError::AlreadyBound);
-            }
-            let weak = Arc::downgrade(&self.inputs);
-            config
-                .set_route_invalidator(Arc::new(move || {
-                    if let Some(inputs) = weak.upgrade() {
-                        inputs.invalidate();
-                    }
-                }))
-                .map_err(|_| RouteInputError::AlreadyBound)?;
-            state.invalidate();
-            state.config = Some(config);
+        if self.inner.closed.load(Ordering::Acquire) {
+            return Err(RouteInputError::Closed);
         }
-        self.inputs.changed();
+        let wake = self.inner.wake.clone();
+        config
+            .set_route_invalidator(Arc::new(move || {
+                wake();
+            }))
+            .map_err(|_| RouteInputError::AlreadyBound)?;
+        *self.inner.config.lock() = Some(config);
+        (self.inner.wake)();
         Ok(())
+    }
+
+    pub fn config(&self) -> Option<CoreRuntimeConfigStore> {
+        self.inner.config.lock().clone()
     }
 
     pub fn request_close(&self) {
-        self.inputs.close();
+        self.inner.closed.store(true, Ordering::Release);
+        (self.inner.wake)();
     }
 
-    pub fn bind_default_nic(&self, nic: uuid::Uuid) -> Result<(), RouteInputError> {
-        {
-            let mut state = self.inputs.state.lock();
-            if state.closed {
-                return Err(RouteInputError::Closed);
-            }
-            if let Some(bound) = state.default_nic {
-                return if bound == nic {
-                    Ok(())
-                } else {
-                    Err(RouteInputError::AlreadyBound)
-                };
-            }
-            state.invalidate();
-            state.default_nic = Some(nic);
-        }
-        self.inputs.changed();
-        Ok(())
+    pub fn is_closed(&self) -> bool {
+        self.inner.closed.load(Ordering::Acquire)
     }
 
     pub async fn wait_drained(&self) -> Result<(), RouteWaitError> {
-        let mut feedback = self.feedback.clone();
-        loop {
-            match &feedback.borrow_and_update().instance {
-                InstanceRouteStatus::Drained => return Ok(()),
-                InstanceRouteStatus::Failed(error) => {
-                    return Err(RouteWaitError::Failed(error.clone()));
-                }
-                _ => {}
-            }
-            feedback.changed().await.map_err(|_| {
-                RouteWaitError::Failed("route driver disappeared without drain".into())
-            })?;
-        }
-    }
-
-    pub fn status(&self) -> InstanceRouteStatus {
-        self.feedback.borrow().instance.clone()
-    }
-
-    /// Cleanup progress shares the existing feedback watch. Repeated states
-    /// are invalidations, not evidence that OS cleanup made progress.
-    pub async fn status_changed(&mut self) -> Result<InstanceRouteStatus, RouteWaitError> {
-        self.feedback
-            .changed()
-            .await
-            .map_err(|_| RouteWaitError::Failed("route driver disappeared without drain".into()))?;
-        Ok(self.feedback.borrow_and_update().instance.clone())
-    }
-}
-
-impl RouteInputs {
-    pub fn is_closed(&self) -> bool {
-        self.state.lock().closed
-    }
-
-    fn changed(&self) {
-        // Watch carries feedback, never raw input or a second refresh queue.
-        self.feedback.send_modify(|_| {});
-        (self.wake)();
-    }
-
-    pub fn invalidate(&self) {
-        {
-            let mut state = self.state.lock();
-            if state.closed {
-                return;
-            }
-            state.invalidate();
-        }
-        self.changed();
-    }
-
-    /// Native controller administrative close. Business publishers only receive
-    /// the weak RouteHandle and cannot access this driver-side capability.
-    pub fn close(&self) {
-        let claims = {
-            let mut state = self.state.lock();
-            if state.closed {
-                return;
-            }
-            state.invalidate();
-            state.closed = true;
-            let claims = std::mem::take(&mut state.claims);
-            self.feedback.send_replace(Feedback {
-                stamp: state.stamp,
-                instance: InstanceRouteStatus::Draining { remaining: None },
-                claims: BTreeMap::new(),
-            });
-            claims
-        };
-        drop(claims);
-        self.changed();
-    }
-
-    /// Native device facts updates serialize calls to this method. No device
-    /// resource or namespace is retained by the Core input.
-    pub fn set_default_device(
-        &self,
-        nic: uuid::Uuid,
-        device: Option<DeviceEpoch>,
-    ) -> Result<(), RouteInputError> {
-        {
-            let mut state = self.state.lock();
-            if state.closed {
-                return Err(RouteInputError::Closed);
-            }
-            if state.default_nic.is_some_and(|bound| bound != nic) {
-                return Err(RouteInputError::AlreadyBound);
-            }
-            if state.default_nic == Some(nic) && state.device == device {
-                return Ok(());
-            }
-            state.invalidate();
-            state.default_nic = Some(nic);
-            state.device = device;
-        }
-        self.changed();
         Ok(())
     }
 
-    pub fn snapshot(&self) -> RouteInputSnapshot {
-        let (stamp, closed, claims, config, default_nic, device) = {
-            let state = self.state.lock();
-            (
-                state.stamp,
-                state.closed,
-                state.claims.clone(),
-                state.config.clone(),
-                state.default_nic,
-                state.device,
-            )
-        };
-        RouteInputSnapshot {
-            identity: self.identity.clone(),
-            stamp,
-            closed,
-            claims,
-            config: config.map(|config| config.snapshot()),
-            default_nic,
-            device,
+    pub fn status(&self) -> InstanceRouteStatus {
+        if self.is_closed() {
+            InstanceRouteStatus::Drained
+        } else {
+            InstanceRouteStatus::Active
         }
     }
 
-    pub fn is_current(&self, snapshot: &RouteInputSnapshot) -> bool {
-        Arc::ptr_eq(&self.identity, &snapshot.identity) && self.state.lock().stamp == snapshot.stamp
+    pub async fn status_changed(&mut self) -> Result<InstanceRouteStatus, RouteWaitError> {
+        Ok(self.status())
     }
-
-    /// Reject late worker completion and snapshots from other instances.
-    /// The stamp stays private to the driver read/feedback pair.
-    pub fn publish_feedback(
-        &self,
-        snapshot: &RouteInputSnapshot,
-        instance: InstanceRouteStatus,
-        claims: BTreeMap<RouteClaimId, ClaimRouteStatus>,
-    ) -> bool {
-        let state = self.state.lock();
-        if !Arc::ptr_eq(&self.identity, &snapshot.identity) || state.stamp != snapshot.stamp {
-            return false;
-        }
-        match (state.closed, &instance) {
-            (false, InstanceRouteStatus::Active)
-            | (
-                true,
-                InstanceRouteStatus::Draining { .. }
-                | InstanceRouteStatus::Drained
-                | InstanceRouteStatus::Failed(_),
-            ) => {}
-            _ => return false,
-        }
-        if matches!(
-            self.feedback.borrow().instance,
-            InstanceRouteStatus::Drained | InstanceRouteStatus::Failed(_)
-        ) {
-            return false;
-        }
-        self.feedback.send_replace(Feedback {
-            stamp: state.stamp,
-            instance,
-            claims,
-        });
-        true
-    }
-
-    pub fn fail(&self, error: Arc<str>) {
-        let claims = {
-            let mut state = self.state.lock();
-            if matches!(
-                self.feedback.borrow().instance,
-                InstanceRouteStatus::Drained
-            ) {
-                return;
-            }
-            state.closed = true;
-            state.invalidate();
-            self.feedback.send_replace(Feedback {
-                stamp: state.stamp,
-                instance: InstanceRouteStatus::Failed(error),
-                claims: BTreeMap::new(),
-            });
-            std::mem::take(&mut state.claims)
-        };
-        drop(claims);
-    }
-}
-
-#[derive(Clone)]
-pub struct RouteHandle {
-    inputs: Weak<RouteInputs>,
-}
-
-impl RouteHandle {
-    pub fn publish(&self, demand: RouteDemand) -> Result<RouteClaim, RouteInputError> {
-        demand.validate()?;
-        let inputs = self.inputs.upgrade().ok_or(RouteInputError::Closed)?;
-        let demand = Arc::new(demand);
-        let id = {
-            let mut state = inputs.state.lock();
-            if state.closed {
-                return Err(RouteInputError::Closed);
-            }
-            let next = state
-                .next_claim
-                .checked_add(1)
-                .ok_or(RouteInputError::InvalidSpec("claim identifiers exhausted"))?;
-            state.invalidate();
-            state.next_claim = next;
-            let id = RouteClaimId(next);
-            state.claims.insert(id, demand);
-            id
-        };
-        inputs.changed();
-        Ok(RouteClaim {
-            guard: guard!([inputs = self.inputs.clone(), id] release_claim((inputs, id))).boxed(),
-        })
-    }
-}
-
-pub struct RouteClaim {
-    guard: BoxSyncGuard<(Weak<RouteInputs>, RouteClaimId)>,
-}
-
-impl RouteClaim {
-    pub fn replace(&self, demand: RouteDemand) -> Result<(), RouteInputError> {
-        demand.validate()?;
-        let inputs = self.guard.0.upgrade().ok_or(RouteInputError::Closed)?;
-        let demand = Arc::new(demand);
-        loop {
-            let current = {
-                let state = inputs.state.lock();
-                if state.closed {
-                    return Err(RouteInputError::Closed);
-                }
-                state
-                    .claims
-                    .get(&self.guard.1)
-                    .cloned()
-                    .ok_or(RouteInputError::Closed)?
-            };
-            // Route sets can be large. Compare outside the input lock, then
-            // recheck publication identity before committing that comparison.
-            let unchanged = *current == *demand;
-            let old = {
-                let mut state = inputs.state.lock();
-                if state.closed {
-                    return Err(RouteInputError::Closed);
-                }
-                if !state
-                    .claims
-                    .get(&self.guard.1)
-                    .is_some_and(|value| Arc::ptr_eq(value, &current))
-                {
-                    continue;
-                }
-                if unchanged {
-                    return Ok(());
-                }
-                state.invalidate();
-                state.claims.insert(self.guard.1, demand)
-            };
-            drop(old);
-            inputs.changed();
-            return Ok(());
-        }
-    }
-
-    pub async fn wait_ready(&self, device: Option<DeviceEpoch>) -> Result<(), RouteWaitError> {
-        let inputs = self.guard.0.upgrade().ok_or(RouteWaitError::Closed)?;
-        let mut feedback = inputs.feedback.subscribe();
-        let publication = {
-            let state = inputs.state.lock();
-            if let InstanceRouteStatus::Failed(error) = &feedback.borrow().instance {
-                return Err(RouteWaitError::Failed(error.clone()));
-            }
-            state
-                .claims
-                .get(&self.guard.1)
-                .cloned()
-                .ok_or(RouteWaitError::Closed)?
-        };
-        if publication.needs_default_device() && device.is_none() {
-            return Err(RouteWaitError::DeviceRequired);
-        }
-        loop {
-            {
-                let state = inputs.state.lock();
-                let status = feedback.borrow_and_update();
-                if let InstanceRouteStatus::Failed(error) = &status.instance {
-                    return Err(RouteWaitError::Failed(error.clone()));
-                }
-                if state.closed {
-                    return Err(RouteWaitError::Closed);
-                }
-                if !state
-                    .claims
-                    .get(&self.guard.1)
-                    .is_some_and(|current| Arc::ptr_eq(current, &publication))
-                {
-                    return Err(RouteWaitError::Superseded);
-                }
-                if device.is_some() && state.device != device {
-                    return Err(RouteWaitError::DeviceChanged);
-                }
-                if status.stamp == state.stamp {
-                    match status.claims.get(&self.guard.1) {
-                        Some(ClaimRouteStatus::Ready) => return Ok(()),
-                        Some(ClaimRouteStatus::Suppressed) => {
-                            return Err(RouteWaitError::Suppressed);
-                        }
-                        Some(ClaimRouteStatus::Rejected(error)) => {
-                            return Err(RouteWaitError::Rejected(error.clone()));
-                        }
-                        Some(ClaimRouteStatus::Failed(error)) => {
-                            return Err(RouteWaitError::Failed(error.clone()));
-                        }
-                        _ => {}
-                    }
-                }
-            }
-            feedback
-                .changed()
-                .await
-                .map_err(|_| RouteWaitError::Failed("route driver disappeared".into()))?;
-        }
-    }
-}
-
-fn release_claim((weak, id): (Weak<RouteInputs>, RouteClaimId)) {
-    let Some(inputs) = weak.upgrade() else {
-        return;
-    };
-    let old = {
-        let mut state = inputs.state.lock();
-        if state.closed {
-            return;
-        }
-        state.invalidate();
-        state.claims.remove(&id)
-    };
-    drop(old);
-    inputs.changed();
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::config::{peers::PeerRuntimeSnapshot, runtime::CoreRuntimeConfig};
-    use futures::FutureExt;
-    use std::sync::atomic::{AtomicUsize, Ordering};
 
     fn config() -> CoreRuntimeConfigStore {
         CoreRuntimeConfigStore::new(
@@ -711,342 +466,57 @@ mod tests {
             Arc::new(PeerRuntimeSnapshot::default()),
         )
     }
-    fn auto(prefix: &str) -> RouteDemand {
-        RouteDemand::AutoProxy(BTreeSet::from([prefix.parse().unwrap()]))
-    }
-    fn additional(prefix: &str) -> RouteDemand {
-        RouteDemand::Additional(BTreeSet::from([RouteSpec::for_tun(
-            prefix.parse().unwrap(),
-        )]))
-    }
-    fn owner() -> InstanceRoutes {
-        InstanceRoutes::new(Arc::new(|| {}))
-    }
-    fn ready(inputs: &RouteInputs) {
-        let snapshot = inputs.snapshot();
-        let feedback = snapshot
-            .claims
-            .keys()
-            .map(|id| (*id, ClaimRouteStatus::Ready))
-            .collect();
-        assert!(inputs.publish_feedback(&snapshot, InstanceRouteStatus::Active, feedback));
-    }
 
     #[test]
-    fn manual_policy_is_local_and_keeps_latest_auto_and_additional() {
-        let owner = owner();
-        let store = config();
-        owner.bind_config(store.clone()).unwrap();
-        let auto = owner.handle().publish(auto("10.50.0.0/24")).unwrap();
-        let _extra = owner.handle().publish(additional("198.18.0.1/32")).unwrap();
-        let inputs = owner.inputs();
-        assert_eq!(inputs.snapshot().effective_routes().len(), 2);
-        store.update_services(|services| services.manual_routes = Some(BTreeSet::new()));
-        assert!(inputs.snapshot().auto_suppressed());
-        assert_eq!(
-            inputs.snapshot().effective_routes(),
-            RouteSet::from([RouteSpec::for_tun("198.18.0.1/32".parse().unwrap())])
+    fn slot_replace_and_close() {
+        let owner = InstanceRoutes::new(Arc::new(|| {}));
+        let slot = owner.handle().open_slot().unwrap();
+        assert_eq!(slot.status(), RouteSlotStatus::Pending);
+
+        let demand = RouteDemand::AutoProxy(BTreeSet::from(["10.0.0.0/24".parse().unwrap()]));
+        slot.replace(demand.clone()).unwrap();
+        assert_eq!(slot.demand(), Some(demand));
+
+        slot.inner.set_ready(None);
+        assert_eq!(slot.status(), RouteSlotStatus::Ready);
+
+        drop(slot);
+        assert!(owner.handle().open_slot().is_ok());
+    }
+
+    #[tokio::test]
+    async fn slot_wait_ready_notification() {
+        let dirty_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let dc = dirty_count.clone();
+        let slot = RouteSlot::new(
+            uuid::Uuid::new_v4(),
+            Arc::new(move || {
+                dc.fetch_add(1, Ordering::SeqCst);
+            }),
         );
-        auto.replace(RouteDemand::AutoProxy(BTreeSet::from(["10.51.0.0/24"
-            .parse()
-            .unwrap()])))
-            .unwrap();
-        store.update_services(|services| {
-            services.manual_routes = Some(BTreeSet::from(["10.52.0.0/24".parse().unwrap()]))
+
+        let epoch = DeviceEpoch::new();
+        let slot_clone = slot.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            slot_clone.inner.set_ready(Some(epoch));
         });
-        assert!(
-            inputs
-                .snapshot()
-                .effective_routes()
-                .contains(&RouteSpec::for_tun("10.52.0.0/24".parse().unwrap()))
-        );
-        store.update_services(|services| services.manual_routes = None);
-        assert!(
-            inputs
-                .snapshot()
-                .effective_routes()
-                .contains(&RouteSpec::for_tun("10.51.0.0/24".parse().unwrap()))
-        );
-        assert!(!inputs.snapshot().auto_suppressed());
+
+        let res = slot.wait_ready(Some(epoch)).await;
+        assert!(res.is_ok(), "got err: {:?}", res);
+        assert_eq!(slot.status(), RouteSlotStatus::Ready);
     }
 
-    #[tokio::test]
-    async fn late_ready_is_rejected_after_claim_config_device_and_os_invalidation() {
-        let owner = owner();
-        let inputs = owner.inputs();
+    #[test]
+    fn bind_config_stores_and_invalidates() {
+        let dirty_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let dc = dirty_count.clone();
+        let owner = InstanceRoutes::new(Arc::new(move || {
+            dc.fetch_add(1, Ordering::SeqCst);
+        }));
+
         let store = config();
         owner.bind_config(store.clone()).unwrap();
-        let epoch = DeviceEpoch::new();
-        inputs
-            .set_default_device(uuid::Uuid::new_v4(), Some(epoch))
-            .unwrap();
-        let claim = owner.handle().publish(additional("198.18.0.1/32")).unwrap();
-        ready(&inputs);
-        claim.wait_ready(Some(epoch)).await.unwrap();
-        let old = inputs.snapshot();
-        claim.replace(additional("198.18.0.2/32")).unwrap();
-        assert!(
-            !inputs.publish_feedback(
-                &old,
-                InstanceRouteStatus::Active,
-                old.claims
-                    .keys()
-                    .map(|id| (*id, ClaimRouteStatus::Ready))
-                    .collect()
-            )
-        );
-        assert!(claim.wait_ready(Some(epoch)).now_or_never().is_none());
-        ready(&inputs);
-        store.update_services(|services| services.dhcp_ipv4 = true);
-        assert!(claim.wait_ready(Some(epoch)).now_or_never().is_none());
-        ready(&inputs);
-        store.update_peer(Arc::new(PeerRuntimeSnapshot::default()));
-        claim.wait_ready(Some(epoch)).await.unwrap();
-        inputs.invalidate();
-        assert!(claim.wait_ready(Some(epoch)).now_or_never().is_none());
-        ready(&inputs);
-        inputs
-            .set_default_device(
-                inputs.snapshot().default_nic.unwrap(),
-                Some(DeviceEpoch::new()),
-            )
-            .unwrap();
-        assert_eq!(
-            claim.wait_ready(Some(epoch)).await,
-            Err(RouteWaitError::DeviceChanged)
-        );
-    }
-
-    #[tokio::test]
-    async fn waiter_captures_publication_and_requires_exact_device_epoch() {
-        let owner = owner();
-        let inputs = owner.inputs();
-        let epoch = DeviceEpoch::new();
-        inputs
-            .set_default_device(uuid::Uuid::new_v4(), Some(epoch))
-            .unwrap();
-        let claim = owner.handle().publish(additional("198.18.0.1/32")).unwrap();
-        assert_eq!(
-            claim.wait_ready(None).await,
-            Err(RouteWaitError::DeviceRequired)
-        );
-        let waiting = claim.wait_ready(Some(epoch));
-        futures::pin_mut!(waiting);
-        assert!(waiting.as_mut().now_or_never().is_none());
-        claim.replace(additional("198.18.0.2/32")).unwrap();
-        assert_eq!(waiting.await, Err(RouteWaitError::Superseded));
-        ready(&inputs);
-        claim.wait_ready(Some(epoch)).await.unwrap();
-        let snapshot = inputs.snapshot();
-        let waiting = claim.wait_ready(Some(epoch));
-        claim.replace(additional("198.18.0.2/32")).unwrap();
-        assert!(
-            inputs.is_current(&snapshot),
-            "equal replacement preserves publication and Ready"
-        );
-        waiting.await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn close_revokes_stale_handles_but_retains_driver_state_until_explicit_drain() {
-        let owner = owner();
-        let inputs = owner.inputs();
-        let handle = owner.handle();
-        let claim = handle.publish(additional("198.18.0.1/32")).unwrap();
-        let weak = Arc::downgrade(&inputs);
-        owner.request_close();
-        assert!(matches!(
-            handle.publish(auto("10.50.0.0/24")),
-            Err(RouteInputError::Closed)
-        ));
-        assert_eq!(
-            claim.replace(additional("198.18.0.2/32")),
-            Err(RouteInputError::Closed)
-        );
-        assert_eq!(
-            claim.wait_ready(Some(DeviceEpoch::new())).await,
-            Err(RouteWaitError::Closed)
-        );
-        assert!(owner.wait_drained().now_or_never().is_none());
-        let closed = inputs.snapshot();
-        assert!(closed.closed);
-        assert!(closed.claims.is_empty());
-        assert!(inputs.publish_feedback(&closed, InstanceRouteStatus::Drained, BTreeMap::new()));
-        inputs.fail("late failure".into());
-        assert!(!inputs.publish_feedback(
-            &closed,
-            InstanceRouteStatus::Draining { remaining: None },
-            BTreeMap::new()
-        ));
-        owner.wait_drained().await.unwrap();
-        drop(owner);
-        drop(inputs);
-        assert!(
-            weak.upgrade().is_none(),
-            "handle/claim must not keep input/config alive"
-        );
-        assert!(matches!(
-            handle.publish(auto("10.50.0.0/24")),
-            Err(RouteInputError::Closed)
-        ));
-    }
-
-    #[tokio::test]
-    async fn failures_and_suppression_are_not_ready_or_drained() {
-        let owner = owner();
-        let inputs = owner.inputs();
-        let epoch = DeviceEpoch::new();
-        inputs
-            .set_default_device(uuid::Uuid::new_v4(), Some(epoch))
-            .unwrap();
-        let claim = owner.handle().publish(auto("10.50.0.0/24")).unwrap();
-        let snapshot = inputs.snapshot();
-        let statuses = snapshot
-            .claims
-            .keys()
-            .map(|id| (*id, ClaimRouteStatus::Suppressed))
-            .collect();
-        inputs.publish_feedback(&snapshot, InstanceRouteStatus::Active, statuses);
-        assert_eq!(
-            claim.wait_ready(Some(epoch)).await,
-            Err(RouteWaitError::Suppressed)
-        );
-        inputs.fail("worker terminated".into());
-        assert_eq!(
-            claim.wait_ready(Some(epoch)).await,
-            Err(RouteWaitError::Failed("worker terminated".into()))
-        );
-        assert_eq!(
-            owner.wait_drained().await,
-            Err(RouteWaitError::Failed("worker terminated".into()))
-        );
-    }
-
-    #[test]
-    fn invalid_replace_preserves_input_and_cross_instance_feedback_is_rejected() {
-        let owner = owner();
-        let inputs = owner.inputs();
-        let claim = owner.handle().publish(additional("198.18.0.1/32")).unwrap();
-        let before = inputs.snapshot();
-        let mut invalid = RouteSpec::for_tun("198.18.0.2/32".parse().unwrap());
-        invalid.preferred_source = Some("::1".parse().unwrap());
-        assert!(matches!(
-            claim.replace(RouteDemand::Additional(RouteSet::from([invalid]))),
-            Err(RouteInputError::InvalidSpec(_))
-        ));
-        assert!(inputs.is_current(&before));
-        let other = super::tests::owner();
-        let _claim = other.handle().publish(additional("198.18.0.1/32")).unwrap();
-        assert!(!other.inputs().is_current(&before));
-        assert!(!other.inputs().publish_feedback(
-            &before,
-            InstanceRouteStatus::Active,
-            BTreeMap::new()
-        ));
-    }
-
-    #[test]
-    fn binding_is_once_per_instance_and_rebinding_cannot_revoke_an_active_epoch() {
-        let owner = owner();
-        let inputs = owner.inputs();
-        let nic = uuid::Uuid::new_v4();
-        owner.bind_default_nic(nic).unwrap();
-        let epoch = DeviceEpoch::new();
-        inputs.set_default_device(nic, Some(epoch)).unwrap();
-        let snapshot = inputs.snapshot();
-        owner.bind_default_nic(nic).unwrap();
-        assert!(inputs.is_current(&snapshot));
-        assert_eq!(inputs.snapshot().device, Some(epoch));
-        assert_eq!(
-            owner.bind_default_nic(uuid::Uuid::new_v4()),
-            Err(RouteInputError::AlreadyBound)
-        );
-        assert_eq!(
-            inputs.set_default_device(uuid::Uuid::new_v4(), Some(epoch)),
-            Err(RouteInputError::AlreadyBound)
-        );
-        assert!(inputs.is_current(&snapshot));
-    }
-
-    #[test]
-    fn concurrent_equal_replacements_commit_one_actual_publication_change() {
-        let owner = owner();
-        let inputs = owner.inputs();
-        let claim = Arc::new(owner.handle().publish(additional("198.18.0.1/32")).unwrap());
-        let before = inputs.snapshot();
-        let barrier = Arc::new(std::sync::Barrier::new(3));
-        let threads = (0..2)
-            .map(|_| {
-                let claim = claim.clone();
-                let barrier = barrier.clone();
-                std::thread::spawn(move || {
-                    barrier.wait();
-                    claim.replace(additional("198.18.0.2/32")).unwrap();
-                })
-            })
-            .collect::<Vec<_>>();
-        barrier.wait();
-        for thread in threads {
-            thread.join().unwrap();
-        }
-        let after = inputs.snapshot();
-        assert_eq!(after.stamp, before.stamp + 1);
-        assert_eq!(after.claims.len(), 1);
-        assert_eq!(
-            after.claims.values().next().unwrap().as_ref(),
-            &additional("198.18.0.2/32")
-        );
-    }
-
-    #[test]
-    fn callbacks_run_outside_input_lock_and_drop_revokes_synchronously() {
-        let wakes = Arc::new(AtomicUsize::new(0));
-        let observed = Arc::new(Mutex::new(Weak::<RouteInputs>::new()));
-        let callback_inputs = observed.clone();
-        let callback_wakes = wakes.clone();
-        let owner = InstanceRoutes::new(Arc::new(move || {
-            callback_wakes.fetch_add(1, Ordering::Relaxed);
-            if let Some(inputs) = callback_inputs.lock().upgrade() {
-                assert!(inputs.state.try_lock().is_some());
-            }
-        }));
-        *observed.lock() = Arc::downgrade(&owner.inputs);
-        let inputs = owner.inputs();
-        let claim = owner.handle().publish(auto("10.50.0.0/24")).unwrap();
-        assert_eq!(wakes.load(Ordering::Relaxed), 1);
-        drop(claim);
-        assert!(inputs.snapshot().claims.is_empty());
-        assert_eq!(wakes.load(Ordering::Relaxed), 2);
-        drop(owner);
-        assert!(inputs.snapshot().closed);
-        assert_eq!(wakes.load(Ordering::Relaxed), 3);
-    }
-    #[tokio::test]
-    async fn cleanup_progress_uses_feedback_and_preserves_the_terminal_result() {
-        let mut owner = owner();
-        owner.request_close();
-        assert_eq!(
-            owner.status(),
-            InstanceRouteStatus::Draining { remaining: None }
-        );
-        let inputs = owner.inputs();
-        let snapshot = inputs.snapshot();
-        assert!(inputs.publish_feedback(
-            &snapshot,
-            InstanceRouteStatus::Draining { remaining: Some(2) },
-            BTreeMap::new()
-        ));
-        assert_eq!(
-            owner.status_changed().await.unwrap(),
-            InstanceRouteStatus::Draining { remaining: Some(2) }
-        );
-        assert!(inputs.publish_feedback(&snapshot, InstanceRouteStatus::Drained, BTreeMap::new()));
-        assert_eq!(
-            owner.status_changed().await.unwrap(),
-            InstanceRouteStatus::Drained
-        );
-        owner.wait_drained().await.unwrap();
-        inputs.fail("late cleanup error".into());
-        assert_eq!(owner.status(), InstanceRouteStatus::Drained);
+        assert!(dirty_count.load(Ordering::SeqCst) > 0);
     }
 }

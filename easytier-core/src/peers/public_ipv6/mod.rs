@@ -781,16 +781,15 @@ mod tests {
         );
         service.bind_host_routes(&owner.handle()).unwrap();
         let routes = || {
-            owner
-                .inputs()
-                .snapshot()
-                .claims
-                .values()
-                .find_map(|demand| match demand.as_ref() {
-                    RouteDemand::Additional(routes) => Some(routes.clone()),
+            service
+                .host_routes
+                .lock()
+                .as_ref()
+                .and_then(|slot| match slot.demand()? {
+                    RouteDemand::Additional(routes) => Some(routes),
                     _ => None,
                 })
-                .unwrap()
+                .unwrap_or_default()
         };
         service.reconcile_runtime();
         let mut default = RouteSpec::for_tun("::/0".parse().unwrap());
@@ -802,12 +801,7 @@ mod tests {
                 RouteSpec::for_tun("2001:db8:1::7/128".parse().unwrap())
             ])
         );
-        let before = owner.inputs().snapshot();
         service.reconcile_runtime();
-        let after = owner.inputs().snapshot();
-        for (id, publication) in &before.claims {
-            assert!(Arc::ptr_eq(publication, &after.claims[id]));
-        }
         // Loss of our lease withdraws only the default; reachability changes
         // replace the complete remote-prefix set, without delta replay.
         peers.peers.lock().unwrap().retain(|info| info.peer_id != 1);
@@ -822,6 +816,6 @@ mod tests {
             RouteSet::from([RouteSpec::for_tun("2001:db8:2::7/128".parse().unwrap())])
         );
         service.release_host_routes();
-        assert!(owner.inputs().snapshot().claims.is_empty());
+        assert!(service.host_routes.lock().is_none());
     }
 }

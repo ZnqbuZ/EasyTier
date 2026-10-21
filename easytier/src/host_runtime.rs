@@ -57,12 +57,7 @@ pub struct NativeNetNSServices {
     net_ns: NetNS,
     #[cfg(feature = "tun")]
     #[educe(PartialEq(ignore), Hash(ignore))]
-    service_initialization: Mutex<()>,
-    #[cfg(feature = "tun")]
-    #[educe(PartialEq(ignore), Hash(ignore))]
-    routes: OnceLock<
-        Result<Arc<tokio::sync::Mutex<crate::instance::route::RouteController>>, Arc<str>>,
-    >,
+    routes: crate::instance::route::RouteController,
     #[educe(PartialEq(ignore), Hash(ignore))]
     dns: RuntimeDnsResolver,
     #[cfg(feature = "tun")]
@@ -86,67 +81,40 @@ impl Deref for NativeNetNSServices {
 }
 
 impl NativeNetNSServices {
-    fn new(net_ns: NetNS) -> Self {
-        Self {
+    fn new(net_ns: NetNS) -> io::Result<Self> {
+        #[cfg(feature = "tun")]
+        let routes = {
+            let shared = native_host_runtime()
+                .shared_executor()
+                .map_err(|e| io::Error::other(e.to_string()))?;
+            crate::instance::route::RouteController::start(net_ns.clone(), &shared)
+                .map_err(|e| io::Error::other(e.to_string()))?
+        };
+
+        Ok(Self {
             dns: RuntimeDnsResolver::in_net_ns(net_ns.clone()),
             #[cfg(feature = "tun")]
-            service_initialization: Mutex::new(()),
-            #[cfg(feature = "tun")]
-            routes: OnceLock::new(),
+            routes,
             #[cfg(feature = "tun")]
             nics: Arc::new(AsyncMutex::new(SharedVirtualNicRegistry::in_domain(
                 net_ns.clone(),
             ))),
             net_ns,
-        }
+        })
     }
 
     #[cfg(feature = "tun")]
     pub(crate) fn route_controller(
         &self,
-    ) -> anyhow::Result<Arc<tokio::sync::Mutex<crate::instance::route::RouteController>>> {
+    ) -> anyhow::Result<crate::instance::route::RouteController> {
         self.ensure_open()?;
-        let result = if let Some(routes) = self.routes.get() {
-            routes
-        } else {
-            // The gate spans OnceLock publication, not just its initializer.
-            // Close cannot miss a newly published worker behind this gate.
-            let _initialization = self.service_initialization.lock().unwrap();
-            self.ensure_open()?;
-            self.routes.get_or_init(|| {
-                let shared = native_host_runtime()
-                    .shared_executor()
-                    .map_err(|error| Arc::<str>::from(error.to_string()))?;
-                crate::instance::route::RouteController::start(self.net_ns.clone(), &shared)
-                    .map_err(|error| Arc::<str>::from(error.to_string()))
-            })
-        };
-        result
-            .as_ref()
-            .map(|r| r.clone())
-            .map_err(|reason| anyhow::anyhow!("route controller initialization failed: {reason}"))
+        Ok(self.routes.clone())
     }
 
     pub(crate) fn request_service_shutdown(&self) {
         self.net_ns.close();
         #[cfg(feature = "tun")]
-        {
-            let _initialization = self.service_initialization.lock().unwrap();
-            if let Some(Ok(routes)) = self.routes.get()
-                && let Ok(mut guard) = routes.try_lock()
-            {
-                guard.request_shutdown();
-            }
-        }
-    }
-
-    #[cfg(feature = "tun")]
-    pub(crate) fn existing_route_controller(
-        &self,
-    ) -> Option<Arc<tokio::sync::Mutex<crate::instance::route::RouteController>>> {
-        self.routes
-            .get()
-            .and_then(|result| result.as_ref().ok().cloned())
+        self.routes.request_shutdown();
     }
 
     pub(crate) async fn wait_services_stopped(&self) -> anyhow::Result<()> {
@@ -158,15 +126,7 @@ impl NativeNetNSServices {
             }
         }
         #[cfg(feature = "tun")]
-        if let Some(routes) = self.routes.get() {
-            match routes {
-                Ok(routes) => {
-                    let mut guard = routes.lock().await;
-                    guard.request_shutdown();
-                }
-                Err(reason) => anyhow::bail!("route controller initialization failed: {reason}"),
-            }
-        }
+        self.routes.request_shutdown();
         Ok(())
     }
 }
@@ -332,9 +292,11 @@ impl NativeHostRuntime {
         if self.closing.load(Ordering::Acquire) {
             return Err(io::Error::other("native host runtime is closing"));
         }
-        let services = entries.get_or_insert_with(&candidate, |net_ns| {
-            Arc::new(NativeNetNSServices::new(net_ns.clone()))
-        });
+        if let Some(services) = entries.get(&candidate) {
+            return Ok(services.net_ns.clone());
+        }
+        let services = Arc::new(NativeNetNSServices::new(candidate)?);
+        entries.insert(services.clone());
         Ok(services.net_ns.clone())
     }
 
@@ -681,7 +643,7 @@ mod tests {
     #[tokio::test]
     async fn closed_domains_reject_new_native_io_through_every_bound_factory() {
         let platform = PlatformNetNS::thread().unwrap();
-        let net_ns = NativeNetNSServices::new(NetNS::new(platform.id(), platform));
+        let net_ns = NativeNetNSServices::new(NetNS::new(platform.id(), platform)).unwrap();
         net_ns.request_service_shutdown();
         let closing =
             |error: anyhow::Error| assert!(error.to_string().contains("closing"), "{error:#}");
@@ -875,47 +837,25 @@ mod tests {
     #[cfg(feature = "tun")]
     #[tokio::test]
     async fn concurrent_route_service_initialization_has_one_owner_and_close_is_final() {
-        // This fixture has no route demands and never mutates the host table.
         let platform = PlatformNetNS::thread().unwrap();
-        let net_ns = Arc::new(NativeNetNSServices::new(NetNS::new(
-            platform.id(),
-            platform,
-        )));
-        let callers = (0..16)
-            .map(|_| {
-                let net_ns = net_ns.clone();
-                std::thread::spawn(move || {
-                    Arc::as_ptr(&net_ns.route_controller().unwrap()) as usize
-                })
-            })
-            .collect::<Vec<_>>();
-        let addresses = callers
-            .into_iter()
-            .map(|caller| caller.join().unwrap())
-            .collect::<std::collections::BTreeSet<_>>();
-        assert_eq!(addresses.len(), 1);
+        let net_ns = Arc::new(
+            NativeNetNSServices::new(NetNS::new(platform.id(), platform)).unwrap(),
+        );
         let controller = net_ns.route_controller().unwrap();
-        let mut guard = controller.try_lock().unwrap();
-        let owner = guard
+        let owner = controller
             .open_instance(uuid::Uuid::new_v4(), String::new())
             .unwrap();
-        drop(guard);
         owner
             .bind_config(easytier_core::config::runtime::CoreRuntimeConfigStore::new(
                 easytier_core::config::runtime::CoreRuntimeConfig::default(),
                 Arc::new(easytier_core::config::peers::PeerRuntimeSnapshot::default()),
             ))
             .unwrap();
-        let claim = owner
-            .handle()
-            .publish(easytier_core::host::route::RouteDemand::Additional(
-                Default::default(),
-            ))
-            .unwrap();
-        tokio::time::timeout(std::time::Duration::from_secs(3), claim.wait_ready(None))
-            .await
-            .unwrap()
-            .unwrap();
+        let slot = owner.handle().open_slot().unwrap();
+        slot.replace(easytier_core::host::route::RouteDemand::Additional(
+            Default::default(),
+        ))
+        .unwrap();
         net_ns.request_service_shutdown();
         tokio::time::timeout(
             std::time::Duration::from_secs(3),
@@ -925,48 +865,11 @@ mod tests {
         .unwrap()
         .unwrap();
         assert!(net_ns.route_controller().is_err());
+        assert!(
+            controller
+                .open_instance(uuid::Uuid::new_v4(), String::new())
+                .is_err()
+        );
         assert!(net_ns.validate_context(&SocketContext::default()).is_err());
-    }
-
-    #[cfg(feature = "tun")]
-    #[tokio::test]
-    async fn close_racing_first_initialization_cannot_publish_an_open_service() {
-        let platform = PlatformNetNS::thread().unwrap();
-        let net_ns = Arc::new(NativeNetNSServices::new(NetNS::new(
-            platform.id(),
-            platform,
-        )));
-        let gate = Arc::new(std::sync::Barrier::new(9));
-        let callers = (0..8)
-            .map(|_| {
-                let net_ns = net_ns.clone();
-                let gate = gate.clone();
-                std::thread::spawn(move || {
-                    gate.wait();
-                    let _ = net_ns.route_controller();
-                })
-            })
-            .collect::<Vec<_>>();
-        gate.wait();
-        net_ns.request_service_shutdown();
-        for caller in callers {
-            caller.join().unwrap();
-        }
-        tokio::time::timeout(
-            std::time::Duration::from_secs(3),
-            net_ns.wait_services_stopped(),
-        )
-        .await
-        .unwrap()
-        .unwrap();
-        assert!(net_ns.route_controller().is_err());
-        if let Some(Ok(controller)) = net_ns.routes.get() {
-            let mut guard = controller.lock().await;
-            assert!(
-                guard
-                    .open_instance(uuid::Uuid::new_v4(), String::new())
-                    .is_err()
-            );
-        }
     }
 }

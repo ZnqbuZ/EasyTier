@@ -13,7 +13,7 @@ use cidr::{Ipv6Cidr, Ipv6Inet};
 
 use crate::{
     config::PeerId,
-    host::route::{RouteClaim, RouteDemand, RouteHandle, RouteInputError, RouteSet, RouteSpec},
+    host::route::{RouteDemand, RouteHandle, RouteInputError, RouteSet, RouteSlot, RouteSpec},
     peers::peer_rpc::PeerRpcManager,
     proto::{
         common::Void,
@@ -78,7 +78,7 @@ pub(crate) struct PublicIpv6Service {
     route_cache: std::sync::Mutex<BTreeSet<Ipv6Inet>>,
     pub(super) my_addr_cache: std::sync::Mutex<Option<Ipv6Inet>>,
     runtime_update: parking_lot::Mutex<()>,
-    host_routes: parking_lot::Mutex<Option<RouteClaim>>,
+    pub(super) host_routes: parking_lot::Mutex<Option<RouteSlot>>,
 }
 
 impl PublicIpv6Service {
@@ -230,10 +230,13 @@ impl PublicIpv6Service {
             publication.is_none(),
             "public IPv6 host routes are already bound"
         );
-        *publication = Some(routes.publish(Self::host_demand(
+        let slot = routes.open_slot()?;
+        let demand = Self::host_demand(
             *self.my_addr_cache.lock().unwrap(),
             &self.route_cache.lock().unwrap(),
-        ))?);
+        );
+        slot.replace(demand)?;
+        *publication = Some(slot);
         Ok(())
     }
 
@@ -281,8 +284,8 @@ impl PublicIpv6Service {
             self.runtime.public_ipv6_routes_changed(added, removed);
         }
         if changed
-            && let Some(claim) = self.host_routes.lock().as_ref()
-            && let Err(error) = claim.replace(Self::host_demand(my_addr, &cached_routes))
+            && let Some(slot) = self.host_routes.lock().as_ref()
+            && let Err(error) = slot.replace(Self::host_demand(my_addr, &cached_routes))
             && !matches!(error, RouteInputError::Closed)
         {
             tracing::error!(?error, "failed to publish public IPv6 host routes");

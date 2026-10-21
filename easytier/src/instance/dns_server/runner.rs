@@ -4,7 +4,7 @@ use tokio_util::sync::CancellationToken;
 use std::{net::Ipv4Addr, sync::Arc, time::Duration};
 
 use easytier_core::host::route::{
-    DeviceEpoch, RouteClaim, RouteDemand, RouteHandle, RouteSet, RouteSpec,
+    DeviceEpoch, RouteDemand, RouteHandle, RouteSet, RouteSlot, RouteSpec,
 };
 use easytier_core::instance::CorePacketPlane;
 
@@ -31,7 +31,7 @@ enum MagicDnsFakeIpRouteClaim {
         route_backend: NicBackend,
     },
     Managed {
-        claim: RouteClaim,
+        slot: RouteSlot,
         device: DeviceEpoch,
     },
 }
@@ -39,8 +39,8 @@ enum MagicDnsFakeIpRouteClaim {
 impl MagicDnsFakeIpRouteClaim {
     async fn add(&self) -> anyhow::Result<()> {
         let (fake_ip, route_backend) = match self {
-            Self::Managed { claim, device } => {
-                return claim.wait_ready(Some(*device)).await.map_err(Into::into);
+            Self::Managed { slot, device } => {
+                return slot.wait_ready(Some(*device)).await.map_err(Into::into);
             }
             Self::Legacy {
                 fake_ip,
@@ -138,10 +138,12 @@ impl DnsRunner {
             let needs_route = !self.tun_inet.contains(&fake_ip);
             let ready = async move {
                 if needs_route {
+                    let slot = routes.open_slot()?;
+                    slot.replace(RouteDemand::Additional(RouteSet::from([
+                        RouteSpec::for_tun(cidr::Ipv4Cidr::new(fake_ip, 32).unwrap().into()),
+                    ])))?;
                     *active = Some(MagicDnsFakeIpRouteClaim::Managed {
-                        claim: routes.publish(RouteDemand::Additional(RouteSet::from([
-                            RouteSpec::for_tun(cidr::Ipv4Cidr::new(fake_ip, 32).unwrap().into()),
-                        ])))?,
+                        slot,
                         device,
                     });
                     tokio::select! {
@@ -243,52 +245,39 @@ impl DnsRunner {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use easytier_core::host::route::{
-        ClaimRouteStatus, InstanceRouteStatus, InstanceRoutes, RouteWaitError,
-    };
+    use easytier_core::host::route::RouteWaitError;
     use futures::FutureExt;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     #[tokio::test]
     async fn managed_dns_claim_waits_for_its_supplied_epoch_and_drop_withdraws() {
-        let owner = InstanceRoutes::new(Arc::new(|| {}));
-        let inputs = owner.inputs();
-        let nic = uuid::Uuid::new_v4();
-        owner.bind_default_nic(nic).unwrap();
         let epoch = DeviceEpoch::new();
-        inputs.set_default_device(nic, Some(epoch)).unwrap();
-        let claim = owner
-            .handle()
-            .publish(RouteDemand::Additional(RouteSet::from([
-                RouteSpec::for_tun("100.100.100.100/32".parse().unwrap()),
-            ])))
-            .unwrap();
+        let woken = Arc::new(AtomicBool::new(false));
+        let woken_clone = woken.clone();
+        let slot = RouteSlot::new(uuid::Uuid::new_v4(), Arc::new(move || {
+            woken_clone.store(true, Ordering::SeqCst);
+        }));
+        let inner = slot.downgrade();
+        slot.replace(RouteDemand::Additional(RouteSet::from([
+            RouteSpec::for_tun("100.100.100.100/32".parse().unwrap()),
+        ])))
+        .unwrap();
         let claim = MagicDnsFakeIpRouteClaim::Managed {
-            claim,
+            slot,
             device: epoch,
         };
         assert!(claim.add().now_or_never().is_none());
-        let snapshot = inputs.snapshot();
-        assert!(
-            inputs.publish_feedback(
-                &snapshot,
-                InstanceRouteStatus::Active,
-                snapshot
-                    .claims
-                    .keys()
-                    .map(|id| (*id, ClaimRouteStatus::Ready))
-                    .collect()
-            )
-        );
+        inner.upgrade().unwrap().set_ready(Some(epoch));
         claim.add().await.unwrap();
-        inputs
-            .set_default_device(nic, Some(DeviceEpoch::new()))
-            .unwrap();
+        inner.upgrade().unwrap().set_ready(Some(DeviceEpoch::new()));
         let error = claim.add().await.unwrap_err();
         assert!(matches!(
             error.downcast_ref::<RouteWaitError>(),
             Some(RouteWaitError::DeviceChanged)
         ));
+        woken.store(false, Ordering::SeqCst);
         claim.remove().await;
-        assert!(inputs.snapshot().claims.is_empty());
+        assert!(woken.load(Ordering::SeqCst));
+        assert!(inner.upgrade().is_none());
     }
 }

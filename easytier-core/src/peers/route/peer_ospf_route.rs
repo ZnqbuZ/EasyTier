@@ -35,7 +35,7 @@ use crate::{
     config::PeerId,
     config::peers::PeerGroupIdentity,
     foundation::small_map_shard_amount,
-    host::route::{RouteClaim, RouteDemand, RouteHandle, RouteInputError},
+    host::route::{RouteDemand, RouteHandle, RouteInputError, RouteSlot},
     peers::{
         PeerPacketFilter,
         context::{
@@ -2363,7 +2363,7 @@ struct PeerRouteServiceImpl {
 
     cost_calculator: std::sync::RwLock<Option<RouteCostCalculator>>,
     // The same short synchronous gate orders table commit and publication.
-    host_routes: parking_lot::Mutex<Option<RouteClaim>>,
+    host_routes: parking_lot::Mutex<Option<RouteSlot>>,
     route_table: OspfRouteTable,
     route_table_with_cost: OspfRouteTable,
     foreign_network_owner_map: DashMap<CoreNetworkIdentity, Vec<PeerId>>,
@@ -2853,9 +2853,9 @@ impl PeerRouteServiceImpl {
             .as_mut()
             .unwrap()
             .end_update();
-        if let Some(claim) = host_routes.as_ref() {
+        if let Some(slot) = host_routes.as_ref() {
             let prefixes = self.route_table.list_proxy_cidrs_excluding(self.my_peer_id);
-            if let Err(error) = claim.replace(RouteDemand::AutoProxy(prefixes))
+            if let Err(error) = slot.replace(RouteDemand::AutoProxy(prefixes))
                 && !matches!(error, RouteInputError::Closed)
             {
                 tracing::error!(?error, "failed to publish committed host route snapshot");
@@ -4356,13 +4356,16 @@ impl PeerRoute {
             "peer routes are stopped"
         );
         anyhow::ensure!(publication.is_none(), "host routes are already bound");
-        let claim = routes.publish(RouteDemand::AutoProxy(
-            self.service_impl
-                .route_table
-                .list_proxy_cidrs_excluding(self.my_peer_id),
-        ))?;
+        let slot = routes.open_slot()?;
+        let prefixes = self
+            .service_impl
+            .route_table
+            .list_proxy_cidrs_excluding(self.my_peer_id);
+        if !prefixes.is_empty() {
+            slot.replace(RouteDemand::AutoProxy(prefixes))?;
+        }
         self.public_ipv6_service.bind_host_routes(routes)?;
-        *publication = Some(claim);
+        *publication = Some(slot);
         Ok(())
     }
 
@@ -6559,7 +6562,6 @@ mod tests {
     async fn committed_topology_publishes_raw_host_routes_and_stop_withdraws_them() {
         use crate::host::route::InstanceRoutes;
         let owner = InstanceRoutes::new(Arc::new(|| {}));
-        let inputs = owner.inputs();
         let rpc = Arc::new(PeerRpcManager::new(TestPeerRpcTransport));
         let route = PeerRoute::new(
             1,
@@ -6570,15 +6572,16 @@ mod tests {
         route.bind_host_routes(&owner.handle()).unwrap();
         assert!(route.bind_host_routes(&owner.handle()).is_err());
         let raw = || {
-            inputs
-                .snapshot()
-                .claims
-                .values()
-                .find_map(|demand| match demand.as_ref() {
-                    RouteDemand::AutoProxy(routes) => Some(routes.clone()),
+            route
+                .service_impl
+                .host_routes
+                .lock()
+                .as_ref()
+                .and_then(|slot| match slot.demand()? {
+                    RouteDemand::AutoProxy(routes) => Some(routes),
                     _ => None,
                 })
-                .unwrap()
+                .unwrap_or_default()
         };
         assert!(raw().is_empty());
         let service = &route.service_impl;
@@ -6603,13 +6606,8 @@ mod tests {
         service.synced_route_info.version.inc();
         service.update_route_table();
         assert_eq!(raw(), BTreeSet::from(["10.50.0.0/24".parse().unwrap()]));
-        // No-op commits retain the original publication identity.
-        let before = inputs.snapshot();
         service.update_route_table();
-        let after = inputs.snapshot();
-        for (id, publication) in &before.claims {
-            assert!(Arc::ptr_eq(publication, &after.claims[id]));
-        }
+        assert_eq!(raw(), BTreeSet::from(["10.50.0.0/24".parse().unwrap()]));
         service
             .synced_route_info
             .peer_infos
@@ -6625,7 +6623,7 @@ mod tests {
         service.update_route_table();
         assert!(raw().is_empty());
         route.stop().await;
-        assert!(inputs.snapshot().claims.is_empty());
+        assert!(route.service_impl.host_routes.lock().is_none());
         assert!(route.bind_host_routes(&owner.handle()).is_err());
     }
 }
