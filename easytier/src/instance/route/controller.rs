@@ -1,5 +1,3 @@
-//! Native route controller managing route slots, interfaces, and reconciliation.
-
 use std::{
     collections::{BTreeMap, BTreeSet},
     num::NonZeroU32,
@@ -7,14 +5,13 @@ use std::{
     time::Duration,
 };
 
+#[cfg(mobile)]
+use cidr::IpCidr;
 use easytier_core::host::route::{
-    DeviceEpoch, InstanceRoutes, RouteDemand, RouteHandle, RouteSlot, RouteSlotInner, RouteSpec,
+    InstanceRoutes, RouteHandle, RouteSlot, RouteSlotInner, RouteSpec,
 };
 use parking_lot::RwLock;
 use uuid::Uuid;
-
-#[cfg(mobile)]
-use cidr::IpCidr;
 
 use crate::{
     common::net_ns::NetNS,
@@ -32,11 +29,20 @@ pub(crate) struct InstanceEntry {
     #[allow(dead_code)]
     pub(crate) name: String,
     pub(crate) routes: InstanceRoutes,
-    pub(crate) default_device: Option<DeviceEpoch>,
+}
+
+pub(crate) struct ReconcilePlan {
+    pub(crate) routes_to_remove: Vec<OsRoute>,
+    pub(crate) routes_to_add: Vec<OsRoute>,
+    pub(crate) slots_to_mark_ready: Vec<Weak<RouteSlotInner>>,
+    pub(crate) slots_to_suppress: Vec<Weak<RouteSlotInner>>,
+    pub(crate) closed_instances: Vec<Uuid>,
+    pub(crate) new_applied: AppliedRoutes,
 }
 
 /// Private internal routing table state, owned exclusively by RouteController
 /// and protected by an RwLock. Lock is held only for microseconds; I/O happens outside the lock.
+#[derive(Default)]
 struct RouteControllerRuntime {
     interface: Option<InterfaceInfo>,
     slots: Vec<Weak<RouteSlotInner>>,
@@ -45,19 +51,7 @@ struct RouteControllerRuntime {
     shutdown: bool,
 }
 
-impl RouteControllerRuntime {
-    fn new() -> Self {
-        Self {
-            interface: None,
-            slots: Vec::new(),
-            instances: BTreeMap::new(),
-            applied: Default::default(),
-            shutdown: false,
-        }
-    }
-}
-
-/// Lightweight handle for native route coordination.
+/// Lightweight, cloneable handle to the per-namespace RouteController.
 /// Cloning this handle is cheap (Arc clone) and safe to hold across components.
 #[derive(Clone)]
 pub(crate) struct RouteController {
@@ -68,7 +62,7 @@ pub(crate) struct RouteController {
 impl RouteController {
     pub fn new(dirty: Arc<DirtyFlag>) -> Self {
         Self {
-            runtime: Arc::new(RwLock::new(RouteControllerRuntime::new())),
+            runtime: Arc::new(RwLock::new(Default::default())),
             dirty,
         }
     }
@@ -80,44 +74,22 @@ impl RouteController {
     ) -> anyhow::Result<Self> {
         let backend = PlatformRouteBackend::new(&net_ns, handle)?;
         let dirty = Arc::new(DirtyFlag::new(false));
-        let controller = Self::new(dirty.clone());
-        handle.spawn(Self::run(controller.clone(), backend, dirty));
+        let controller = Self::new(dirty);
+        let reconciler = RouteReconciler::new(controller.clone(), backend);
+        handle.spawn(reconciler.run());
         Ok(controller)
     }
 
-    /// Background worker loop: reacts to dirty events and periodic audits without holding locks across await.
-    pub async fn run<B: RouteBackend>(
-        controller: Self,
-        mut backend: B,
-        dirty: Arc<DirtyFlag>,
-    ) {
-        loop {
-            tokio::select! {
-                _ = dirty.wait() => {
-                    dirty.reset();
-                    if controller.is_shutdown() {
-                        break;
-                    }
-                    #[cfg(not(mobile))]
-                    let _ = controller.reconcile(&mut backend).await;
-                    #[cfg(mobile)]
-                    controller.reconcile_mobile();
-                }
-                _ = tokio::time::sleep(Duration::from_secs(60)) => {
-                    if controller.is_shutdown() {
-                        break;
-                    }
-                    #[cfg(not(mobile))]
-                    let _ = controller.audit(&mut backend).await;
-                }
-            }
-        }
+    /// Read the currently applied routes in memory (microsecond read lock, zero system calls).
+    #[allow(dead_code)]
+    pub fn applied_routes(&self) -> AppliedRoutes {
+        self.runtime.read().applied.clone()
     }
 
     /// Allocate a new empty slot owned by Controller's exclusive registry and hand it to caller.
-    pub fn add_slot(&self, run: Uuid) -> RouteSlot {
+    pub fn add_slot(&self, run: Uuid, is_auto_proxy: bool) -> RouteSlot {
         let dirty = self.dirty.clone();
-        let slot = RouteSlot::new(run, Arc::new(move || dirty.mark()));
+        let slot = RouteSlot::new(run, is_auto_proxy, Arc::new(move || dirty.mark()));
         let mut rt = self.runtime.write();
         rt.slots.push(slot.downgrade());
         self.dirty.mark();
@@ -140,7 +112,7 @@ impl RouteController {
     pub fn open_instance(&self, run: Uuid, name: String) -> anyhow::Result<InstanceRoutes> {
         anyhow::ensure!(!self.is_shutdown(), "route controller is shut down");
         let ctrl = self.clone();
-        let handle = RouteHandle::new(move || Ok(ctrl.add_slot(run)));
+        let handle = RouteHandle::new(move |is_auto_proxy| Ok(ctrl.add_slot(run, is_auto_proxy)));
         let dirty = self.dirty.clone();
         let routes = InstanceRoutes::with_handle(run, handle, Arc::new(move || dirty.mark()));
         let mut rt = self.runtime.write();
@@ -149,7 +121,6 @@ impl RouteController {
             InstanceEntry {
                 name,
                 routes: routes.clone(),
-                default_device: None,
             },
         );
         self.dirty.mark();
@@ -174,20 +145,6 @@ impl RouteController {
         }
     }
 
-    pub fn set_instance_default_device(&self, run: &Uuid, epoch: Option<DeviceEpoch>) {
-        let mut rt = self.runtime.write();
-        if let Some(entry) = rt.instances.get_mut(run) {
-            if entry.default_device != epoch {
-                entry.default_device = epoch;
-                self.dirty.mark();
-            }
-        }
-    }
-
-    pub fn invalidate_instance(&self, _run: &Uuid) {
-        self.dirty.mark();
-    }
-
     pub fn request_shutdown(&self) {
         let mut rt = self.runtime.write();
         rt.shutdown = true;
@@ -197,58 +154,91 @@ impl RouteController {
     pub fn is_shutdown(&self) -> bool {
         self.runtime.read().shutdown
     }
+
+    pub fn plan_reconciliation(&self) -> Option<ReconcilePlan> {
+        self.runtime.write().plan_reconciliation()
+    }
+
+    pub fn commit_plan(&self, plan: ReconcilePlan) {
+        self.runtime.write().commit_plan(plan);
+    }
+
+    pub fn prune_missing_routes(&self, missing: Vec<OsRouteSlotKey>) {
+        let mut rt = self.runtime.write();
+        for key in missing {
+            rt.applied.remove(&key);
+        }
+        self.dirty.mark();
+    }
+
+    pub fn invalidate_instance(&self, _run: &Uuid) {
+        self.dirty.mark();
+    }
 }
 
-#[cfg(not(mobile))]
-impl RouteController {
-    /// Declarative reconciliation: aligns desired slots with current applied state.
-    /// Memory state is evaluated under a brief lock; OS system calls run unlocked.
-    pub async fn reconcile<B: RouteBackend>(&self, backend: &mut B) -> Result<(), RouteError> {
-        let plan = {
-            let mut rt = self.runtime.write();
-            rt.plan_reconciliation()
-        };
+/// Dedicated background reconciler actor: exclusively owns the RouteBackend (0 locks)
+/// and drives OS route reconciliation based on plans from RouteController.
+pub(crate) struct RouteReconciler<B> {
+    controller: RouteController,
+    backend: B,
+}
 
-        let Some((to_remove, to_add, winning_slots, suppressed_slots, closed_instances, new_applied)) =
-            plan
-        else {
+impl<B: RouteBackend> RouteReconciler<B> {
+    pub fn new(controller: RouteController, backend: B) -> Self {
+        Self { controller, backend }
+    }
+
+    /// Background worker loop: reacts to dirty events and periodic audits without holding locks across await.
+    pub async fn run(mut self) {
+        loop {
+            tokio::select! {
+                _ = self.controller.dirty.wait() => {
+                    self.controller.dirty.reset();
+                    if self.controller.is_shutdown() {
+                        break;
+                    }
+                    #[cfg(not(mobile))]
+                    let _ = self.reconcile().await;
+                    #[cfg(mobile)]
+                    self.controller.reconcile_mobile();
+                }
+                _ = tokio::time::sleep(Duration::from_secs(60)) => {
+                    if self.controller.is_shutdown() {
+                        break;
+                    }
+                    #[cfg(not(mobile))]
+                    let _ = self.audit().await;
+                }
+            }
+        }
+    }
+
+    #[cfg(not(mobile))]
+    pub async fn reconcile(&mut self) -> Result<(), RouteError> {
+        let Some(plan) = self.controller.plan_reconciliation() else {
             return Ok(());
         };
 
-        for route in to_remove {
-            backend.remove(&route).await?;
-        }
-        for route in to_add {
-            backend.add(&route).await?;
-        }
-
-        {
-            let mut rt = self.runtime.write();
-            rt.applied = new_applied;
-            for (weak, device) in winning_slots {
-                if let Some(slot) = weak.upgrade() {
-                    slot.set_ready(device);
-                }
-            }
-            for weak in suppressed_slots {
-                if let Some(slot) = weak.upgrade() {
-                    slot.set_suppressed();
-                }
-            }
-            for run in closed_instances {
-                let has_routes = rt.applied.values().any(|r| r.owners.contains(&run));
-                if !has_routes {
-                    rt.instances.remove(&run);
-                }
+        for r in &plan.routes_to_remove {
+            if let Err(err) = self.backend.remove(r).await {
+                tracing::warn!(?err, ?r, "failed to remove route from kernel");
             }
         }
 
+        for r in &plan.routes_to_add {
+            if let Err(err) = self.backend.add(r).await {
+                tracing::warn!(?err, ?r, "failed to add route to kernel");
+            }
+        }
+
+        self.controller.commit_plan(plan);
         Ok(())
     }
 
-    pub async fn audit<B: RouteBackend>(&self, backend: &mut B) -> Result<(), RouteError> {
+    #[cfg(not(mobile))]
+    pub async fn audit(&mut self) -> Result<(), RouteError> {
         let requested: BTreeSet<OsRoute> = {
-            let rt = self.runtime.read();
+            let rt = self.controller.runtime.read();
             rt.applied.values().map(|a| a.route.clone()).collect()
         };
 
@@ -256,10 +246,10 @@ impl RouteController {
             return Ok(());
         }
 
-        let existing = backend.existing(&requested).await?;
+        let existing = self.backend.existing(&requested).await?;
         let mut missing = Vec::new();
         {
-            let rt = self.runtime.read();
+            let rt = self.controller.runtime.read();
             for (slot_key, applied) in &rt.applied {
                 if !existing.contains(&applied.route) {
                     missing.push(slot_key.clone());
@@ -268,25 +258,12 @@ impl RouteController {
         }
 
         if !missing.is_empty() {
-            let mut rt = self.runtime.write();
-            for key in missing {
-                rt.applied.remove(&key);
-            }
-            self.dirty.mark();
+            self.controller.prune_missing_routes(missing);
         }
 
         Ok(())
     }
 }
-
-type ReconcilePlan = (
-    Vec<OsRoute>,
-    Vec<OsRoute>,
-    Vec<(Weak<RouteSlotInner>, Option<DeviceEpoch>)>,
-    Vec<Weak<RouteSlotInner>>,
-    Vec<Uuid>,
-    AppliedRoutes,
-);
 
 #[cfg(not(mobile))]
 impl RouteControllerRuntime {
@@ -303,14 +280,14 @@ impl RouteControllerRuntime {
 
         let Some(active_if) = &self.interface else {
             let to_remove = self.applied.values().map(|a| a.route.clone()).collect();
-            return Some((
-                to_remove,
-                Vec::new(),
-                Vec::new(),
-                Vec::new(),
+            return Some(ReconcilePlan {
+                routes_to_remove: to_remove,
+                routes_to_add: Vec::new(),
+                slots_to_mark_ready: Vec::new(),
+                slots_to_suppress: Vec::new(),
                 closed_instances,
-                Default::default(),
-            ));
+                new_applied: Default::default(),
+            });
         };
 
         // slot_key -> claims sorted by (metric, owner, Option<Weak<Slot>>)
@@ -351,30 +328,20 @@ impl RouteControllerRuntime {
                 continue;
             };
             let run = slot.instance();
-            let is_auto_suppressed = self.instances.get(&run).is_some_and(|entry| {
-                entry
-                    .routes
-                    .config()
-                    .is_some_and(|c| c.snapshot().services.manual_routes.is_some())
-            });
+            let is_auto_suppressed = slot.is_auto_proxy()
+                && self.instances.get(&run).is_some_and(|entry| {
+                    entry
+                        .routes
+                        .config()
+                        .is_some_and(|c| c.snapshot().services.manual_routes.is_some())
+                });
 
-            let demand = slot.demand();
-            let specs: Vec<RouteSpec> = match demand {
-                Some(RouteDemand::AutoProxy(prefixes)) => {
-                    if is_auto_suppressed {
-                        suppressed_slots.push(weak.clone());
-                        continue;
-                    }
-                    prefixes
-                        .iter()
-                        .map(|p| RouteSpec::for_tun((*p).into()))
-                        .collect()
-                }
-                Some(RouteDemand::Additional(routes)) => routes.into_iter().collect(),
-                None => continue,
-            };
+            if is_auto_suppressed {
+                suppressed_slots.push(weak.clone());
+                continue;
+            }
 
-            for spec in specs {
+            for spec in slot.routes() {
                 if let Ok(metric) = validate_tun_spec(&spec) {
                     let route = OsRoute {
                         table: spec.table.unwrap_or(254),
@@ -398,20 +365,16 @@ impl RouteControllerRuntime {
         for (slot_key, mut claims) in claims_by_key {
             claims.sort_by_key(|c| c.0);
             let min_metric = claims[0].0;
-            let mut winners = BTreeSet::new();
+            let mut owners = BTreeSet::new();
 
-            for (metric, owner, slot_weak) in claims {
+            for (metric, owner, opt_slot) in claims {
                 if metric == min_metric {
-                    winners.insert(owner);
-                    if let Some(weak) = slot_weak {
-                        let epoch = self
-                            .instances
-                            .get(&owner)
-                            .and_then(|entry| entry.default_device);
-                        winning_slots.push((weak, epoch));
+                    owners.insert(owner);
+                    if let Some(slot) = opt_slot {
+                        winning_slots.push(slot);
                     }
-                } else if let Some(weak) = slot_weak {
-                    suppressed_slots.push(weak);
+                } else if let Some(slot) = opt_slot {
+                    suppressed_slots.push(slot);
                 }
             }
 
@@ -422,10 +385,10 @@ impl RouteControllerRuntime {
                 ifindex: active_if.ifindex,
                 preferred_source: None,
             };
-            desired_routes.insert(slot_key, (os_route, winners));
+            desired_routes.insert(slot_key, (os_route, owners));
         }
 
-        // 4. Diff against currently applied routes
+        // 4. Calculate Add / Remove diff against current applied
         let mut to_remove = Vec::new();
         let mut to_add = Vec::new();
         let mut new_applied = AppliedRoutes::default();
@@ -462,14 +425,37 @@ impl RouteControllerRuntime {
             }
         }
 
-        Some((
-            to_remove,
-            to_add,
-            winning_slots,
-            suppressed_slots,
+        Some(ReconcilePlan {
+            routes_to_remove: to_remove,
+            routes_to_add: to_add,
+            slots_to_mark_ready: winning_slots,
+            slots_to_suppress: suppressed_slots,
             closed_instances,
             new_applied,
-        ))
+        })
+    }
+
+    fn commit_plan(&mut self, plan: ReconcilePlan) {
+        self.applied = plan.new_applied;
+        for weak in plan.slots_to_mark_ready {
+            if let Some(slot) = weak.upgrade() {
+                slot.set_ready();
+            }
+        }
+        for weak in plan.slots_to_suppress {
+            if let Some(slot) = weak.upgrade() {
+                slot.set_suppressed();
+            }
+        }
+        for run in plan.closed_instances {
+            let has_routes = self
+                .slots
+                .iter()
+                .any(|w| w.upgrade().is_some_and(|s| s.instance() == run && !s.is_closed()));
+            if !has_routes {
+                self.instances.remove(&run);
+            }
+        }
     }
 }
 
@@ -483,28 +469,16 @@ impl RouteController {
         let mut prefixes = BTreeSet::new();
         for weak in &rt.slots {
             if let Some(slot) = weak.upgrade() {
-                if let Some(demand) = slot.demand() {
-                    match demand {
-                        RouteDemand::AutoProxy(p) => {
-                            for cidr in p {
-                                prefixes.insert(IpCidr::V4(cidr));
-                            }
-                        }
-                        RouteDemand::Additional(routes) => {
-                            for spec in routes {
-                                prefixes.insert(spec.destination);
-                            }
-                        }
-                    }
+                for spec in slot.routes() {
+                    prefixes.insert(spec.destination);
                 }
             }
         }
 
-        let epoch = DeviceEpoch::new();
-        rt.applied = Some(AppliedSnapshot { epoch, prefixes });
+        rt.applied = Some(AppliedSnapshot { prefixes });
         for weak in &rt.slots {
             if let Some(slot) = weak.upgrade() {
-                slot.set_ready(Some(epoch));
+                slot.set_ready();
             }
         }
     }
@@ -518,30 +492,19 @@ impl RouteController {
         for weak in &rt.slots {
             if let Some(slot) = weak.upgrade() {
                 if slot.instance() == *run {
-                    if let Some(demand) = slot.demand() {
-                        match demand {
-                            RouteDemand::AutoProxy(p) => {
-                                for cidr in p {
-                                    routes.insert(RouteSpec::for_tun(IpCidr::V4(cidr)));
-                                }
-                            }
-                            RouteDemand::Additional(r) => {
-                                routes.extend(r);
-                            }
-                        }
-                    }
+                    routes.extend(slot.routes());
                 }
             }
         }
         routes
     }
 
-    pub fn acknowledge_external(&self, epoch: DeviceEpoch, prefixes: BTreeSet<IpCidr>) {
+    pub fn acknowledge_external(&self, prefixes: BTreeSet<IpCidr>) {
         let mut rt = self.runtime.write();
-        rt.applied = Some(AppliedSnapshot { epoch, prefixes });
+        rt.applied = Some(AppliedSnapshot { prefixes });
         for weak in &rt.slots {
             if let Some(slot) = weak.upgrade() {
-                slot.set_ready(Some(epoch));
+                slot.set_ready();
             }
         }
     }
@@ -587,9 +550,10 @@ mod tests {
 
     #[tokio::test]
     async fn multi_owner_shared_same_metric() {
-        let mut mock = Arc::new(MockBackend::default());
+        let mock = Arc::new(MockBackend::default());
         let dirty = Arc::new(DirtyFlag::new(false));
         let controller = RouteController::new(dirty);
+        let mut reconciler = RouteReconciler::new(controller.clone(), mock.clone());
         let if_info = InterfaceInfo {
             name: "tun0".into(),
             ifindex: 10,
@@ -606,27 +570,23 @@ mod tests {
         spec.metric = 10;
 
         let slot_a = routes_a.handle().open_slot().unwrap();
-        slot_a
-            .replace(RouteDemand::Additional(BTreeSet::from([spec.clone()])))
-            .unwrap();
+        slot_a.set_routes(BTreeSet::from([spec.clone()])).unwrap();
 
-        controller.reconcile(&mut mock).await.unwrap();
+        reconciler.reconcile().await.unwrap();
         assert!(mock.routes.lock().contains(&r1));
 
         let slot_b = routes_b.handle().open_slot().unwrap();
-        slot_b
-            .replace(RouteDemand::Additional(BTreeSet::from([spec])))
-            .unwrap();
+        slot_b.set_routes(BTreeSet::from([spec])).unwrap();
 
-        controller.reconcile(&mut mock).await.unwrap();
+        reconciler.reconcile().await.unwrap();
         assert_eq!(mock.routes.lock().len(), 1);
 
         drop(slot_a);
-        controller.reconcile(&mut mock).await.unwrap();
+        reconciler.reconcile().await.unwrap();
         assert!(mock.routes.lock().contains(&r1));
 
         drop(slot_b);
-        controller.reconcile(&mut mock).await.unwrap();
+        reconciler.reconcile().await.unwrap();
         assert!(mock.routes.lock().is_empty());
     }
 }

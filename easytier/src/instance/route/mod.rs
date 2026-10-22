@@ -11,7 +11,6 @@ cfg_select! {
     mobile => {
         #[derive(Clone, Debug, PartialEq, Eq)]
         pub(crate) struct AppliedSnapshot {
-            pub epoch: easytier_core::host::route::DeviceEpoch,
             pub prefixes: BTreeSet<IpCidr>,
         }
         pub(crate) type AppliedRoutes = Option<AppliedSnapshot>;
@@ -20,6 +19,7 @@ cfg_select! {
         #[derive(Clone, Debug)]
         pub(crate) struct AppliedRoute {
             pub route: OsRoute,
+            #[allow(dead_code)]
             pub owners: BTreeSet<uuid::Uuid>,
             #[allow(dead_code)]
             pub retry: Option<(u32, tokio::time::Instant)>,

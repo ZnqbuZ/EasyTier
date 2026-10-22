@@ -852,10 +852,7 @@ mod tests {
             ))
             .unwrap();
         let slot = owner.handle().open_slot().unwrap();
-        slot.replace(easytier_core::host::route::RouteDemand::Additional(
-            Default::default(),
-        ))
-        .unwrap();
+        slot.set_routes(Default::default()).unwrap();
         net_ns.request_service_shutdown();
         tokio::time::timeout(
             std::time::Duration::from_secs(3),

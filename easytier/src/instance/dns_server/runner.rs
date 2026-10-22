@@ -3,9 +3,7 @@ use tokio_util::sync::CancellationToken;
 
 use std::{net::Ipv4Addr, sync::Arc, time::Duration};
 
-use easytier_core::host::route::{
-    DeviceEpoch, RouteDemand, RouteHandle, RouteSet, RouteSlot, RouteSpec,
-};
+use easytier_core::host::route::{RouteHandle, RouteSet, RouteSlot, RouteSpec};
 use easytier_core::instance::CorePacketPlane;
 
 use crate::{common::global_ctx::ArcGlobalCtx, instance::virtual_nic::NicBackend};
@@ -21,7 +19,7 @@ pub struct DnsRunner {
     tun_inet: Ipv4Inet,
     fake_ip: Ipv4Addr,
     shared_route_backend: Option<NicBackend>,
-    managed_routes: Option<(RouteHandle, DeviceEpoch)>,
+    managed_routes: Option<RouteHandle>,
     active_fake_ip_route: Option<MagicDnsFakeIpRouteClaim>,
 }
 
@@ -32,15 +30,14 @@ enum MagicDnsFakeIpRouteClaim {
     },
     Managed {
         slot: RouteSlot,
-        device: DeviceEpoch,
     },
 }
 
 impl MagicDnsFakeIpRouteClaim {
     async fn add(&self) -> anyhow::Result<()> {
         let (fake_ip, route_backend) = match self {
-            Self::Managed { slot, device } => {
-                return slot.wait_ready(Some(*device)).await.map_err(Into::into);
+            Self::Managed { slot } => {
+                return slot.wait_ready().await.map_err(Into::into);
             }
             Self::Legacy {
                 fake_ip,
@@ -98,8 +95,8 @@ impl DnsRunner {
         self
     }
 
-    pub(crate) fn with_managed_routes(mut self, routes: RouteHandle, device: DeviceEpoch) -> Self {
-        self.managed_routes = Some((routes, device));
+    pub(crate) fn with_managed_routes(mut self, routes: RouteHandle) -> Self {
+        self.managed_routes = Some(routes);
         self.shared_route_backend = None;
         self
     }
@@ -132,20 +129,17 @@ impl DnsRunner {
 
     async fn run_once(&mut self, cancel_token: &CancellationToken) -> anyhow::Result<()> {
         // try server first
-        let server_result = if let Some((routes, device)) = self.managed_routes.clone() {
+        let server_result = if let Some(routes) = self.managed_routes.clone() {
             let active = &mut self.active_fake_ip_route;
             let fake_ip = self.fake_ip;
             let needs_route = !self.tun_inet.contains(&fake_ip);
             let ready = async move {
                 if needs_route {
                     let slot = routes.open_slot()?;
-                    slot.replace(RouteDemand::Additional(RouteSet::from([
+                    slot.set_routes(RouteSet::from([
                         RouteSpec::for_tun(cidr::Ipv4Cidr::new(fake_ip, 32).unwrap().into()),
-                    ])))?;
-                    *active = Some(MagicDnsFakeIpRouteClaim::Managed {
-                        slot,
-                        device,
-                    });
+                    ]))?;
+                    *active = Some(MagicDnsFakeIpRouteClaim::Managed { slot });
                     tokio::select! {
                         _ = cancel_token.cancelled() => anyhow::bail!("DNS route readiness cancelled"),
                         result = active.as_ref().unwrap().add() => result?,
@@ -245,36 +239,25 @@ impl DnsRunner {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use easytier_core::host::route::RouteWaitError;
     use futures::FutureExt;
     use std::sync::atomic::{AtomicBool, Ordering};
 
     #[tokio::test]
-    async fn managed_dns_claim_waits_for_its_supplied_epoch_and_drop_withdraws() {
-        let epoch = DeviceEpoch::new();
+    async fn managed_dns_claim_waits_for_readiness_and_drop_withdraws() {
         let woken = Arc::new(AtomicBool::new(false));
         let woken_clone = woken.clone();
-        let slot = RouteSlot::new(uuid::Uuid::new_v4(), Arc::new(move || {
+        let slot = RouteSlot::new(uuid::Uuid::new_v4(), false, Arc::new(move || {
             woken_clone.store(true, Ordering::SeqCst);
         }));
         let inner = slot.downgrade();
-        slot.replace(RouteDemand::Additional(RouteSet::from([
+        slot.set_routes(RouteSet::from([
             RouteSpec::for_tun("100.100.100.100/32".parse().unwrap()),
-        ])))
+        ]))
         .unwrap();
-        let claim = MagicDnsFakeIpRouteClaim::Managed {
-            slot,
-            device: epoch,
-        };
+        let claim = MagicDnsFakeIpRouteClaim::Managed { slot };
         assert!(claim.add().now_or_never().is_none());
-        inner.upgrade().unwrap().set_ready(Some(epoch));
+        inner.upgrade().unwrap().set_ready();
         claim.add().await.unwrap();
-        inner.upgrade().unwrap().set_ready(Some(DeviceEpoch::new()));
-        let error = claim.add().await.unwrap_err();
-        assert!(matches!(
-            error.downcast_ref::<RouteWaitError>(),
-            Some(RouteWaitError::DeviceChanged)
-        ));
         woken.store(false, Ordering::SeqCst);
         claim.remove().await;
         assert!(woken.load(Ordering::SeqCst));

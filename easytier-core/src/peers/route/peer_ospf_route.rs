@@ -35,7 +35,7 @@ use crate::{
     config::PeerId,
     config::peers::PeerGroupIdentity,
     foundation::small_map_shard_amount,
-    host::route::{RouteDemand, RouteHandle, RouteInputError, RouteSlot},
+    host::route::{RouteHandle, RouteInputError, RouteSet, RouteSlot, RouteSpec},
     peers::{
         PeerPacketFilter,
         context::{
@@ -2855,7 +2855,11 @@ impl PeerRouteServiceImpl {
             .end_update();
         if let Some(slot) = host_routes.as_ref() {
             let prefixes = self.route_table.list_proxy_cidrs_excluding(self.my_peer_id);
-            if let Err(error) = slot.replace(RouteDemand::AutoProxy(prefixes))
+            let routes: RouteSet = prefixes
+                .into_iter()
+                .map(|p| RouteSpec::for_tun(p.into()))
+                .collect();
+            if let Err(error) = slot.set_routes(routes)
                 && !matches!(error, RouteInputError::Closed)
             {
                 tracing::error!(?error, "failed to publish committed host route snapshot");
@@ -4356,13 +4360,17 @@ impl PeerRoute {
             "peer routes are stopped"
         );
         anyhow::ensure!(publication.is_none(), "host routes are already bound");
-        let slot = routes.open_slot()?;
+        let slot = routes.open_auto_proxy_slot()?;
         let prefixes = self
             .service_impl
             .route_table
             .list_proxy_cidrs_excluding(self.my_peer_id);
         if !prefixes.is_empty() {
-            slot.replace(RouteDemand::AutoProxy(prefixes))?;
+            let routes = prefixes
+                .into_iter()
+                .map(|p| RouteSpec::for_tun(p.into()))
+                .collect();
+            slot.set_routes(routes)?;
         }
         self.public_ipv6_service.bind_host_routes(routes)?;
         *publication = Some(slot);
@@ -6577,10 +6585,7 @@ mod tests {
                 .host_routes
                 .lock()
                 .as_ref()
-                .and_then(|slot| match slot.demand()? {
-                    RouteDemand::AutoProxy(routes) => Some(routes),
-                    _ => None,
-                })
+                .map(|slot| slot.routes())
                 .unwrap_or_default()
         };
         assert!(raw().is_empty());
@@ -6605,9 +6610,15 @@ mod tests {
         install_conn_row(service, 2, [1]);
         service.synced_route_info.version.inc();
         service.update_route_table();
-        assert_eq!(raw(), BTreeSet::from(["10.50.0.0/24".parse().unwrap()]));
+        assert_eq!(
+            raw(),
+            RouteSet::from([RouteSpec::for_tun("10.50.0.0/24".parse().unwrap())])
+        );
         service.update_route_table();
-        assert_eq!(raw(), BTreeSet::from(["10.50.0.0/24".parse().unwrap()]));
+        assert_eq!(
+            raw(),
+            RouteSet::from([RouteSpec::for_tun("10.50.0.0/24".parse().unwrap())])
+        );
         service
             .synced_route_info
             .peer_infos
@@ -6617,7 +6628,10 @@ mod tests {
             .proxy_cidrs = vec!["10.51.0.0/24".into()];
         service.synced_route_info.version.inc();
         service.update_route_table();
-        assert_eq!(raw(), BTreeSet::from(["10.51.0.0/24".parse().unwrap()]));
+        assert_eq!(
+            raw(),
+            RouteSet::from([RouteSpec::for_tun("10.51.0.0/24".parse().unwrap())])
+        );
         service.synced_route_info.conn_map.write().clear();
         service.synced_route_info.version.inc();
         service.update_route_table();

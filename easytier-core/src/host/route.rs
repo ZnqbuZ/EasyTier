@@ -10,7 +10,7 @@ use std::{
     },
 };
 
-use cidr::{IpCidr, Ipv4Cidr};
+use cidr::IpCidr;
 
 use crate::config::runtime::CoreRuntimeConfigStore;
 
@@ -64,78 +64,12 @@ impl RouteSpec {
             }
         )
     }
-
-    pub fn validate(&self) -> Result<(), RouteInputError> {
-        let same_family = |ip: IpAddr| ip.is_ipv4() == self.destination.first_address().is_ipv4();
-        if self.preferred_source.is_some_and(|ip| !same_family(ip)) {
-            return Err(RouteInputError::InvalidSpec(
-                "source address family differs",
-            ));
-        }
-        if let RouteAction::Unicast { device, via } = &self.action {
-            if device.is_none() && via.is_none() {
-                return Err(RouteInputError::InvalidSpec(
-                    "unicast requires a device or gateway",
-                ));
-            }
-            if via.is_some_and(|ip| !same_family(ip)) {
-                return Err(RouteInputError::InvalidSpec(
-                    "gateway address family differs",
-                ));
-            }
-            if matches!(device, Some(DeviceSelector::Named(name)) if name.is_empty()) {
-                return Err(RouteInputError::InvalidSpec("empty device name"));
-            }
-        }
-        Ok(())
-    }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum RouteDemand {
-    AutoProxy(BTreeSet<Ipv4Cidr>),
-    Additional(RouteSet),
-}
-
-impl RouteDemand {
-    pub fn validate(&self) -> Result<(), RouteInputError> {
-        if let Self::Additional(routes) = self {
-            for route in routes {
-                route.validate()?;
-            }
-        }
-        Ok(())
-    }
-
-    pub fn needs_default_device(&self) -> bool {
-        match self {
-            Self::AutoProxy(_) => true,
-            Self::Additional(routes) => routes.iter().any(RouteSpec::needs_default_device),
-        }
-    }
-}
-
-/// Allocated once by the owner of each actual physical device generation.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct DeviceEpoch(uuid::Uuid);
-
-impl DeviceEpoch {
-    pub fn new() -> Self {
-        Self(uuid::Uuid::new_v4())
-    }
-}
-impl Default for DeviceEpoch {
-    fn default() -> Self {
-        Self::new()
-    }
 }
 
 #[derive(Clone, Debug, thiserror::Error, PartialEq, Eq)]
 pub enum RouteInputError {
     #[error("route input is closed")]
     Closed,
-    #[error("invalid route: {0}")]
-    InvalidSpec(&'static str),
     #[error("route configuration is already bound")]
     AlreadyBound,
 }
@@ -144,12 +78,6 @@ pub enum RouteInputError {
 pub enum RouteWaitError {
     #[error("route input is closed")]
     Closed,
-    #[error("route declaration was replaced")]
-    Superseded,
-    #[error("device generation changed")]
-    DeviceChanged,
-    #[error("an expected device generation is required")]
-    DeviceRequired,
     #[error("automatic route is suppressed by manual policy")]
     Suppressed,
     #[error("route rejected: {0}")]
@@ -176,13 +104,13 @@ pub enum InstanceRouteStatus {
 
 pub struct RouteSlotInner {
     instance: uuid::Uuid,
-    demand: parking_lot::Mutex<Option<RouteDemand>>,
+    is_auto_proxy: AtomicBool,
+    routes: parking_lot::Mutex<RouteSet>,
     status: AtomicU8, // 0: Pending, 1: Ready, 2: Suppressed, 3: Closed
     error: parking_lot::Mutex<Option<Arc<str>>>,
     notify: tokio::sync::Notify,
     wake: Arc<dyn Fn() + Send + Sync>,
     closed: AtomicBool,
-    device: parking_lot::Mutex<Option<DeviceEpoch>>,
 }
 
 impl RouteSlotInner {
@@ -190,16 +118,19 @@ impl RouteSlotInner {
         self.instance
     }
 
-    pub fn demand(&self) -> Option<RouteDemand> {
-        self.demand.lock().clone()
+    pub fn is_auto_proxy(&self) -> bool {
+        self.is_auto_proxy.load(Ordering::Acquire)
+    }
+
+    pub fn routes(&self) -> RouteSet {
+        self.routes.lock().clone()
     }
 
     pub fn is_closed(&self) -> bool {
         self.closed.load(Ordering::Acquire)
     }
 
-    pub fn set_ready(&self, device: Option<DeviceEpoch>) {
-        *self.device.lock() = device;
+    pub fn set_ready(&self) {
         self.status.store(1, Ordering::Release);
         self.notify.notify_waiters();
     }
@@ -224,31 +155,71 @@ pub struct RouteSlot {
 }
 
 impl RouteSlot {
-    pub fn new(instance: uuid::Uuid, wake: Arc<dyn Fn() + Send + Sync>) -> Self {
+    pub fn new(
+        instance: uuid::Uuid,
+        is_auto_proxy: bool,
+        wake: Arc<dyn Fn() + Send + Sync>,
+    ) -> Self {
         Self {
             inner: Arc::new(RouteSlotInner {
                 instance,
-                demand: parking_lot::Mutex::new(None),
+                is_auto_proxy: AtomicBool::new(is_auto_proxy),
+                routes: parking_lot::Mutex::new(RouteSet::new()),
                 status: AtomicU8::new(0),
                 error: parking_lot::Mutex::new(None),
                 notify: tokio::sync::Notify::new(),
                 wake,
                 closed: AtomicBool::new(false),
-                device: parking_lot::Mutex::new(None),
             }),
         }
     }
 
-    pub fn replace(&self, demand: RouteDemand) -> Result<(), RouteInputError> {
-        demand.validate()?;
+    pub fn instance(&self) -> uuid::Uuid {
+        self.inner.instance
+    }
+
+    pub fn is_auto_proxy(&self) -> bool {
+        self.inner.is_auto_proxy()
+    }
+
+    pub fn routes(&self) -> RouteSet {
+        self.inner.routes()
+    }
+
+    pub fn set_routes(&self, routes: RouteSet) -> Result<(), RouteInputError> {
         if self.inner.closed.load(Ordering::Acquire) {
             return Err(RouteInputError::Closed);
         }
-        *self.inner.demand.lock() = Some(demand);
+        *self.inner.routes.lock() = routes;
         self.inner.status.store(0, Ordering::Release);
         *self.inner.error.lock() = None;
         (self.inner.wake)();
         Ok(())
+    }
+
+    pub fn replace(&self, routes: RouteSet) -> Result<(), RouteInputError> {
+        self.set_routes(routes)
+    }
+
+    pub fn modify<F, R>(&self, f: F) -> Result<R, RouteInputError>
+    where
+        F: FnOnce(&mut RouteSet) -> R,
+    {
+        if self.inner.closed.load(Ordering::Acquire) {
+            return Err(RouteInputError::Closed);
+        }
+        let ret = {
+            let mut guard = self.inner.routes.lock();
+            f(&mut guard)
+        };
+        self.inner.status.store(0, Ordering::Release);
+        *self.inner.error.lock() = None;
+        (self.inner.wake)();
+        Ok(ret)
+    }
+
+    pub fn clear(&self) -> Result<(), RouteInputError> {
+        self.set_routes(RouteSet::new())
     }
 
     pub fn status(&self) -> RouteSlotStatus {
@@ -263,20 +234,12 @@ impl RouteSlot {
         }
     }
 
-    pub fn instance(&self) -> uuid::Uuid {
-        self.inner.instance
-    }
-
-    pub fn demand(&self) -> Option<RouteDemand> {
-        self.inner.demand.lock().clone()
-    }
-
     pub fn is_closed(&self) -> bool {
         self.inner.closed.load(Ordering::Acquire)
     }
 
-    pub fn set_ready(&self, device: Option<DeviceEpoch>) {
-        self.inner.set_ready(device);
+    pub fn set_ready(&self) {
+        self.inner.set_ready();
     }
 
     pub fn set_suppressed(&self) {
@@ -287,7 +250,7 @@ impl RouteSlot {
         self.inner.set_failed(error);
     }
 
-    pub async fn wait_ready(&self, device: Option<DeviceEpoch>) -> Result<(), RouteWaitError> {
+    pub async fn wait_ready(&self) -> Result<(), RouteWaitError> {
         loop {
             if self.inner.closed.load(Ordering::Acquire) {
                 return Err(RouteWaitError::Closed);
@@ -295,22 +258,8 @@ impl RouteSlot {
             if let Some(err) = self.inner.error.lock().clone() {
                 return Err(RouteWaitError::Failed(err));
             }
-            if device.is_some() {
-                let current_device = *self.inner.device.lock();
-                if current_device.is_some() && current_device != device {
-                    return Err(RouteWaitError::DeviceChanged);
-                }
-            }
             match self.status() {
-                RouteSlotStatus::Ready => {
-                    if let Some(expected) = device {
-                        if *self.inner.device.lock() == Some(expected) {
-                            return Ok(());
-                        }
-                    } else {
-                        return Ok(());
-                    }
-                }
+                RouteSlotStatus::Ready => return Ok(()),
                 RouteSlotStatus::Suppressed => return Err(RouteWaitError::Suppressed),
                 RouteSlotStatus::Closed => return Err(RouteWaitError::Closed),
                 RouteSlotStatus::Pending => {}
@@ -337,22 +286,27 @@ impl Drop for RouteSlot {
 /// Immutable, cloneable handle passed to business components to allocate route slots.
 #[derive(Clone)]
 pub struct RouteHandle {
-    open_fn: Arc<dyn Fn() -> Result<RouteSlot, RouteInputError> + Send + Sync>,
+    open_fn: Arc<dyn Fn(bool) -> Result<RouteSlot, RouteInputError> + Send + Sync>,
 }
 
 impl RouteHandle {
     pub fn new<F>(f: F) -> Self
     where
-        F: Fn() -> Result<RouteSlot, RouteInputError> + Send + Sync + 'static,
+        F: Fn(bool) -> Result<RouteSlot, RouteInputError> + Send + Sync + 'static,
     {
         Self {
             open_fn: Arc::new(f),
         }
     }
 
-    /// Allocate a new empty slot from the controller. No prefixes are required up front.
+    /// Allocate a new empty slot from the controller.
     pub fn open_slot(&self) -> Result<RouteSlot, RouteInputError> {
-        (self.open_fn)()
+        (self.open_fn)(false)
+    }
+
+    /// Allocate a new empty slot designated for automatic proxy routes.
+    pub fn open_auto_proxy_slot(&self) -> Result<RouteSlot, RouteInputError> {
+        (self.open_fn)(true)
     }
 }
 
@@ -374,7 +328,9 @@ impl InstanceRoutes {
     pub fn new(wake: Arc<dyn Fn() + Send + Sync>) -> Self {
         let run = uuid::Uuid::new_v4();
         let wake_clone = wake.clone();
-        let handle = RouteHandle::new(move || Ok(RouteSlot::new(run, wake_clone.clone())));
+        let handle = RouteHandle::new(move |is_auto_proxy| {
+            Ok(RouteSlot::new(run, is_auto_proxy, wake_clone.clone()))
+        });
         Self {
             inner: Arc::new(InstanceRoutesInner {
                 run,
@@ -410,6 +366,14 @@ impl InstanceRoutes {
         self.inner.handle.clone()
     }
 
+    pub fn open_slot(&self) -> Result<RouteSlot, RouteInputError> {
+        self.inner.handle.open_slot()
+    }
+
+    pub fn open_auto_proxy_slot(&self) -> Result<RouteSlot, RouteInputError> {
+        self.inner.handle.open_auto_proxy_slot()
+    }
+
     pub fn bind_config(&self, config: CoreRuntimeConfigStore) -> Result<(), RouteInputError> {
         if self.inner.closed.load(Ordering::Acquire) {
             return Err(RouteInputError::Closed);
@@ -429,17 +393,14 @@ impl InstanceRoutes {
         self.inner.config.lock().clone()
     }
 
-    pub fn request_close(&self) {
-        self.inner.closed.store(true, Ordering::Release);
-        (self.inner.wake)();
-    }
-
     pub fn is_closed(&self) -> bool {
         self.inner.closed.load(Ordering::Acquire)
     }
 
-    pub async fn wait_drained(&self) -> Result<(), RouteWaitError> {
-        Ok(())
+    pub fn request_close(&self) {
+        if !self.inner.closed.swap(true, Ordering::AcqRel) {
+            (self.inner.wake)();
+        }
     }
 
     pub fn status(&self) -> InstanceRouteStatus {
@@ -473,11 +434,11 @@ mod tests {
         let slot = owner.handle().open_slot().unwrap();
         assert_eq!(slot.status(), RouteSlotStatus::Pending);
 
-        let demand = RouteDemand::AutoProxy(BTreeSet::from(["10.0.0.0/24".parse().unwrap()]));
-        slot.replace(demand.clone()).unwrap();
-        assert_eq!(slot.demand(), Some(demand));
+        let routes = RouteSet::from([RouteSpec::for_tun("10.0.0.0/24".parse().unwrap())]);
+        slot.set_routes(routes.clone()).unwrap();
+        assert_eq!(slot.routes(), routes);
 
-        slot.inner.set_ready(None);
+        slot.inner.set_ready();
         assert_eq!(slot.status(), RouteSlotStatus::Ready);
 
         drop(slot);
@@ -490,19 +451,19 @@ mod tests {
         let dc = dirty_count.clone();
         let slot = RouteSlot::new(
             uuid::Uuid::new_v4(),
+            false,
             Arc::new(move || {
                 dc.fetch_add(1, Ordering::SeqCst);
             }),
         );
 
-        let epoch = DeviceEpoch::new();
         let slot_clone = slot.clone();
         tokio::spawn(async move {
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-            slot_clone.inner.set_ready(Some(epoch));
+            slot_clone.inner.set_ready();
         });
 
-        let res = slot.wait_ready(Some(epoch)).await;
+        let res = slot.wait_ready().await;
         assert!(res.is_ok(), "got err: {:?}", res);
         assert_eq!(slot.status(), RouteSlotStatus::Ready);
     }

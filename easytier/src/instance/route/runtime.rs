@@ -2,7 +2,7 @@
 
 use easytier_core::{
     config::runtime::CoreRuntimeConfigStore,
-    host::route::{DeviceEpoch, InstanceRouteStatus, InstanceRoutes, RouteHandle},
+    host::route::{InstanceRouteStatus, InstanceRoutes, RouteHandle},
 };
 use guarden::guard;
 use parking_lot::Mutex;
@@ -44,11 +44,10 @@ impl NativeRouteContext {
     pub(crate) async fn ready(
         &self,
         member: &SharedVirtualNicMember,
-        epoch: DeviceEpoch,
         applied_public_address: Option<cidr::Ipv6Inet>,
-    ) -> anyhow::Result<Option<DeviceEpoch>> {
+    ) -> anyhow::Result<bool> {
         if *self.public_address.lock() != applied_public_address {
-            return Ok(None);
+            return Ok(false);
         }
         self.ensure_open()?;
         let ifname = member
@@ -61,8 +60,7 @@ impl NativeRouteContext {
             ifindex,
         };
         self.controller.set_interface(Some(info));
-        self.controller.set_instance_default_device(&self.run, Some(epoch));
-        Ok(Some(epoch))
+        Ok(true)
     }
 
     #[cfg(mobile)]
@@ -78,11 +76,10 @@ impl NativeRouteContext {
     #[cfg(mobile)]
     pub(crate) fn acknowledge_external(
         &self,
-        epoch: DeviceEpoch,
         prefixes: std::collections::BTreeSet<cidr::IpCidr>,
     ) -> anyhow::Result<()> {
         self.ensure_open()?;
-        self.controller.acknowledge_external(epoch, prefixes);
+        self.controller.acknowledge_external(prefixes);
         Ok(())
     }
 
@@ -101,7 +98,6 @@ impl NativeRouteContext {
 
     pub(crate) async fn unready(&self, _member: &SharedVirtualNicMember) {
         self.controller.set_interface(None);
-        self.controller.set_instance_default_device(&self.run, None);
     }
 
     pub(crate) fn abandon(&self, reason: Arc<str>) {
@@ -289,7 +285,6 @@ mod tests {
         ));
         let runtime = NativeRouteRuntime::new(&global).unwrap();
         let context = &runtime.context();
-        let epoch = DeviceEpoch::new();
         let mut registry = crate::instance::shared_virtual_nic::SharedVirtualNicRegistry::new();
         let member = registry
             .try_create_member(
@@ -303,21 +298,12 @@ mod tests {
         let first = "2001:db8::1/128".parse().unwrap();
         let next = "2001:db8::2/128".parse().unwrap();
         context.public_address_changing(Some(first));
-        assert_eq!(
-            context.ready(&member, epoch, Some(first)).await.unwrap(),
-            Some(epoch)
-        );
+        assert!(context.ready(&member, Some(first)).await.unwrap());
         context.public_address_changing(Some(next));
-        assert_eq!(
-            context.ready(&member, epoch, Some(first)).await.unwrap(),
-            None
-        );
-        assert_eq!(
-            context.ready(&member, epoch, Some(next)).await.unwrap(),
-            Some(epoch)
-        );
+        assert!(!context.ready(&member, Some(first)).await.unwrap());
+        assert!(context.ready(&member, Some(next)).await.unwrap());
         runtime.request_close();
-        assert!(context.ready(&member, epoch, Some(next)).await.is_err());
+        assert!(context.ready(&member, Some(next)).await.is_err());
         runtime.drain().await.unwrap();
     }
 

@@ -13,7 +13,7 @@ use cidr::{Ipv6Cidr, Ipv6Inet};
 
 use crate::{
     config::PeerId,
-    host::route::{RouteDemand, RouteHandle, RouteInputError, RouteSet, RouteSlot, RouteSpec},
+    host::route::{RouteHandle, RouteInputError, RouteSet, RouteSlot, RouteSpec},
     peers::peer_rpc::PeerRpcManager,
     proto::{
         common::Void,
@@ -206,7 +206,7 @@ impl PublicIpv6Service {
         (my_addr, routes)
     }
 
-    fn host_demand(my_addr: Option<Ipv6Inet>, routes: &BTreeSet<Ipv6Inet>) -> RouteDemand {
+    fn host_routes(my_addr: Option<Ipv6Inet>, routes: &BTreeSet<Ipv6Inet>) -> RouteSet {
         let mut routes = routes
             .iter()
             .map(|route| RouteSpec::for_tun(route.network().into()))
@@ -220,7 +220,7 @@ impl PublicIpv6Service {
             default.metric = 5;
             routes.insert(default);
         }
-        RouteDemand::Additional(routes)
+        routes
     }
 
     pub(crate) fn bind_host_routes(&self, routes: &RouteHandle) -> anyhow::Result<()> {
@@ -231,11 +231,11 @@ impl PublicIpv6Service {
             "public IPv6 host routes are already bound"
         );
         let slot = routes.open_slot()?;
-        let demand = Self::host_demand(
+        let routes = Self::host_routes(
             *self.my_addr_cache.lock().unwrap(),
             &self.route_cache.lock().unwrap(),
         );
-        slot.replace(demand)?;
+        slot.set_routes(routes)?;
         *publication = Some(slot);
         Ok(())
     }
@@ -285,7 +285,7 @@ impl PublicIpv6Service {
         }
         if changed
             && let Some(slot) = self.host_routes.lock().as_ref()
-            && let Err(error) = slot.replace(Self::host_demand(my_addr, &cached_routes))
+            && let Err(error) = slot.set_routes(Self::host_routes(my_addr, &cached_routes))
             && !matches!(error, RouteInputError::Closed)
         {
             tracing::error!(?error, "failed to publish public IPv6 host routes");

@@ -27,10 +27,7 @@ impl MagicDnsRuntime {
         tun_dev: Option<String>,
         tun_ip: Ipv4Inet,
         shared_route_backend: Option<NicBackend>,
-        managed_routes: Option<(
-            easytier_core::host::route::RouteHandle,
-            easytier_core::host::route::DeviceEpoch,
-        )>,
+        managed_routes: Option<easytier_core::host::route::RouteHandle>,
     ) -> Self {
         let active = global_ctx.get_flags().accept_dns.then(|| {
             let mut runner = DnsRunner::new(
@@ -41,8 +38,8 @@ impl MagicDnsRuntime {
                 MAGIC_DNS_FAKE_IP.parse().unwrap(),
             )
             .with_shared_route_backend(shared_route_backend);
-            if let Some((routes, epoch)) = managed_routes {
-                runner = runner.with_managed_routes(routes, epoch);
+            if let Some(routes) = managed_routes {
+                runner = runner.with_managed_routes(routes);
             }
             let cancel = CancellationToken::new();
             let task_cancel = cancel.clone();
@@ -64,10 +61,7 @@ impl MagicDnsRuntime {
         _tun_dev: Option<String>,
         _tun_ip: Ipv4Inet,
         _shared_route_backend: Option<NicBackend>,
-        _managed_routes: Option<(
-            easytier_core::host::route::RouteHandle,
-            easytier_core::host::route::DeviceEpoch,
-        )>,
+        _managed_routes: Option<easytier_core::host::route::RouteHandle>,
     ) -> Self {
         Self::default()
     }

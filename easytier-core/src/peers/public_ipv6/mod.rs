@@ -742,7 +742,7 @@ mod tests {
     }
     #[tokio::test]
     async fn host_route_claim_tracks_complete_ipv6_state_with_explicit_default_metric() {
-        use crate::host::route::{InstanceRoutes, RouteDemand, RouteSet, RouteSpec};
+        use crate::host::route::{InstanceRoutes, RouteSet, RouteSpec};
         let owner = InstanceRoutes::new(Arc::new(|| {}));
         let peers = Arc::new(TestRouteControl {
             my_peer_id: 1,
@@ -785,10 +785,7 @@ mod tests {
                 .host_routes
                 .lock()
                 .as_ref()
-                .and_then(|slot| match slot.demand()? {
-                    RouteDemand::Additional(routes) => Some(routes),
-                    _ => None,
-                })
+                .map(|slot| slot.routes())
                 .unwrap_or_default()
         };
         service.reconcile_runtime();

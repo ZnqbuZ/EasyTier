@@ -280,7 +280,6 @@ impl VirtualNicConfig {
 
 pub struct VirtualNic {
     config: VirtualNicConfig,
-    device_epoch: Option<easytier_core::host::route::DeviceEpoch>,
     ifname: BoxSyncGuard<Option<String>>,
     ifcfg: Box<dyn IfConfiguerTrait + Send + Sync + 'static>,
 
@@ -317,7 +316,6 @@ impl VirtualNic {
         let ifcfg = Box::new(IfConfiger::new(config.net_ns.clone()));
         Self {
             config,
-            device_epoch: None,
             ifname: guard!([ifname = None] release_interface_name(ifname)).boxed(),
             ifcfg,
             #[cfg(target_os = "windows")]
@@ -635,8 +633,6 @@ impl VirtualNic {
         config.close_fd_on_drop(false);
         config.up();
 
-        self.device_epoch = Some(easytier_core::host::route::DeviceEpoch::new());
-
         let has_packet_info = cfg!(any(
             target_os = "ios",
             all(target_os = "macos", feature = "macos-ne")
@@ -739,7 +735,6 @@ impl VirtualNic {
         );
 
         **self.ifname = Some(ifname.to_owned());
-        self.device_epoch = Some(easytier_core::host::route::DeviceEpoch::new());
 
         #[cfg(target_os = "windows")]
         {
@@ -773,10 +768,6 @@ impl VirtualNic {
 
     pub fn ifname_opt(&self) -> Option<String> {
         self.ifname.as_ref().cloned()
-    }
-
-    pub(crate) fn device_epoch(&self) -> Option<easytier_core::host::route::DeviceEpoch> {
-        self.device_epoch
     }
 
     pub async fn link_up(&self) -> Result<(), Error> {
@@ -934,25 +925,9 @@ pub enum NicBackend {
 
 impl NicBackend {
     pub async fn create_dev(&self) -> Result<Box<dyn Tunnel>, Error> {
-        Ok(self.create_dev_with_epoch().await?.0)
-    }
-
-    pub(crate) async fn create_dev_with_epoch(
-        &self,
-    ) -> Result<
-        (
-            Box<dyn Tunnel>,
-            Option<easytier_core::host::route::DeviceEpoch>,
-        ),
-        Error,
-    > {
         match self {
-            Self::Dedicated(nic) => {
-                let mut nic = nic.lock().await;
-                let tunnel = nic.create_dev().await?;
-                Ok((tunnel, nic.device_epoch()))
-            }
-            Self::Shared(member) => member.create_dev_with_epoch().await,
+            Self::Dedicated(nic) => nic.lock().await.create_dev().await,
+            Self::Shared(member) => member.create_dev().await,
         }
     }
 
@@ -961,19 +936,9 @@ impl NicBackend {
         &self,
         tun_fd: std::os::fd::RawFd,
         replace_tun_fd: bool,
-    ) -> Result<
-        (
-            Box<dyn Tunnel>,
-            Option<easytier_core::host::route::DeviceEpoch>,
-        ),
-        Error,
-    > {
+    ) -> Result<Box<dyn Tunnel>, Error> {
         match self {
-            Self::Dedicated(nic) => {
-                let mut nic = nic.lock().await;
-                let tunnel = nic.create_dev_for_mobile(tun_fd).await?;
-                Ok((tunnel, nic.device_epoch()))
-            }
+            Self::Dedicated(nic) => nic.lock().await.create_dev_for_mobile(tun_fd).await,
             Self::Shared(member) => member.create_dev_for_mobile(tun_fd, replace_tun_fd).await,
         }
     }
@@ -1124,7 +1089,6 @@ pub struct NicCtx {
     backend: NicBackend,
     tasks: JoinSet<()>,
     routes: Option<Arc<super::route::runtime::NativeRouteContext>>,
-    ready_epoch: Option<easytier_core::host::route::DeviceEpoch>,
 
     #[cfg(target_os = "windows")]
     windows_udp_broadcast_relay: Option<AbortOnDropHandle<()>>,
@@ -1167,7 +1131,6 @@ impl NicCtx {
             backend,
             tasks: JoinSet::new(),
             routes: None,
-            ready_epoch: None,
 
             #[cfg(target_os = "windows")]
             windows_udp_broadcast_relay: None,
@@ -1224,14 +1187,8 @@ impl NicCtx {
 
     pub(crate) fn managed_dns_routes(
         &self,
-    ) -> Option<(
-        easytier_core::host::route::RouteHandle,
-        easytier_core::host::route::DeviceEpoch,
-    )> {
-        if let (Some(routes), Some(epoch)) = (&self.routes, self.ready_epoch) {
-            return Some((routes.handle.clone(), epoch));
-        }
-        None
+    ) -> Option<easytier_core::host::route::RouteHandle> {
+        self.routes.as_ref().map(|routes| routes.handle.clone())
     }
 
     pub async fn ifname(&self) -> Option<String> {
@@ -1242,7 +1199,6 @@ impl NicCtx {
         if let (Some(routes), NicBackend::Shared(member)) = (&self.routes, &self.backend) {
             routes.unready(member).await;
         }
-        self.ready_epoch = None;
         // The forwarding tasks own the TUN stream and sink. Wait until both
         // release the device before another NIC with the same name is created.
         self.tasks.shutdown().await;
@@ -1579,12 +1535,10 @@ impl NicCtx {
     async fn run_managed_public_ipv6_addr_updater(
         &mut self,
         routes: Arc<super::route::runtime::NativeRouteContext>,
-        epoch: easytier_core::host::route::DeviceEpoch,
     ) -> Result<(), Error> {
         async fn apply(
             backend: &NicBackend,
             routes: &super::route::runtime::NativeRouteContext,
-            epoch: easytier_core::host::route::DeviceEpoch,
             current: &mut Option<cidr::Ipv6Inet>,
         ) -> Result<(), Error> {
             let NicBackend::Shared(member) = backend else {
@@ -1605,7 +1559,7 @@ impl NicCtx {
                     }
                     *current = next;
                 }
-                if routes.ready(member, epoch, *current).await?.is_some() {
+                if routes.ready(member, *current).await? {
                     return Ok(());
                 }
             }
@@ -1613,7 +1567,7 @@ impl NicCtx {
         let backend = self.backend.clone();
         let mut events = self.global_ctx.subscribe();
         let mut current = None;
-        apply(&backend, &routes, epoch, &mut current).await?;
+        apply(&backend, &routes, &mut current).await?;
         let closed = self.close_notifier.clone();
         self.tasks.spawn(async move {
             loop {
@@ -1623,7 +1577,7 @@ impl NicCtx {
                     Ok(_) => continue,
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                 }
-                if let Err(error) = apply(&backend, &routes, epoch, &mut current).await {
+                if let Err(error) = apply(&backend, &routes, &mut current).await {
                     if let NicBackend::Shared(member) = &backend {
                         routes.unready(member).await;
                     }
@@ -1718,7 +1672,7 @@ impl NicCtx {
         ipv4_addr: Option<cidr::Ipv4Inet>,
         ipv6_addr: Option<cidr::Ipv6Inet>,
     ) -> Result<(), Error> {
-        let (tunnel, epoch) = match self.backend.create_dev_with_epoch().await {
+        let tunnel = match self.backend.create_dev().await {
             Ok(ret) => {
                 let ifname = self.tun_ifname().await?;
 
@@ -1751,14 +1705,10 @@ impl NicCtx {
         }
 
         if let Some(routes) = self.routes.clone() {
-            let epoch =
-                epoch.ok_or_else(|| anyhow::anyhow!("managed TUN has no physical epoch"))?;
-            self.run_managed_public_ipv6_addr_updater(routes, epoch)
+            self.run_managed_public_ipv6_addr_updater(routes)
                 .await?;
-            self.ready_epoch = Some(epoch);
             return Ok(());
         }
-        let _ = epoch;
         self.run_proxy_cidrs_route_updater().await?;
         self.run_public_ipv6_route_updater().await?;
         // Keep the updater running so runtime config patches can enable auto mode

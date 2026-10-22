@@ -745,20 +745,8 @@ impl SharedVirtualNicMember {
     }
 
     pub async fn create_dev(&self) -> Result<Box<dyn Tunnel>, Error> {
-        Ok(self.create_dev_with_epoch().await?.0)
-    }
-
-    pub(crate) async fn create_dev_with_epoch(
-        &self,
-    ) -> Result<
-        (
-            Box<dyn Tunnel>,
-            Option<easytier_core::host::route::DeviceEpoch>,
-        ),
-        Error,
-    > {
         let member = self.clone();
-        let epoch = crate::host_runtime::native_host_runtime()
+        crate::host_runtime::native_host_runtime()
             .shared_executor()?
             .spawn(async move {
                 let mut shared_nic = member.shared_nic.lock().await;
@@ -777,17 +765,14 @@ impl SharedVirtualNicMember {
                         member.configured_mtu,
                     )
                     .await?;
-                // Capture the epoch under the same NIC lock as dispatcher
-                // creation/reuse. Ready/DNS must receive this causal result.
-                let epoch = shared_nic.nic.lock().await.device_epoch();
-                Ok::<_, Error>(epoch)
+                Ok::<_, Error>(())
             })
             .await
             .map_err(anyhow::Error::from)??;
         let tunnel = self
             .registration
             .register_tunnel(self.close_notifier.clone())?;
-        Ok((tunnel, epoch))
+        Ok(tunnel)
     }
 
     #[cfg(mobile)]
@@ -795,15 +780,9 @@ impl SharedVirtualNicMember {
         &self,
         tun_fd: std::os::fd::RawFd,
         replace_tun_fd: bool,
-    ) -> Result<
-        (
-            Box<dyn Tunnel>,
-            Option<easytier_core::host::route::DeviceEpoch>,
-        ),
-        Error,
-    > {
+    ) -> Result<Box<dyn Tunnel>, Error> {
         let member = self.clone();
-        let epoch = crate::host_runtime::native_host_runtime()
+        crate::host_runtime::native_host_runtime()
             .shared_executor()?
             .spawn(async move {
                 let mut shared_nic = member.shared_nic.lock().await;
@@ -824,15 +803,14 @@ impl SharedVirtualNicMember {
                         member.configured_mtu,
                     )
                     .await?;
-                let epoch = shared_nic.nic.lock().await.device_epoch();
-                Ok::<_, Error>(epoch)
+                Ok::<_, Error>(())
             })
             .await
             .map_err(anyhow::Error::from)??;
         let tunnel = self
             .registration
             .register_tunnel(self.close_notifier.clone())?;
-        Ok((tunnel, epoch))
+        Ok(tunnel)
     }
 
     pub async fn ifname(&self) -> Option<String> {
