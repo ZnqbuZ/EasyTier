@@ -24,12 +24,17 @@ use uuid::Uuid;
 use crate::common::net_ns::NetNS;
 #[cfg(not(mobile))]
 use crate::instance::route::RouteError;
-#[cfg(all(not(mobile), feature = "tun"))]
+#[cfg(feature = "tun")]
 use crate::instance::shared_virtual_nic::SharedIfConfigClaims;
 #[cfg(all(not(mobile), feature = "tun"))]
 use crate::instance::shared_virtual_nic::SharedIfConfigConflict;
 #[cfg(feature = "tun")]
 use crate::instance::shared_virtual_nic::SharedVirtualNicMember;
+#[cfg(all(mobile, feature = "tun"))]
+use crate::instance::{
+    factory::{MobileTunConfig, mobile_tun::MobileTunMember},
+    route::AppliedSnapshot,
+};
 use crate::{instance::route::AppliedRoutes, utils::dirty::DirtyFlag};
 
 #[cfg(not(mobile))]
@@ -145,8 +150,9 @@ impl RouteController {
     /// Notification that instance records or actual effects visibly changed.
     ///
     /// It carries no payload: a `drain` waiter rechecks cleanup conditions and
-    /// the mobile host re-exports the current configuration.
-    pub fn changed(&self) -> &Notify {
+    /// the mobile host re-exports the current configuration. The handle is the
+    /// controller's one `Arc<Notify>`; callers that need to keep it clone it.
+    pub fn changed(&self) -> &Arc<Notify> {
         &self.changed
     }
 
@@ -397,6 +403,285 @@ impl RouteController {
             self.dirty.mark();
             self.changed.notify_waiters();
         }
+    }
+
+    /// Register a new whole-domain mobile install or withdraw request.
+    ///
+    /// Every accepted request gets a fresh identity even when the desired
+    /// content is unchanged. Only a domain that is shut down with nothing left
+    /// to clean up is rejected; shutdown while real cleanup is still owed must
+    /// still accept requests. The write lock covers only the request mark, and
+    /// the notification is sent after it is released without marking input
+    /// dirty.
+    #[cfg(all(mobile, feature = "tun"))]
+    pub fn request_mobile_install(&self) -> anyhow::Result<Uuid> {
+        let id = Uuid::new_v4();
+        {
+            let mut rt = self.runtime.write();
+            anyhow::ensure!(
+                !(rt.shutdown
+                    && rt.instances.is_empty()
+                    && rt.applied.is_none()
+                    && rt.pending_install.is_none()),
+                "route controller is shut down and has no outstanding cleanup"
+            );
+            rt.pending_install = Some(id);
+        }
+        self.changed.notify_waiters();
+        Ok(id)
+    }
+
+    /// Copy the latest accepted request identity without taking it.
+    #[cfg(all(mobile, feature = "tun"))]
+    pub fn pending_mobile_install(&self) -> Option<Uuid> {
+        self.runtime.read().pending_install
+    }
+
+    /// Complete the request only when it is still the latest accepted one.
+    ///
+    /// A late completion never clears a newer request. The actual installation
+    /// record and the request mark are independent, and no input is marked
+    /// dirty here.
+    #[cfg(all(mobile, feature = "tun"))]
+    pub fn complete_mobile_install(&self, id: Uuid) -> bool {
+        let completed = {
+            let mut rt = self.runtime.write();
+            if rt.pending_install != Some(id) {
+                false
+            } else {
+                rt.pending_install = None;
+                true
+            }
+        };
+        if completed {
+            self.changed.notify_waiters();
+        }
+        completed
+    }
+
+    /// The attachment identity of the system configuration the external owner
+    /// last confirmed. A pending request is not an attachment.
+    #[cfg(all(mobile, feature = "tun"))]
+    pub fn current_mobile_attachment(&self) -> Option<Uuid> {
+        self.runtime
+            .read()
+            .applied
+            .as_ref()
+            .map(|snapshot| snapshot.attachment_id)
+    }
+
+    /// Record the real system installation the external owner just completed.
+    ///
+    /// This is an observed fact, not the acceptance of a request: a late A is
+    /// recorded even after shutdown or after the latest request became D. It
+    /// never clears the request mark and never reopens an instance; whether the
+    /// exported content is still current is the caller's boundary check.
+    #[cfg(all(mobile, feature = "tun"))]
+    pub fn record_mobile_install(
+        &self,
+        attachment_id: Uuid,
+        config: MobileTunConfig,
+        members: Vec<MobileTunMember>,
+    ) {
+        let members = members
+            .into_iter()
+            .map(|mut member| {
+                // A selection hint, not part of the actual installation fact.
+                member.current_claims = None;
+                member
+            })
+            .collect();
+        {
+            let mut rt = self.runtime.write();
+            rt.applied = Some(AppliedSnapshot {
+                attachment_id,
+                config,
+                members,
+                attached_members: BTreeMap::new(),
+            });
+        }
+        self.dirty.mark();
+        self.changed.notify_waiters();
+    }
+
+    /// Confirm one member's real attachment to the recorded installation.
+    ///
+    /// Only the run's current registration and the matching attachment may
+    /// change the ledger. A late result from an older registration or an older
+    /// attachment is rejected without touching newer records. Root release and
+    /// shutdown do not erase a real I/O fact.
+    #[cfg(all(mobile, feature = "tun"))]
+    pub fn mobile_ready(
+        &self,
+        run: Uuid,
+        member: &SharedVirtualNicMember,
+        attachment_id: Uuid,
+    ) -> bool {
+        if member.member_id() != run || member.ensure_open().is_err() {
+            return false;
+        }
+        let changed = {
+            let mut rt = self.runtime.write();
+            let current_registration = rt
+                .instances
+                .get(&run)
+                .and_then(|instances| instances.member.as_ref())
+                .map(SharedVirtualNicMember::registration_id);
+            if current_registration != Some(member.registration_id()) {
+                return false;
+            }
+            let Some(snapshot) = rt.applied.as_mut() else {
+                return false;
+            };
+            if snapshot.attachment_id != attachment_id
+                || !snapshot
+                    .members
+                    .iter()
+                    .any(|installed| installed.instance_id == run)
+            {
+                return false;
+            }
+            let previous = snapshot
+                .attached_members
+                .insert(run, member.registration_id());
+            previous != Some(member.registration_id())
+        };
+        if changed {
+            self.dirty.mark();
+            self.changed.notify_waiters();
+        }
+        true
+    }
+
+    /// Cleanup handles of the recorded installation when it is still the actual
+    /// one. Runs whose registry root has already been released are included:
+    /// this copies the current binding for cleanup and never queries the
+    /// manager's running list or closes anything here.
+    #[cfg(all(mobile, feature = "tun"))]
+    pub fn mobile_attachment_members(&self, attachment_id: Uuid) -> Vec<SharedVirtualNicMember> {
+        let rt = self.runtime.read();
+        let Some(snapshot) = rt.applied.as_ref() else {
+            return Vec::new();
+        };
+        if snapshot.attachment_id != attachment_id {
+            return Vec::new();
+        }
+        snapshot
+            .members
+            .iter()
+            .filter_map(|member| {
+                rt.instances
+                    .get(&member.instance_id)
+                    .and_then(|instances| instances.member.clone())
+            })
+            .collect()
+    }
+
+    /// Clear the actual record only when it is the attachment the caller really
+    /// revoked. A stale revocation never touches a newer installation, and the
+    /// request mark is never cleared here.
+    #[cfg(all(mobile, feature = "tun"))]
+    pub fn confirm_mobile_revoked(&self, attachment_id: Uuid) -> bool {
+        let removed = {
+            let mut rt = self.runtime.write();
+            let matches = rt
+                .applied
+                .as_ref()
+                .is_some_and(|snapshot| snapshot.attachment_id == attachment_id);
+            if matches {
+                rt.applied = None;
+            }
+            matches
+        };
+        if removed {
+            self.dirty.mark();
+            self.changed.notify_waiters();
+        }
+        removed
+    }
+
+    /// Whether the whole recorded installation is still attached: the snapshot
+    /// matches, every run still owns its registry root, every current member is
+    /// open, and every run's attached registration is the current one. This is
+    /// not a per-route readiness verdict, and an empty target is never attached.
+    #[cfg(all(mobile, feature = "tun"))]
+    pub fn mobile_snapshot_attached(&self, snapshot_id: Uuid) -> bool {
+        let rt = self.runtime.read();
+        if rt.shutdown {
+            return false;
+        }
+        let Some(snapshot) = rt.applied.as_ref() else {
+            return false;
+        };
+        if snapshot.config.snapshot_id != snapshot_id || snapshot.members.is_empty() {
+            return false;
+        }
+        snapshot.members.iter().all(|member| {
+            let run = member.instance_id;
+            let Some(instances) = rt.instances.get(&run) else {
+                return false;
+            };
+            if instances.registry.upgrade().is_none() {
+                return false;
+            }
+            let Some(current) = instances.member.as_ref() else {
+                return false;
+            };
+            current.ensure_open().is_ok()
+                && snapshot.attached_members.get(&run) == Some(&current.registration_id())
+        })
+    }
+
+    /// Whether the current configuration really asks for Magic DNS.
+    ///
+    /// The answer comes from the current store under a short lock: a live root,
+    /// an enabled build, `accept_dns`, and a current peer IPv4. The native side
+    /// still verifies the actual IPv4 source.
+    #[cfg(all(mobile, feature = "tun"))]
+    pub fn mobile_dns_enabled(&self, run: Uuid) -> bool {
+        #[cfg(not(feature = "magic-dns"))]
+        {
+            let _ = run;
+            false
+        }
+        #[cfg(feature = "magic-dns")]
+        {
+            let rt = self.runtime.read();
+            if rt.shutdown {
+                return false;
+            }
+            let Some(instances) = rt.instances.get(&run) else {
+                return false;
+            };
+            if instances.registry.upgrade().is_none() {
+                return false;
+            }
+            let Some(config) = instances.config.as_ref() else {
+                return false;
+            };
+            let snapshot = config.snapshot();
+            snapshot.peer.flags.accept_dns && snapshot.peer.runtime.core.routes.ipv4.is_some()
+        }
+    }
+
+    /// Claims of the run's actual installed member.
+    ///
+    /// Only a registration that is both attached in the ledger and still the
+    /// run's current binding may provide claims. This reads the existing ledger
+    /// only: it never waits for the NIC, projects a new target or caches input.
+    #[cfg(all(mobile, feature = "tun"))]
+    pub fn mobile_installed_claims(&self, run: Uuid) -> Option<SharedIfConfigClaims> {
+        let rt = self.runtime.read();
+        let snapshot = rt.applied.as_ref()?;
+        let current = rt.instances.get(&run)?.member.as_ref()?;
+        if snapshot.attached_members.get(&run) != Some(&current.registration_id()) {
+            return None;
+        }
+        snapshot
+            .members
+            .iter()
+            .find(|member| member.instance_id == run)
+            .map(|member| member.claims.clone())
     }
 
     pub fn request_shutdown(&self) {
@@ -9101,5 +9386,403 @@ mod tests {
         assert!(!mock.contains(&route));
         assert!(controller.runtime.read().instances.is_empty());
         assert!(controller.applied_routes().is_empty());
+    }
+}
+
+/// RouteController's mobile request mark and actual installation ledger.
+///
+/// These tests build state through the controller's normal entry points
+/// (`open_instance`, `bind_config`, `bind_member`) and the real member
+/// registry. The actual worker, native install chain and drain belong to
+/// R04-R07; nothing here fakes a completed worker.
+#[cfg(all(test, mobile, feature = "tun"))]
+mod mobile_tests {
+    use std::{collections::BTreeSet, sync::Arc};
+
+    #[cfg(feature = "magic-dns")]
+    use easytier_core::config::{IpPrefix, peers::PeerRuntimeSnapshot, runtime::CoreRuntimeConfig};
+
+    use super::*;
+    use crate::{
+        common::net_ns::tests::test_net_ns,
+        instance::{
+            shared_virtual_nic::{SharedIfConfigClaims, SharedVirtualNicRegistry},
+            virtual_nic::VirtualNicConfig,
+        },
+    };
+
+    fn test_controller() -> RouteController {
+        RouteController::new(Arc::new(DirtyFlag::new(false)))
+    }
+
+    fn open_run(controller: &RouteController, run: Uuid) -> Arc<Registry> {
+        let registry = controller.open_instance(run).unwrap();
+        controller.dirty.reset();
+        registry
+    }
+
+    fn test_member(registry: &mut SharedVirtualNicRegistry, run: Uuid) -> SharedVirtualNicMember {
+        registry.create_member(
+            format!("et-{run}"),
+            VirtualNicConfig::new(format!("et-{run}"), 1400, test_net_ns(None)),
+            run,
+            Arc::new(Notify::new()),
+        )
+    }
+
+    fn tun_member(run: Uuid) -> MobileTunMember {
+        MobileTunMember {
+            instance_id: run,
+            run,
+            claims: SharedIfConfigClaims {
+                ipv4_addresses: BTreeSet::from(["10.126.126.7/24".parse().unwrap()]),
+                ..Default::default()
+            },
+            current_claims: None,
+            dns: false,
+        }
+    }
+
+    fn config(snapshot_id: Uuid) -> MobileTunConfig {
+        MobileTunConfig {
+            snapshot_id,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn requests_replace_pending_and_only_the_latest_completes() {
+        let controller = test_controller();
+        let run = Uuid::new_v4();
+        let _root = open_run(&controller, run);
+        // Shutdown with a live instance still has cleanup responsibility.
+        controller.request_shutdown();
+        controller.dirty.reset();
+
+        let a = controller.request_mobile_install().unwrap();
+        assert!(!controller.dirty.peek(), "a request mark is not an input");
+        let b = controller.request_mobile_install().unwrap();
+        let c = controller.request_mobile_install().unwrap();
+        assert_ne!(a, b);
+        assert_ne!(b, c);
+        assert_eq!(controller.pending_mobile_install(), Some(c));
+
+        assert!(!controller.complete_mobile_install(a));
+        assert!(!controller.complete_mobile_install(b));
+        assert_eq!(controller.pending_mobile_install(), Some(c));
+        assert!(!controller.dirty.peek());
+        assert!(controller.complete_mobile_install(c));
+        assert_eq!(controller.pending_mobile_install(), None);
+        assert!(!controller.dirty.peek());
+    }
+
+    #[test]
+    fn fully_drained_shutdown_rejects_new_requests() {
+        let controller = test_controller();
+        controller.request_shutdown();
+        assert!(controller.request_mobile_install().is_err());
+        assert_eq!(controller.pending_mobile_install(), None);
+    }
+
+    #[test]
+    fn releasing_the_root_or_shutting_down_keeps_the_request_mark() {
+        let controller = test_controller();
+        let run = Uuid::new_v4();
+        let root = open_run(&controller, run);
+        let id = controller.request_mobile_install().unwrap();
+
+        drop(root);
+        assert_eq!(controller.pending_mobile_install(), Some(id));
+        controller.request_shutdown();
+        assert_eq!(controller.pending_mobile_install(), Some(id));
+
+        assert!(!controller.complete_mobile_install(Uuid::new_v4()));
+        assert_eq!(controller.pending_mobile_install(), Some(id));
+        assert!(controller.complete_mobile_install(id));
+        assert_eq!(controller.pending_mobile_install(), None);
+    }
+
+    #[test]
+    fn late_install_facts_are_recorded_over_a_newer_request() {
+        let controller = test_controller();
+        let run = Uuid::new_v4();
+        let root = open_run(&controller, run);
+        let a = controller.request_mobile_install().unwrap();
+        let d = controller.request_mobile_install().unwrap();
+        let snapshot = Uuid::new_v4();
+
+        controller.dirty.reset();
+        let mut member = tun_member(run);
+        member.current_claims = Some(member.claims.clone());
+        controller.record_mobile_install(a, config(snapshot), vec![member]);
+        assert!(controller.dirty.peek(), "a real fact wakes the reconciler");
+        assert_eq!(controller.current_mobile_attachment(), Some(a));
+        assert_eq!(controller.pending_mobile_install(), Some(d));
+        assert!(
+            controller.runtime.read().applied.as_ref().unwrap().members[0]
+                .current_claims
+                .is_none(),
+            "the selection hint is not part of the recorded fact"
+        );
+
+        // A late A is still the real installation even after the domain has
+        // shut down and its root has been released.
+        drop(root);
+        controller.request_shutdown();
+        let _cleanup = controller.request_mobile_install().unwrap();
+        controller.record_mobile_install(a, config(snapshot), vec![tun_member(run)]);
+        assert_eq!(controller.current_mobile_attachment(), Some(a));
+    }
+
+    #[test]
+    fn only_the_current_registration_and_attachment_change_the_ledger() {
+        let controller = test_controller();
+        let run = Uuid::new_v4();
+        let _root = open_run(&controller, run);
+        let mut nics = SharedVirtualNicRegistry::new();
+        let first = test_member(&mut nics, run);
+        controller.bind_member(run, &first).unwrap();
+
+        let snapshot = Uuid::new_v4();
+        let attachment = Uuid::new_v4();
+        controller.record_mobile_install(attachment, config(snapshot), vec![tun_member(run)]);
+        assert!(controller.mobile_ready(run, &first, attachment));
+        controller.dirty.reset();
+        assert!(
+            controller.mobile_ready(run, &first, attachment),
+            "a repeated matching report is still accepted"
+        );
+        assert!(
+            !controller.dirty.peek(),
+            "an unchanged attachment record is not a change"
+        );
+
+        let second = test_member(&mut nics, run);
+        controller.bind_member(run, &second).unwrap();
+        assert!(
+            !controller.mobile_ready(run, &first, attachment),
+            "an old registration cannot attach to the new binding"
+        );
+        assert!(!controller.mobile_ready(run, &first, Uuid::new_v4()));
+        assert!(!controller.mobile_ready(run, &second, Uuid::new_v4()));
+        assert!(controller.mobile_ready(run, &second, attachment));
+
+        let newer_snapshot = Uuid::new_v4();
+        let newer_attachment = Uuid::new_v4();
+        controller.record_mobile_install(
+            newer_attachment,
+            config(newer_snapshot),
+            vec![tun_member(run)],
+        );
+        assert!(
+            !controller.mobile_ready(run, &second, attachment),
+            "an old attachment cannot attach to the newer installation"
+        );
+        assert!(controller.mobile_ready(run, &second, newer_attachment));
+        assert_eq!(
+            controller.current_mobile_attachment(),
+            Some(newer_attachment)
+        );
+    }
+
+    #[test]
+    fn unready_keeps_the_installed_configuration_and_ownership() {
+        let controller = test_controller();
+        let run = Uuid::new_v4();
+        let _root = open_run(&controller, run);
+        let mut nics = SharedVirtualNicRegistry::new();
+        let member = test_member(&mut nics, run);
+        controller.bind_member(run, &member).unwrap();
+
+        let snapshot = Uuid::new_v4();
+        let attachment = Uuid::new_v4();
+        controller.record_mobile_install(attachment, config(snapshot), vec![tun_member(run)]);
+        assert!(controller.mobile_ready(run, &member, attachment));
+        assert_eq!(
+            controller.mobile_installed_claims(run),
+            Some(tun_member(run).claims)
+        );
+        assert!(controller.mobile_snapshot_attached(snapshot));
+
+        controller.unready(run, member.registration_id());
+        assert_eq!(controller.current_mobile_attachment(), Some(attachment));
+        assert!(controller.mobile_installed_claims(run).is_none());
+        assert!(!controller.mobile_snapshot_attached(snapshot));
+
+        controller.dirty.reset();
+        controller.unready(run, member.registration_id());
+        assert!(
+            !controller.dirty.peek(),
+            "a second unready for the same registration is a no-op"
+        );
+    }
+
+    #[test]
+    fn revocation_clears_only_the_matching_installation_and_never_the_request() {
+        let controller = test_controller();
+        let run = Uuid::new_v4();
+        let _root = open_run(&controller, run);
+        let snapshot = Uuid::new_v4();
+        let attachment = Uuid::new_v4();
+        let pending = controller.request_mobile_install().unwrap();
+        controller.record_mobile_install(attachment, config(snapshot), vec![tun_member(run)]);
+
+        assert!(!controller.confirm_mobile_revoked(Uuid::new_v4()));
+        assert_eq!(controller.current_mobile_attachment(), Some(attachment));
+        assert_eq!(controller.pending_mobile_install(), Some(pending));
+
+        controller.dirty.reset();
+        assert!(controller.confirm_mobile_revoked(attachment));
+        assert!(
+            controller.dirty.peek(),
+            "a real revocation wakes the worker"
+        );
+        assert_eq!(controller.current_mobile_attachment(), None);
+        assert_eq!(controller.pending_mobile_install(), Some(pending));
+
+        let newer_snapshot = Uuid::new_v4();
+        let newer_attachment = Uuid::new_v4();
+        controller.record_mobile_install(
+            newer_attachment,
+            config(newer_snapshot),
+            vec![tun_member(run)],
+        );
+        assert!(
+            !controller.confirm_mobile_revoked(attachment),
+            "an old revocation must not clear the newer installation"
+        );
+        assert_eq!(
+            controller.current_mobile_attachment(),
+            Some(newer_attachment)
+        );
+        assert_eq!(controller.pending_mobile_install(), Some(pending));
+    }
+
+    #[test]
+    fn whole_snapshot_attachment_requires_every_current_member() {
+        let controller = test_controller();
+        let run_a = Uuid::new_v4();
+        let run_b = Uuid::new_v4();
+        let _root_a = open_run(&controller, run_a);
+        let root_b = open_run(&controller, run_b);
+        let mut nics = SharedVirtualNicRegistry::new();
+        let member_a = test_member(&mut nics, run_a);
+        let member_b = test_member(&mut nics, run_b);
+        controller.bind_member(run_a, &member_a).unwrap();
+        controller.bind_member(run_b, &member_b).unwrap();
+
+        let snapshot = Uuid::new_v4();
+        let attachment = Uuid::new_v4();
+        controller.record_mobile_install(
+            attachment,
+            config(snapshot),
+            vec![tun_member(run_a), tun_member(run_b)],
+        );
+        assert!(
+            !controller.mobile_snapshot_attached(snapshot),
+            "no member is attached yet"
+        );
+        assert!(controller.mobile_ready(run_a, &member_a, attachment));
+        assert!(
+            !controller.mobile_snapshot_attached(snapshot),
+            "one attached member is not the whole target"
+        );
+        assert!(controller.mobile_ready(run_b, &member_b, attachment));
+        assert!(controller.mobile_snapshot_attached(snapshot));
+        assert!(!controller.mobile_snapshot_attached(Uuid::new_v4()));
+
+        // Releasing any real run's root withdraws its input and invalidates
+        // the whole-attachment verdict, never a subset of the checks.
+        drop(root_b);
+        assert!(!controller.mobile_snapshot_attached(snapshot));
+
+        controller.request_shutdown();
+        assert!(!controller.mobile_snapshot_attached(snapshot));
+    }
+
+    #[test]
+    fn empty_target_is_never_reported_attached() {
+        let controller = test_controller();
+        let run = Uuid::new_v4();
+        let _root = open_run(&controller, run);
+        let snapshot = Uuid::new_v4();
+        controller.record_mobile_install(Uuid::new_v4(), config(snapshot), Vec::new());
+        assert!(!controller.mobile_snapshot_attached(snapshot));
+    }
+
+    #[tokio::test]
+    async fn installed_claims_reads_the_ledger_without_the_nic_lock() {
+        let controller = test_controller();
+        let run = Uuid::new_v4();
+        let _root = open_run(&controller, run);
+        let mut nics = SharedVirtualNicRegistry::new();
+        let member = test_member(&mut nics, run);
+        controller.bind_member(run, &member).unwrap();
+
+        let attachment = Uuid::new_v4();
+        controller.record_mobile_install(attachment, config(Uuid::new_v4()), vec![tun_member(run)]);
+        assert!(controller.mobile_ready(run, &member, attachment));
+
+        // Holding the NIC lock must not block a synchronous ledger read.
+        let nic = member.shared_nic();
+        let _guard = nic.lock().await;
+        assert_eq!(
+            controller.mobile_installed_claims(run),
+            Some(tun_member(run).claims)
+        );
+    }
+
+    #[cfg(feature = "magic-dns")]
+    fn peer(accept_dns: bool, ipv4: Option<&str>) -> PeerRuntimeSnapshot {
+        let mut peer = PeerRuntimeSnapshot::default();
+        peer.flags.accept_dns = accept_dns;
+        peer.runtime.core.routes.ipv4 = ipv4.map(|address| IpPrefix {
+            address: address.parse().unwrap(),
+            prefix_len: 24,
+        });
+        peer
+    }
+
+    #[cfg(feature = "magic-dns")]
+    fn dns_enabled_for(accept_dns: bool, ipv4: Option<&str>) -> bool {
+        let controller = test_controller();
+        let run = Uuid::new_v4();
+        let _root = controller.open_instance(run).unwrap();
+        controller
+            .bind_config(
+                run,
+                CoreRuntimeConfigStore::new(
+                    CoreRuntimeConfig::default(),
+                    Arc::new(peer(accept_dns, ipv4)),
+                ),
+            )
+            .unwrap();
+        controller.mobile_dns_enabled(run)
+    }
+
+    #[cfg(feature = "magic-dns")]
+    #[test]
+    fn dns_enabled_reads_the_current_configuration() {
+        assert!(dns_enabled_for(true, Some("10.126.126.7")));
+        assert!(!dns_enabled_for(false, Some("10.126.126.7")));
+        assert!(!dns_enabled_for(true, None));
+
+        let controller = test_controller();
+        let run = Uuid::new_v4();
+        let root = controller.open_instance(run).unwrap();
+        controller
+            .bind_config(
+                run,
+                CoreRuntimeConfigStore::new(
+                    CoreRuntimeConfig::default(),
+                    Arc::new(peer(true, Some("10.126.126.7"))),
+                ),
+            )
+            .unwrap();
+        assert!(!controller.mobile_dns_enabled(Uuid::new_v4()));
+        drop(root);
+        assert!(!controller.mobile_dns_enabled(run));
+        controller.request_shutdown();
+        assert!(!controller.mobile_dns_enabled(run));
     }
 }
