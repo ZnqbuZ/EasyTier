@@ -12,7 +12,7 @@ use std::{
 
 use cidr::IpCidr;
 use easytier_core::host::route::{
-    RouteAction, RouteDevice, RouteSlotInner, RouteSource, RouteSpec, RouteStatus,
+    RouteAction, RouteDevice, RouteSet, RouteSlotInner, RouteSource, RouteSpec, RouteStatus,
 };
 use uuid::Uuid;
 
@@ -2206,8 +2206,60 @@ impl<B: RouteBackend> RouteReconciler<B> {
     }
 }
 
+/// The copied inputs of one desktop planning round.
+///
+/// Sampling upgrades each instance's registry and slots only for the duration
+/// of the copy; this value keeps owned declarations, weak slot observations
+/// and member handles, never a strong registry or slot reference.
+pub(super) struct PlanInputs {
+    /// `(run, current declarations, resolved device)` of every live instance.
+    inputs: Vec<(Uuid, RouteSet, Option<InterfaceInfo>)>,
+    /// Live slot observations for the feedback stage; weak by design.
+    slots: Vec<(Uuid, Weak<RouteSlotInner>)>,
+    #[cfg(feature = "tun")]
+    members: BTreeMap<Uuid, SharedVirtualNicMember>,
+    #[cfg(feature = "tun")]
+    managed: BTreeSet<u32>,
+    applied: AppliedRoutes,
+}
+
+/// This round's pure resolution of declarations into installable routes.
+pub(super) struct PlanCandidates {
+    /// Ordinary declarations, keyed by their own declaration.
+    planned: BTreeMap<(Uuid, RouteSpec<RouteDevice>), RouteSpec<u32>>,
+    /// Installable claims per physical key, in stable declaration order.
+    claims: BTreeMap<RouteKey, Vec<(RouteSpec<u32>, Uuid)>>,
+    /// Managed candidates admitted as one whole per member.
+    #[cfg(feature = "tun")]
+    through_tun: BTreeMap<Uuid, Vec<(RouteSpec<u32>, RouteSpec<RouteDevice>)>>,
+}
+
+/// This round's whole-member admission outcomes from the real NIC.
+#[cfg(feature = "tun")]
+#[derive(Default)]
+pub(super) struct MemberAdmissions {
+    pub(super) accepted: BTreeSet<Uuid>,
+    pub(super) failures: BTreeMap<Uuid, MemberAdmissionFailure>,
+}
+
+#[cfg(feature = "tun")]
+pub(super) struct MemberAdmissionFailure {
+    pub(super) registration: Uuid,
+    pub(super) prefixes: BTreeSet<IpCidr>,
+    pub(super) status: RouteStatus,
+}
+
+/// Without the TUN feature no declaration reaches member admission.
+#[cfg(not(feature = "tun"))]
+#[derive(Default)]
+pub(super) struct MemberAdmissions {}
+
 impl RouteController {
-    /// Rebuild this round's target and feed the current declarations.
+    /// Temporary S03 adapter: sample, resolve candidates, admit members and
+    /// feed back through the real stages for existing callers.
+    ///
+    /// S04 must delete this entry and drive the stages from the round; it is
+    /// not a second long-term planner.
     ///
     /// `synced` is this round's local `(run, registration) -> acknowledged
     /// prefixes` set: `None` plans before executing, `Some` feeds back after
@@ -2228,13 +2280,35 @@ impl RouteController {
             // The caller's record describes this call only.
             failures.clear();
         }
-        // A. Copy the current inputs, slots and, with the TUN feature, members
-        // and managed interfaces under one short read lock. No registry or
-        // slot strong reference survives it.
+        let inputs = self.sample_plan_inputs();
+        let candidates = resolve_plan_candidates(&inputs);
+        #[cfg(feature = "tun")]
+        let admissions = admit_plan_members(&inputs, &candidates).await;
+        #[cfg(not(feature = "tun"))]
+        let admissions = MemberAdmissions::default();
+        #[cfg(feature = "tun")]
+        if let Some(failures) = admission_failures.as_deref_mut() {
+            for (run, failure) in &admissions.failures {
+                failures.insert(
+                    (*run, failure.registration),
+                    (failure.prefixes.clone(), failure.status.clone()),
+                );
+            }
+        }
+        let plan = build_plan(&inputs, &candidates, &admissions);
+        self.update_plan_statuses(&plan, &inputs, &candidates, &admissions, synced, errors);
+        plan
+    }
+
+    /// Copy the current planning inputs under one short read lock.
+    ///
+    /// Nothing strong survives the copy: declarations are owned values, slots
+    /// are weak observations and members are the existing handles.
+    pub(super) fn sample_plan_inputs(&self) -> PlanInputs {
+        let mut inputs = Vec::new();
         let mut slots = Vec::new();
         #[cfg(feature = "tun")]
         let mut members = BTreeMap::new();
-        let mut inputs = Vec::new();
         #[cfg(feature = "tun")]
         let mut managed = BTreeSet::new();
         let applied = {
@@ -2278,450 +2352,541 @@ impl RouteController {
             }
             rt.applied.clone()
         };
-
-        // B/C. Resolve each declaration through this run's real device, then
-        // normalize the platform fields. Everything that reaches a managed TUN
-        // needs this run's matching member; other routes go straight into the
-        // system candidates.
-        let mut planned = BTreeMap::<(Uuid, RouteSpec<RouteDevice>), RouteSpec<u32>>::new();
-        // Per-member admission outcomes, tied to the resolved contents and the
-        // registration that produced them. Parameter and ownership errors are
-        // recomputed during feedback; only the whole-member admission needs
-        // this round's NIC result.
-        #[cfg(feature = "tun")]
-        let mut admission_failed =
-            BTreeMap::<(Uuid, RouteSpec<RouteDevice>), (RouteSpec<u32>, Uuid, RouteStatus)>::new();
-        let mut claims = BTreeMap::<RouteKey, Vec<(RouteSpec<u32>, Uuid)>>::new();
-        #[cfg(feature = "tun")]
-        let mut through_tun =
-            BTreeMap::<Uuid, Vec<(RouteSpec<u32>, RouteSpec<RouteDevice>)>>::new();
-
-        for (run, declarations, interface) in &inputs {
-            let tun_ifindex = interface.as_ref().map(|info| info.ifindex);
-            for declaration in declarations {
-                let Some(resolved) = declaration.clone().resolve(tun_ifindex) else {
-                    // `Tun` without a bound device stays pending until the
-                    // binding changes.
-                    continue;
-                };
-                let Ok(route) = normalize_route(resolved) else {
-                    // A real input error, recomputed during feedback.
-                    continue;
-                };
-                match unicast_dev(&route) {
-                    // Only this run's own bound device goes through member
-                    // admission. An index into another known managed TUN has no
-                    // matching member here, so it is rejected rather than
-                    // becoming an ordinary system route; feedback recomputes
-                    // that from the same current interface set.
-                    #[cfg(feature = "tun")]
-                    Some(dev) if managed.contains(&dev) => {
-                        if Some(dev) != tun_ifindex {
-                            continue;
-                        }
-                        through_tun
-                            .entry(*run)
-                            .or_default()
-                            .push((route, declaration.clone()));
-                    }
-                    // Without the TUN feature nothing is managed, and a normal
-                    // interface needs no TUN membership either.
-                    _ => {
-                        planned.insert((*run, declaration.clone()), route.clone());
-                        claims
-                            .entry(RouteKey::of(&route))
-                            .or_default()
-                            .push((route, *run));
-                    }
-                }
-            }
-        }
-
-        // D. Admit every TUN candidate of a member as one whole, using the
-        // current registration and the existing overlap rule. This only plans:
-        // nothing is committed and the returned claims are dropped here.
-        #[cfg(feature = "tun")]
-        for (run, candidates) in &through_tun {
-            let prefixes: BTreeSet<IpCidr> = candidates
-                .iter()
-                .map(|(route, _)| route.destination)
-                .collect();
-            let member = members.get(run);
-            let registration = member.map(SharedVirtualNicMember::registration_id);
-            let admission: Result<_, RouteStatus> = match member {
-                // Reaching a managed device without this run's own member would
-                // bypass admission, so it is an input error.
-                None => Err(RouteStatus::Rejected(
-                    "route targets a managed tun interface this instance does not own".into(),
-                )),
-                Some(member) => {
-                    let nic = member.shared_nic();
-                    // Bounding this wait only settles this member's admission;
-                    // the rest of the round still plans, and the retry policy
-                    // belongs to the caller's next round.
-                    match tokio::time::timeout(Duration::from_secs(5), nic.lock()).await {
-                        Err(_) => Err(RouteStatus::Pending {
-                            error: Some(
-                                format!(
-                                    "timed out locking shared NIC for member {}",
-                                    member.member_id()
-                                )
-                                .into(),
-                            ),
-                        }),
-                        Ok(guard) => {
-                            // Recheck under the NIC lock: a member may close or
-                            // its binding may go stale while this round waits
-                            // for it, and neither may prepare. Those facts are
-                            // already known invalidations, not failed attempts.
-                            if member.ensure_open().is_err()
-                                || !guard.is_valid()
-                                || !guard.is_current_member_registration(
-                                    member.member_id(),
-                                    member.registration_id(),
-                                )
-                            {
-                                Err(RouteStatus::Pending { error: None })
-                            } else {
-                                match guard.prepare_managed_routes(
-                                    member.member_id(),
-                                    member.registration_id(),
-                                    &prefixes,
-                                ) {
-                                    Ok(claims) => Ok(claims),
-                                    // A whole-member overlap is an input error until the
-                                    // declarations or the topology change.
-                                    Err(error) if error.is::<SharedIfConfigConflict>() => {
-                                        Err(RouteStatus::Rejected(error.to_string().into()))
-                                    }
-                                    // The binding was current, valid and open, so
-                                    // this is a real failed prepare the caller may
-                                    // retry.
-                                    Err(error) => Err(RouteStatus::Pending {
-                                        error: Some(error.to_string().into()),
-                                    }),
-                                }
-                            }
-                        }
-                    }
-                }
-            };
-            match admission {
-                Ok(_claims) => {
-                    for (route, declaration) in candidates {
-                        planned.insert((*run, declaration.clone()), route.clone());
-                        claims
-                            .entry(RouteKey::of(route))
-                            .or_default()
-                            .push((route.clone(), *run));
-                    }
-                }
-                Err(status) => {
-                    if let Some(registration) = registration {
-                        if let Some(failures) = admission_failures.as_deref_mut() {
-                            failures.insert((*run, registration), (prefixes, status.clone()));
-                        }
-                        for (route, declaration) in candidates {
-                            admission_failed.insert(
-                                (*run, declaration.clone()),
-                                (route.clone(), registration, status.clone()),
-                            );
-                        }
-                    }
-                }
-            }
-        }
-
-        // E. One complete row per physical key. The row already installed wins
-        // while it is still a candidate; otherwise the first claim in stable
-        // run and declaration order does. Different keys coexist, so a metric
-        // never acts as a per-prefix selector.
-        let mut desired: BTreeMap<RouteKey, (RouteSpec<u32>, BTreeSet<Uuid>)> = BTreeMap::new();
-        for (key, mut key_claims) in claims {
-            key_claims.sort_by_key(|(_, run)| *run);
-            let winner = applied
-                .get(&key)
-                .map(|row| row.route.clone())
-                .filter(|current| key_claims.iter().any(|(route, _)| route == current))
-                .or_else(|| key_claims.first().map(|(route, _)| route.clone()));
-            let Some(winner) = winner else {
-                continue;
-            };
-            let owners: BTreeSet<Uuid> = key_claims
-                .iter()
-                .filter(|(route, _)| *route == winner)
-                .map(|(_, run)| *run)
-                .collect();
-            desired.insert(key, (winner, owners));
-        }
-
-        // F. Diff the target against the actual ledger. Adding and Removing
-        // effects stay unconfirmed, and the ledger itself stays untouched.
-        let mut remove = Vec::new();
-        let mut add = Vec::new();
-        for (key, row) in &applied {
-            if desired
-                .get(key)
-                .is_none_or(|(route, _)| *route != row.route)
-            {
-                remove.push(row.route.clone());
-            }
-        }
-        for (key, (route, _)) in &desired {
-            let confirmed = applied.get(key).is_some_and(|row| {
-                row.route == *route
-                    && matches!(row.effect, RouteEffect::Owned | RouteEffect::External)
-            });
-            if !confirmed {
-                add.push(route.clone());
-            }
-        }
-
-        // Feedback. One short synchronous scope re-reads the live runtime:
-        // shutdown, the current instance records and their live slots, the
-        // current policy and bindings, and the actual ledger. Nothing awaits
-        // here, so no registry root or slot handle crosses a suspension point.
-        // Each run's temporary root lives only until that run's feedback ends.
-        {
-            let rt = self.runtime.read();
-            if !rt.shutdown {
-                // The managed set is recomputed from the current bindings and
-                // ledger, not from the copied planning inputs.
-                #[cfg(feature = "tun")]
-                let mut managed = BTreeSet::new();
-                #[cfg(feature = "tun")]
-                {
-                    for instance in rt.instances.values() {
-                        if let Some(info) = &instance.interface {
-                            managed.insert(info.ifindex);
-                        }
-                    }
-                    for row in rt.applied.values() {
-                        if !row.members.is_empty()
-                            && let Some(dev) = unicast_dev(&row.route)
-                        {
-                            managed.insert(dev);
-                        }
-                    }
-                }
-
-                for (run, instance) in &rt.instances {
-                    let Some(registry) = instance.registry.upgrade() else {
-                        // The instance withdrew its inputs; no feedback.
-                        continue;
-                    };
-                    let run = *run;
-                    // A failed admission describes the whole candidate set it
-                    // prepared. If any other managed declaration of this member
-                    // changed while it awaited, that failure no longer describes
-                    // the current input and the next marked round decides.
-                    #[cfg(feature = "tun")]
-                    let admission_prefixes = admission_failed
-                        .keys()
-                        .any(|(failed_run, _)| *failed_run == run)
-                        .then(|| {
-                            let planned: BTreeSet<IpCidr> = through_tun
-                                .get(&run)
-                                .into_iter()
-                                .flatten()
-                                .map(|(route, _)| route.destination)
-                                .collect();
-                            let current: BTreeSet<IpCidr> = instance
-                                .interface
-                                .as_ref()
-                                .map_or_else(BTreeSet::new, |info| {
-                                    let dev = info.ifindex;
-                                    let (declarations, slots) =
-                                        instance.declarations().unwrap_or_default();
-                                    drop(slots);
-                                    declarations
-                                        .into_iter()
-                                        .filter_map(|declaration| declaration.resolve(Some(dev)))
-                                        .filter_map(|resolved| normalize_route(resolved).ok())
-                                        .filter(|route| unicast_dev(route) == Some(dev))
-                                        .map(|route| route.destination)
-                                        .collect()
-                                });
-                            planned == current
-                        });
-                    for weak in registry.slots() {
-                        let Some(slot) = weak.upgrade() else {
-                            continue;
-                        };
-                        let source = slot.source();
-                        slot.update_statuses(|declaration| {
-                            let manual = instance.config.as_ref().is_some_and(|store| {
-                                store.snapshot().services.manual_routes.is_some()
-                            });
-                            if source == RouteSource::AutoProxy && manual {
-                                return Some(RouteStatus::Suppressed(
-                                    "manual routes replace auto proxy declarations".into(),
-                                ));
-                            }
-
-                            // Without the TUN feature an instance has no real
-                            // device, so its `Tun` declarations stay pending.
-                            #[cfg(feature = "tun")]
-                            let tun_ifindex = instance.interface.as_ref().map(|info| info.ifindex);
-                            #[cfg(not(feature = "tun"))]
-                            let tun_ifindex = None;
-                            let Some(resolved) = declaration.clone().resolve(tun_ifindex) else {
-                                return Some(pending_status(None, errors));
-                            };
-                            let route = match normalize_route(resolved) {
-                                Ok(route) => route,
-                                Err(error) => {
-                                    return Some(RouteStatus::Rejected(error.to_string().into()));
-                                }
-                            };
-                            #[cfg(feature = "tun")]
-                            let managed_tun =
-                                unicast_dev(&route).filter(|dev| managed.contains(dev));
-                            #[cfg(feature = "tun")]
-                            if let Some(dev) = managed_tun
-                                && Some(dev) != tun_ifindex
-                            {
-                                return Some(RouteStatus::Rejected(
-                                    "route targets a managed tun interface this instance does not own"
-                                        .into(),
-                                ));
-                            }
-
-                            #[cfg(feature = "tun")]
-                            {
-                                // A declaration admitted this round keeps this round's
-                                // result. Anything else — including content that changed
-                                // while planning, or a rebinding that now resolves through
-                                // another device — waits for the next marked round.
-                                if let Some((admitted, registration, status)) =
-                                    admission_failed.get(&(run, declaration.clone()))
-                                {
-                                    // The whole candidate set that failed to prepare
-                                    // must still be exactly the current one, or this
-                                    // result describes an input that no longer exists.
-                                    let unchanged_set = admission_prefixes == Some(true);
-                                    if *admitted == route
-                                        && unchanged_set
-                                        && Some(*registration) == instance
-                                            .member
-                                            .as_ref()
-                                            .map(SharedVirtualNicMember::registration_id)
-                                    {
-                                        return Some(status.clone());
-                                    }
-                                    return Some(pending_status(Some(&route), errors));
-                                }
-                                // Admission used this round's member. If the instance
-                                // is now bound to another registration, that result
-                                // describes an old binding and cannot stand, even
-                                // when the declaration itself did not change. An
-                                // unrelated change to another run leaves this
-                                // registration intact.
-                                if managed_tun.is_some()
-                                    && members
-                                        .get(&run)
-                                        .map(SharedVirtualNicMember::registration_id)
-                                        != instance
-                                            .member
-                                            .as_ref()
-                                            .map(SharedVirtualNicMember::registration_id)
-                                {
-                                    return Some(pending_status(Some(&route), errors));
-                                }
-                            }
-                            if planned.get(&(run, declaration.clone())) != Some(&route) {
-                                return Some(pending_status(Some(&route), errors));
-                            }
-
-                            let key = RouteKey::of(&route);
-                            match desired.get(&key) {
-                                Some((target, owners)) if *target == route => {
-                                    if !owners.contains(&run) {
-                                        return Some(pending_status(Some(&route), errors));
-                                    }
-                                }
-                                Some(_) => {
-                                    return Some(RouteStatus::Suppressed(
-                                        "another declaration takes this route".into(),
-                                    ));
-                                }
-                                None => return Some(pending_status(Some(&route), errors)),
-                            }
-
-                            let Some(row) = rt.applied.get(&key) else {
-                                return Some(pending_status(Some(&route), errors));
-                            };
-                            if row.route != route
-                                || !matches!(row.effect, RouteEffect::Owned | RouteEffect::External)
-                                || !row.owners.contains(&run)
-                            {
-                                return Some(pending_status(Some(&route), errors));
-                            }
-
-                            // A managed declaration also needs this run's member
-                            // and, after execution, this round's acknowledgement.
-                            #[cfg(feature = "tun")]
-                            let status = {
-                                let Some(member) =
-                                    managed_tun.and_then(|_| instance.member.as_ref())
-                                else {
-                                    if managed_tun.is_some() {
-                                        return Some(pending_status(Some(&route), errors));
-                                    }
-                                    return Some(RouteStatus::Ready);
-                                };
-                                if member.ensure_open().is_err()
-                                    || row
-                                        .members
-                                        .get(&run)
-                                        .map(SharedVirtualNicMember::registration_id)
-                                        != Some(member.registration_id())
-                                {
-                                    return Some(pending_status(Some(&route), errors));
-                                }
-
-                                match synced {
-                                    // Planning alone must not turn an old confirmation into
-                                    // pending; the post-execution round reports the effect.
-                                    None => None,
-                                    Some(synced) => {
-                                        let acknowledged = synced
-                                            .get(&(run, member.registration_id()))
-                                            .is_some_and(|prefixes| {
-                                                prefixes.contains(&route.destination)
-                                            });
-                                        if acknowledged {
-                                            Some(RouteStatus::Ready)
-                                        } else {
-                                            Some(pending_status(Some(&route), errors))
-                                        }
-                                    }
-                                }
-                            };
-                            // Without the TUN feature no declaration reaches a
-                            // managed device, so an installed row that is the
-                            // desired target and owned by this run is ready.
-                            #[cfg(not(feature = "tun"))]
-                            let status = {
-                                let _ = synced;
-                                Some(RouteStatus::Ready)
-                            };
-                            status
-                        });
-                    }
-                }
-            }
-        }
-
-        ReconcilePlan {
-            desired,
-            remove,
-            add,
+        PlanInputs {
+            inputs,
             slots,
             #[cfg(feature = "tun")]
             members,
+            #[cfg(feature = "tun")]
+            managed,
+            applied,
         }
     }
+
+    /// Report this round's pure plan back to the current slots.
+    ///
+    /// This is the only feedback step: it re-reads the live runtime instead of
+    /// treating sampled declarations as current, never awaits and never
+    /// performs NIC admission.
+    fn update_plan_statuses(
+        &self,
+        plan: &ReconcilePlan,
+        inputs: &PlanInputs,
+        candidates: &PlanCandidates,
+        admissions: &MemberAdmissions,
+        synced: Option<&BTreeMap<(Uuid, Uuid), BTreeSet<IpCidr>>>,
+        errors: &BTreeMap<RouteSpec<u32>, Arc<str>>,
+    ) {
+        // Rebuild the per-declaration admission evidence for this feedback
+        // call from the sampled candidates and this round's real outcomes.
+        #[cfg(feature = "tun")]
+        let mut admission_failed =
+            BTreeMap::<(Uuid, RouteSpec<RouteDevice>), (RouteSpec<u32>, Uuid, RouteStatus)>::new();
+        #[cfg(feature = "tun")]
+        for (run, failure) in &admissions.failures {
+            if let Some(routes) = candidates.through_tun.get(run) {
+                for (route, declaration) in routes {
+                    admission_failed.insert(
+                        (*run, declaration.clone()),
+                        (route.clone(), failure.registration, failure.status.clone()),
+                    );
+                }
+            }
+        }
+        // One short synchronous scope re-reads the live runtime: shutdown, the
+        // current instance records and their live slots, the current policy and
+        // bindings, and the actual ledger. Nothing awaits here, so no registry
+        // root or slot handle crosses a suspension point.
+        let rt = self.runtime.read();
+        if rt.shutdown {
+            return;
+        }
+        // The managed set is recomputed from the current bindings and ledger,
+        // not from the copied planning inputs.
+        #[cfg(feature = "tun")]
+        let mut managed = BTreeSet::new();
+        #[cfg(feature = "tun")]
+        {
+            for instance in rt.instances.values() {
+                if let Some(info) = &instance.interface {
+                    managed.insert(info.ifindex);
+                }
+            }
+            for row in rt.applied.values() {
+                if !row.members.is_empty()
+                    && let Some(dev) = unicast_dev(&row.route)
+                {
+                    managed.insert(dev);
+                }
+            }
+        }
+        for (run, instance) in &rt.instances {
+            let Some(registry) = instance.registry.upgrade() else {
+                // The instance withdrew its inputs; no feedback.
+                continue;
+            };
+            let run = *run;
+            // A failed admission describes the whole candidate set it
+            // prepared. If any other managed declaration of this member
+            // changed while it awaited, that failure no longer describes the
+            // current input and the next marked round decides.
+            #[cfg(feature = "tun")]
+            let admission_prefixes = admissions.failures.contains_key(&run).then(|| {
+                let planned: BTreeSet<IpCidr> = candidates
+                    .through_tun
+                    .get(&run)
+                    .into_iter()
+                    .flatten()
+                    .map(|(route, _)| route.destination)
+                    .collect();
+                let current: BTreeSet<IpCidr> =
+                    instance
+                        .interface
+                        .as_ref()
+                        .map_or_else(BTreeSet::new, |info| {
+                            let dev = info.ifindex;
+                            let (declarations, slots) = instance.declarations().unwrap_or_default();
+                            drop(slots);
+                            declarations
+                                .into_iter()
+                                .filter_map(|declaration| declaration.resolve(Some(dev)))
+                                .filter_map(|resolved| normalize_route(resolved).ok())
+                                .filter(|route| unicast_dev(route) == Some(dev))
+                                .map(|route| route.destination)
+                                .collect()
+                        });
+                planned == current
+            });
+            for weak in registry.slots() {
+                let Some(slot) = weak.upgrade() else {
+                    continue;
+                };
+                let source = slot.source();
+                slot.update_statuses(|declaration| {
+                    let manual = instance
+                        .config
+                        .as_ref()
+                        .is_some_and(|store| store.snapshot().services.manual_routes.is_some());
+                    if source == RouteSource::AutoProxy && manual {
+                        return Some(RouteStatus::Suppressed(
+                            "manual routes replace auto proxy declarations".into(),
+                        ));
+                    }
+
+                    // Without the TUN feature an instance has no real device,
+                    // so its `Tun` declarations stay pending.
+                    #[cfg(feature = "tun")]
+                    let tun_ifindex = instance.interface.as_ref().map(|info| info.ifindex);
+                    #[cfg(not(feature = "tun"))]
+                    let tun_ifindex = None;
+                    let Some(resolved) = declaration.clone().resolve(tun_ifindex) else {
+                        return Some(pending_status(None, errors));
+                    };
+                    let route = match normalize_route(resolved) {
+                        Ok(route) => route,
+                        Err(error) => {
+                            return Some(RouteStatus::Rejected(error.to_string().into()));
+                        }
+                    };
+                    #[cfg(feature = "tun")]
+                    let managed_tun = unicast_dev(&route).filter(|dev| managed.contains(dev));
+                    #[cfg(feature = "tun")]
+                    if let Some(dev) = managed_tun
+                        && Some(dev) != tun_ifindex
+                    {
+                        return Some(RouteStatus::Rejected(
+                            "route targets a managed tun interface this instance does not own"
+                                .into(),
+                        ));
+                    }
+
+                    #[cfg(feature = "tun")]
+                    {
+                        // A declaration admitted this round keeps this round's
+                        // result. Anything else — including content that changed
+                        // while planning, or a rebinding that now resolves through
+                        // another device — waits for the next marked round.
+                        if let Some((admitted, registration, status)) =
+                            admission_failed.get(&(run, declaration.clone()))
+                        {
+                            // The whole candidate set that failed to prepare
+                            // must still be exactly the current one, or this
+                            // result describes an input that no longer exists.
+                            let unchanged_set = admission_prefixes == Some(true);
+                            if *admitted == route
+                                && unchanged_set
+                                && Some(*registration)
+                                    == instance
+                                        .member
+                                        .as_ref()
+                                        .map(SharedVirtualNicMember::registration_id)
+                            {
+                                return Some(status.clone());
+                            }
+                            return Some(pending_status(Some(&route), errors));
+                        }
+                        // Admission used this round's member. If the instance
+                        // is now bound to another registration, that result
+                        // describes an old binding and cannot stand, even when
+                        // the declaration itself did not change. An unrelated
+                        // change to another run leaves this registration intact.
+                        if managed_tun.is_some()
+                            && inputs
+                                .members
+                                .get(&run)
+                                .map(SharedVirtualNicMember::registration_id)
+                                != instance
+                                    .member
+                                    .as_ref()
+                                    .map(SharedVirtualNicMember::registration_id)
+                        {
+                            return Some(pending_status(Some(&route), errors));
+                        }
+                    }
+                    if candidate_route(candidates, admissions, run, declaration) != Some(&route) {
+                        return Some(pending_status(Some(&route), errors));
+                    }
+
+                    let key = RouteKey::of(&route);
+                    match plan.desired.get(&key) {
+                        Some((target, owners)) if *target == route => {
+                            if !owners.contains(&run) {
+                                return Some(pending_status(Some(&route), errors));
+                            }
+                        }
+                        Some(_) => {
+                            return Some(RouteStatus::Suppressed(
+                                "another declaration takes this route".into(),
+                            ));
+                        }
+                        None => return Some(pending_status(Some(&route), errors)),
+                    }
+
+                    let Some(row) = rt.applied.get(&key) else {
+                        return Some(pending_status(Some(&route), errors));
+                    };
+                    if row.route != route
+                        || !matches!(row.effect, RouteEffect::Owned | RouteEffect::External)
+                        || !row.owners.contains(&run)
+                    {
+                        return Some(pending_status(Some(&route), errors));
+                    }
+
+                    // A managed declaration also needs this run's member and,
+                    // after execution, this round's acknowledgement.
+                    #[cfg(feature = "tun")]
+                    let status = {
+                        let Some(member) = managed_tun.and_then(|_| instance.member.as_ref())
+                        else {
+                            if managed_tun.is_some() {
+                                return Some(pending_status(Some(&route), errors));
+                            }
+                            return Some(RouteStatus::Ready);
+                        };
+                        if member.ensure_open().is_err()
+                            || row
+                                .members
+                                .get(&run)
+                                .map(SharedVirtualNicMember::registration_id)
+                                != Some(member.registration_id())
+                        {
+                            return Some(pending_status(Some(&route), errors));
+                        }
+
+                        match synced {
+                            // Planning alone must not turn an old confirmation
+                            // into pending; the post-execution round reports the
+                            // effect.
+                            None => None,
+                            Some(synced) => {
+                                let acknowledged = synced
+                                    .get(&(run, member.registration_id()))
+                                    .is_some_and(|prefixes| prefixes.contains(&route.destination));
+                                if acknowledged {
+                                    Some(RouteStatus::Ready)
+                                } else {
+                                    Some(pending_status(Some(&route), errors))
+                                }
+                            }
+                        }
+                    };
+                    // Without the TUN feature no declaration reaches a managed
+                    // device, so an installed row that is the desired target
+                    // and owned by this run is ready.
+                    #[cfg(not(feature = "tun"))]
+                    let status = {
+                        let _ = synced;
+                        Some(RouteStatus::Ready)
+                    };
+                    status
+                });
+            }
+        }
+    }
+}
+
+/// Resolve this round's declarations into installable route candidates.
+///
+/// Pure: it only reads the sampled values, resolves each declaration through
+/// the instance's real device and normalizes the platform fields. It never
+/// waits, takes a NIC lock or reports status.
+pub(super) fn resolve_plan_candidates(inputs: &PlanInputs) -> PlanCandidates {
+    let mut planned = BTreeMap::<(Uuid, RouteSpec<RouteDevice>), RouteSpec<u32>>::new();
+    let mut claims = BTreeMap::<RouteKey, Vec<(RouteSpec<u32>, Uuid)>>::new();
+    #[cfg(feature = "tun")]
+    let mut through_tun = BTreeMap::<Uuid, Vec<(RouteSpec<u32>, RouteSpec<RouteDevice>)>>::new();
+
+    for (run, declarations, interface) in &inputs.inputs {
+        let tun_ifindex = interface.as_ref().map(|info| info.ifindex);
+        for declaration in declarations {
+            let Some(resolved) = declaration.clone().resolve(tun_ifindex) else {
+                // `Tun` without a bound device stays pending until the binding
+                // changes.
+                continue;
+            };
+            let Ok(route) = normalize_route(resolved) else {
+                // A real input error, recomputed during feedback.
+                continue;
+            };
+            match unicast_dev(&route) {
+                // Only this run's own bound device goes through member
+                // admission. An index into another known managed TUN has no
+                // matching member here, so it is rejected rather than becoming
+                // an ordinary system route; feedback recomputes that from the
+                // same current interface set.
+                #[cfg(feature = "tun")]
+                Some(dev) if inputs.managed.contains(&dev) => {
+                    if Some(dev) != tun_ifindex {
+                        continue;
+                    }
+                    through_tun
+                        .entry(*run)
+                        .or_default()
+                        .push((route, declaration.clone()));
+                }
+                // Without the TUN feature nothing is managed, and a normal
+                // interface needs no TUN membership either.
+                _ => {
+                    planned.insert((*run, declaration.clone()), route.clone());
+                    claims
+                        .entry(RouteKey::of(&route))
+                        .or_default()
+                        .push((route, *run));
+                }
+            }
+        }
+    }
+    PlanCandidates {
+        planned,
+        claims,
+        #[cfg(feature = "tun")]
+        through_tun,
+    }
+}
+
+/// Admit every managed member target as one whole through the real NIC.
+///
+/// This is the only planning stage that waits for a NIC; its outcome is tied
+/// to the complete target and the registration that produced it.
+#[cfg(feature = "tun")]
+async fn admit_plan_members(inputs: &PlanInputs, candidates: &PlanCandidates) -> MemberAdmissions {
+    let mut admissions = MemberAdmissions::default();
+    for (run, candidates_for_run) in &candidates.through_tun {
+        let prefixes: BTreeSet<IpCidr> = candidates_for_run
+            .iter()
+            .map(|(route, _)| route.destination)
+            .collect();
+        let member = inputs.members.get(run);
+        let registration = member.map(SharedVirtualNicMember::registration_id);
+        let admission: Result<_, RouteStatus> = match member {
+            // Reaching a managed device without this run's own member would
+            // bypass admission, so it is an input error. It is not recorded as
+            // a failed attempt of a registration that does not exist.
+            None => Err(RouteStatus::Rejected(
+                "route targets a managed tun interface this instance does not own".into(),
+            )),
+            Some(member) => {
+                let nic = member.shared_nic();
+                // Bounding this wait only settles this member's admission; the
+                // rest of the round still plans, and the retry policy belongs
+                // to the caller's next round.
+                match tokio::time::timeout(Duration::from_secs(5), nic.lock()).await {
+                    Err(_) => Err(RouteStatus::Pending {
+                        error: Some(
+                            format!(
+                                "timed out locking shared NIC for member {}",
+                                member.member_id()
+                            )
+                            .into(),
+                        ),
+                    }),
+                    Ok(guard) => {
+                        // Recheck under the NIC lock: a member may close or its
+                        // binding may go stale while this round waits for it,
+                        // and neither may prepare. Those facts are already known
+                        // invalidations, not failed attempts.
+                        if member.ensure_open().is_err()
+                            || !guard.is_valid()
+                            || !guard.is_current_member_registration(
+                                member.member_id(),
+                                member.registration_id(),
+                            )
+                        {
+                            Err(RouteStatus::Pending { error: None })
+                        } else {
+                            match guard.prepare_managed_routes(
+                                member.member_id(),
+                                member.registration_id(),
+                                &prefixes,
+                            ) {
+                                Ok(_claims) => Ok(()),
+                                // A whole-member overlap is an input error until
+                                // the declarations or the topology change.
+                                Err(error) if error.is::<SharedIfConfigConflict>() => {
+                                    Err(RouteStatus::Rejected(error.to_string().into()))
+                                }
+                                // The binding was current, valid and open, so
+                                // this is a real failed prepare the caller may
+                                // retry.
+                                Err(error) => Err(RouteStatus::Pending {
+                                    error: Some(error.to_string().into()),
+                                }),
+                            }
+                        }
+                    }
+                }
+            }
+        };
+        match admission {
+            Ok(()) => {
+                admissions.accepted.insert(*run);
+            }
+            Err(status) => {
+                if let Some(registration) = registration {
+                    admissions.failures.insert(
+                        *run,
+                        MemberAdmissionFailure {
+                            registration,
+                            prefixes,
+                            status,
+                        },
+                    );
+                }
+            }
+        }
+    }
+    admissions
+}
+
+/// Build the one complete target of this round.
+///
+/// Pure: consumes the sampled inputs and this round's admission outcomes. It
+/// performs only device competition, stable owner merge and the ledger diff.
+pub(super) fn build_plan(
+    inputs: &PlanInputs,
+    candidates: &PlanCandidates,
+    admissions: &MemberAdmissions,
+) -> ReconcilePlan {
+    // E. One complete row per physical key. The row already installed wins
+    // while it is still a candidate; otherwise the first claim in stable run
+    // and declaration order does. Different keys coexist, so a metric never
+    // acts as a per-prefix selector.
+    let mut claimed_keys: BTreeSet<RouteKey> = candidates.claims.keys().cloned().collect();
+    #[cfg(feature = "tun")]
+    for run in &admissions.accepted {
+        if let Some(routes) = candidates.through_tun.get(run) {
+            for (route, _) in routes {
+                claimed_keys.insert(RouteKey::of(route));
+            }
+        }
+    }
+    let mut desired: BTreeMap<RouteKey, (RouteSpec<u32>, BTreeSet<Uuid>)> = BTreeMap::new();
+    for key in claimed_keys {
+        let mut key_claims: Vec<(RouteSpec<u32>, Uuid)> =
+            candidates.claims.get(&key).cloned().unwrap_or_default();
+        #[cfg(feature = "tun")]
+        for run in &admissions.accepted {
+            if let Some(routes) = candidates.through_tun.get(run) {
+                for (route, _) in routes {
+                    if RouteKey::of(route) == key {
+                        key_claims.push((route.clone(), *run));
+                    }
+                }
+            }
+        }
+        key_claims.sort_by_key(|(_, run)| *run);
+        let winner = inputs
+            .applied
+            .get(&key)
+            .map(|row| row.route.clone())
+            .filter(|current| key_claims.iter().any(|(route, _)| route == current))
+            .or_else(|| key_claims.first().map(|(route, _)| route.clone()));
+        let Some(winner) = winner else {
+            continue;
+        };
+        let owners: BTreeSet<Uuid> = key_claims
+            .iter()
+            .filter(|(route, _)| *route == winner)
+            .map(|(_, run)| *run)
+            .collect();
+        desired.insert(key, (winner, owners));
+    }
+
+    // F. Diff the target against the actual ledger. Adding and Removing
+    // effects stay unconfirmed, and the ledger itself stays untouched.
+    let mut remove = Vec::new();
+    let mut add = Vec::new();
+    for (key, row) in &inputs.applied {
+        if desired
+            .get(key)
+            .is_none_or(|(route, _)| *route != row.route)
+        {
+            remove.push(row.route.clone());
+        }
+    }
+    for (key, (route, _)) in &desired {
+        let confirmed = inputs.applied.get(key).is_some_and(|row| {
+            row.route == *route && matches!(row.effect, RouteEffect::Owned | RouteEffect::External)
+        });
+        if !confirmed {
+            add.push(route.clone());
+        }
+    }
+
+    ReconcilePlan {
+        desired,
+        remove,
+        add,
+        // Only weak slot observations and existing member handles are copied;
+        // no input, target or ledger is duplicated.
+        slots: inputs.slots.clone(),
+        #[cfg(feature = "tun")]
+        members: inputs.members.clone(),
+    }
+}
+
+/// The route of one declaration in this round's candidate set, if admitted.
+fn candidate_route<'a>(
+    candidates: &'a PlanCandidates,
+    admissions: &MemberAdmissions,
+    run: Uuid,
+    declaration: &RouteSpec<RouteDevice>,
+) -> Option<&'a RouteSpec<u32>> {
+    if let Some(route) = candidates.planned.get(&(run, declaration.clone())) {
+        return Some(route);
+    }
+    #[cfg(feature = "tun")]
+    if admissions.accepted.contains(&run) {
+        return candidates
+            .through_tun
+            .get(&run)?
+            .iter()
+            .find(|(_, candidate)| candidate == declaration)
+            .map(|(route, _)| route);
+    }
+    #[cfg(not(feature = "tun"))]
+    let _ = admissions;
+    None
 }
 /// The fixed desktop audit grid. Input changes never restart it.
 const AUDIT_INTERVAL: Duration = Duration::from_secs(60);

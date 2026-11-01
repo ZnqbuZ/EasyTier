@@ -541,6 +541,95 @@ fn instance_with_slot(
     (run, registry, slot)
 }
 
+// Pure planning tests. They resolve the sampled candidates and build the
+// complete target outside an async context: no NIC lock, backend call or slot
+// status update may be needed to compute it.
+
+#[test]
+fn pure_plan_builds_the_target_without_backend_nic_or_slot_feedback() {
+    let controller = RouteController::new(Arc::new(DirtyFlag::new(false)));
+    let declaration = indexed("10.23.0.0/24", 7, None);
+    let route = resolved(&declaration);
+    let (run, registry, slot) = instance_with_slot(&controller, RouteSource::Additional);
+    slot.set_routes(RouteSet::from([declaration.clone()]));
+
+    let inputs = controller.sample_plan_inputs();
+    let candidates = resolve_plan_candidates(&inputs);
+    let plan = build_plan(&inputs, &candidates, &MemberAdmissions::default());
+
+    assert_eq!(
+        plan.desired.get(&RouteKey::of(&route)),
+        Some(&(route.clone(), BTreeSet::from([run])))
+    );
+    assert_eq!(plan.add, vec![route]);
+    assert!(plan.remove.is_empty());
+    assert_eq!(
+        slot.statuses().get(&declaration),
+        Some(&RouteStatus::Pending { error: None }),
+        "building the plan must not report status"
+    );
+
+    drop(slot);
+    drop(registry);
+    assert!(
+        plan.slots.iter().all(|(_, weak)| weak.strong_count() == 0),
+        "sampling keeps slots only weakly"
+    );
+}
+
+#[cfg(feature = "tun")]
+#[test]
+fn pure_plan_consumes_member_admission_without_taking_the_nic() {
+    let controller = RouteController::new(Arc::new(DirtyFlag::new(false)));
+    let run = Uuid::new_v4();
+    let registry = controller.open_instance(run).unwrap();
+    let slot = registry
+        .handle()
+        .open_slot(RouteSource::Additional)
+        .unwrap();
+    let mut fixture = ManagedNicFixture::new(run);
+    let member = fixture.create_member();
+    controller.bind_member(run, &member).unwrap();
+    controller
+        .ready(
+            run,
+            &member,
+            InterfaceInfo {
+                name: MANAGED_NIC_NAME.to_owned(),
+                ifindex: 7,
+            },
+        )
+        .unwrap();
+
+    let declaration = indexed("10.24.0.0/24", 7, None);
+    let route = resolved(&declaration);
+    slot.set_routes(RouteSet::from([declaration.clone()]));
+
+    let inputs = controller.sample_plan_inputs();
+    let candidates = resolve_plan_candidates(&inputs);
+    let unadmitted = build_plan(&inputs, &candidates, &MemberAdmissions::default());
+    assert!(
+        unadmitted.desired.is_empty() && unadmitted.add.is_empty(),
+        "a managed candidate without this round's admission is not a target"
+    );
+
+    let mut admitted = MemberAdmissions::default();
+    admitted.accepted.insert(run);
+    let plan = build_plan(&inputs, &candidates, &admitted);
+    assert_eq!(
+        plan.desired.get(&RouteKey::of(&route)),
+        Some(&(route.clone(), BTreeSet::from([run])))
+    );
+    assert_eq!(plan.add, vec![route]);
+    assert!(
+        matches!(
+            slot.statuses().get(&declaration),
+            Some(RouteStatus::Pending { .. })
+        ),
+        "neither build consumes the NIC or reports status"
+    );
+}
+
 // Execution tests. They use the in-memory mock above only; no platform
 // backend, TUN device or system network state is touched.
 
