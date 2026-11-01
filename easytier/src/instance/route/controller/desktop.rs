@@ -24,12 +24,12 @@ use crate::instance::route::{
 use crate::instance::shared_virtual_nic::{SharedIfConfigConflict, SharedVirtualNicMember};
 
 #[cfg(feature = "tun")]
+use super::RouteControllerRuntime;
+#[cfg(feature = "tun")]
 use super::member::{
     MemberRetry, claim_prefixes, member_retry_blocked, record_member_failure, sync_member_routes,
 };
-use super::{
-    InstanceRoutes, ROUTE_IO_TIMEOUT, RouteController, RouteControllerRuntime, retry_backoff,
-};
+use super::{InstanceRoutes, ROUTE_IO_TIMEOUT, RouteController, retry_backoff};
 
 /// This round's desktop target and the operations the executor still owes.
 ///
@@ -50,7 +50,9 @@ pub(crate) struct ReconcilePlan {
 }
 
 impl RouteController {
-    /// Read the currently applied routes in memory (microsecond read lock, zero system calls).
+    /// Test-only view of the applied ledger (microsecond read lock, zero system
+    /// calls). Desktop production has no route-table export.
+    #[cfg(test)]
     pub(super) fn applied_routes(&self) -> AppliedRoutes {
         self.runtime.read().applied.clone()
     }
@@ -116,6 +118,24 @@ pub(super) struct RouteRetry {
     pub(super) retry_at: tokio::time::Instant,
     pub(super) attempts: u32,
     pub(super) error: Arc<str>,
+}
+
+/// One desktop round's local evidence and responsibilities.
+///
+/// It holds this round's admission result, the related member handles that may
+/// still owe cleanup, the acknowledged prefixes and the cleared registrations.
+/// Long-term retries stay on the reconciler and the actual ledger stays in the
+/// Runtime; nothing here survives the round or caches a success.
+#[derive(Default)]
+struct ReconcileRound {
+    #[cfg(feature = "tun")]
+    related: BTreeMap<(Uuid, Uuid), SharedVirtualNicMember>,
+    #[cfg(feature = "tun")]
+    admission_failures: BTreeMap<(Uuid, Uuid), (BTreeSet<IpCidr>, RouteStatus)>,
+    /// This round's real member admission evidence.
+    admissions: MemberAdmissions,
+    synced: BTreeMap<(Uuid, Uuid), BTreeSet<IpCidr>>,
+    cleared: BTreeSet<(Uuid, Uuid)>,
 }
 
 /// Dedicated desktop background reconciler actor: exclusively owns the
@@ -283,73 +303,85 @@ impl<B: RouteBackend> RouteReconciler<B> {
     /// prefix cleanup; no input, target or second ledger is stored. `Ok` means
     /// this round ended, not that every route finished.
     pub(super) async fn reconcile(&mut self) -> anyhow::Result<()> {
-        // A. Plan from the current inputs plus the evidence of older failures.
-        // The admission record belongs to one planning call: the planner clears
-        // it on entry and reports only that call's failed member admissions.
-        let mut admission_failures = BTreeMap::new();
-        let errors = self.retry_errors();
+        // 1. Sample the current inputs and resolve this round's pure
+        // candidates. The withdrawal stage only needs each member's declared
+        // target; admission follows it.
         #[cfg_attr(not(feature = "tun"), allow(unused_mut))]
-        let mut plan = self
-            .controller
-            .plan_reconciliation(None, &errors, Some(&mut admission_failures))
-            .await;
-        #[cfg(feature = "tun")]
-        self.record_admission_failures(&plan, &admission_failures);
-
-        #[cfg_attr(not(feature = "tun"), allow(unused_mut))]
-        let mut synced: BTreeMap<(Uuid, Uuid), BTreeSet<IpCidr>> = BTreeMap::new();
-        #[cfg_attr(not(feature = "tun"), allow(unused_mut))]
-        let mut cleared: BTreeSet<(Uuid, Uuid)> = BTreeSet::new();
-        #[cfg(feature = "tun")]
-        let mut related = self.related_members(&plan);
-
-        // B/C. Member prefixes first: withdraw what is no longer declared so a
-        // member blocked by stale claims can be admitted again, then plan once
-        // more and commit every related member's complete current target.
+        let mut round = ReconcileRound::default();
         #[cfg(feature = "tun")]
         {
-            self.withdraw_member_prefixes(
-                &plan,
-                &related,
-                &admission_failures,
-                &mut synced,
-                &mut cleared,
-            )
-            .await;
-            let errors = self.retry_errors();
-            plan = self
-                .controller
-                .plan_reconciliation(None, &errors, Some(&mut admission_failures))
+            let inputs = self.controller.sample_plan_inputs();
+            let candidates = resolve_plan_candidates(&inputs);
+            round.related = self.related_members(&inputs);
+            self.withdraw_member_prefixes(&inputs, &candidates, &mut round)
                 .await;
-            self.record_admission_failures(&plan, &admission_failures);
-            Self::extend_related_members(&mut related, &plan);
-            self.sync_member_prefixes(
-                &plan,
-                &related,
-                &admission_failures,
-                &mut synced,
-                &mut cleared,
-            )
-            .await;
         }
 
-        // D–H. Reconcile every actual row, its owners and the OS effects.
-        let (changed, budget_exhausted) = self.reconcile_routes(&plan, &synced, &cleared).await;
+        // 2. Necessary replan after those waits: sample again and admit the
+        // new target as one whole, then build the complete plan. Building the
+        // plan reads no NIC and performs no OS effect.
+        let inputs = self.controller.sample_plan_inputs();
+        let candidates = resolve_plan_candidates(&inputs);
+        #[cfg(feature = "tun")]
+        {
+            for (run, member) in &inputs.members {
+                round
+                    .related
+                    .entry((*run, member.registration_id()))
+                    .or_insert_with(|| member.clone());
+            }
+            round.admissions = admit_plan_members(&inputs, &candidates).await;
+            round.admission_failures = admission_failure_map(&round.admissions);
+            self.record_admission_failures(&inputs, &round.admission_failures);
+        }
+        let plan = build_plan(&inputs, &candidates, &round.admissions);
+        #[cfg(feature = "tun")]
+        self.sync_member_prefixes(&plan, &mut round).await;
 
-        // I. Feed this round's real evidence back through the same planner.
+        // 3. OS diff on the complete plan. The real effects and their facts
+        // live in the ledger; this step only adds and removes what differs.
+        let (changed, budget_exhausted) = self.reconcile_routes(&plan, &round).await;
+
+        // 4. Necessary recompute after the OS facts: sample the current
+        // declarations again. The round's admission evidence is reused while
+        // it still describes the current registration and complete target; a
+        // failed or stale evidence set is re-admitted once, then feedback
+        // consumes the final evidence.
         self.prune_route_retries(&plan.desired);
         let errors = self.retry_errors();
-        let final_plan = self
-            .controller
-            .plan_reconciliation(Some(&synced), &errors, Some(&mut admission_failures))
-            .await;
+        let inputs = self.controller.sample_plan_inputs();
+        let candidates = resolve_plan_candidates(&inputs);
         #[cfg(feature = "tun")]
         {
-            self.record_admission_failures(&final_plan, &admission_failures);
-            Self::extend_related_members(&mut related, &final_plan);
-            self.transfer_orphan_members(&related, &synced, &cleared);
+            if member_evidence_stale(&round.admissions, &inputs, &candidates) {
+                round.admissions = admit_plan_members(&inputs, &candidates).await;
+                round.admission_failures = admission_failure_map(&round.admissions);
+                self.record_admission_failures(&inputs, &round.admission_failures);
+            } else {
+                round.admissions = carry_member_admissions(&inputs, &candidates, &round.admissions);
+            }
+            for (run, member) in &inputs.members {
+                round
+                    .related
+                    .entry((*run, member.registration_id()))
+                    .or_insert_with(|| member.clone());
+            }
         }
-        let removed = self.remove_finished_instances(&synced, &cleared);
+        let final_plan = build_plan(&inputs, &candidates, &round.admissions);
+        self.controller.update_plan_statuses(
+            &final_plan,
+            &inputs,
+            &candidates,
+            &round.admissions,
+            Some(&round.synced),
+            &errors,
+        );
+
+        // 5. Responsibility cleanup: orphaned member cleanup and records whose
+        // real work is finished.
+        #[cfg(feature = "tun")]
+        self.transfer_orphan_members(&round.related, &round.synced, &round.cleared);
+        let removed = self.remove_finished_instances(&round.synced, &round.cleared);
         if changed || removed {
             self.controller.changed().notify_waiters();
         }
@@ -359,15 +391,15 @@ impl<B: RouteBackend> RouteReconciler<B> {
         // deadline never reaches here, so neither can spin the loop.
         #[cfg(feature = "tun")]
         let member_actionable = {
-            let targets = self.member_targets(&final_plan, &related);
+            let targets = self.member_targets(&final_plan, &round.related);
             let now = tokio::time::Instant::now();
-            related.keys().any(|key| {
-                if cleared.contains(key) {
+            round.related.keys().any(|key| {
+                if round.cleared.contains(key) {
                     return false;
                 }
                 let final_target = targets.get(key).cloned().unwrap_or_default();
                 let target = self.fresh_member_target(*key, &final_target);
-                if synced.get(key) == Some(&target) {
+                if round.synced.get(key) == Some(&target) {
                     // This round's own commit confirmed the whole goal.
                     return false;
                 }
@@ -375,12 +407,13 @@ impl<B: RouteBackend> RouteReconciler<B> {
                     // The next attempt is already scheduled.
                     return false;
                 }
-                !self.transient_admission_unresolved(&admission_failures, *key)
+                !self.transient_admission_unresolved(&round.admission_failures, *key)
             })
         };
         #[cfg(not(feature = "tun"))]
         let member_actionable = false;
-        if budget_exhausted || member_actionable || self.actionable_add(&final_plan, &synced) {
+        if budget_exhausted || member_actionable || self.actionable_add(&final_plan, &round.synced)
+        {
             // Work this round could not start or finish is actionable right
             // now, for example a member acknowledgement that arrived after
             // this round's plan. A future retry deadline never reaches here,
@@ -403,14 +436,14 @@ impl<B: RouteBackend> RouteReconciler<B> {
     #[cfg(feature = "tun")]
     fn record_admission_failures(
         &mut self,
-        plan: &ReconcilePlan,
+        inputs: &PlanInputs,
         admission_failures: &BTreeMap<(Uuid, Uuid), (BTreeSet<IpCidr>, RouteStatus)>,
     ) {
         for ((run, registration), (prefixes, status)) in admission_failures {
             let RouteStatus::Pending { error: Some(error) } = status else {
                 continue;
             };
-            let Some(member) = plan
+            let Some(member) = inputs
                 .members
                 .get(run)
                 .filter(|member| member.registration_id() == *registration)
@@ -519,10 +552,14 @@ impl<B: RouteBackend> RouteReconciler<B> {
     #[cfg(feature = "tun")]
     fn related_members(
         &self,
-        plan: &ReconcilePlan,
+        inputs: &PlanInputs,
     ) -> BTreeMap<(Uuid, Uuid), SharedVirtualNicMember> {
         let mut related = BTreeMap::new();
-        Self::extend_related_members(&mut related, plan);
+        for (run, member) in &inputs.members {
+            related
+                .entry((*run, member.registration_id()))
+                .or_insert_with(|| member.clone());
+        }
         {
             let rt = self.controller.runtime.read();
             for row in rt.applied.values() {
@@ -537,18 +574,6 @@ impl<B: RouteBackend> RouteReconciler<B> {
             related.entry(*key).or_insert_with(|| retry.member.clone());
         }
         related
-    }
-
-    #[cfg(feature = "tun")]
-    fn extend_related_members(
-        related: &mut BTreeMap<(Uuid, Uuid), SharedVirtualNicMember>,
-        plan: &ReconcilePlan,
-    ) {
-        for (run, member) in &plan.members {
-            related
-                .entry((*run, member.registration_id()))
-                .or_insert_with(|| member.clone());
-        }
     }
 
     /// The final legal prefix target of every related member.
@@ -598,18 +623,22 @@ impl<B: RouteBackend> RouteReconciler<B> {
     #[cfg(feature = "tun")]
     async fn withdraw_member_prefixes(
         &mut self,
-        plan: &ReconcilePlan,
-        related: &BTreeMap<(Uuid, Uuid), SharedVirtualNicMember>,
-        admission_failures: &BTreeMap<(Uuid, Uuid), (BTreeSet<IpCidr>, RouteStatus)>,
-        synced: &mut BTreeMap<(Uuid, Uuid), BTreeSet<IpCidr>>,
-        cleared: &mut BTreeSet<(Uuid, Uuid)>,
+        inputs: &PlanInputs,
+        candidates: &PlanCandidates,
+        round: &mut ReconcileRound,
     ) {
-        let targets = self.member_targets(plan, related);
+        // Withdrawal only needs each member's currently declared target. It
+        // runs before admission so stale claims cannot block the new whole
+        // target; competition and rejection are settled by the commit below.
+        let targets = declared_member_targets(inputs, candidates, &round.related);
+        let ReconcileRound {
+            related,
+            synced,
+            cleared,
+            ..
+        } = round;
         let now = tokio::time::Instant::now();
-        for (key, member) in related {
-            if self.transient_admission_unresolved(admission_failures, *key) {
-                continue;
-            }
+        for (key, member) in related.iter() {
             let final_target = targets.get(key).cloned().unwrap_or_default();
             if member_retry_blocked(&self.member_retries, key, &final_target, now) {
                 continue;
@@ -677,17 +706,17 @@ impl<B: RouteBackend> RouteReconciler<B> {
     /// waits is not re-added. An acknowledgement records its real prefix set;
     /// a dead registration records only that it is cleared.
     #[cfg(feature = "tun")]
-    async fn sync_member_prefixes(
-        &mut self,
-        plan: &ReconcilePlan,
-        related: &BTreeMap<(Uuid, Uuid), SharedVirtualNicMember>,
-        admission_failures: &BTreeMap<(Uuid, Uuid), (BTreeSet<IpCidr>, RouteStatus)>,
-        synced: &mut BTreeMap<(Uuid, Uuid), BTreeSet<IpCidr>>,
-        cleared: &mut BTreeSet<(Uuid, Uuid)>,
-    ) {
-        let targets = self.member_targets(plan, related);
+    async fn sync_member_prefixes(&mut self, plan: &ReconcilePlan, round: &mut ReconcileRound) {
+        let targets = self.member_targets(plan, &round.related);
+        let ReconcileRound {
+            related,
+            admission_failures,
+            synced,
+            cleared,
+            ..
+        } = round;
         let now = tokio::time::Instant::now();
-        for (key, member) in related {
+        for (key, member) in related.iter() {
             if self.transient_admission_unresolved(admission_failures, *key) {
                 continue;
             }
@@ -863,8 +892,7 @@ impl<B: RouteBackend> RouteReconciler<B> {
     async fn reconcile_routes(
         &mut self,
         plan: &ReconcilePlan,
-        synced: &BTreeMap<(Uuid, Uuid), BTreeSet<IpCidr>>,
-        cleared: &BTreeSet<(Uuid, Uuid)>,
+        round: &ReconcileRound,
     ) -> (bool, bool) {
         let now = tokio::time::Instant::now();
         let applied = self.controller.runtime.read().applied.clone();
@@ -896,14 +924,20 @@ impl<B: RouteBackend> RouteReconciler<B> {
                 .collect();
             for old_owner in &row.owners {
                 if !owners.contains(old_owner)
-                    && !self.row_member_released(row, *old_owner, synced, cleared)
+                    && !self.row_member_released(row, *old_owner, &round.synced, &round.cleared)
                 {
                     owners.insert(*old_owner);
                 }
             }
             #[cfg(feature = "tun")]
-            let members =
-                self.row_members(row, &owners, desired_owners, &bindings, synced, cleared);
+            let members = self.row_members(
+                row,
+                &owners,
+                desired_owners,
+                &bindings,
+                &round.synced,
+                &round.cleared,
+            );
             #[cfg(feature = "tun")]
             let members_changed = !Self::same_members(&members, &row.members);
             #[cfg(not(feature = "tun"))]
@@ -964,7 +998,7 @@ impl<B: RouteBackend> RouteReconciler<B> {
             // Only an owner that could act now justifies a readback: either an
             // ordinary owner, or one whose managed row this round acknowledged.
             let Some((owners, _, executable)) =
-                self.current_add_evidence(route, desired_owners, plan, synced)
+                self.current_add_evidence(route, desired_owners, plan, &round.synced)
             else {
                 continue;
             };
@@ -1042,7 +1076,7 @@ impl<B: RouteBackend> RouteReconciler<B> {
                 // or an instance rebound while an earlier addition awaited must
                 // not be acted on.
                 let Some((owners, members, executable)) =
-                    self.current_add_evidence(&route, &planned_owners, plan, synced)
+                    self.current_add_evidence(&route, &planned_owners, plan, &round.synced)
                 else {
                     continue;
                 };
@@ -1149,7 +1183,7 @@ impl<B: RouteBackend> RouteReconciler<B> {
                             current.route == row.route && current.effect == RouteEffect::External
                         })
                     };
-                    if !current_external || !self.row_may_be_removed(row, synced, cleared).await {
+                    if !current_external || !self.row_may_be_removed(row, round) {
                         continue;
                     }
                     let mut rt = self.controller.runtime.write();
@@ -1200,7 +1234,7 @@ impl<B: RouteBackend> RouteReconciler<B> {
                 let Some(current) = current else {
                     continue;
                 };
-                if !self.row_may_be_removed(&current, synced, cleared).await {
+                if !self.row_may_be_removed(&current, round) {
                     continue;
                 }
                 // No await may separate this fresh result from the deletion:
@@ -1556,24 +1590,22 @@ impl<B: RouteBackend> RouteReconciler<B> {
     /// acknowledgement that still carries the destination is acceptable only
     /// when another full row of that same registration now carries it.
     ///
-    /// This only plans: it records a transient admission failure in the
-    /// caller's retry map, reads no OS state and changes no member claim.
-    async fn row_may_be_removed(
-        &mut self,
-        row: &AppliedRoute,
-        synced: &BTreeMap<(Uuid, Uuid), BTreeSet<IpCidr>>,
-        cleared: &BTreeSet<(Uuid, Uuid)>,
-    ) -> bool {
-        let errors = self.retry_errors();
-        let mut admission_failures = BTreeMap::new();
-        let fresh = self
-            .controller
-            .plan_reconciliation(None, &errors, Some(&mut admission_failures))
-            .await;
+    /// This only plans: it carries this round's admission evidence while the
+    /// registration and complete target are unchanged, reads no OS state and
+    /// changes no member claim. A changed binding or target is deferred to the
+    /// next marked round instead of starting another admission here.
+    fn row_may_be_removed(&mut self, row: &AppliedRoute, round: &ReconcileRound) -> bool {
+        let inputs = self.controller.sample_plan_inputs();
+        let candidates = resolve_plan_candidates(&inputs);
         #[cfg(feature = "tun")]
-        self.record_admission_failures(&fresh, &admission_failures);
+        let admissions = carry_member_admissions(&inputs, &candidates, &round.admissions);
         #[cfg(not(feature = "tun"))]
-        let _ = (&admission_failures, synced, cleared);
+        let admissions = MemberAdmissions::default();
+        #[cfg(feature = "tun")]
+        let admission_failures = admission_failure_map(&admissions);
+        #[cfg(not(feature = "tun"))]
+        let _ = (&round.admissions,);
+        let fresh = build_plan(&inputs, &candidates, &admissions);
 
         let key = RouteKey::of(&row.route);
         let mut missing = false;
@@ -1672,10 +1704,10 @@ impl<B: RouteBackend> RouteReconciler<B> {
                 // Every old member's prefix responsibility must be settled.
                 for (run, member) in &row.members {
                     let old_registration = member.registration_id();
-                    if cleared.contains(&(*run, old_registration)) {
+                    if round.cleared.contains(&(*run, old_registration)) {
                         continue;
                     }
-                    let Some(acknowledged) = synced.get(&(*run, old_registration)) else {
+                    let Some(acknowledged) = round.synced.get(&(*run, old_registration)) else {
                         // Neither an acknowledgement nor a clear: not proof.
                         return false;
                     };
@@ -2238,8 +2270,15 @@ pub(super) struct PlanCandidates {
 #[cfg(feature = "tun")]
 #[derive(Default)]
 pub(super) struct MemberAdmissions {
-    pub(super) accepted: BTreeSet<Uuid>,
+    pub(super) accepted: BTreeMap<Uuid, MemberAdmission>,
     pub(super) failures: BTreeMap<Uuid, MemberAdmissionFailure>,
+}
+
+/// One accepted whole-member target and the registration that was prepared.
+#[cfg(feature = "tun")]
+pub(super) struct MemberAdmission {
+    pub(super) registration: Uuid,
+    pub(super) prefixes: BTreeSet<IpCidr>,
 }
 
 #[cfg(feature = "tun")]
@@ -2249,57 +2288,29 @@ pub(super) struct MemberAdmissionFailure {
     pub(super) status: RouteStatus,
 }
 
+/// The per-registration failure view feedback and retries use.
+#[cfg(feature = "tun")]
+fn admission_failure_map(
+    admissions: &MemberAdmissions,
+) -> BTreeMap<(Uuid, Uuid), (BTreeSet<IpCidr>, RouteStatus)> {
+    admissions
+        .failures
+        .iter()
+        .map(|(run, failure)| {
+            (
+                (*run, failure.registration),
+                (failure.prefixes.clone(), failure.status.clone()),
+            )
+        })
+        .collect()
+}
+
 /// Without the TUN feature no declaration reaches member admission.
 #[cfg(not(feature = "tun"))]
 #[derive(Default)]
 pub(super) struct MemberAdmissions {}
 
 impl RouteController {
-    /// Temporary S03 adapter: sample, resolve candidates, admit members and
-    /// feed back through the real stages for existing callers.
-    ///
-    /// S04 must delete this entry and drive the stages from the round; it is
-    /// not a second long-term planner.
-    ///
-    /// `synced` is this round's local `(run, registration) -> acknowledged
-    /// prefixes` set: `None` plans before executing, `Some` feeds back after
-    /// execution. `errors` holds this round's local installation failures.
-    /// `admission_failures`, when given, is cleared on entry and then receives
-    /// only this call's failed member admissions. None of them is stored
-    /// anywhere. The target is rebuilt from the current inputs; the applied
-    /// ledger is only read for comparison and is never replaced, cleared or
-    /// written from here.
-    pub(super) async fn plan_reconciliation(
-        &self,
-        synced: Option<&BTreeMap<(Uuid, Uuid), BTreeSet<IpCidr>>>,
-        errors: &BTreeMap<RouteSpec<u32>, Arc<str>>,
-        admission_failures: Option<&mut BTreeMap<(Uuid, Uuid), (BTreeSet<IpCidr>, RouteStatus)>>,
-    ) -> ReconcilePlan {
-        let mut admission_failures = admission_failures;
-        if let Some(failures) = admission_failures.as_deref_mut() {
-            // The caller's record describes this call only.
-            failures.clear();
-        }
-        let inputs = self.sample_plan_inputs();
-        let candidates = resolve_plan_candidates(&inputs);
-        #[cfg(feature = "tun")]
-        let admissions = admit_plan_members(&inputs, &candidates).await;
-        #[cfg(not(feature = "tun"))]
-        let admissions = MemberAdmissions::default();
-        #[cfg(feature = "tun")]
-        if let Some(failures) = admission_failures.as_deref_mut() {
-            for (run, failure) in &admissions.failures {
-                failures.insert(
-                    (*run, failure.registration),
-                    (failure.prefixes.clone(), failure.status.clone()),
-                );
-            }
-        }
-        let plan = build_plan(&inputs, &candidates, &admissions);
-        self.update_plan_statuses(&plan, &inputs, &candidates, &admissions, synced, errors);
-        plan
-    }
-
     /// Copy the current planning inputs under one short read lock.
     ///
     /// Nothing strong survives the copy: declarations are owned values, slots
@@ -2368,7 +2379,7 @@ impl RouteController {
     /// This is the only feedback step: it re-reads the live runtime instead of
     /// treating sampled declarations as current, never awaits and never
     /// performs NIC admission.
-    fn update_plan_statuses(
+    pub(super) fn update_plan_statuses(
         &self,
         plan: &ReconcilePlan,
         inputs: &PlanInputs,
@@ -2377,6 +2388,8 @@ impl RouteController {
         synced: Option<&BTreeMap<(Uuid, Uuid), BTreeSet<IpCidr>>>,
         errors: &BTreeMap<RouteSpec<u32>, Arc<str>>,
     ) {
+        #[cfg(not(feature = "tun"))]
+        let _ = inputs;
         // Rebuild the per-declaration admission evidence for this feedback
         // call from the sampled candidates and this round's real outcomes.
         #[cfg(feature = "tun")]
@@ -2684,12 +2697,158 @@ pub(super) fn resolve_plan_candidates(inputs: &PlanInputs) -> PlanCandidates {
     }
 }
 
+/// Whole-member targets declared by the current sampled inputs.
+///
+/// This is the withdrawal stage's target: every managed destination this
+/// member still declares. Competition and admission decisions belong to the
+/// later plan and commit, so this stage never withdraws a declared prefix.
+#[cfg(feature = "tun")]
+fn declared_member_targets(
+    inputs: &PlanInputs,
+    candidates: &PlanCandidates,
+    related: &BTreeMap<(Uuid, Uuid), SharedVirtualNicMember>,
+) -> BTreeMap<(Uuid, Uuid), BTreeSet<IpCidr>> {
+    let mut targets = BTreeMap::new();
+    for (run, registration) in related.keys() {
+        let bound = inputs
+            .members
+            .get(run)
+            .map(SharedVirtualNicMember::registration_id);
+        let prefixes = if bound == Some(*registration) {
+            candidates
+                .through_tun
+                .get(run)
+                .into_iter()
+                .flatten()
+                .map(|(route, _)| route.destination)
+                .collect()
+        } else {
+            BTreeSet::new()
+        };
+        targets.insert((*run, *registration), prefixes);
+    }
+    targets
+}
+
+/// Carry this round's admission evidence into a fresh pure plan.
+///
+/// The evidence is reused only while the current registration and complete
+/// target are unchanged. A closed binding becomes the same known-invalid result
+/// a real admission would return, so a deferred removal decision never becomes
+/// a busy loop; any other changed input is left without evidence and deferred
+/// to the next marked round.
+#[cfg(feature = "tun")]
+fn carry_member_admissions(
+    inputs: &PlanInputs,
+    candidates: &PlanCandidates,
+    previous: &MemberAdmissions,
+) -> MemberAdmissions {
+    let mut carried = MemberAdmissions::default();
+    for (run, admission) in &previous.accepted {
+        let Some(member) = inputs.members.get(run) else {
+            continue;
+        };
+        let prefixes: BTreeSet<IpCidr> = candidates
+            .through_tun
+            .get(run)
+            .into_iter()
+            .flatten()
+            .map(|(route, _)| route.destination)
+            .collect();
+        if member.registration_id() != admission.registration || prefixes != admission.prefixes {
+            continue;
+        }
+        if member.ensure_open().is_ok() {
+            carried.accepted.insert(
+                *run,
+                MemberAdmission {
+                    registration: admission.registration,
+                    prefixes,
+                },
+            );
+        } else {
+            carried.failures.insert(
+                *run,
+                MemberAdmissionFailure {
+                    registration: admission.registration,
+                    prefixes,
+                    status: RouteStatus::Pending { error: None },
+                },
+            );
+        }
+    }
+    for (run, failure) in &previous.failures {
+        let Some(member) = inputs.members.get(run) else {
+            continue;
+        };
+        let prefixes: BTreeSet<IpCidr> = candidates
+            .through_tun
+            .get(run)
+            .into_iter()
+            .flatten()
+            .map(|(route, _)| route.destination)
+            .collect();
+        if member.registration_id() == failure.registration && prefixes == failure.prefixes {
+            carried.failures.insert(
+                *run,
+                MemberAdmissionFailure {
+                    registration: failure.registration,
+                    prefixes,
+                    status: failure.status.clone(),
+                },
+            );
+        }
+    }
+    carried
+}
+
+/// Whether this round's admission evidence no longer describes the current
+/// inputs.
+///
+/// A failed admission is retried once after the OS facts, because an awaited
+/// operation may have released a conflict. An accepted target is stale when
+/// the registration or the complete target changed, and a newly declared
+/// managed target has no evidence yet.
+#[cfg(feature = "tun")]
+fn member_evidence_stale(
+    previous: &MemberAdmissions,
+    inputs: &PlanInputs,
+    candidates: &PlanCandidates,
+) -> bool {
+    if !previous.failures.is_empty() {
+        return true;
+    }
+    for (run, admission) in &previous.accepted {
+        let bound = inputs
+            .members
+            .get(run)
+            .map(SharedVirtualNicMember::registration_id);
+        let prefixes: BTreeSet<IpCidr> = candidates
+            .through_tun
+            .get(run)
+            .into_iter()
+            .flatten()
+            .map(|(route, _)| route.destination)
+            .collect();
+        if bound != Some(admission.registration) || prefixes != admission.prefixes {
+            return true;
+        }
+    }
+    candidates
+        .through_tun
+        .keys()
+        .any(|run| !previous.accepted.contains_key(run) && !previous.failures.contains_key(run))
+}
+
 /// Admit every managed member target as one whole through the real NIC.
 ///
 /// This is the only planning stage that waits for a NIC; its outcome is tied
 /// to the complete target and the registration that produced it.
 #[cfg(feature = "tun")]
-async fn admit_plan_members(inputs: &PlanInputs, candidates: &PlanCandidates) -> MemberAdmissions {
+pub(super) async fn admit_plan_members(
+    inputs: &PlanInputs,
+    candidates: &PlanCandidates,
+) -> MemberAdmissions {
     let mut admissions = MemberAdmissions::default();
     for (run, candidates_for_run) in &candidates.through_tun {
         let prefixes: BTreeSet<IpCidr> = candidates_for_run
@@ -2759,7 +2918,15 @@ async fn admit_plan_members(inputs: &PlanInputs, candidates: &PlanCandidates) ->
         };
         match admission {
             Ok(()) => {
-                admissions.accepted.insert(*run);
+                if let Some(registration) = registration {
+                    admissions.accepted.insert(
+                        *run,
+                        MemberAdmission {
+                            registration,
+                            prefixes,
+                        },
+                    );
+                }
             }
             Err(status) => {
                 if let Some(registration) = registration {
@@ -2787,13 +2954,16 @@ pub(super) fn build_plan(
     candidates: &PlanCandidates,
     admissions: &MemberAdmissions,
 ) -> ReconcilePlan {
+    #[cfg(not(feature = "tun"))]
+    let _ = admissions;
     // E. One complete row per physical key. The row already installed wins
     // while it is still a candidate; otherwise the first claim in stable run
     // and declaration order does. Different keys coexist, so a metric never
     // acts as a per-prefix selector.
+    #[cfg_attr(not(feature = "tun"), allow(unused_mut))]
     let mut claimed_keys: BTreeSet<RouteKey> = candidates.claims.keys().cloned().collect();
     #[cfg(feature = "tun")]
-    for run in &admissions.accepted {
+    for run in admissions.accepted.keys() {
         if let Some(routes) = candidates.through_tun.get(run) {
             for (route, _) in routes {
                 claimed_keys.insert(RouteKey::of(route));
@@ -2805,7 +2975,7 @@ pub(super) fn build_plan(
         let mut key_claims: Vec<(RouteSpec<u32>, Uuid)> =
             candidates.claims.get(&key).cloned().unwrap_or_default();
         #[cfg(feature = "tun")]
-        for run in &admissions.accepted {
+        for run in admissions.accepted.keys() {
             if let Some(routes) = candidates.through_tun.get(run) {
                 for (route, _) in routes {
                     if RouteKey::of(route) == key {
@@ -2876,7 +3046,7 @@ fn candidate_route<'a>(
         return Some(route);
     }
     #[cfg(feature = "tun")]
-    if admissions.accepted.contains(&run) {
+    if admissions.accepted.contains_key(&run) {
         return candidates
             .through_tun
             .get(&run)?

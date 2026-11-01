@@ -220,6 +220,41 @@ impl RouteBackend for Arc<MockBackend> {
     }
 }
 
+/// Test-only composition of the same planning stages the round drives.
+///
+/// Production `reconcile` orders sampling, admission, planning, OS execution
+/// and feedback itself; this helper exists only because these tests observe a
+/// single plan (and its feedback) without a backend.
+async fn plan_stages(
+    controller: &RouteController,
+    synced: Option<&BTreeMap<(Uuid, Uuid), BTreeSet<IpCidr>>>,
+    errors: &BTreeMap<RouteSpec<u32>, Arc<str>>,
+    admission_failures: Option<&mut BTreeMap<(Uuid, Uuid), (BTreeSet<IpCidr>, RouteStatus)>>,
+) -> ReconcilePlan {
+    let mut admission_failures = admission_failures;
+    if let Some(failures) = admission_failures.as_deref_mut() {
+        failures.clear();
+    }
+    let inputs = controller.sample_plan_inputs();
+    let candidates = resolve_plan_candidates(&inputs);
+    #[cfg(feature = "tun")]
+    let admissions = admit_plan_members(&inputs, &candidates).await;
+    #[cfg(not(feature = "tun"))]
+    let admissions = MemberAdmissions::default();
+    #[cfg(feature = "tun")]
+    if let Some(failures) = admission_failures.as_deref_mut() {
+        for (run, failure) in &admissions.failures {
+            failures.insert(
+                (*run, failure.registration),
+                (failure.prefixes.clone(), failure.status.clone()),
+            );
+        }
+    }
+    let plan = build_plan(&inputs, &candidates, &admissions);
+    controller.update_plan_statuses(&plan, &inputs, &candidates, &admissions, synced, errors);
+    plan
+}
+
 /// One reconciler; the retry records belong to the same task.
 struct Harness {
     controller: RouteController,
@@ -614,7 +649,13 @@ fn pure_plan_consumes_member_admission_without_taking_the_nic() {
     );
 
     let mut admitted = MemberAdmissions::default();
-    admitted.accepted.insert(run);
+    admitted.accepted.insert(
+        run,
+        MemberAdmission {
+            registration: member.registration_id(),
+            prefixes: BTreeSet::from([route.destination]),
+        },
+    );
     let plan = build_plan(&inputs, &candidates, &admitted);
     assert_eq!(
         plan.desired.get(&RouteKey::of(&route)),
@@ -1792,9 +1833,7 @@ async fn planning_merges_the_same_row_and_drops_the_withdrawn_declaration() {
     let c_route = resolved(&c);
     let a_route = resolved(&a);
 
-    let plan = controller
-        .plan_reconciliation(None, &BTreeMap::new(), None)
-        .await;
+    let plan = plan_stages(&controller, None, &BTreeMap::new(), None).await;
     assert_eq!(
         plan.desired.get(&RouteKey::of(&b_route)),
         Some(&(b_route.clone(), BTreeSet::from([p_run, q_run]))),
@@ -1806,9 +1845,7 @@ async fn planning_merges_the_same_row_and_drops_the_withdrawn_declaration() {
     // P replaces {A, B} with {C}; Q still declares B. A disappears only
     // because no current input needs it, and B keeps Q as its owner.
     p_slot.set_routes(RouteSet::from([c.clone()]));
-    let plan = controller
-        .plan_reconciliation(None, &BTreeMap::new(), None)
-        .await;
+    let plan = plan_stages(&controller, None, &BTreeMap::new(), None).await;
     assert_eq!(plan.desired.len(), 2, "only the current B and C remain");
     assert_eq!(
         plan.desired.get(&RouteKey::of(&b_route)),
@@ -1838,9 +1875,7 @@ async fn different_linux_metrics_coexist_and_keep_the_installed_occupant() {
     let zero = indexed_with_metric("10.5.0.0/24", 7, 0, None);
     let ten = indexed_with_metric("10.5.0.0/24", 7, 10, None);
     slot.set_routes(RouteSet::from([zero.clone(), ten.clone()]));
-    let plan = controller
-        .plan_reconciliation(None, &BTreeMap::new(), None)
-        .await;
+    let plan = plan_stages(&controller, None, &BTreeMap::new(), None).await;
     assert_eq!(
         plan.desired.len(),
         2,
@@ -1862,9 +1897,7 @@ async fn different_linux_metrics_coexist_and_keep_the_installed_occupant() {
         .applied
         .insert(RouteKey::of(&stable_route), row);
 
-    let plan = controller
-        .plan_reconciliation(None, &BTreeMap::new(), None)
-        .await;
+    let plan = plan_stages(&controller, None, &BTreeMap::new(), None).await;
     assert_eq!(
         plan.desired
             .get(&RouteKey::of(&stable_route))
@@ -1884,9 +1917,7 @@ async fn different_linux_metrics_coexist_and_keep_the_installed_occupant() {
     // Once the installed row is withdrawn, the stable first candidate wins
     // and the complete parameter change yields both remove and add.
     slot.set_routes(RouteSet::from([second.clone()]));
-    let plan = controller
-        .plan_reconciliation(None, &BTreeMap::new(), None)
-        .await;
+    let plan = plan_stages(&controller, None, &BTreeMap::new(), None).await;
     let second_route = resolved(&second);
     assert_eq!(
         plan.desired
@@ -1933,9 +1964,7 @@ async fn manual_policy_decides_auto_proxy_and_keeps_additional() {
         exported,
         RouteSet::from([auto_route.clone(), additional_route.clone()])
     );
-    let plan = controller
-        .plan_reconciliation(None, &BTreeMap::new(), None)
-        .await;
+    let plan = plan_stages(&controller, None, &BTreeMap::new(), None).await;
     assert_eq!(plan.desired.len(), 2);
 
     // Some(empty): no manual route is generated and AutoProxy is
@@ -1946,9 +1975,7 @@ async fn manual_policy_decides_auto_proxy_and_keeps_additional() {
         RouteSet::from([additional_route.clone()]),
         "a configured manual policy suppresses every AutoProxy declaration"
     );
-    let plan = controller
-        .plan_reconciliation(None, &BTreeMap::new(), None)
-        .await;
+    let plan = plan_stages(&controller, None, &BTreeMap::new(), None).await;
     assert_eq!(plan.desired.len(), 1, "AutoProxy is no longer a target");
     assert!(matches!(
         auto.statuses().get(&auto_route),
@@ -2001,9 +2028,7 @@ async fn dropped_registry_plans_nothing_and_keeps_the_ledger() {
 
     drop(registry);
     slot.set_routes(RouteSet::from([indexed("10.12.0.0/24", 7, None)]));
-    let plan = controller
-        .plan_reconciliation(None, &BTreeMap::new(), None)
-        .await;
+    let plan = plan_stages(&controller, None, &BTreeMap::new(), None).await;
     assert!(plan.desired.is_empty(), "a released registry plans nothing");
     assert!(plan.slots.is_empty());
     assert_eq!(plan.remove, vec![planned.clone()]);
@@ -2018,9 +2043,7 @@ async fn dropped_registry_plans_nothing_and_keeps_the_ledger() {
     );
 
     controller.request_shutdown();
-    let plan = controller
-        .plan_reconciliation(None, &BTreeMap::new(), None)
-        .await;
+    let plan = plan_stages(&controller, None, &BTreeMap::new(), None).await;
     assert!(plan.desired.is_empty(), "shutdown clears every target");
     assert!(!controller.applied_routes().is_empty());
     assert_eq!(
@@ -2053,9 +2076,7 @@ async fn feedback_reports_each_row_of_one_slot_separately() {
         .applied
         .insert(RouteKey::of(&ready_route), ready_row);
 
-    let plan = controller
-        .plan_reconciliation(None, &BTreeMap::new(), None)
-        .await;
+    let plan = plan_stages(&controller, None, &BTreeMap::new(), None).await;
     assert_eq!(
         plan.desired
             .get(&RouteKey::of(&ready_route))
@@ -2084,7 +2105,7 @@ async fn feedback_reports_each_row_of_one_slot_separately() {
     let pending_route = resolved(&pending);
     let mut errors = BTreeMap::new();
     errors.insert(pending_route, Arc::<str>::from("install failed"));
-    controller.plan_reconciliation(None, &errors, None).await;
+    plan_stages(&controller, None, &errors, None).await;
     let statuses = slot.statuses();
     assert_eq!(
         statuses.get(&pending),
@@ -2100,7 +2121,7 @@ async fn feedback_reports_each_row_of_one_slot_separately() {
         resolved(&indexed("10.99.0.0/24", 7, None)),
         Arc::<str>::from("unrelated"),
     );
-    controller.plan_reconciliation(None, &errors, None).await;
+    plan_stages(&controller, None, &errors, None).await;
     assert_eq!(
         slot.statuses().get(&pending),
         Some(&RouteStatus::Pending { error: None })
@@ -2326,7 +2347,7 @@ async fn nic_lock_timeout_only_pends_the_managed_declaration() {
     let guard = shared_nic.lock().await;
 
     let errors = BTreeMap::new();
-    let plan = controller.plan_reconciliation(None, &errors, None);
+    let plan = plan_stages(&controller, None, &errors, None);
     tokio::pin!(plan);
     assert!(
         futures::poll!(&mut plan).is_pending(),
@@ -2450,7 +2471,7 @@ async fn a_dropped_registry_during_nic_admission_gets_no_ready_feedback() {
     let guard = shared_nic.lock().await;
     controller.dirty.reset();
     let errors = BTreeMap::new();
-    let plan = controller.plan_reconciliation(None, &errors, None);
+    let plan = plan_stages(&controller, None, &errors, None);
     tokio::pin!(plan);
     assert!(
         futures::poll!(&mut plan).is_pending(),
@@ -2500,7 +2521,7 @@ async fn a_dropped_registry_during_nic_admission_gets_no_ready_feedback() {
         "the store really still holds the nonempty manual policy"
     );
 
-    let fresh = controller.plan_reconciliation(None, &errors, None).await;
+    let fresh = plan_stages(&controller, None, &errors, None).await;
     assert!(
         fresh.desired.is_empty(),
         "the next round plans from the now-empty input directory"
@@ -2600,7 +2621,8 @@ async fn assert_stale_admission_pends_for_the_new_registration(old_rejects: bool
     let guard = shared_nic.lock().await;
     let errors = BTreeMap::new();
     let mut admission_failures = BTreeMap::new();
-    let mut plan = Box::pin(controller.plan_reconciliation(
+    let mut plan = Box::pin(plan_stages(
+        &controller,
         Some(&synced),
         &errors,
         Some(&mut admission_failures),
@@ -2674,9 +2696,7 @@ async fn assert_stale_admission_pends_for_the_new_registration(old_rejects: bool
         "an old rejection must not be reported on the new registration"
     );
 
-    let fresh = controller
-        .plan_reconciliation(Some(&synced), &errors, None)
-        .await;
+    let fresh = plan_stages(&controller, Some(&synced), &errors, None).await;
     assert_eq!(
         slot.statuses().get(&managed),
         Some(&RouteStatus::Ready),
@@ -2777,8 +2797,12 @@ async fn a_whole_set_admission_failure_goes_stale_with_its_captured_set() {
     let guard = shared_nic.lock().await;
     let errors = BTreeMap::new();
     let mut admission_failures = BTreeMap::new();
-    let mut plan =
-        Box::pin(controller.plan_reconciliation(None, &errors, Some(&mut admission_failures)));
+    let mut plan = Box::pin(plan_stages(
+        &controller,
+        None,
+        &errors,
+        Some(&mut admission_failures),
+    ));
     assert!(
         futures::poll!(&mut plan).is_pending(),
         "the whole-set admission waits for the held NIC lock"
@@ -2822,9 +2846,7 @@ async fn a_whole_set_admission_failure_goes_stale_with_its_captured_set() {
     );
 
     let synced = BTreeMap::from([((run, member.registration_id()), BTreeSet::from([p_prefix]))]);
-    let fresh = controller
-        .plan_reconciliation(Some(&synced), &errors, None)
-        .await;
+    let fresh = plan_stages(&controller, Some(&synced), &errors, None).await;
     assert_eq!(
         slot.statuses().get(&p),
         Some(&RouteStatus::Ready),
@@ -2899,7 +2921,7 @@ async fn an_unrelated_run_change_preserves_a_valid_managed_feedback() {
     let shared_nic = member.shared_nic();
     let guard = shared_nic.lock().await;
     let errors = BTreeMap::new();
-    let plan = controller.plan_reconciliation(Some(&synced), &errors, None);
+    let plan = plan_stages(&controller, Some(&synced), &errors, None);
     tokio::pin!(plan);
     assert!(
         futures::poll!(&mut plan).is_pending(),
@@ -4502,13 +4524,9 @@ async fn an_audit_keeps_the_old_member_cleanup_across_a_rebind() {
         member_claim_prefixes(&old_member).await.is_empty(),
         "the old registration really withdrew the prefix before the addition"
     );
-    assert!(
-        matches!(
-            slot_handle.statuses().get(&p),
-            Some(RouteStatus::Pending { .. })
-        ),
-        "the new binding is not ready before its row is confirmed"
-    );
+    // Feedback runs after the OS facts, so the slot still carries its earlier
+    // status while this row is only Adding. The round can report Ready only
+    // after the real installation (asserted below).
     assert_eq!(
         controller
             .applied_routes()
@@ -5260,13 +5278,14 @@ async fn a_due_os_retry_waits_for_the_member_deadline_and_then_runs() {
         advances, 2,
         "the B gate follows exactly two bounded admission attempts"
     );
-    assert!(
-        matches!(
-            slot_a.statuses().get(&p),
-            Some(RouteStatus::Pending { error: Some(error) })
-                if error.contains("timed out locking shared NIC")
-        ),
-        "A really passed its bounded NIC lock timeout"
+    // The two bounded waits above are the real timeout evidence. Feedback
+    // runs after the OS facts, so A's slot still carries the previous round's
+    // pending failure while this admission attempt is in flight; a timed-out
+    // attempt never confirms A as ready.
+    assert_ne!(
+        slot_a.statuses().get(&p),
+        Some(&RouteStatus::Ready),
+        "A really passed its bounded NIC lock timeout without being confirmed"
     );
     assert_eq!(
         backend_calls(&mock.add_calls, &p_route),

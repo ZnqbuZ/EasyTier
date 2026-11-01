@@ -355,14 +355,18 @@ impl RouteController {
     pub fn is_shutdown(&self) -> bool {
         self.runtime.read().shutdown
     }
-    /// Candidate declarations of one instance for the configuration export.
+    /// Candidate declarations of one instance for the mobile external route
+    /// entry and the desktop tests.
     ///
-    /// This is the same policy entry the desktop planner uses: the manual list
-    /// of the current configuration decides whether AutoProxy declarations are
-    /// part of the target, and Additional declarations are always included.
-    /// It never depends on a bound NIC, so an instance without a TUN can still
-    /// contribute its manual routes. A stopped namespace, a released registry
-    /// and an unknown run all contribute nothing.
+    /// Desktop production has no route-table export: the plan and the ledger
+    /// stay inside the reconciler. The policy read itself is the same one the
+    /// desktop planner uses; the manual list of the current configuration
+    /// decides whether AutoProxy declarations are part of the target, and
+    /// Additional declarations are always included. It never depends on a
+    /// bound NIC, so an instance without a TUN can still contribute its manual
+    /// routes. A stopped namespace, a released registry and an unknown run all
+    /// contribute nothing.
+    #[cfg(any(mobile, test))]
     pub fn effective_routes_for_instance(&self, run: &Uuid) -> RouteSet {
         let rt = self.runtime.read();
         if rt.shutdown {
