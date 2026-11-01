@@ -1,4 +1,6 @@
-use super::{OsRoute, RouteBackend, RouteError};
+use easytier_core::host::route::RouteSpec;
+
+use super::{RouteBackend, RouteError};
 use crate::common::net_ns::NetNS;
 use std::collections::BTreeSet;
 use tokio::runtime::Handle;
@@ -12,18 +14,19 @@ impl PlatformRouteBackend {
     }
 }
 impl RouteBackend for PlatformRouteBackend {
-    async fn add(&mut self, _: &OsRoute) -> Result<(), RouteError> {
+    async fn add(&mut self, _: &RouteSpec<u32>) -> Result<(), RouteError> {
         Err(unsupported())
     }
-    async fn remove(&mut self, _: &OsRoute) -> Result<(), RouteError> {
+    async fn remove(&mut self, _: &RouteSpec<u32>) -> Result<(), RouteError> {
         Err(unsupported())
     }
-    async fn existing(&mut self, _: &BTreeSet<OsRoute>) -> Result<BTreeSet<OsRoute>, RouteError> {
+    async fn existing(
+        &mut self,
+        _: &BTreeSet<RouteSpec<u32>>,
+    ) -> Result<BTreeSet<RouteSpec<u32>>, RouteError> {
         Err(unsupported())
     }
 }
 fn unsupported() -> RouteError {
-    RouteError::Failed(
-        std::io::Error::new(std::io::ErrorKind::Unsupported, UNSUPPORTED).into(),
-    )
+    RouteError::Failed(std::io::Error::new(std::io::ErrorKind::Unsupported, UNSUPPORTED).into())
 }

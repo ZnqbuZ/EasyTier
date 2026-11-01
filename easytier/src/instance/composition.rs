@@ -84,7 +84,7 @@ pub(super) fn compose_native_core_instance(
         runtime_host.clone(),
         host_config,
     );
-    #[cfg(feature = "tun")]
+    #[cfg(any(not(mobile), feature = "tun"))]
     if let Some(routes) = runtime_host.route_context() {
         adapters.routes = Some(routes.handle.clone());
         #[cfg(feature = "public-ipv6-provider")]

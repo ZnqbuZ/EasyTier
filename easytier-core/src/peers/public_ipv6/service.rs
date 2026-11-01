@@ -13,7 +13,7 @@ use cidr::{Ipv6Cidr, Ipv6Inet};
 
 use crate::{
     config::PeerId,
-    host::route::{RouteHandle, RouteInputError, RouteSet, RouteSlot, RouteSpec},
+    host::route::{RouteHandle, RouteSet, RouteSlot, RouteSource, RouteSpec},
     peers::peer_rpc::PeerRpcManager,
     proto::{
         common::Void,
@@ -78,7 +78,8 @@ pub(crate) struct PublicIpv6Service {
     route_cache: std::sync::Mutex<BTreeSet<Ipv6Inet>>,
     pub(super) my_addr_cache: std::sync::Mutex<Option<Ipv6Inet>>,
     runtime_update: parking_lot::Mutex<()>,
-    pub(super) host_routes: parking_lot::Mutex<Option<RouteSlot>>,
+    /// Bound publication slots, ordered `(auto_proxy, additional)`.
+    pub(super) host_routes: parking_lot::Mutex<Option<(RouteSlot, RouteSlot)>>,
 }
 
 impl PublicIpv6Service {
@@ -206,21 +207,31 @@ impl PublicIpv6Service {
         (my_addr, routes)
     }
 
-    fn host_routes(my_addr: Option<Ipv6Inet>, routes: &BTreeSet<Ipv6Inet>) -> RouteSet {
-        let mut routes = routes
+    /// Declarations for both publication slots, ordered `(auto_proxy, additional)`.
+    ///
+    /// The auto-proxy slot carries every remote reachable lease prefix; the
+    /// additional slot only carries the `::/0` egress route that exists while
+    /// this instance holds a lease.
+    fn host_routes(my_addr: Option<Ipv6Inet>, routes: &BTreeSet<Ipv6Inet>) -> (RouteSet, RouteSet) {
+        let auto_proxy = routes
             .iter()
             .map(|route| RouteSpec::for_tun(route.network().into()))
             .collect::<RouteSet>();
-        if my_addr.is_some() {
-            let mut default = RouteSpec::for_tun(
+        let additional_default = my_addr.map(|_| {
+            let default = RouteSpec::for_tun(
                 cidr::Ipv6Cidr::new(Ipv6Addr::UNSPECIFIED, 0)
                     .unwrap()
                     .into(),
             );
-            default.metric = 5;
-            routes.insert(default);
-        }
-        routes
+            #[cfg(all(not(mobile), any(target_os = "linux", windows)))]
+            let default = {
+                let mut default = default;
+                default.metric = 5;
+                default
+            };
+            default
+        });
+        (auto_proxy, additional_default.into_iter().collect())
     }
 
     pub(crate) fn bind_host_routes(&self, routes: &RouteHandle) -> anyhow::Result<()> {
@@ -230,17 +241,21 @@ impl PublicIpv6Service {
             publication.is_none(),
             "public IPv6 host routes are already bound"
         );
-        let slot = routes.open_slot()?;
-        let routes = Self::host_routes(
+        let (auto_proxy_routes, additional_routes) = Self::host_routes(
             *self.my_addr_cache.lock().unwrap(),
             &self.route_cache.lock().unwrap(),
         );
-        slot.set_routes(routes)?;
-        *publication = Some(slot);
+        let auto_proxy = routes.open_slot(RouteSource::AutoProxy)?;
+        let additional = routes.open_slot(RouteSource::Additional)?;
+        auto_proxy.set_routes(auto_proxy_routes);
+        additional.set_routes(additional_routes);
+        *publication = Some((auto_proxy, additional));
         Ok(())
     }
 
     pub(crate) fn release_host_routes(&self) {
+        // Taking the tuple releases both slots at once; their inner drops mark
+        // the shared dirty flag.
         let publication = {
             let _update = self.runtime_update.lock();
             self.host_routes.lock().take()
@@ -283,12 +298,10 @@ impl PublicIpv6Service {
             *cached_routes = routes;
             self.runtime.public_ipv6_routes_changed(added, removed);
         }
-        if changed
-            && let Some(slot) = self.host_routes.lock().as_ref()
-            && let Err(error) = slot.set_routes(Self::host_routes(my_addr, &cached_routes))
-            && !matches!(error, RouteInputError::Closed)
-        {
-            tracing::error!(?error, "failed to publish public IPv6 host routes");
+        if changed && let Some((auto_proxy, additional)) = self.host_routes.lock().as_ref() {
+            let (auto_proxy_routes, additional_routes) = Self::host_routes(my_addr, &cached_routes);
+            auto_proxy.set_routes(auto_proxy_routes);
+            additional.set_routes(additional_routes);
         }
     }
 

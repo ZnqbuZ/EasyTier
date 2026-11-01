@@ -1,54 +1,127 @@
 use std::{
-    collections::{BTreeMap, BTreeSet},
-    num::NonZeroU32,
+    collections::BTreeMap,
     sync::{Arc, Weak},
     time::Duration,
 };
 
-#[cfg(mobile)]
+#[cfg(not(mobile))]
+use std::collections::BTreeSet;
+
+#[cfg(not(mobile))]
 use cidr::IpCidr;
-use easytier_core::host::route::{
-    InstanceRoutes, RouteHandle, RouteSlot, RouteSlotInner, RouteSpec,
+#[cfg(not(mobile))]
+use easytier_core::host::route::{RouteAction, RouteDevice, RouteStatus};
+use easytier_core::{
+    config::runtime::CoreRuntimeConfigStore,
+    host::route::{Registry, RouteSet, RouteSlotInner, RouteSource, RouteSpec},
 };
+
 use parking_lot::RwLock;
+use tokio::sync::Notify;
 use uuid::Uuid;
 
-use crate::{
-    common::net_ns::NetNS,
-    instance::route::{
-        AppliedRoute, AppliedRoutes, InterfaceInfo, OsRoute, OsRouteSlotKey, PlatformRouteBackend,
-        RouteBackend, RouteError, validate_tun_spec,
-    },
-    utils::dirty::DirtyFlag,
+#[cfg(not(mobile))]
+use crate::common::net_ns::NetNS;
+#[cfg(not(mobile))]
+use crate::instance::route::RouteError;
+#[cfg(all(not(mobile), feature = "tun"))]
+use crate::instance::shared_virtual_nic::SharedIfConfigClaims;
+#[cfg(all(not(mobile), feature = "tun"))]
+use crate::instance::shared_virtual_nic::SharedIfConfigConflict;
+#[cfg(feature = "tun")]
+use crate::instance::shared_virtual_nic::SharedVirtualNicMember;
+use crate::{instance::route::AppliedRoutes, utils::dirty::DirtyFlag};
+
+#[cfg(not(mobile))]
+use crate::instance::route::{
+    AppliedRoute, InterfaceInfo, PlatformRouteBackend, RouteBackend, RouteEffect, RouteKey,
+    normalize_route,
 };
 
-#[cfg(mobile)]
-use crate::instance::route::AppliedSnapshot;
-
-pub(crate) struct InstanceEntry {
-    #[allow(dead_code)]
-    pub(crate) name: String,
-    pub(crate) routes: InstanceRoutes,
+/// This round's desktop target and the operations the executor still owes.
+///
+/// It is a local value: targets are rebuilt from the current inputs every
+/// round and never replace the applied ledger.
+#[cfg(not(mobile))]
+pub(crate) struct ReconcilePlan {
+    /// Resolved target per physical route key, with the runs that need it.
+    pub(crate) desired: BTreeMap<RouteKey, (RouteSpec<u32>, BTreeSet<Uuid>)>,
+    /// Applied rows whose full parameters are no longer required.
+    pub(crate) remove: Vec<RouteSpec<u32>>,
+    /// Target rows without a confirmed Owned or External effect.
+    pub(crate) add: Vec<RouteSpec<u32>>,
+    /// Live slot references of this round, paired with the owning run.
+    pub(crate) slots: Vec<(Uuid, Weak<RouteSlotInner>)>,
+    /// Currently bound members, including instances whose inputs are gone.
+    #[cfg(feature = "tun")]
+    pub(crate) members: BTreeMap<Uuid, SharedVirtualNicMember>,
 }
 
-pub(crate) struct ReconcilePlan {
-    pub(crate) routes_to_remove: Vec<OsRoute>,
-    pub(crate) routes_to_add: Vec<OsRoute>,
-    pub(crate) slots_to_mark_ready: Vec<Weak<RouteSlotInner>>,
-    pub(crate) slots_to_suppress: Vec<Weak<RouteSlotInner>>,
-    pub(crate) closed_instances: Vec<Uuid>,
-    pub(crate) new_applied: AppliedRoutes,
+/// One instance's input directory and current device binding.
+///
+/// The registry is only observed weakly: the native instance runtime owns the
+/// single strong root reference.
+struct InstanceRoutes {
+    registry: Weak<Registry>,
+    config: Option<CoreRuntimeConfigStore>,
+
+    #[cfg(feature = "tun")]
+    member: Option<SharedVirtualNicMember>,
+    #[cfg(all(feature = "tun", not(mobile)))]
+    interface: Option<InterfaceInfo>,
+}
+
+impl InstanceRoutes {
+    /// This instance's current declarations under the current policy.
+    ///
+    /// Returns `None` once the registry root is gone: the whole instance has
+    /// withdrawn its inputs, including the manual policy its config still
+    /// holds. Otherwise the manual list of the current configuration decides
+    /// whether AutoProxy declarations count; `Some` suppresses every AutoProxy
+    /// declaration, `Some(empty)` contributes no manual routes and `None`
+    /// keeps them. Additional declarations are always included. The live slot
+    /// references come back too, including the suppressed ones, for feedback;
+    /// every temporary registry and slot handle is released before returning.
+    fn declarations(&self) -> Option<(RouteSet, Vec<Weak<RouteSlotInner>>)> {
+        let registry = self.registry.upgrade()?;
+        let manual = self
+            .config
+            .as_ref()
+            .and_then(|config| config.snapshot().services.manual_routes.clone());
+
+        let mut declarations = RouteSet::new();
+        let mut slots = Vec::new();
+        for weak in registry.slots() {
+            if let Some(slot) = weak.upgrade() {
+                if slot.source() != RouteSource::AutoProxy || manual.is_none() {
+                    declarations.extend(slot.routes());
+                }
+            }
+            slots.push(weak);
+        }
+        if let Some(manual) = &manual {
+            declarations.extend(
+                manual
+                    .iter()
+                    .map(|prefix| RouteSpec::for_tun((*prefix).into())),
+            );
+        }
+        drop(registry);
+        Some((declarations, slots))
+    }
 }
 
 /// Private internal routing table state, owned exclusively by RouteController
 /// and protected by an RwLock. Lock is held only for microseconds; I/O happens outside the lock.
 #[derive(Default)]
 struct RouteControllerRuntime {
-    interface: Option<InterfaceInfo>,
-    slots: Vec<Weak<RouteSlotInner>>,
-    instances: BTreeMap<Uuid, InstanceEntry>,
+    instances: BTreeMap<Uuid, InstanceRoutes>,
     applied: AppliedRoutes,
     shutdown: bool,
+    // Only the mobile TUN build: the latest accepted whole-domain install or
+    // withdraw request that has not really completed yet.
+    #[cfg(all(mobile, feature = "tun"))]
+    pending_install: Option<Uuid>,
 }
 
 /// Lightweight, cloneable handle to the per-namespace RouteController.
@@ -57,6 +130,7 @@ struct RouteControllerRuntime {
 pub(crate) struct RouteController {
     runtime: Arc<RwLock<RouteControllerRuntime>>,
     dirty: Arc<DirtyFlag>,
+    changed: Arc<Notify>,
 }
 
 impl RouteController {
@@ -64,529 +138,8968 @@ impl RouteController {
         Self {
             runtime: Arc::new(RwLock::new(Default::default())),
             dirty,
+            changed: Arc::new(Notify::new()),
         }
     }
 
-    /// Static constructor: starts the platform backend worker in net_ns and returns a lightweight handle.
+    /// Notification that instance records or actual effects visibly changed.
+    ///
+    /// It carries no payload: a `drain` waiter rechecks cleanup conditions and
+    /// the mobile host re-exports the current configuration.
+    pub fn changed(&self) -> &Notify {
+        &self.changed
+    }
+
+    /// Static constructor: starts the platform backend worker in `net_ns` and
+    /// returns a lightweight handle together with the real worker task.
+    ///
+    /// The caller keeps the `JoinHandle`: the worker owns the backend and the
+    /// actual ledger, so detaching it would lose both the completion signal and
+    /// the error of a task that really stopped.
+    #[cfg(not(mobile))]
     pub fn start(
         net_ns: NetNS,
         handle: &tokio::runtime::Handle,
-    ) -> anyhow::Result<Self> {
+    ) -> anyhow::Result<(Self, tokio::task::JoinHandle<anyhow::Result<()>>)> {
         let backend = PlatformRouteBackend::new(&net_ns, handle)?;
         let dirty = Arc::new(DirtyFlag::new(false));
         let controller = Self::new(dirty);
         let reconciler = RouteReconciler::new(controller.clone(), backend);
-        handle.spawn(reconciler.run());
-        Ok(controller)
+        let task = handle.spawn(reconciler.run());
+        Ok((controller, task))
     }
 
     /// Read the currently applied routes in memory (microsecond read lock, zero system calls).
-    #[allow(dead_code)]
+    #[cfg(not(mobile))]
     pub fn applied_routes(&self) -> AppliedRoutes {
         self.runtime.read().applied.clone()
     }
 
-    /// Allocate a new empty slot owned by Controller's exclusive registry and hand it to caller.
-    pub fn add_slot(&self, run: Uuid, is_auto_proxy: bool) -> RouteSlot {
-        let dirty = self.dirty.clone();
-        let slot = RouteSlot::new(run, is_auto_proxy, Arc::new(move || dirty.mark()));
-        let mut rt = self.runtime.write();
-        rt.slots.push(slot.downgrade());
+    /// Allocate the instance's route input directory.
+    ///
+    /// The caller receives the only strong root of the new [`Registry`]; the
+    /// controller keeps a weak observation of it. A repeated run does not
+    /// replace a record that is still present.
+    pub fn open_instance(&self, run: Uuid) -> anyhow::Result<Arc<Registry>> {
+        let registry = {
+            let mut rt = self.runtime.write();
+            anyhow::ensure!(!rt.shutdown, "route controller is shut down");
+            anyhow::ensure!(
+                !rt.instances.contains_key(&run),
+                "instance {run} already has route inputs"
+            );
+            let registry = Arc::new(Registry::new(self.dirty.clone()));
+            rt.instances.insert(
+                run,
+                InstanceRoutes {
+                    registry: Arc::downgrade(&registry),
+                    config: None,
+                    #[cfg(feature = "tun")]
+                    member: None,
+                    #[cfg(all(feature = "tun", not(mobile)))]
+                    interface: None,
+                },
+            );
+            registry
+        };
         self.dirty.mark();
-        slot
+        Ok(registry)
     }
 
-    pub fn set_interface(&self, info: Option<InterfaceInfo>) {
-        let mut rt = self.runtime.write();
-        if rt.interface != info {
-            rt.interface = info;
-            self.dirty.mark();
+    /// Bind the instance's runtime configuration store to this controller.
+    ///
+    /// The store keeps the same shared dirty flag from then on; a second
+    /// binding, whether on this record or on the store itself, fails without
+    /// replacing the first one.
+    pub fn bind_config(&self, run: Uuid, config: CoreRuntimeConfigStore) -> anyhow::Result<()> {
+        {
+            let mut rt = self.runtime.write();
+            anyhow::ensure!(!rt.shutdown, "route controller is shut down");
+            let instances = rt
+                .instances
+                .get_mut(&run)
+                .ok_or_else(|| anyhow::anyhow!("instance {run} has no route inputs"))?;
+            anyhow::ensure!(
+                instances.registry.upgrade().is_some(),
+                "instance {run} route registry is closed"
+            );
+            anyhow::ensure!(
+                instances.config.is_none(),
+                "route configuration is already bound for instance {run}"
+            );
+            config.bind_route_dirty(self.dirty.clone()).map_err(|()| {
+                anyhow::anyhow!("route configuration of instance {run} is already bound")
+            })?;
+            instances.config = Some(config);
         }
-    }
-
-    #[allow(dead_code)]
-    pub fn interface(&self) -> Option<InterfaceInfo> {
-        self.runtime.read().interface.clone()
-    }
-
-    pub fn open_instance(&self, run: Uuid, name: String) -> anyhow::Result<InstanceRoutes> {
-        anyhow::ensure!(!self.is_shutdown(), "route controller is shut down");
-        let ctrl = self.clone();
-        let handle = RouteHandle::new(move |is_auto_proxy| Ok(ctrl.add_slot(run, is_auto_proxy)));
-        let dirty = self.dirty.clone();
-        let routes = InstanceRoutes::with_handle(run, handle, Arc::new(move || dirty.mark()));
-        let mut rt = self.runtime.write();
-        rt.instances.insert(
-            run,
-            InstanceEntry {
-                name,
-                routes: routes.clone(),
-            },
-        );
         self.dirty.mark();
-        Ok(routes)
+        Ok(())
     }
 
     pub fn ensure_instance_open(&self, run: Uuid) -> anyhow::Result<()> {
         let rt = self.runtime.read();
         anyhow::ensure!(!rt.shutdown, "route controller is shut down");
+        let instances = rt
+            .instances
+            .get(&run)
+            .ok_or_else(|| anyhow::anyhow!("instance {run} has no route inputs"))?;
         anyhow::ensure!(
-            rt.instances.get(&run).is_some_and(|e| !e.routes.is_closed()),
-            "instance route capability is closed"
+            instances.registry.upgrade().is_some(),
+            "instance route registry is closed"
         );
         Ok(())
     }
 
-    pub fn abandon_instance(&self, run: Uuid, _reason: Arc<str>) {
-        let mut rt = self.runtime.write();
-        if let Some(entry) = rt.instances.remove(&run) {
-            entry.routes.request_close();
+    /// Bind the shared NIC member that currently carries this instance's TUN.
+    ///
+    /// Re-binding the same registration keeps the recorded interface and does
+    /// not mark. A new registration replaces the member; on desktop the old
+    /// interface no longer describes the new device, while on mobile only this
+    /// run's old attachment record is dropped. Applied routes are not removed
+    /// here: an input change still has to be reconciled against the real
+    /// ledger.
+    #[cfg(feature = "tun")]
+    pub fn bind_member(&self, run: Uuid, member: &SharedVirtualNicMember) -> anyhow::Result<()> {
+        member.ensure_open()?;
+        anyhow::ensure!(
+            member.member_id() == run,
+            "shared NIC member does not belong to instance {run}"
+        );
+
+        let changed = {
+            let mut rt = self.runtime.write();
+            anyhow::ensure!(!rt.shutdown, "route controller is shut down");
+            let replaced = {
+                let instances = rt
+                    .instances
+                    .get_mut(&run)
+                    .ok_or_else(|| anyhow::anyhow!("instance {run} has no route inputs"))?;
+                anyhow::ensure!(
+                    instances.registry.upgrade().is_some(),
+                    "instance {run} route registry is closed"
+                );
+
+                let same_registration = instances
+                    .member
+                    .as_ref()
+                    .is_some_and(|current| current.registration_id() == member.registration_id());
+                if same_registration {
+                    false
+                } else {
+                    instances.member = Some(member.clone());
+                    #[cfg(not(mobile))]
+                    {
+                        instances.interface = None;
+                    }
+                    true
+                }
+            };
+
+            #[cfg(mobile)]
+            if replaced && let Some(snapshot) = rt.applied.as_mut() {
+                snapshot.attached_members.remove(&run);
+            }
+            replaced
+        };
+
+        if changed {
             self.dirty.mark();
+        }
+        Ok(())
+    }
+
+    /// Record the real interface of the currently bound member.
+    ///
+    /// Returns `Ok(false)` for a late callback from a registration that is no
+    /// longer bound, without touching the binding or any other run. This does
+    /// no device query or I/O; the native context supplies the observed info.
+    #[cfg(all(feature = "tun", not(mobile)))]
+    pub fn ready(
+        &self,
+        run: Uuid,
+        member: &SharedVirtualNicMember,
+        info: InterfaceInfo,
+    ) -> anyhow::Result<bool> {
+        anyhow::ensure!(info.ifindex != 0, "route interface index must be nonzero");
+
+        let changed = {
+            let mut rt = self.runtime.write();
+            anyhow::ensure!(!rt.shutdown, "route controller is shut down");
+            let instances = rt
+                .instances
+                .get_mut(&run)
+                .ok_or_else(|| anyhow::anyhow!("instance {run} has no route inputs"))?;
+            anyhow::ensure!(
+                instances.registry.upgrade().is_some(),
+                "instance {run} route registry is closed"
+            );
+
+            let current = match &instances.member {
+                Some(current) => current,
+                None => return Ok(false),
+            };
+            if current.registration_id() != member.registration_id() || member.member_id() != run {
+                return Ok(false);
+            }
+            member.ensure_open()?;
+
+            if instances.interface.as_ref() == Some(&info) {
+                return Ok(true);
+            }
+            instances.interface = Some(info);
+            true
+        };
+
+        if changed {
+            self.dirty.mark();
+        }
+        Ok(true)
+    }
+
+    /// Withdraw the member binding of one registration.
+    ///
+    /// Cleanup callbacks may still arrive after shutdown or after the registry
+    /// has been released, so this never reopens or recreates anything. Only a
+    /// matching registration changes state: the desktop interface of this
+    /// instance, or on mobile this run's attachment record. The member handle
+    /// itself stays for cleanup.
+    #[cfg(feature = "tun")]
+    pub fn unready(&self, run: Uuid, registration: Uuid) {
+        let changed = {
+            let mut rt = self.runtime.write();
+            #[cfg(not(mobile))]
+            {
+                let Some(instances) = rt.instances.get_mut(&run) else {
+                    return;
+                };
+                let matches_registration = instances
+                    .member
+                    .as_ref()
+                    .is_some_and(|member| member.registration_id() == registration);
+                if !matches_registration {
+                    return;
+                }
+                instances.interface.take().is_some()
+            }
+            #[cfg(mobile)]
+            {
+                rt.applied.as_mut().is_some_and(|snapshot| {
+                    if snapshot.attached_members.get(&run) != Some(&registration) {
+                        return false;
+                    }
+                    snapshot.attached_members.remove(&run);
+                    true
+                })
+            }
+        };
+
+        if changed {
+            self.dirty.mark();
+            self.changed.notify_waiters();
         }
     }
 
     pub fn request_shutdown(&self) {
-        let mut rt = self.runtime.write();
-        rt.shutdown = true;
+        {
+            let mut rt = self.runtime.write();
+            rt.shutdown = true;
+        }
         self.dirty.mark();
+        self.changed.notify_waiters();
     }
 
     pub fn is_shutdown(&self) -> bool {
         self.runtime.read().shutdown
     }
 
-    pub fn plan_reconciliation(&self) -> Option<ReconcilePlan> {
-        self.runtime.write().plan_reconciliation()
-    }
-
-    pub fn commit_plan(&self, plan: ReconcilePlan) {
-        self.runtime.write().commit_plan(plan);
-    }
-
-    pub fn prune_missing_routes(&self, missing: Vec<OsRouteSlotKey>) {
-        let mut rt = self.runtime.write();
-        for key in missing {
-            rt.applied.remove(&key);
+    /// Candidate declarations of one instance for the configuration export.
+    ///
+    /// This is the same policy entry the desktop planner uses: the manual list
+    /// of the current configuration decides whether AutoProxy declarations are
+    /// part of the target, and Additional declarations are always included.
+    /// It never depends on a bound NIC, so an instance without a TUN can still
+    /// contribute its manual routes. A stopped namespace, a released registry
+    /// and an unknown run all contribute nothing.
+    pub fn effective_routes_for_instance(&self, run: &Uuid) -> RouteSet {
+        let rt = self.runtime.read();
+        if rt.shutdown {
+            return RouteSet::new();
         }
-        self.dirty.mark();
+        rt.instances
+            .get(run)
+            .and_then(InstanceRoutes::declarations)
+            .map_or_else(RouteSet::new, |(routes, _)| routes)
     }
 
-    pub fn invalidate_instance(&self, _run: &Uuid) {
-        self.dirty.mark();
+    /// Mark an input change that is not visible as a slot update.
+    pub fn invalidate_instance(&self, run: &Uuid) {
+        let exists = self.runtime.read().instances.contains_key(run);
+        if exists {
+            self.dirty.mark();
+        }
+    }
+
+    /// Wait until the reconciler has removed this run's instance record.
+    ///
+    /// The registry having been released is not enough: the record stays while
+    /// actual cleanup is still owed. The caller does not own the registry here,
+    /// and an empty owner is not treated as success.
+    pub async fn drain(&self, run: Uuid) -> anyhow::Result<()> {
+        let wait = async {
+            loop {
+                let notified = self.changed.notified();
+                if !self.runtime.read().instances.contains_key(&run) {
+                    return;
+                }
+                notified.await;
+            }
+        };
+
+        match tokio::time::timeout(Duration::from_secs(30), wait).await {
+            Ok(()) => Ok(()),
+            // The timeout stays in the error chain: a host that sees it knows
+            // the background worker is still cleaning up and may keep waiting,
+            // unlike a real task failure.
+            Err(elapsed) => Err(self.drain_timeout_error(run, elapsed)),
+        }
+    }
+
+    /// Whether every accepted record and actual effect is really finished.
+    ///
+    /// This is the stop diagnosis for the host: a consumed `JoinHandle` is not
+    /// proof of success, only an empty record directory, ledger and, on mobile,
+    /// no outstanding install request are.
+    pub fn ensure_drained(&self) -> anyhow::Result<()> {
+        let rt = self.runtime.read();
+        #[cfg(not(mobile))]
+        let drained = rt.shutdown && rt.instances.is_empty() && rt.applied.is_empty();
+        #[cfg(mobile)]
+        let drained = rt.shutdown
+            && rt.instances.is_empty()
+            && rt.applied.is_none()
+            && rt.pending_install.is_none();
+        if drained {
+            return Ok(());
+        }
+        // One complete diagnostic per platform: never hide a not-yet-shut-down
+        // controller or an outstanding record behind an earlier condition.
+        #[cfg(not(mobile))]
+        let detail = format!(
+            "route controller is not drained: shutdown {}, instance records {:?}, \
+             applied routes {:?}",
+            rt.shutdown,
+            rt.instances.keys().collect::<Vec<_>>(),
+            rt.applied
+                .values()
+                .map(|applied| {
+                    format!(
+                        "{:?} effect {:?} owners {:?}",
+                        applied.route, applied.effect, applied.owners
+                    )
+                })
+                .collect::<Vec<_>>()
+        );
+        #[cfg(mobile)]
+        let detail = format!(
+            "route controller is not drained: shutdown {}, instance records {:?}, \
+             attachment {:?}, pending install {:?}",
+            rt.shutdown,
+            rt.instances.keys().collect::<Vec<_>>(),
+            rt.applied.as_ref().map(|snapshot| snapshot.attachment_id),
+            rt.pending_install
+        );
+        Err(anyhow::anyhow!(detail))
+    }
+
+    fn drain_timeout_error(
+        &self,
+        run: Uuid,
+        elapsed: tokio::time::error::Elapsed,
+    ) -> anyhow::Error {
+        let rt = self.runtime.read();
+        let record = if rt.instances.contains_key(&run) {
+            "still present"
+        } else {
+            "removed"
+        };
+        #[cfg(not(mobile))]
+        let detail = {
+            let remaining: Vec<String> = rt
+                .applied
+                .values()
+                .filter(|applied| applied.owners.contains(&run))
+                .map(|applied| {
+                    format!(
+                        "{:?} effect {:?} owners {:?}",
+                        applied.route, applied.effect, applied.owners
+                    )
+                })
+                .collect();
+            format!(
+                "timed out waiting for route cleanup of instance {run}: \
+                 instance record {record}, remaining applied routes {remaining:?}"
+            )
+        };
+        #[cfg(mobile)]
+        let detail = {
+            let attachment = rt.applied.as_ref().map(|snapshot| snapshot.attachment_id);
+            let pending = rt.pending_install;
+            format!(
+                "timed out waiting for route cleanup of instance {run}: \
+                 instance record {record}, attachment {attachment:?}, \
+                 pending install {pending:?}"
+            )
+        };
+        anyhow::Error::new(elapsed).context(detail)
     }
 }
 
-/// Dedicated background reconciler actor: exclusively owns the RouteBackend (0 locks)
-/// and drives OS route reconciliation based on plans from RouteController.
+/// Dedicated desktop background reconciler actor: exclusively owns the
+/// RouteBackend (0 locks) and drives OS route reconciliation based on plans
+/// from RouteController.
+///
+/// The mobile flow installs a whole domain through its own snapshot contract
+/// and has no system route backend, so it has no instance of this actor.
+#[cfg(not(mobile))]
 pub(crate) struct RouteReconciler<B> {
     controller: RouteController,
     backend: B,
 }
 
+#[cfg(not(mobile))]
 impl<B: RouteBackend> RouteReconciler<B> {
     pub fn new(controller: RouteController, backend: B) -> Self {
-        Self { controller, backend }
+        Self {
+            controller,
+            backend,
+        }
     }
 
-    /// Background worker loop: reacts to dirty events and periodic audits without holding locks across await.
-    pub async fn run(mut self) {
+    /// Desktop worker loop: fixed audit grid plus retry deadlines and dirty
+    /// input changes.
+    ///
+    /// All scheduling state is local to this task; nothing here is a second
+    /// ledger. The loop never cancels a shutdown: it keeps reconciling against
+    /// the empty target until no record, actual effect or member cleanup is
+    /// left, and only then returns `Ok`. Ordinary operation failures become
+    /// retry deadlines; only a real task error is returned.
+    pub async fn run(mut self) -> anyhow::Result<()> {
+        let mut next_audit = tokio::time::Instant::now() + AUDIT_INTERVAL;
+        let mut audit_retry_at: Option<tokio::time::Instant> = None;
+        let mut audit_attempt: u32 = 0;
+        // Retries are only backoff for an operation that already failed. The
+        // deadlines are read after every I/O wait, never from a stale `now`.
+        let mut route_retries: BTreeMap<
+            RouteKey,
+            (RouteSpec<u32>, bool, tokio::time::Instant, u32, Arc<str>),
+        > = BTreeMap::new();
+        #[cfg(feature = "tun")]
+        let mut member_retries: BTreeMap<
+            (Uuid, Uuid),
+            (
+                SharedVirtualNicMember,
+                BTreeSet<IpCidr>,
+                tokio::time::Instant,
+                u32,
+                Arc<str>,
+            ),
+        > = BTreeMap::new();
+        // Deadlines at or before this instant have already had their attempt.
+        // A retry recorded by the attempt itself always lies in the future, so
+        // an entry this round could not act on cannot spin the loop, while an
+        // unrelated dirty mark cannot skip an operation that really is due.
+        let mut retry_horizon = tokio::time::Instant::now();
+
+        // The first round reads the current inputs even without any event.
+        self.controller.dirty.mark();
+
         loop {
+            let now = tokio::time::Instant::now();
+            let mut audit_removed = false;
+
+            // 1. The fixed audit grid wins over dirty work. Its deadline is
+            // never rebuilt from an input change; its own failure backoff is
+            // independent of the route and member retries. A periodic tick and
+            // a due retry share one attempt; a tick that falls inside a pending
+            // backoff only advances the grid, so nothing is read twice.
+            let periodic_due = next_audit <= now;
+            let retry_due = audit_retry_at.is_some_and(|retry_at| retry_at <= now);
+            let retry_pending = audit_retry_at.is_some_and(|retry_at| retry_at > now);
+            if periodic_due {
+                // Advance on the original grid, not relative to this moment.
+                while next_audit <= now {
+                    next_audit += AUDIT_INTERVAL;
+                }
+            }
+            if retry_due || (periodic_due && !retry_pending) {
+                match self
+                    .audit(
+                        &mut route_retries,
+                        #[cfg(feature = "tun")]
+                        &mut member_retries,
+                    )
+                    .await
+                {
+                    Ok(removed) => {
+                        audit_attempt = 0;
+                        audit_retry_at = None;
+                        audit_removed = removed;
+                    }
+                    Err(error) => {
+                        // An incomplete read proves nothing about absence. The
+                        // ledger, its effects and the slot statuses stay as
+                        // they are, and only the audit itself backs off.
+                        audit_attempt = audit_attempt.saturating_add(1);
+                        audit_retry_at =
+                            Some(tokio::time::Instant::now() + retry_backoff(audit_attempt));
+                        tracing::warn!(?error, "route audit failed");
+                    }
+                }
+            }
+
+            // 2. Re-read the current time and every due item after that I/O.
+            let now = tokio::time::Instant::now();
+            let route_due = route_retries
+                .values()
+                .any(|(_, _, deadline, ..)| *deadline > retry_horizon && *deadline <= now);
+            #[cfg(feature = "tun")]
+            let member_due = member_retries
+                .values()
+                .any(|(_, _, deadline, ..)| *deadline > retry_horizon && *deadline <= now);
+            #[cfg(not(feature = "tun"))]
+            let member_due = false;
+
+            if self.controller.dirty.peek() || audit_removed || route_due || member_due {
+                // Consume the mark only right before reconcile reads the new
+                // inputs. A mark that arrives during the round is the next
+                // round's input, so it is never reset afterwards.
+                let batch_started = tokio::time::Instant::now();
+                self.controller.dirty.reset();
+                self.reconcile(
+                    &mut route_retries,
+                    #[cfg(feature = "tun")]
+                    &mut member_retries,
+                )
+                .await?;
+                retry_horizon = batch_started;
+                // A batch of purely in-memory work must still hand the
+                // executor back, even while inputs keep changing.
+                tokio::task::yield_now().await;
+                continue;
+            }
+
+            // 3. Nothing is actionable. Shutdown is not a break: it only ends
+            // the task after every accepted record and actual effect is gone,
+            // and no member still owes a real prefix withdrawal. Stale route
+            // retries without an actual responsibility do not block.
+            {
+                let rt = self.controller.runtime.read();
+                #[cfg(feature = "tun")]
+                let members_done = member_retries.is_empty();
+                #[cfg(not(feature = "tun"))]
+                let members_done = true;
+                if rt.shutdown && rt.instances.is_empty() && rt.applied.is_empty() && members_done {
+                    return Ok(());
+                }
+            }
+
+            // 4. Wait for a real event: an input mark, the pending audit retry,
+            // the next fixed audit tick, or the nearest retry deadline that has
+            // not been attempted yet.
+            let mut wait_until = next_audit;
+            if let Some(retry_at) = audit_retry_at {
+                wait_until = wait_until.min(retry_at);
+            }
+            for (_, _, deadline, ..) in route_retries.values() {
+                if *deadline > now && *deadline < wait_until {
+                    wait_until = *deadline;
+                }
+            }
+            #[cfg(feature = "tun")]
+            for (_, _, deadline, ..) in member_retries.values() {
+                if *deadline > now && *deadline < wait_until {
+                    wait_until = *deadline;
+                }
+            }
             tokio::select! {
-                _ = self.controller.dirty.wait() => {
-                    self.controller.dirty.reset();
-                    if self.controller.is_shutdown() {
-                        break;
-                    }
-                    #[cfg(not(mobile))]
-                    let _ = self.reconcile().await;
-                    #[cfg(mobile)]
-                    self.controller.reconcile_mobile();
-                }
-                _ = tokio::time::sleep(Duration::from_secs(60)) => {
-                    if self.controller.is_shutdown() {
-                        break;
-                    }
-                    #[cfg(not(mobile))]
-                    let _ = self.audit().await;
-                }
+                _ = self.controller.dirty.wait() => {}
+                _ = tokio::time::sleep_until(wait_until) => {}
             }
         }
-    }
-
-    #[cfg(not(mobile))]
-    pub async fn reconcile(&mut self) -> Result<(), RouteError> {
-        let Some(plan) = self.controller.plan_reconciliation() else {
-            return Ok(());
-        };
-
-        for r in &plan.routes_to_remove {
-            if let Err(err) = self.backend.remove(r).await {
-                tracing::warn!(?err, ?r, "failed to remove route from kernel");
-            }
-        }
-
-        for r in &plan.routes_to_add {
-            if let Err(err) = self.backend.add(r).await {
-                tracing::warn!(?err, ?r, "failed to add route to kernel");
-            }
-        }
-
-        self.controller.commit_plan(plan);
-        Ok(())
-    }
-
-    #[cfg(not(mobile))]
-    pub async fn audit(&mut self) -> Result<(), RouteError> {
-        let requested: BTreeSet<OsRoute> = {
-            let rt = self.controller.runtime.read();
-            rt.applied.values().map(|a| a.route.clone()).collect()
-        };
-
-        if requested.is_empty() {
-            return Ok(());
-        }
-
-        let existing = self.backend.existing(&requested).await?;
-        let mut missing = Vec::new();
-        {
-            let rt = self.controller.runtime.read();
-            for (slot_key, applied) in &rt.applied {
-                if !existing.contains(&applied.route) {
-                    missing.push(slot_key.clone());
-                }
-            }
-        }
-
-        if !missing.is_empty() {
-            self.controller.prune_missing_routes(missing);
-        }
-
-        Ok(())
     }
 }
 
 #[cfg(not(mobile))]
-impl RouteControllerRuntime {
-    fn plan_reconciliation(&mut self) -> Option<ReconcilePlan> {
-        self.slots
-            .retain(|weak| weak.upgrade().is_some_and(|s| !s.is_closed()));
+impl<B: RouteBackend> RouteReconciler<B> {
+    /// One desktop reconciliation round.
+    ///
+    /// The two retry maps belong to the caller's loop. They hold only the
+    /// backoff of an operation that already failed and the member handles that
+    /// still owe prefix cleanup; no input, target or second ledger is stored.
+    /// `Ok` means this round ended, not that every route finished.
+    pub(crate) async fn reconcile(
+        &mut self,
+        route_retries: &mut BTreeMap<
+            RouteKey,
+            (RouteSpec<u32>, bool, tokio::time::Instant, u32, Arc<str>),
+        >,
+        #[cfg(feature = "tun")] member_retries: &mut BTreeMap<
+            (Uuid, Uuid),
+            (
+                SharedVirtualNicMember,
+                BTreeSet<IpCidr>,
+                tokio::time::Instant,
+                u32,
+                Arc<str>,
+            ),
+        >,
+    ) -> anyhow::Result<()> {
+        // A. Plan from the current inputs plus the evidence of older failures.
+        // The admission record belongs to one planning call: the planner clears
+        // it on entry and reports only that call's failed member admissions.
+        let mut admission_failures = BTreeMap::new();
+        let errors = self.retry_errors(
+            route_retries,
+            #[cfg(feature = "tun")]
+            member_retries,
+        );
+        #[cfg_attr(not(feature = "tun"), allow(unused_mut))]
+        let mut plan = self
+            .controller
+            .plan_reconciliation(None, &errors, Some(&mut admission_failures))
+            .await;
+        #[cfg(feature = "tun")]
+        self.record_admission_failures(&plan, &admission_failures, member_retries);
 
-        let mut closed_instances = Vec::new();
-        for (run, entry) in &self.instances {
-            if entry.routes.is_closed() {
-                closed_instances.push(*run);
+        #[cfg_attr(not(feature = "tun"), allow(unused_mut))]
+        let mut synced: BTreeMap<(Uuid, Uuid), BTreeSet<IpCidr>> = BTreeMap::new();
+        #[cfg_attr(not(feature = "tun"), allow(unused_mut))]
+        let mut cleared: BTreeSet<(Uuid, Uuid)> = BTreeSet::new();
+        #[cfg(feature = "tun")]
+        let mut related = self.related_members(&plan, member_retries);
+
+        // B/C. Member prefixes first: withdraw what is no longer declared so a
+        // member blocked by stale claims can be admitted again, then plan once
+        // more and commit every related member's complete current target.
+        #[cfg(feature = "tun")]
+        {
+            self.withdraw_member_prefixes(
+                &plan,
+                &related,
+                member_retries,
+                &admission_failures,
+                &mut synced,
+                &mut cleared,
+            )
+            .await;
+            let errors = self.retry_errors(
+                route_retries,
+                #[cfg(feature = "tun")]
+                member_retries,
+            );
+            plan = self
+                .controller
+                .plan_reconciliation(None, &errors, Some(&mut admission_failures))
+                .await;
+            self.record_admission_failures(&plan, &admission_failures, member_retries);
+            Self::extend_related_members(&mut related, &plan);
+            self.sync_member_prefixes(
+                &plan,
+                &related,
+                member_retries,
+                &admission_failures,
+                &mut synced,
+                &mut cleared,
+            )
+            .await;
+        }
+
+        // D–H. Reconcile every actual row, its owners and the OS effects.
+        let (changed, budget_exhausted) = self
+            .reconcile_routes(
+                &plan,
+                route_retries,
+                #[cfg(feature = "tun")]
+                member_retries,
+                &synced,
+                &cleared,
+            )
+            .await;
+
+        // I. Feed this round's real evidence back through the same planner.
+        self.prune_route_retries(route_retries, &plan.desired);
+        let errors = self.retry_errors(
+            route_retries,
+            #[cfg(feature = "tun")]
+            member_retries,
+        );
+        let final_plan = self
+            .controller
+            .plan_reconciliation(Some(&synced), &errors, Some(&mut admission_failures))
+            .await;
+        #[cfg(feature = "tun")]
+        {
+            self.record_admission_failures(&final_plan, &admission_failures, member_retries);
+            Self::extend_related_members(&mut related, &final_plan);
+            self.transfer_orphan_members(&related, member_retries, &synced, &cleared);
+        }
+        let removed = self.remove_finished_instances(
+            &synced,
+            &cleared,
+            #[cfg(feature = "tun")]
+            member_retries,
+        );
+        if changed || removed {
+            self.controller.changed().notify_waiters();
+        }
+        // A member goal that this round did not confirm and cannot start again
+        // is actionable right now. A transient admission failure already has
+        // its retry record and wakes at that deadline, and a matching future
+        // deadline never reaches here, so neither can spin the loop.
+        #[cfg(feature = "tun")]
+        let member_actionable = {
+            let targets = self.member_targets(&final_plan, &related);
+            let now = tokio::time::Instant::now();
+            related.keys().any(|key| {
+                if cleared.contains(key) {
+                    return false;
+                }
+                let final_target = targets.get(key).cloned().unwrap_or_default();
+                let target = self.fresh_member_target(*key, &final_target);
+                if synced.get(key) == Some(&target) {
+                    // This round's own commit confirmed the whole goal.
+                    return false;
+                }
+                if member_retry_blocked(member_retries, key, &final_target, now) {
+                    // The next attempt is already scheduled.
+                    return false;
+                }
+                !self.transient_admission_unresolved(&admission_failures, *key)
+            })
+        };
+        #[cfg(not(feature = "tun"))]
+        let member_actionable = false;
+        if budget_exhausted
+            || member_actionable
+            || self.actionable_add(&final_plan, route_retries, &synced)
+        {
+            // Work this round could not start or finish is actionable right
+            // now, for example a member acknowledgement that arrived after
+            // this round's plan. A future retry deadline never reaches here,
+            // so the loop does not spin, and an input mark produced during
+            // this round's I/O is left untouched.
+            self.controller.dirty.mark();
+        }
+        Ok(())
+    }
+
+    /// Turn this planning call's transient member admission failures into the
+    /// ordinary member retries.
+    ///
+    /// Only a current binding whose complete declared prefix set is exactly
+    /// the set that failed to prepare is a real failed attempt of the current
+    /// goal. A rebound registration, a released root or any changed
+    /// declaration belongs to the next marked round and must not inherit this
+    /// error; an explicit conflict or a known-invalid binding never schedules
+    /// a timer here.
+    #[cfg(feature = "tun")]
+    fn record_admission_failures(
+        &self,
+        plan: &ReconcilePlan,
+        admission_failures: &BTreeMap<(Uuid, Uuid), (BTreeSet<IpCidr>, RouteStatus)>,
+        member_retries: &mut BTreeMap<
+            (Uuid, Uuid),
+            (
+                SharedVirtualNicMember,
+                BTreeSet<IpCidr>,
+                tokio::time::Instant,
+                u32,
+                Arc<str>,
+            ),
+        >,
+    ) {
+        for ((run, registration), (prefixes, status)) in admission_failures {
+            let RouteStatus::Pending { error: Some(error) } = status else {
+                continue;
+            };
+            let Some(member) = plan
+                .members
+                .get(run)
+                .filter(|member| member.registration_id() == *registration)
+            else {
+                continue;
+            };
+            if self.declared_member_prefixes(*run, *registration).as_ref() != Some(prefixes) {
+                continue;
+            }
+            record_member_failure(
+                member_retries,
+                (*run, *registration),
+                member,
+                prefixes.clone(),
+                &anyhow::anyhow!("{error}"),
+            );
+        }
+    }
+
+    /// Whether this member's latest admission failed transiently while its
+    /// declarations are still nonempty.
+    ///
+    /// Committing an empty set for such a member would turn a failed prepare
+    /// into a withdrawal nobody requested, so both member stages leave its
+    /// real claims and its retry alone until a fresh round re-admits it. A
+    /// released root, a rebound registration or genuinely empty declarations
+    /// need no admission and keep their real cleanup.
+    #[cfg(feature = "tun")]
+    fn transient_admission_unresolved(
+        &self,
+        admission_failures: &BTreeMap<(Uuid, Uuid), (BTreeSet<IpCidr>, RouteStatus)>,
+        (run, registration): (Uuid, Uuid),
+    ) -> bool {
+        matches!(
+            admission_failures.get(&(run, registration)),
+            Some((_, RouteStatus::Pending { error: Some(_) }))
+        ) && self
+            .declared_member_prefixes(run, registration)
+            .is_some_and(|declared| !declared.is_empty())
+    }
+
+    /// Whether a desired addition is actionable right now.
+    ///
+    /// This covers work that only became possible after this round's member
+    /// acknowledgements, which the round's plans predate. An addition still
+    /// inside its backoff, or one with no owner that can act now, is not
+    /// actionable and must not wake the loop.
+    fn actionable_add(
+        &self,
+        plan: &ReconcilePlan,
+        route_retries: &BTreeMap<
+            RouteKey,
+            (RouteSpec<u32>, bool, tokio::time::Instant, u32, Arc<str>),
+        >,
+        synced: &BTreeMap<(Uuid, Uuid), BTreeSet<IpCidr>>,
+    ) -> bool {
+        let applied = self.controller.runtime.read().applied.clone();
+        let now = tokio::time::Instant::now();
+        plan.add.iter().any(|route| {
+            let key = RouteKey::of(route);
+            if applied.contains_key(&key)
+                || route_retry_blocked(route_retries, &key, route, true, now)
+            {
+                return false;
+            }
+            let Some((_, planned_owners)) = plan.desired.get(&key) else {
+                return false;
+            };
+            self.current_add_evidence(route, planned_owners, plan, synced)
+                .is_some_and(|(owners, _, admissible)| !owners.is_empty() && admissible)
+        })
+    }
+
+    /// This round's evidence of older failures, keyed by the complete route.
+    ///
+    /// A retry is only backoff for an operation that already failed; it never
+    /// becomes a target or an effect. Member failures reach only the rows that
+    /// this registration still carries.
+    fn retry_errors(
+        &self,
+        route_retries: &BTreeMap<
+            RouteKey,
+            (RouteSpec<u32>, bool, tokio::time::Instant, u32, Arc<str>),
+        >,
+        #[cfg(feature = "tun")] member_retries: &BTreeMap<
+            (Uuid, Uuid),
+            (
+                SharedVirtualNicMember,
+                BTreeSet<IpCidr>,
+                tokio::time::Instant,
+                u32,
+                Arc<str>,
+            ),
+        >,
+    ) -> BTreeMap<RouteSpec<u32>, Arc<str>> {
+        let mut errors = BTreeMap::new();
+        for (route, _, _, _, error) in route_retries.values() {
+            errors.insert(route.clone(), error.clone());
+        }
+        #[cfg(feature = "tun")]
+        self.member_retry_errors(member_retries, &mut errors);
+        errors
+    }
+
+    #[cfg(feature = "tun")]
+    fn member_retry_errors(
+        &self,
+        member_retries: &BTreeMap<
+            (Uuid, Uuid),
+            (
+                SharedVirtualNicMember,
+                BTreeSet<IpCidr>,
+                tokio::time::Instant,
+                u32,
+                Arc<str>,
+            ),
+        >,
+        errors: &mut BTreeMap<RouteSpec<u32>, Arc<str>>,
+    ) {
+        for ((run, registration), (_, target, _, _, error)) in member_retries {
+            if target.is_empty() {
+                continue;
+            }
+            let Some(routes) = self.declared_member_routes(*run, *registration) else {
+                continue;
+            };
+            for route in routes {
+                if target.contains(&route.destination) {
+                    errors.insert(route, error.clone());
+                }
+            }
+        }
+    }
+
+    /// Every member this round may touch, deduplicated by run and registration.
+    ///
+    /// The set is a local cleanup reference: plan members, members recorded on
+    /// actual rows and members still owing prefix withdrawals in the retry map.
+    #[cfg(feature = "tun")]
+    fn related_members(
+        &self,
+        plan: &ReconcilePlan,
+        member_retries: &BTreeMap<
+            (Uuid, Uuid),
+            (
+                SharedVirtualNicMember,
+                BTreeSet<IpCidr>,
+                tokio::time::Instant,
+                u32,
+                Arc<str>,
+            ),
+        >,
+    ) -> BTreeMap<(Uuid, Uuid), SharedVirtualNicMember> {
+        let mut related = BTreeMap::new();
+        Self::extend_related_members(&mut related, plan);
+        {
+            let rt = self.controller.runtime.read();
+            for row in rt.applied.values() {
+                for (run, member) in &row.members {
+                    related
+                        .entry((*run, member.registration_id()))
+                        .or_insert_with(|| member.clone());
+                }
+            }
+        }
+        for (key, (member, ..)) in member_retries {
+            related.entry(*key).or_insert_with(|| member.clone());
+        }
+        related
+    }
+
+    #[cfg(feature = "tun")]
+    fn extend_related_members(
+        related: &mut BTreeMap<(Uuid, Uuid), SharedVirtualNicMember>,
+        plan: &ReconcilePlan,
+    ) {
+        for (run, member) in &plan.members {
+            related
+                .entry((*run, member.registration_id()))
+                .or_insert_with(|| member.clone());
+        }
+    }
+
+    /// The final legal prefix target of every related member.
+    ///
+    /// The target is fixed by the selected desired rows that pass through this
+    /// run's own bound device, so ordinary indexed rows and actions without a
+    /// device never reach a member. A route the planner could not admit this
+    /// round is not in `desired`, and its declaration is a separate concern:
+    /// the retry map, not the member target, is what schedules the next
+    /// attempt. A registration that is no longer bound to this run, a released
+    /// registry or a shutdown leaves the target empty, which withdraws
+    /// everything that registration still holds.
+    #[cfg(feature = "tun")]
+    fn member_targets(
+        &self,
+        plan: &ReconcilePlan,
+        related: &BTreeMap<(Uuid, Uuid), SharedVirtualNicMember>,
+    ) -> BTreeMap<(Uuid, Uuid), BTreeSet<IpCidr>> {
+        let bindings = self.current_bindings();
+        let mut targets = BTreeMap::new();
+        for (run, registration) in related.keys() {
+            let dev = match bindings.get(run) {
+                Some((current, Some(dev), _)) if current == registration => Some(*dev),
+                _ => None,
+            };
+            let mut prefixes = BTreeSet::new();
+            if let Some(dev) = dev {
+                for (route, owners) in plan.desired.values() {
+                    if owners.contains(run) && unicast_dev(route) == Some(dev) {
+                        prefixes.insert(route.destination);
+                    }
+                }
+            }
+            targets.insert((*run, *registration), prefixes);
+        }
+        targets
+    }
+
+    /// Withdraw every related member's stale prefixes before the full sync.
+    ///
+    /// A member whose claims are already a subset of the target has nothing to
+    /// withdraw. The stage set is the intersection, but the backoff always
+    /// belongs to the member's final target: replacing the target with this
+    /// stage set would let the second stage dodge the deadline. A member whose
+    /// current admission failed transiently is not read as withdrawn: its
+    /// real claims and retry stay until a fresh round admits it.
+    #[cfg(feature = "tun")]
+    async fn withdraw_member_prefixes(
+        &self,
+        plan: &ReconcilePlan,
+        related: &BTreeMap<(Uuid, Uuid), SharedVirtualNicMember>,
+        member_retries: &mut BTreeMap<
+            (Uuid, Uuid),
+            (
+                SharedVirtualNicMember,
+                BTreeSet<IpCidr>,
+                tokio::time::Instant,
+                u32,
+                Arc<str>,
+            ),
+        >,
+        admission_failures: &BTreeMap<(Uuid, Uuid), (BTreeSet<IpCidr>, RouteStatus)>,
+        synced: &mut BTreeMap<(Uuid, Uuid), BTreeSet<IpCidr>>,
+        cleared: &mut BTreeSet<(Uuid, Uuid)>,
+    ) {
+        let targets = self.member_targets(plan, related);
+        let now = tokio::time::Instant::now();
+        for (key, member) in related {
+            if self.transient_admission_unresolved(admission_failures, *key) {
+                continue;
+            }
+            let final_target = targets.get(key).cloned().unwrap_or_default();
+            if member_retry_blocked(member_retries, key, &final_target, now) {
+                continue;
+            }
+            let claims = match tokio::time::timeout(ROUTE_IO_TIMEOUT, member.claims()).await {
+                Ok(claims) => claims,
+                Err(_) => {
+                    let error = anyhow::anyhow!(
+                        "timed out reading claims of member {}",
+                        member.member_id()
+                    );
+                    synced.remove(key);
+                    cleared.remove(key);
+                    record_member_failure(member_retries, *key, member, final_target, &error);
+                    continue;
+                }
+            };
+            let current = claim_prefixes(&claims);
+            let target = self.fresh_member_target(*key, &final_target);
+            let stage: BTreeSet<IpCidr> = current.intersection(&target).copied().collect();
+            if stage == current {
+                // Nothing stale to withdraw. Committing the same claims is not
+                // the confirmation of the member's goal; the full sync owns
+                // that at the due final target.
+                continue;
+            }
+            // A real withdrawal: only the commit proves it.
+            match sync_member_routes(member, &stage).await {
+                Ok(true) => {
+                    cleared.remove(key);
+                    synced.insert(*key, stage);
+                    member_retries.remove(key);
+                }
+                Ok(false) => {
+                    synced.remove(key);
+                    cleared.insert(*key);
+                    member_retries.remove(key);
+                }
+                Err(error) => {
+                    synced.remove(key);
+                    cleared.remove(key);
+                    tracing::warn!(?error, ?key, "failed to withdraw member routes");
+                    record_member_failure(member_retries, *key, member, final_target, &error);
+                }
+            }
+        }
+    }
+
+    /// Commit every related member's complete current target.
+    ///
+    /// The target of a non-empty commit is rechecked against the declarations
+    /// that are current now, so a requirement withdrawn during this round's
+    /// waits is not re-added. An acknowledgement records its real prefix set;
+    /// a dead registration records only that it is cleared.
+    #[cfg(feature = "tun")]
+    async fn sync_member_prefixes(
+        &self,
+        plan: &ReconcilePlan,
+        related: &BTreeMap<(Uuid, Uuid), SharedVirtualNicMember>,
+        member_retries: &mut BTreeMap<
+            (Uuid, Uuid),
+            (
+                SharedVirtualNicMember,
+                BTreeSet<IpCidr>,
+                tokio::time::Instant,
+                u32,
+                Arc<str>,
+            ),
+        >,
+        admission_failures: &BTreeMap<(Uuid, Uuid), (BTreeSet<IpCidr>, RouteStatus)>,
+        synced: &mut BTreeMap<(Uuid, Uuid), BTreeSet<IpCidr>>,
+        cleared: &mut BTreeSet<(Uuid, Uuid)>,
+    ) {
+        let targets = self.member_targets(plan, related);
+        let now = tokio::time::Instant::now();
+        for (key, member) in related {
+            if self.transient_admission_unresolved(admission_failures, *key) {
+                continue;
+            }
+            let final_target = targets.get(key).cloned().unwrap_or_default();
+            if member_retry_blocked(member_retries, key, &final_target, now) {
+                continue;
+            }
+            let target = self.fresh_member_target(*key, &final_target);
+            if synced.get(key) == Some(&target) && !member_retries.contains_key(key) {
+                // This round already committed exactly this target for this
+                // registration; that commit is the acknowledgement.
+                continue;
+            }
+            match sync_member_routes(member, &target).await {
+                Ok(true) => {
+                    cleared.remove(key);
+                    synced.insert(*key, target);
+                    member_retries.remove(key);
+                }
+                Ok(false) => {
+                    synced.remove(key);
+                    cleared.insert(*key);
+                    member_retries.remove(key);
+                }
+                Err(error) => {
+                    synced.remove(key);
+                    cleared.remove(key);
+                    tracing::warn!(?error, ?key, "failed to sync member routes");
+                    record_member_failure(member_retries, *key, member, final_target, &error);
+                }
+            }
+        }
+    }
+
+    /// One member's final target, narrowed to what is declared right now.
+    ///
+    /// The declared set is only a filter for this operation; the retry map
+    /// keeps the final target so a narrower commit cannot reset its backoff.
+    #[cfg(feature = "tun")]
+    fn fresh_member_target(
+        &self,
+        (run, registration): (Uuid, Uuid),
+        final_target: &BTreeSet<IpCidr>,
+    ) -> BTreeSet<IpCidr> {
+        if final_target.is_empty() {
+            return BTreeSet::new();
+        }
+        match self.declared_member_prefixes(run, registration) {
+            Some(current) => final_target.intersection(&current).copied().collect(),
+            None => BTreeSet::new(),
+        }
+    }
+
+    /// Keep an orphaned member's last cleanup reference.
+    ///
+    /// A member no longer held by the current binding of its run and by no
+    /// actual row still owes a withdrawal unless this round acknowledged an
+    /// empty set for it or confirmed the registration gone. It moves into the
+    /// caller's retry map with an empty target, keeping an existing empty
+    /// target's backoff.
+    #[cfg(feature = "tun")]
+    fn transfer_orphan_members(
+        &self,
+        related: &BTreeMap<(Uuid, Uuid), SharedVirtualNicMember>,
+        member_retries: &mut BTreeMap<
+            (Uuid, Uuid),
+            (
+                SharedVirtualNicMember,
+                BTreeSet<IpCidr>,
+                tokio::time::Instant,
+                u32,
+                Arc<str>,
+            ),
+        >,
+        synced: &BTreeMap<(Uuid, Uuid), BTreeSet<IpCidr>>,
+        cleared: &BTreeSet<(Uuid, Uuid)>,
+    ) {
+        let held = {
+            let rt = self.controller.runtime.read();
+            let mut held = BTreeSet::new();
+            for (run, instance) in &rt.instances {
+                if let Some(member) = &instance.member {
+                    held.insert((*run, member.registration_id()));
+                }
+            }
+            for row in rt.applied.values() {
+                for (run, member) in &row.members {
+                    held.insert((*run, member.registration_id()));
+                }
+            }
+            held
+        };
+        let now = tokio::time::Instant::now();
+        for (key, member) in related {
+            if held.contains(key) || cleared.contains(key) {
+                continue;
+            }
+            if synced.get(key).is_some_and(|prefixes| prefixes.is_empty()) {
+                continue;
+            }
+            if member_retries
+                .get(key)
+                .is_some_and(|(_, target, ..)| target.is_empty())
+            {
+                continue;
+            }
+            member_retries.insert(
+                *key,
+                (
+                    member.clone(),
+                    BTreeSet::new(),
+                    now,
+                    0,
+                    Arc::from("member binding withdrew before its prefixes were cleared"),
+                ),
+            );
+        }
+    }
+
+    /// Remove the instance records whose real responsibility is finished.
+    ///
+    /// Only a released root or a shutdown makes a record eligible. It stays
+    /// while any actual row still owns it, while any member withdrawal is
+    /// still owed, and until its current member acknowledged an empty set or
+    /// its registration is gone. A record with no bound member has no NIC
+    /// condition to wait for.
+    fn remove_finished_instances(
+        &self,
+        synced: &BTreeMap<(Uuid, Uuid), BTreeSet<IpCidr>>,
+        cleared: &BTreeSet<(Uuid, Uuid)>,
+        #[cfg(feature = "tun")] member_retries: &BTreeMap<
+            (Uuid, Uuid),
+            (
+                SharedVirtualNicMember,
+                BTreeSet<IpCidr>,
+                tokio::time::Instant,
+                u32,
+                Arc<str>,
+            ),
+        >,
+    ) -> bool {
+        #[cfg(not(feature = "tun"))]
+        let _ = (synced, cleared);
+        let mut rt = self.controller.runtime.write();
+        let shutdown = rt.shutdown;
+        let mut finished = Vec::new();
+        for (run, instance) in &rt.instances {
+            if !shutdown && instance.registry.upgrade().is_some() {
+                continue;
+            }
+            if rt.applied.values().any(|row| row.owners.contains(run)) {
+                continue;
+            }
+            #[cfg(feature = "tun")]
+            {
+                if member_retries.keys().any(|(retry_run, _)| retry_run == run) {
+                    continue;
+                }
+                if let Some(member) = &instance.member {
+                    let registration = member.registration_id();
+                    let empty_ack = synced
+                        .get(&(*run, registration))
+                        .is_some_and(|prefixes| prefixes.is_empty());
+                    if !empty_ack && !cleared.contains(&(*run, registration)) {
+                        continue;
+                    }
+                }
+            }
+            finished.push(*run);
+        }
+        let removed = !finished.is_empty();
+        for run in finished {
+            rt.instances.remove(&run);
+        }
+        removed
+    }
+
+    /// D–H of one round: owners, confirmed effects and the real OS operations.
+    ///
+    /// Returns whether the ledger really changed and whether actionable work
+    /// was left only because this round's operation budget ran out.
+    async fn reconcile_routes(
+        &mut self,
+        plan: &ReconcilePlan,
+        route_retries: &mut BTreeMap<
+            RouteKey,
+            (RouteSpec<u32>, bool, tokio::time::Instant, u32, Arc<str>),
+        >,
+        #[cfg(feature = "tun")] member_retries: &mut BTreeMap<
+            (Uuid, Uuid),
+            (
+                SharedVirtualNicMember,
+                BTreeSet<IpCidr>,
+                tokio::time::Instant,
+                u32,
+                Arc<str>,
+            ),
+        >,
+        synced: &BTreeMap<(Uuid, Uuid), BTreeSet<IpCidr>>,
+        cleared: &BTreeSet<(Uuid, Uuid)>,
+    ) -> (bool, bool) {
+        let now = tokio::time::Instant::now();
+        let applied = self.controller.runtime.read().applied.clone();
+        let live = self.live_routes();
+        #[cfg(feature = "tun")]
+        let bindings = self.current_bindings();
+        let mut changed = false;
+        let mut budget_exhausted = false;
+        let mut budget = ROUTE_OPERATION_BUDGET;
+
+        // D. A row that is still the target keeps its route and effect; only
+        // its owners change. An owner whose member prefix is not yet
+        // acknowledged away keeps its responsibility, and a rebind never
+        // replaces the old member handle before that.
+        for (key, row) in &applied {
+            let Some((target, desired_owners)) = plan.desired.get(key) else {
+                continue;
+            };
+            if *target != row.route
+                || !matches!(row.effect, RouteEffect::Owned | RouteEffect::External)
+            {
+                continue;
+            }
+            let declared = live.get(&row.route);
+            let mut owners: BTreeSet<Uuid> = desired_owners
+                .iter()
+                .copied()
+                .filter(|run| declared.is_some_and(|runs| runs.contains(run)))
+                .collect();
+            for old_owner in &row.owners {
+                if !owners.contains(old_owner)
+                    && !self.row_member_released(row, *old_owner, synced, cleared)
+                {
+                    owners.insert(*old_owner);
+                }
+            }
+            #[cfg(feature = "tun")]
+            let members =
+                self.row_members(row, &owners, desired_owners, &bindings, synced, cleared);
+            #[cfg(feature = "tun")]
+            let members_changed = !Self::same_members(&members, &row.members);
+            #[cfg(not(feature = "tun"))]
+            let members_changed = false;
+            if owners.is_empty() {
+                // Every declaration of this row disappeared while member
+                // prefixes were synced. Keep the actual row and its owners
+                // for the next round, which no longer has it as a target.
+                continue;
+            }
+            if owners == row.owners && !members_changed {
+                continue;
+            }
+            let mut rt = self.controller.runtime.write();
+            if let Some(current) = rt.applied.get_mut(key)
+                && current.route == row.route
+                && matches!(current.effect, RouteEffect::Owned | RouteEffect::External)
+            {
+                current.owners = owners;
+                #[cfg(feature = "tun")]
+                {
+                    current.members = members;
+                }
+                changed = true;
             }
         }
 
-        let Some(active_if) = &self.interface else {
-            let to_remove = self.applied.values().map(|a| a.route.clone()).collect();
-            return Some(ReconcilePlan {
-                routes_to_remove: to_remove,
-                routes_to_add: Vec::new(),
-                slots_to_mark_ready: Vec::new(),
-                slots_to_suppress: Vec::new(),
-                closed_instances,
-                new_applied: Default::default(),
-            });
+        // G. Rows whose earlier operation is still unconfirmed are read at
+        // their deadline; only a confirmed absence may retire them.
+        let mut confirm: Vec<(RouteKey, RouteSpec<u32>, bool)> = Vec::new();
+        for (key, row) in &applied {
+            let add = match row.effect {
+                RouteEffect::Adding => true,
+                RouteEffect::Removing => false,
+                _ => continue,
+            };
+            if !route_retry_blocked(route_retries, key, &row.route, add, now) {
+                confirm.push((key.clone(), row.route.clone(), add));
+            }
+        }
+
+        // F. A desired row without a confirmed effect needs one complete
+        // readback before any addition. Any key the actual ledger still holds
+        // — Adding and Removing included — is confirmed only, never replaced
+        // by a new candidate, and a future deadline is not read at all.
+        let mut candidates: Vec<(RouteSpec<u32>, BTreeSet<Uuid>)> = Vec::new();
+        for route in &plan.add {
+            let key = RouteKey::of(route);
+            let Some((target, desired_owners)) = plan.desired.get(&key) else {
+                continue;
+            };
+            if target != route
+                || applied.contains_key(&key)
+                || route_retry_blocked(route_retries, &key, route, true, now)
+            {
+                continue;
+            }
+            // Only an owner that could act now justifies a readback: either an
+            // ordinary owner, or one whose managed row this round acknowledged.
+            let Some((owners, _, executable)) =
+                self.current_add_evidence(route, desired_owners, plan, synced)
+            else {
+                continue;
+            };
+            if !executable {
+                continue;
+            }
+            candidates.push((route.clone(), owners));
+        }
+
+        let mut read: BTreeSet<RouteSpec<u32>> =
+            confirm.iter().map(|(_, route, _)| route.clone()).collect();
+        read.extend(candidates.iter().map(|(route, _)| route.clone()));
+        let existing = if read.is_empty() {
+            Some(BTreeSet::new())
+        } else {
+            match tokio::time::timeout(ROUTE_IO_TIMEOUT, self.backend.existing(&read)).await {
+                Ok(Ok(existing)) => Some(existing),
+                Ok(Err(failure)) => {
+                    // An incomplete readback proves nothing about absence.
+                    let error = anyhow::anyhow!(failure.to_string());
+                    record_read_failure(&confirm, &candidates, route_retries, &error);
+                    None
+                }
+                Err(_) => {
+                    let error = anyhow::anyhow!("timed out reading existing routes");
+                    record_read_failure(&confirm, &candidates, route_retries, &error);
+                    None
+                }
+            }
         };
 
-        // slot_key -> claims sorted by (metric, owner, Option<Weak<Slot>>)
-        let mut claims_by_key = BTreeMap::<
-            OsRouteSlotKey,
-            Vec<(NonZeroU32, Uuid, Option<Weak<RouteSlotInner>>)>,
-        >::new();
-        let mut suppressed_slots = Vec::new();
+        // G. Confirmed absence retires an uncertain record; a row that is
+        // still there is never promoted, and an uncertain Adding record is
+        // never deleted just because its declaration was withdrawn.
+        let mut retry_removals: Vec<RouteSpec<u32>> = Vec::new();
+        if let Some(existing) = &existing {
+            for (key, route, add) in &confirm {
+                if !existing.contains(route) {
+                    let mut rt = self.controller.runtime.write();
+                    let retire = rt.applied.get(key).is_some_and(|row| {
+                        row.route == *route
+                            && matches!(
+                                (row.effect, *add),
+                                (RouteEffect::Adding, true) | (RouteEffect::Removing, false)
+                            )
+                    });
+                    if retire {
+                        rt.applied.remove(key);
+                    }
+                    drop(rt);
+                    if retire {
+                        route_retries.remove(key);
+                        changed = true;
+                    }
+                } else if *add {
+                    record_route_failure(
+                        route_retries,
+                        key.clone(),
+                        route,
+                        true,
+                        Arc::from("route addition is still unconfirmed"),
+                    );
+                } else {
+                    retry_removals.push(route.clone());
+                }
+            }
+        }
 
-        // 1. Manual routes from instance configs
-        for (run, entry) in &self.instances {
-            if let Some(config) = entry.routes.config() {
-                let snapshot = config.snapshot();
-                if let Some(manual) = &snapshot.services.manual_routes {
-                    for prefix in manual {
-                        let spec = RouteSpec::for_tun((*prefix).into());
-                        if let Ok(metric) = validate_tun_spec(&spec) {
-                            let route = OsRoute {
-                                table: spec.table.unwrap_or(254),
-                                destination: spec.destination,
-                                metric,
-                                ifindex: active_if.ifindex,
-                                preferred_source: spec.preferred_source,
-                            };
-                            claims_by_key
-                                .entry(route.slot())
-                                .or_default()
-                                .push((metric, *run, None));
+        // F. A complete external row satisfies the declaration without any
+        // ownership; only a row proven absent may be added, and only with
+        // owners that still declare it and admitted member evidence.
+        if let Some(existing) = &existing {
+            for (route, planned_owners) in candidates {
+                // Fresh semantics for this operation: a declaration withdrawn
+                // or an instance rebound while an earlier addition awaited must
+                // not be acted on.
+                let Some((owners, members, executable)) =
+                    self.current_add_evidence(&route, &planned_owners, plan, synced)
+                else {
+                    continue;
+                };
+                let key = RouteKey::of(&route);
+                {
+                    let rt = self.controller.runtime.read();
+                    if rt.applied.contains_key(&key) {
+                        // An older row of this key is still in place or still
+                        // unconfirmed; the new row waits for its cleanup.
+                        continue;
+                    }
+                }
+                if existing.contains(&route) {
+                    let mut rt = self.controller.runtime.write();
+                    if !rt.applied.contains_key(&key) {
+                        rt.applied.insert(
+                            key,
+                            AppliedRoute {
+                                route,
+                                owners,
+                                effect: RouteEffect::External,
+                                #[cfg(feature = "tun")]
+                                members,
+                            },
+                        );
+                        changed = true;
+                    }
+                    continue;
+                }
+                #[cfg(not(feature = "tun"))]
+                let _ = &members;
+                if !executable {
+                    // No owner can act this round: every managed owner lacks
+                    // this round's acknowledgement, so creating the row now
+                    // would bypass admission.
+                    continue;
+                }
+                if route_retry_blocked(route_retries, &key, &route, true, now) {
+                    continue;
+                }
+                if budget == 0 {
+                    budget_exhausted = true;
+                    break;
+                }
+                budget -= 1;
+                #[cfg(feature = "tun")]
+                let result = self
+                    .add_route_effect(route.clone(), owners.clone(), members)
+                    .await;
+                #[cfg(not(feature = "tun"))]
+                let result = self.add_route_effect(route.clone(), owners.clone()).await;
+                match result {
+                    Ok(()) => {
+                        route_retries.remove(&key);
+                        changed = true;
+                    }
+                    Err(error) => {
+                        // An unknown outcome leaves the Adding record, which is
+                        // a real ledger change; a definite failure restores the
+                        // empty key and is no progress.
+                        if matches!(error, RouteError::Unknown(_)) {
+                            changed = true;
+                        }
+                        record_route_failure(
+                            route_retries,
+                            key,
+                            &route,
+                            true,
+                            Arc::from(error.to_string()),
+                        );
+                        tracing::warn!(?error, route = %route.destination, "failed to add route");
+                    }
+                }
+            }
+        }
+
+        // G. An external row is only released. An owned row is deleted only
+        // after its member prefixes are acknowledged away, and a removing row
+        // completes the deletion right it already had. The plan's selected row
+        // decides whether the exact applied row is still the target. An owned
+        // candidate is only queued here: its removal proof is re-admitted from
+        // fresh inputs at execution time, right before the deletion, because an
+        // earlier candidate's await may have changed what the row's owners
+        // declare.
+        let mut removals: Vec<(RouteSpec<u32>, bool)> = retry_removals
+            .into_iter()
+            .map(|route| (route, false))
+            .collect();
+        for (key, row) in &applied {
+            if plan
+                .desired
+                .get(key)
+                .is_some_and(|(target, _)| *target == row.route)
+            {
+                continue;
+            }
+            match row.effect {
+                RouteEffect::External => {
+                    // Release only while this exact external row is still the
+                    // actual effect the snapshot described.
+                    let current_external = {
+                        let rt = self.controller.runtime.read();
+                        rt.applied.get(key).is_some_and(|current| {
+                            current.route == row.route && current.effect == RouteEffect::External
+                        })
+                    };
+                    if !current_external
+                        || !self
+                            .row_may_be_removed(
+                                row,
+                                route_retries,
+                                #[cfg(feature = "tun")]
+                                member_retries,
+                                synced,
+                                cleared,
+                            )
+                            .await
+                    {
+                        continue;
+                    }
+                    let mut rt = self.controller.runtime.write();
+                    let release = rt.applied.get(key).is_some_and(|current| {
+                        current.route == row.route && current.effect == RouteEffect::External
+                    });
+                    if release {
+                        rt.applied.remove(key);
+                        changed = true;
+                    }
+                }
+                RouteEffect::Owned => {
+                    // Only queue: the execution loop re-checks this row's
+                    // deadline and re-admits the deletion from fresh inputs
+                    // immediately before it really deletes the row.
+                    removals.push((row.route.clone(), true));
+                }
+                RouteEffect::Adding | RouteEffect::Removing => {}
+            }
+        }
+        for (route, check_live) in removals {
+            let key = RouteKey::of(&route);
+            // A restored Owned row's earlier failure and every other failed
+            // deletion keep their deadline until it really passes; an
+            // unrelated dirty mark cannot shorten it.
+            if route_retry_blocked(
+                route_retries,
+                &key,
+                &route,
+                false,
+                tokio::time::Instant::now(),
+            ) {
+                continue;
+            }
+            if check_live {
+                // Re-admit this row from fresh inputs now, at execution time:
+                // the collection loop only queued it, and an earlier
+                // candidate's awaits may have let its owners declare it again.
+                let current = {
+                    let rt = self.controller.runtime.read();
+                    rt.applied
+                        .get(&key)
+                        .filter(|current| {
+                            current.route == route && current.effect == RouteEffect::Owned
+                        })
+                        .cloned()
+                };
+                let Some(current) = current else {
+                    continue;
+                };
+                if !self
+                    .row_may_be_removed(
+                        &current,
+                        route_retries,
+                        #[cfg(feature = "tun")]
+                        member_retries,
+                        synced,
+                        cleared,
+                    )
+                    .await
+                {
+                    continue;
+                }
+                // No await may separate this fresh result from the deletion:
+                // only the same complete row, still Owned in the actual
+                // ledger, may be deleted now.
+                let owned = {
+                    let rt = self.controller.runtime.read();
+                    rt.applied.get(&key).is_some_and(|current| {
+                        current.route == route && current.effect == RouteEffect::Owned
+                    })
+                };
+                if !owned {
+                    continue;
+                }
+            }
+            if budget == 0 {
+                budget_exhausted = true;
+                break;
+            }
+            budget -= 1;
+            let prior_effect = {
+                let rt = self.controller.runtime.read();
+                rt.applied
+                    .get(&key)
+                    .filter(|row| row.route == route)
+                    .map(|row| row.effect)
+            };
+            match self.remove_route_effect(&route).await {
+                Ok(()) => {
+                    route_retries.remove(&key);
+                    changed = true;
+                }
+                Err(error) => {
+                    // A definite failure restores the prior effect and an
+                    // unknown one leaves Removing; only a final record that
+                    // really differs from the one before the call is progress.
+                    let final_effect = {
+                        let rt = self.controller.runtime.read();
+                        rt.applied
+                            .get(&key)
+                            .filter(|row| row.route == route)
+                            .map(|row| row.effect)
+                    };
+                    if prior_effect != final_effect {
+                        changed = true;
+                    }
+                    record_route_failure(
+                        route_retries,
+                        key,
+                        &route,
+                        false,
+                        Arc::from(error.to_string()),
+                    );
+                    tracing::warn!(?error, route = %route.destination, "failed to remove route");
+                }
+            }
+        }
+
+        (changed, budget_exhausted)
+    }
+
+    /// Current member binding and real device of every run.
+    #[cfg(feature = "tun")]
+    fn current_bindings(&self) -> BTreeMap<Uuid, (Uuid, Option<u32>, SharedVirtualNicMember)> {
+        let rt = self.controller.runtime.read();
+        let mut bindings = BTreeMap::new();
+        for (run, instance) in &rt.instances {
+            let Some(member) = &instance.member else {
+                continue;
+            };
+            bindings.insert(
+                *run,
+                (
+                    member.registration_id(),
+                    instance.interface.as_ref().map(|info| info.ifindex),
+                    member.clone(),
+                ),
+            );
+        }
+        bindings
+    }
+
+    /// Every live declaration resolved to an installable route, by run.
+    ///
+    /// This is a fresh read of the current inputs, used only to check that an
+    /// owner still declares the exact row before an OS operation. It applies
+    /// the same managed-device rule as the planner: an explicit index that now
+    /// points at a TUN this run does not own is not this run's declaration.
+    fn live_routes(&self) -> BTreeMap<RouteSpec<u32>, BTreeSet<Uuid>> {
+        let rt = self.controller.runtime.read();
+        let mut routes: BTreeMap<RouteSpec<u32>, BTreeSet<Uuid>> = BTreeMap::new();
+        if rt.shutdown {
+            return routes;
+        }
+        #[cfg(feature = "tun")]
+        let managed = Self::managed_devices(&rt);
+        for (run, instance) in &rt.instances {
+            #[cfg(feature = "tun")]
+            let own = instance.interface.as_ref().map(|info| info.ifindex);
+            for route in Self::resolved_declarations(instance) {
+                #[cfg(feature = "tun")]
+                if let Some(dev) = unicast_dev(&route)
+                    && managed.contains(&dev)
+                    && Some(dev) != own
+                {
+                    // Reaching another run's managed TUN needs that run's own
+                    // member admission, so it is not declared here.
+                    continue;
+                }
+                routes.entry(route).or_default().insert(*run);
+            }
+        }
+        routes
+    }
+
+    /// Devices owned by a bound TUN or referenced by a managed row.
+    #[cfg(feature = "tun")]
+    fn managed_devices(rt: &RouteControllerRuntime) -> BTreeSet<u32> {
+        let mut managed = BTreeSet::new();
+        for instance in rt.instances.values() {
+            if let Some(info) = &instance.interface {
+                managed.insert(info.ifindex);
+            }
+        }
+        for row in rt.applied.values() {
+            if !row.members.is_empty()
+                && let Some(dev) = unicast_dev(&row.route)
+            {
+                managed.insert(dev);
+            }
+        }
+        managed
+    }
+
+    /// One instance's declarations resolved against its current device.
+    fn resolved_declarations(instance: &InstanceRoutes) -> Vec<RouteSpec<u32>> {
+        let Some((declarations, slots)) = instance.declarations() else {
+            return Vec::new();
+        };
+        drop(slots);
+        #[cfg(feature = "tun")]
+        let interface = instance.interface.as_ref().map(|info| info.ifindex);
+        #[cfg(not(feature = "tun"))]
+        let interface = None::<u32>;
+        declarations
+            .into_iter()
+            .filter_map(|declaration| declaration.resolve(interface))
+            .filter_map(|resolved| normalize_route(resolved).ok())
+            .collect()
+    }
+
+    /// The owners of one addition under the current semantics, with the
+    /// acknowledged member evidence allowed to be recorded for them.
+    ///
+    /// One short read lock re-reads every fact this admission depends on:
+    /// shutdown, each planned owner's complete current declarations under the
+    /// current policy, the current managed devices and the current binding.
+    /// No snapshot taken earlier in the round can make a withdrawn or rebound
+    /// owner act on stale admission. Owners outside this round's plan stay
+    /// out. The third value says whether at least one owner can act now: an
+    /// ordinary owner, or a managed owner whose current registration this
+    /// round acknowledged. A managed owner without that acknowledgement stays
+    /// a logical owner and keeps its status pending instead of being dropped
+    /// or turned into a recorded member.
+    #[cfg(feature = "tun")]
+    fn current_add_evidence(
+        &self,
+        route: &RouteSpec<u32>,
+        planned_owners: &BTreeSet<Uuid>,
+        plan: &ReconcilePlan,
+        synced: &BTreeMap<(Uuid, Uuid), BTreeSet<IpCidr>>,
+    ) -> Option<(BTreeSet<Uuid>, BTreeMap<Uuid, SharedVirtualNicMember>, bool)> {
+        let rt = self.controller.runtime.read();
+        if rt.shutdown {
+            return None;
+        }
+        let managed = Self::managed_devices(&rt);
+        let mut owners = BTreeSet::new();
+        let mut members = BTreeMap::new();
+        let mut executable = false;
+        for run in planned_owners {
+            let Some(instance) = rt.instances.get(run) else {
+                continue;
+            };
+            if !Self::resolved_declarations(instance).contains(route) {
+                continue;
+            }
+            let dev = instance.interface.as_ref().map(|info| info.ifindex);
+            // An action without a device is never managed; only an explicit
+            // index that currently belongs to a managed TUN needs admission.
+            let managed_dev = unicast_dev(route).filter(|dev| managed.contains(dev));
+            let Some(route_dev) = managed_dev else {
+                owners.insert(*run);
+                executable = true;
+                continue;
+            };
+            // Another run's managed TUN, or an index this run does not
+            // currently bind, cannot borrow this instance's member.
+            if Some(route_dev) != dev {
+                continue;
+            }
+            let Some(member) = &instance.member else {
+                continue;
+            };
+            let registration = member.registration_id();
+            let planned = plan
+                .members
+                .get(run)
+                .map(SharedVirtualNicMember::registration_id);
+            if planned != Some(registration) {
+                // A rebind or an unplanned registration cannot inherit the
+                // old admission.
+                continue;
+            }
+            let acknowledged = synced
+                .get(&(*run, registration))
+                .is_some_and(|prefixes| prefixes.contains(&route.destination));
+            if acknowledged && member.ensure_open().is_ok() {
+                members.insert(*run, member.clone());
+                executable = true;
+            }
+            owners.insert(*run);
+        }
+        if owners.is_empty() {
+            return None;
+        }
+        Some((owners, members, executable))
+    }
+
+    #[cfg(not(feature = "tun"))]
+    fn current_add_evidence(
+        &self,
+        route: &RouteSpec<u32>,
+        planned_owners: &BTreeSet<Uuid>,
+        plan: &ReconcilePlan,
+        synced: &BTreeMap<(Uuid, Uuid), BTreeSet<IpCidr>>,
+    ) -> Option<(BTreeSet<Uuid>, (), bool)> {
+        let _ = (plan, synced);
+        let rt = self.controller.runtime.read();
+        if rt.shutdown {
+            return None;
+        }
+        let owners: BTreeSet<Uuid> = planned_owners
+            .iter()
+            .copied()
+            .filter(|run| {
+                rt.instances
+                    .get(run)
+                    .is_some_and(|instance| Self::resolved_declarations(instance).contains(route))
+            })
+            .collect();
+        (!owners.is_empty()).then_some((owners, (), true))
+    }
+
+    /// The member handles of a still-needed row.
+    ///
+    /// A recorded handle stays until its prefix is acknowledged away or its
+    /// registration is cleared. A new handle is recorded only as this round's
+    /// acknowledgement for the current registration, so a rebind never
+    /// replaces an old cleanup reference silently.
+    #[cfg(feature = "tun")]
+    fn row_members(
+        &self,
+        row: &AppliedRoute,
+        owners: &BTreeSet<Uuid>,
+        desired_owners: &BTreeSet<Uuid>,
+        bindings: &BTreeMap<Uuid, (Uuid, Option<u32>, SharedVirtualNicMember)>,
+        synced: &BTreeMap<(Uuid, Uuid), BTreeSet<IpCidr>>,
+        cleared: &BTreeSet<(Uuid, Uuid)>,
+    ) -> BTreeMap<Uuid, SharedVirtualNicMember> {
+        let mut members = BTreeMap::new();
+        for run in owners {
+            if let Some(old) = row.members.get(run) {
+                let same = bindings
+                    .get(run)
+                    .is_some_and(|(registration, _, _)| *registration == old.registration_id());
+                if same
+                    || !self.member_responsibility_released(
+                        &row.route.destination,
+                        *run,
+                        old.registration_id(),
+                        synced,
+                        cleared,
+                    )
+                {
+                    members.insert(*run, old.clone());
+                    continue;
+                }
+            }
+            if desired_owners.contains(run)
+                && let Some((registration, Some(dev), member)) = bindings.get(run)
+                && unicast_dev(&row.route) == Some(*dev)
+                && synced
+                    .get(&(*run, *registration))
+                    .is_some_and(|prefixes| prefixes.contains(&row.route.destination))
+            {
+                members.insert(*run, member.clone());
+            }
+        }
+        members
+    }
+
+    #[cfg(feature = "tun")]
+    fn same_members(
+        left: &BTreeMap<Uuid, SharedVirtualNicMember>,
+        right: &BTreeMap<Uuid, SharedVirtualNicMember>,
+    ) -> bool {
+        left.len() == right.len()
+            && left.iter().all(|(run, member)| {
+                right
+                    .get(run)
+                    .is_some_and(|other| other.registration_id() == member.registration_id())
+            })
+    }
+
+    /// Whether a row's own member responsibility for this run is finished.
+    fn row_member_released(
+        &self,
+        row: &AppliedRoute,
+        run: Uuid,
+        synced: &BTreeMap<(Uuid, Uuid), BTreeSet<IpCidr>>,
+        cleared: &BTreeSet<(Uuid, Uuid)>,
+    ) -> bool {
+        #[cfg(feature = "tun")]
+        {
+            let Some(member) = row.members.get(&run) else {
+                return true;
+            };
+            self.member_responsibility_released(
+                &row.route.destination,
+                run,
+                member.registration_id(),
+                synced,
+                cleared,
+            )
+        }
+        #[cfg(not(feature = "tun"))]
+        {
+            let _ = (row, run, synced, cleared);
+            true
+        }
+    }
+
+    /// Whether this actual row may really be removed or released now.
+    ///
+    /// A raw declaration that still exists proves nothing about ownership: a
+    /// member whose whole admission was rejected keeps declaring the row, and
+    /// another member may already own the same exclusive key. The same planner
+    /// is asked again after the earlier waits, and only a declaration that
+    /// this fresh plan still selects as an owner — or a managed one whose
+    /// admission is merely pending with an error — keeps the row. Only when no
+    /// such owner is left do the old member prefix proofs decide; an
+    /// acknowledgement that still carries the destination is acceptable only
+    /// when another full row of that same registration now carries it.
+    ///
+    /// This only plans: it records a transient admission failure in the
+    /// caller's retry map, reads no OS state and changes no member claim.
+    async fn row_may_be_removed(
+        &self,
+        row: &AppliedRoute,
+        route_retries: &BTreeMap<
+            RouteKey,
+            (RouteSpec<u32>, bool, tokio::time::Instant, u32, Arc<str>),
+        >,
+        #[cfg(feature = "tun")] member_retries: &mut BTreeMap<
+            (Uuid, Uuid),
+            (
+                SharedVirtualNicMember,
+                BTreeSet<IpCidr>,
+                tokio::time::Instant,
+                u32,
+                Arc<str>,
+            ),
+        >,
+        synced: &BTreeMap<(Uuid, Uuid), BTreeSet<IpCidr>>,
+        cleared: &BTreeSet<(Uuid, Uuid)>,
+    ) -> bool {
+        let errors = self.retry_errors(
+            route_retries,
+            #[cfg(feature = "tun")]
+            member_retries,
+        );
+        let mut admission_failures = BTreeMap::new();
+        let fresh = self
+            .controller
+            .plan_reconciliation(None, &errors, Some(&mut admission_failures))
+            .await;
+        #[cfg(feature = "tun")]
+        self.record_admission_failures(&fresh, &admission_failures, member_retries);
+        #[cfg(not(feature = "tun"))]
+        let _ = (&admission_failures, synced, cleared);
+
+        let key = RouteKey::of(&row.route);
+        let mut missing = false;
+        {
+            // One short synchronous read of everything the fresh decision
+            // depends on: shutdown, the current root, policy, complete
+            // normalized declarations, managed devices and bindings. Nothing
+            // is held across an await.
+            let rt = self.controller.runtime.read();
+            if !rt.shutdown {
+                #[cfg(feature = "tun")]
+                let managed = Self::managed_devices(&rt);
+                for (run, instance) in &rt.instances {
+                    let declarations = Self::resolved_declarations(instance);
+                    if !declarations.contains(&row.route) {
+                        continue;
+                    }
+                    #[cfg(feature = "tun")]
+                    let own_dev = instance.interface.as_ref().map(|info| info.ifindex);
+                    #[cfg(feature = "tun")]
+                    let managed_dev = unicast_dev(&row.route).filter(|dev| managed.contains(dev));
+                    #[cfg(feature = "tun")]
+                    if let Some(dev) = managed_dev
+                        && Some(dev) != own_dev
+                    {
+                        // Another run's managed TUN, or an index this run does
+                        // not currently bind, is not this run's declaration.
+                        continue;
+                    }
+                    #[cfg(feature = "tun")]
+                    let registration = instance
+                        .member
+                        .as_ref()
+                        .map(SharedVirtualNicMember::registration_id);
+
+                    let owner = fresh.desired.get(&key).is_some_and(|(target, owners)| {
+                        *target == row.route && owners.contains(run)
+                    });
+                    if owner {
+                        #[cfg(feature = "tun")]
+                        if managed_dev.is_some()
+                            && fresh
+                                .members
+                                .get(run)
+                                .map(SharedVirtualNicMember::registration_id)
+                                != registration
+                        {
+                            // The plan selected an older binding of this run;
+                            // its current declaration is not decided yet.
+                            missing = true;
+                            continue;
+                        }
+                        return false;
+                    }
+                    #[cfg(feature = "tun")]
+                    if let Some(dev) = managed_dev {
+                        let Some(registration) = registration else {
+                            // Without a bound member the planner rejects every
+                            // managed declaration, so it owns nothing.
+                            continue;
+                        };
+                        let prefixes: BTreeSet<IpCidr> = declarations
+                            .iter()
+                            .filter(|route| unicast_dev(route) == Some(dev))
+                            .map(|route| route.destination)
+                            .collect();
+                        match admission_failures.get(&(*run, registration)) {
+                            Some((failed, RouteStatus::Pending { error: Some(_) }))
+                                if *failed == prefixes =>
+                            {
+                                // A transient failure of this exact candidate
+                                // set cannot prove the row is no longer
+                                // needed; its retry is already recorded.
+                                return false;
+                            }
+                            Some((
+                                failed,
+                                RouteStatus::Rejected(_) | RouteStatus::Pending { error: None },
+                            )) if *failed == prefixes => {
+                                // A rejected admission or a known invalid
+                                // binding is no owner of this row.
+                            }
+                            _ => missing = true,
+                        }
+                        continue;
+                    }
+                    // The fresh plan does not describe this declaration: it
+                    // arrived or was rebound while the plan waited. The next
+                    // round decides, never this stale evidence.
+                    missing = true;
+                }
+            }
+
+            #[cfg(feature = "tun")]
+            if !missing {
+                // Every old member's prefix responsibility must be settled.
+                for (run, member) in &row.members {
+                    let old_registration = member.registration_id();
+                    if cleared.contains(&(*run, old_registration)) {
+                        continue;
+                    }
+                    let Some(acknowledged) = synced.get(&(*run, old_registration)) else {
+                        // Neither an acknowledgement nor a clear: not proof.
+                        return false;
+                    };
+                    if !acknowledged.contains(&row.route.destination) {
+                        continue;
+                    }
+                    // The acknowledgement still carries this prefix. Only
+                    // another selected full row of the same registration,
+                    // under the current root, policy and binding, may justify
+                    // keeping it.
+                    let justified = if rt.shutdown {
+                        false
+                    } else if let Some(instance) = rt.instances.get(run) {
+                        let bound = instance
+                            .member
+                            .as_ref()
+                            .map(SharedVirtualNicMember::registration_id);
+                        let planned = fresh
+                            .members
+                            .get(run)
+                            .map(SharedVirtualNicMember::registration_id);
+                        if bound != Some(old_registration) || planned != Some(old_registration) {
+                            // A released or rebound member cannot borrow the
+                            // old registration's acknowledgement.
+                            false
+                        } else {
+                            let dev = instance.interface.as_ref().map(|info| info.ifindex);
+                            let declarations = Self::resolved_declarations(instance);
+                            fresh.desired.values().any(|(route, owners)| {
+                                route != &row.route
+                                    && route.destination == row.route.destination
+                                    && owners.contains(run)
+                                    && unicast_dev(route).is_some()
+                                    && unicast_dev(route) == dev
+                                    && declarations.contains(route)
+                            })
+                        }
+                    } else {
+                        false
+                    };
+                    if !justified {
+                        return false;
+                    }
+                }
+            }
+        }
+        if missing {
+            // The next round must re-plan the declaration this plan predates.
+            // This guarantees one fresh round; it is not a retry loop.
+            self.controller.dirty.mark();
+        }
+        !missing
+    }
+
+    /// Whether this registration no longer owes the row's prefix.
+    ///
+    /// A cleared registration is finished. An acknowledgement that excludes
+    /// the prefix is too, and so is one that still contains it when another
+    /// current declaration of the same member needs that prefix anyway.
+    #[cfg(feature = "tun")]
+    fn member_responsibility_released(
+        &self,
+        prefix: &IpCidr,
+        run: Uuid,
+        registration: Uuid,
+        synced: &BTreeMap<(Uuid, Uuid), BTreeSet<IpCidr>>,
+        cleared: &BTreeSet<(Uuid, Uuid)>,
+    ) -> bool {
+        if cleared.contains(&(run, registration)) {
+            return true;
+        }
+        let Some(acknowledged) = synced.get(&(run, registration)) else {
+            return false;
+        };
+        if !acknowledged.contains(prefix) {
+            return true;
+        }
+        self.declared_member_prefixes(run, registration)
+            .is_some_and(|prefixes| prefixes.contains(prefix))
+    }
+
+    /// Routes this run currently declares through its own bound member device.
+    ///
+    /// `None` means the registry or the binding is gone, so the member's
+    /// current target is empty. Nothing outlives the short read lock.
+    #[cfg(feature = "tun")]
+    fn declared_member_routes(
+        &self,
+        run: Uuid,
+        registration: Uuid,
+    ) -> Option<BTreeSet<RouteSpec<u32>>> {
+        let rt = self.controller.runtime.read();
+        if rt.shutdown {
+            return None;
+        }
+        let instance = rt.instances.get(&run)?;
+        if instance.member.as_ref()?.registration_id() != registration {
+            return None;
+        }
+        let dev = instance.interface.as_ref()?.ifindex;
+        Some(
+            Self::resolved_declarations(instance)
+                .into_iter()
+                .filter(|route| unicast_dev(route) == Some(dev))
+                .collect(),
+        )
+    }
+
+    #[cfg(feature = "tun")]
+    fn declared_member_prefixes(&self, run: Uuid, registration: Uuid) -> Option<BTreeSet<IpCidr>> {
+        self.declared_member_routes(run, registration)
+            .map(|routes| routes.into_iter().map(|route| route.destination).collect())
+    }
+
+    /// Drop retries that no longer guard any uncertainty or cleanup.
+    fn prune_route_retries(
+        &self,
+        retries: &mut BTreeMap<
+            RouteKey,
+            (RouteSpec<u32>, bool, tokio::time::Instant, u32, Arc<str>),
+        >,
+        desired: &BTreeMap<RouteKey, (RouteSpec<u32>, BTreeSet<Uuid>)>,
+    ) {
+        let applied = self.controller.runtime.read().applied.clone();
+        retries.retain(|key, (route, add, _, _, _)| {
+            let confirmed = applied.get(key).is_some_and(|row| {
+                row.route == *route
+                    && matches!(row.effect, RouteEffect::Owned | RouteEffect::External)
+            });
+            let wanted = desired.get(key).is_some_and(|(target, _)| target == route);
+            if *add {
+                if confirmed {
+                    return false;
+                }
+                wanted
+                    || applied
+                        .get(key)
+                        .is_some_and(|row| row.route == *route && row.effect == RouteEffect::Adding)
+            } else {
+                match applied.get(key) {
+                    Some(row) if row.route == *route => !(confirmed && wanted),
+                    _ => false,
+                }
+            }
+        });
+    }
+
+    /// One complete desktop audit of the actual ledger.
+    ///
+    /// It reads the whole ledger once and asks the backend about every recorded
+    /// row in one bounded batch. An incomplete readback proves nothing about
+    /// absence: the ledger, its effects and every slot status stay untouched
+    /// and the error belongs to the audit's own backoff. The return value is
+    /// whether a record was really confirmed missing and removed; that is
+    /// actual progress the normal reconcile repairs from the current inputs.
+    ///
+    /// The audit never re-plans: it only invalidates the declarations this
+    /// readback proved missing, so an unrelated member admission cannot turn a
+    /// healthy row pending. Every other status is left for the next reconcile.
+    pub(crate) async fn audit(
+        &mut self,
+        route_retries: &mut BTreeMap<
+            RouteKey,
+            (RouteSpec<u32>, bool, tokio::time::Instant, u32, Arc<str>),
+        >,
+        #[cfg(feature = "tun")] member_retries: &mut BTreeMap<
+            (Uuid, Uuid),
+            (
+                SharedVirtualNicMember,
+                BTreeSet<IpCidr>,
+                tokio::time::Instant,
+                u32,
+                Arc<str>,
+            ),
+        >,
+    ) -> anyhow::Result<bool> {
+        // One short lock copies the complete actual rows: full route, effect,
+        // owners and member registrations. No lock survives the readback.
+        let observed = self.controller.runtime.read().applied.clone();
+        if observed.is_empty() {
+            return Ok(false);
+        }
+        let requested: BTreeSet<RouteSpec<u32>> =
+            observed.values().map(|row| row.route.clone()).collect();
+        let existing =
+            match tokio::time::timeout(ROUTE_IO_TIMEOUT, self.backend.existing(&requested)).await {
+                Ok(Ok(existing)) => existing,
+                // A partial or failed readback is not a missing route.
+                Ok(Err(failure)) => return Err(failure.into()),
+                Err(_) => return Err(anyhow::anyhow!("timed out reading existing routes")),
+            };
+
+        // Only a record that is still exactly what was observed may adopt this
+        // readback's absence. A row that appeared, changed effect, gained or
+        // lost an owner or changed its member registration meanwhile belongs to
+        // the newer facts. A complete, still identity-matching absence clears
+        // every effect, Adding and Removing included; a present Adding row does
+        // not gain ownership, and a present Removing row keeps its record.
+        let mut removed: Vec<(RouteKey, RouteSpec<u32>, RouteEffect)> = Vec::new();
+        {
+            let mut rt = self.controller.runtime.write();
+            for (key, row) in &observed {
+                if existing.contains(&row.route) {
+                    continue;
+                }
+                let unchanged = rt.applied.get(key).is_some_and(|current| {
+                    let same = current.route == row.route
+                        && current.effect == row.effect
+                        && current.owners == row.owners;
+                    #[cfg(feature = "tun")]
+                    let same = same && Self::same_members(&current.members, &row.members);
+                    same
+                });
+                if unchanged {
+                    rt.applied.remove(key);
+                    removed.push((key.clone(), row.route.clone(), row.effect));
+                }
+            }
+        }
+        if removed.is_empty() {
+            return Ok(false);
+        }
+
+        // The observation and this local map hold the real member handles until
+        // the audit ends; the ledger entry was only removed, not its cleanup
+        // responsibility.
+        #[cfg(feature = "tun")]
+        let mut removed_members: BTreeMap<(Uuid, Uuid), SharedVirtualNicMember> = BTreeMap::new();
+        let mut missing: BTreeSet<RouteSpec<u32>> = BTreeSet::new();
+        for (key, route, effect) in &removed {
+            // Only the retry of this exact row and operation is stale: a
+            // confirmed absence is real progress for it.
+            let stale = |add: bool| match effect {
+                RouteEffect::Owned | RouteEffect::External => true,
+                RouteEffect::Adding => add,
+                RouteEffect::Removing => !add,
+            };
+            if route_retries
+                .get(key)
+                .is_some_and(|(failed, add, ..)| failed == route && stale(*add))
+            {
+                route_retries.remove(key);
+            }
+            #[cfg(feature = "tun")]
+            if let Some(row) = observed.get(key) {
+                for (run, member) in &row.members {
+                    removed_members
+                        .entry((*run, member.registration_id()))
+                        .or_insert_with(|| member.clone());
+                }
+            }
+            missing.insert(route.clone());
+        }
+
+        // A member no longer held by its run's binding and by no other actual
+        // row still owes the prefix withdrawal; keep it in the existing
+        // empty-goal retry. An entry that already has an empty goal keeps its
+        // own deadline.
+        #[cfg(feature = "tun")]
+        {
+            let empty_synced = BTreeMap::new();
+            let empty_cleared = BTreeSet::new();
+            self.transfer_orphan_members(
+                &removed_members,
+                member_retries,
+                &empty_synced,
+                &empty_cleared,
+            );
+        }
+
+        // Invalidate only the current declarations this readback proved
+        // missing. Everything recomputed here comes from the live runtime: a
+        // released root, a rebound device or a withdrawn slot is never
+        // described by an older observation, and no slot is prepared or
+        // re-planned.
+        let errors = self.retry_errors(
+            route_retries,
+            #[cfg(feature = "tun")]
+            member_retries,
+        );
+        {
+            let rt = self.controller.runtime.read();
+            if !rt.shutdown {
+                for instance in rt.instances.values() {
+                    let Some(registry) = instance.registry.upgrade() else {
+                        continue;
+                    };
+                    let manual = instance
+                        .config
+                        .as_ref()
+                        .and_then(|config| config.snapshot().services.manual_routes.clone());
+                    #[cfg(feature = "tun")]
+                    let tun_ifindex = instance.interface.as_ref().map(|info| info.ifindex);
+                    #[cfg(not(feature = "tun"))]
+                    let tun_ifindex = None;
+                    for weak in registry.slots() {
+                        let Some(slot) = weak.upgrade() else {
+                            continue;
+                        };
+                        let source = slot.source();
+                        let manual = manual.as_ref();
+                        slot.update_statuses(|declaration| {
+                            // The current policy decides what this slot
+                            // contributes at all.
+                            if source == RouteSource::AutoProxy && manual.is_some() {
+                                return None;
+                            }
+                            let resolved = declaration.clone().resolve(tun_ifindex)?;
+                            let route = normalize_route(resolved).ok()?;
+                            if !missing.contains(&route) {
+                                return None;
+                            }
+                            let confirmed =
+                                rt.applied.get(&RouteKey::of(&route)).is_some_and(|row| {
+                                    row.route == route
+                                        && matches!(
+                                            row.effect,
+                                            RouteEffect::Owned | RouteEffect::External
+                                        )
+                                });
+                            if confirmed {
+                                return None;
+                            }
+                            Some(RouteStatus::Pending {
+                                error: errors.get(&route).cloned(),
+                            })
+                        });
+                    }
+                }
+            }
+        }
+
+        // The normal reconcile repairs these rows from the current inputs.
+        self.controller.dirty.mark();
+        self.controller.changed().notify_waiters();
+        Ok(true)
+    }
+
+    /// Perform one real desktop addition and record its actual result.
+    ///
+    /// The caller has already rechecked, in its last short synchronous step,
+    /// the current root, policy, complete declarations and registration. The
+    /// owners are nonempty, `members` holds only acknowledged members, and the
+    /// caller's local related set keeps the cleanup handles. Nothing awaits
+    /// before this operation's record is registered. The confirmed fact is
+    /// recorded before returning; Slot feedback, owner removal, a compensating
+    /// delete, dirty marking and backoff all belong to later rounds.
+    async fn add_route_effect(
+        &mut self,
+        route: RouteSpec<u32>,
+        owners: BTreeSet<Uuid>,
+        #[cfg(feature = "tun")] members: BTreeMap<Uuid, SharedVirtualNicMember>,
+    ) -> Result<(), RouteError> {
+        let key = RouteKey::of(&route);
+        // The record precedes the system call: an addition in flight is not a
+        // confirmed effect and never replaces an existing actual row.
+        {
+            let mut rt = self.controller.runtime.write();
+            if owners.is_empty() {
+                return Err(RouteError::Failed(anyhow::anyhow!(
+                    "route {} has no owner",
+                    route.destination
+                )));
+            }
+            if rt.applied.contains_key(&key) {
+                return Err(RouteError::Failed(anyhow::anyhow!(
+                    "route {} already has an applied record",
+                    route.destination
+                )));
+            }
+            rt.applied.insert(
+                key.clone(),
+                AppliedRoute {
+                    route: route.clone(),
+                    owners: owners.clone(),
+                    effect: RouteEffect::Adding,
+                    #[cfg(feature = "tun")]
+                    members: members.clone(),
+                },
+            );
+        }
+
+        // The call, not the match, owns the borrow of `route`: a match
+        // scrutinee keeps its temporaries until the whole match ends.
+        let result = tokio::time::timeout(Duration::from_secs(5), self.backend.add(&route)).await;
+        match result {
+            // The addition really happened: the same key and the same full
+            // route become the confirmed fact immediately.
+            Ok(Ok(())) => {
+                let mut rt = self.controller.runtime.write();
+                if let Some(row) = rt.applied.get_mut(&key)
+                    && row.route == route
+                {
+                    row.effect = RouteEffect::Owned;
+                }
+                Ok(())
+            }
+            // A definite failure first removes this operation's record and
+            // restores the empty ledger. Only an "already exists" failure is
+            // probed for a complete external row; other failures are never
+            // read back into an External effect.
+            Ok(Err(RouteError::Failed(error))) => {
+                {
+                    let mut rt = self.controller.runtime.write();
+                    if rt
+                        .applied
+                        .get(&key)
+                        .is_some_and(|row| row.effect == RouteEffect::Adding && row.route == route)
+                    {
+                        rt.applied.remove(&key);
+                    }
+                }
+
+                let already_exists = error.chain().any(|cause| {
+                    cause
+                        .downcast_ref::<std::io::Error>()
+                        .is_some_and(|cause| cause.kind() == std::io::ErrorKind::AlreadyExists)
+                });
+                if !already_exists {
+                    return Err(RouteError::Failed(error));
+                }
+
+                // A complete matching row may satisfy this declaration; only a
+                // complete match becomes External, and nothing is deleted.
+                let requested = BTreeSet::from([route.clone()]);
+                let existing =
+                    tokio::time::timeout(Duration::from_secs(5), self.backend.existing(&requested))
+                        .await;
+                match existing {
+                    Ok(Ok(existing)) if existing.contains(&route) => {
+                        self.controller.runtime.write().applied.insert(
+                            key,
+                            AppliedRoute {
+                                route,
+                                owners,
+                                effect: RouteEffect::External,
+                                #[cfg(feature = "tun")]
+                                members,
+                            },
+                        );
+                        Ok(())
+                    }
+                    // A readback error or a partial match keeps the original
+                    // definite failure; it is not success.
+                    _ => Err(RouteError::Failed(error)),
+                }
+            }
+            // An unknown outcome, including an add timeout, keeps the Adding
+            // record: the side effect may have happened, so neither drop the
+            // responsibility nor promote it to Owned.
+            Ok(Err(RouteError::Unknown(error))) => Err(RouteError::Unknown(error)),
+            Err(_) => Err(RouteError::Unknown(anyhow::anyhow!(
+                "timed out adding route {}",
+                route.destination
+            ))),
+        }
+    }
+
+    /// Perform one real desktop removal and record its actual result.
+    ///
+    /// The caller has already confirmed that this route must be withdrawn, has
+    /// released the member prefixes that are no longer needed and keeps the
+    /// related cleanup handles in its local set. Only a full row that matches
+    /// this key and route and is already Owned or Removing has delete rights;
+    /// an External or Adding row fails without any system operation. The
+    /// record becomes Removing before the call. A definite delete, or a
+    /// definite failure whose single readback proves the row absent, removes
+    /// the record; an unknown outcome keeps Removing. Slot feedback, owner
+    /// removal, marking and backoff all belong to later rounds.
+    async fn remove_route_effect(&mut self, route: &RouteSpec<u32>) -> Result<(), RouteError> {
+        let key = RouteKey::of(route);
+        {
+            let mut rt = self.controller.runtime.write();
+            let Some(row) = rt.applied.get_mut(&key) else {
+                return Err(RouteError::Failed(anyhow::anyhow!(
+                    "route {} has no applied record",
+                    route.destination
+                )));
+            };
+            if row.route != *route {
+                return Err(RouteError::Failed(anyhow::anyhow!(
+                    "route {} has a different applied record",
+                    route.destination
+                )));
+            }
+            match row.effect {
+                // Both already hold the delete right; the second call of an
+                // earlier unknown removal simply stays in flight.
+                RouteEffect::Owned | RouteEffect::Removing => row.effect = RouteEffect::Removing,
+                RouteEffect::External | RouteEffect::Adding => {
+                    return Err(RouteError::Failed(anyhow::anyhow!(
+                        "route {} cannot be removed with effect {:?}",
+                        route.destination,
+                        row.effect
+                    )));
+                }
+            }
+        }
+
+        // The call, not the match, owns the borrow of `route`.
+        let result = tokio::time::timeout(Duration::from_secs(5), self.backend.remove(route)).await;
+        match result {
+            // The row really went away: the record of this exact route is no
+            // longer an effect that still exists.
+            Ok(Ok(())) => {
+                let mut rt = self.controller.runtime.write();
+                if rt.applied.get(&key).is_some_and(|row| row.route == *route) {
+                    rt.applied.remove(&key);
+                }
+                Ok(())
+            }
+            // A definite failure does not prove the row absent. Restore the
+            // prior actual record first, then allow exactly one complete
+            // readback to confirm the deletion did happen anyway.
+            Ok(Err(RouteError::Failed(error))) => {
+                {
+                    let mut rt = self.controller.runtime.write();
+                    if let Some(row) = rt.applied.get_mut(&key)
+                        && row.route == *route
+                        && row.effect == RouteEffect::Removing
+                    {
+                        row.effect = RouteEffect::Owned;
+                    }
+                }
+
+                let requested = BTreeSet::from([route.clone()]);
+                let existing =
+                    tokio::time::timeout(Duration::from_secs(5), self.backend.existing(&requested))
+                        .await;
+                match existing {
+                    // A complete readback without the row is the only other
+                    // evidence that the removal happened.
+                    Ok(Ok(existing)) if !existing.contains(route) => {
+                        let mut rt = self.controller.runtime.write();
+                        if rt.applied.get(&key).is_some_and(|row| row.route == *route) {
+                            rt.applied.remove(&key);
+                        }
+                        Ok(())
+                    }
+                    // The row is still there, or the readback itself failed:
+                    // keep the restored Owned record and the original failure.
+                    _ => Err(RouteError::Failed(error)),
+                }
+            }
+            // An unknown outcome, including a removal timeout, keeps the
+            // Removing record: the deletion may have happened, so neither the
+            // right nor the responsibility is dropped.
+            Ok(Err(RouteError::Unknown(error))) => Err(RouteError::Unknown(error)),
+            Err(_) => Err(RouteError::Unknown(anyhow::anyhow!(
+                "timed out removing route {}",
+                route.destination
+            ))),
+        }
+    }
+}
+
+#[cfg(not(mobile))]
+impl RouteController {
+    /// Rebuild this round's target and feed the current declarations.
+    ///
+    /// `synced` is this round's local `(run, registration) -> acknowledged
+    /// prefixes` set: `None` plans before executing, `Some` feeds back after
+    /// execution. `errors` holds this round's local installation failures.
+    /// `admission_failures`, when given, is cleared on entry and then receives
+    /// only this call's failed member admissions. None of them is stored
+    /// anywhere. The target is rebuilt from the current inputs; the applied
+    /// ledger is only read for comparison and is never replaced, cleared or
+    /// written from here.
+    pub(crate) async fn plan_reconciliation(
+        &self,
+        synced: Option<&BTreeMap<(Uuid, Uuid), BTreeSet<IpCidr>>>,
+        errors: &BTreeMap<RouteSpec<u32>, Arc<str>>,
+        admission_failures: Option<&mut BTreeMap<(Uuid, Uuid), (BTreeSet<IpCidr>, RouteStatus)>>,
+    ) -> ReconcilePlan {
+        let mut admission_failures = admission_failures;
+        if let Some(failures) = admission_failures.as_deref_mut() {
+            // The caller's record describes this call only.
+            failures.clear();
+        }
+        // A. Copy the current inputs, slots and, with the TUN feature, members
+        // and managed interfaces under one short read lock. No registry or
+        // slot strong reference survives it.
+        let mut slots = Vec::new();
+        #[cfg(feature = "tun")]
+        let mut members = BTreeMap::new();
+        let mut inputs = Vec::new();
+        #[cfg(feature = "tun")]
+        let mut managed = BTreeSet::new();
+        let applied = {
+            let rt = self.runtime.read();
+            #[cfg(feature = "tun")]
+            {
+                for instance in rt.instances.values() {
+                    if let Some(info) = &instance.interface {
+                        managed.insert(info.ifindex);
+                    }
+                }
+                for row in rt.applied.values() {
+                    if !row.members.is_empty()
+                        && let Some(dev) = unicast_dev(&row.route)
+                    {
+                        managed.insert(dev);
+                    }
+                }
+            }
+            for (run, instance) in &rt.instances {
+                #[cfg(feature = "tun")]
+                if let Some(member) = &instance.member {
+                    members.insert(*run, member.clone());
+                }
+                if rt.shutdown {
+                    continue;
+                }
+                let Some((declarations, instance_slots)) = instance.declarations() else {
+                    continue;
+                };
+                for weak in instance_slots {
+                    slots.push((*run, weak));
+                }
+                // Without the TUN feature an instance has no real device, so
+                // its `Tun` declarations stay unresolved.
+                #[cfg(feature = "tun")]
+                let interface = instance.interface.clone();
+                #[cfg(not(feature = "tun"))]
+                let interface = None::<InterfaceInfo>;
+                inputs.push((*run, declarations, interface));
+            }
+            rt.applied.clone()
+        };
+
+        // B/C. Resolve each declaration through this run's real device, then
+        // normalize the platform fields. Everything that reaches a managed TUN
+        // needs this run's matching member; other routes go straight into the
+        // system candidates.
+        let mut planned = BTreeMap::<(Uuid, RouteSpec<RouteDevice>), RouteSpec<u32>>::new();
+        // Per-member admission outcomes, tied to the resolved contents and the
+        // registration that produced them. Parameter and ownership errors are
+        // recomputed during feedback; only the whole-member admission needs
+        // this round's NIC result.
+        #[cfg(feature = "tun")]
+        let mut admission_failed =
+            BTreeMap::<(Uuid, RouteSpec<RouteDevice>), (RouteSpec<u32>, Uuid, RouteStatus)>::new();
+        let mut claims = BTreeMap::<RouteKey, Vec<(RouteSpec<u32>, Uuid)>>::new();
+        #[cfg(feature = "tun")]
+        let mut through_tun =
+            BTreeMap::<Uuid, Vec<(RouteSpec<u32>, RouteSpec<RouteDevice>)>>::new();
+
+        for (run, declarations, interface) in &inputs {
+            let tun_ifindex = interface.as_ref().map(|info| info.ifindex);
+            for declaration in declarations {
+                let Some(resolved) = declaration.clone().resolve(tun_ifindex) else {
+                    // `Tun` without a bound device stays pending until the
+                    // binding changes.
+                    continue;
+                };
+                let Ok(route) = normalize_route(resolved) else {
+                    // A real input error, recomputed during feedback.
+                    continue;
+                };
+                match unicast_dev(&route) {
+                    // Only this run's own bound device goes through member
+                    // admission. An index into another known managed TUN has no
+                    // matching member here, so it is rejected rather than
+                    // becoming an ordinary system route; feedback recomputes
+                    // that from the same current interface set.
+                    #[cfg(feature = "tun")]
+                    Some(dev) if managed.contains(&dev) => {
+                        if Some(dev) != tun_ifindex {
+                            continue;
+                        }
+                        through_tun
+                            .entry(*run)
+                            .or_default()
+                            .push((route, declaration.clone()));
+                    }
+                    // Without the TUN feature nothing is managed, and a normal
+                    // interface needs no TUN membership either.
+                    _ => {
+                        planned.insert((*run, declaration.clone()), route.clone());
+                        claims
+                            .entry(RouteKey::of(&route))
+                            .or_default()
+                            .push((route, *run));
+                    }
+                }
+            }
+        }
+
+        // D. Admit every TUN candidate of a member as one whole, using the
+        // current registration and the existing overlap rule. This only plans:
+        // nothing is committed and the returned claims are dropped here.
+        #[cfg(feature = "tun")]
+        for (run, candidates) in &through_tun {
+            let prefixes: BTreeSet<IpCidr> = candidates
+                .iter()
+                .map(|(route, _)| route.destination)
+                .collect();
+            let member = members.get(run);
+            let registration = member.map(SharedVirtualNicMember::registration_id);
+            let admission: Result<_, RouteStatus> = match member {
+                // Reaching a managed device without this run's own member would
+                // bypass admission, so it is an input error.
+                None => Err(RouteStatus::Rejected(
+                    "route targets a managed tun interface this instance does not own".into(),
+                )),
+                Some(member) => {
+                    let nic = member.shared_nic();
+                    // Bounding this wait only settles this member's admission;
+                    // the rest of the round still plans, and the retry policy
+                    // belongs to the caller's next round.
+                    match tokio::time::timeout(Duration::from_secs(5), nic.lock()).await {
+                        Err(_) => Err(RouteStatus::Pending {
+                            error: Some(
+                                format!(
+                                    "timed out locking shared NIC for member {}",
+                                    member.member_id()
+                                )
+                                .into(),
+                            ),
+                        }),
+                        Ok(guard) => {
+                            // Recheck under the NIC lock: a member may close or
+                            // its binding may go stale while this round waits
+                            // for it, and neither may prepare. Those facts are
+                            // already known invalidations, not failed attempts.
+                            if member.ensure_open().is_err()
+                                || !guard.is_valid()
+                                || !guard.is_current_member_registration(
+                                    member.member_id(),
+                                    member.registration_id(),
+                                )
+                            {
+                                Err(RouteStatus::Pending { error: None })
+                            } else {
+                                match guard.prepare_managed_routes(
+                                    member.member_id(),
+                                    member.registration_id(),
+                                    &prefixes,
+                                ) {
+                                    Ok(claims) => Ok(claims),
+                                    // A whole-member overlap is an input error until the
+                                    // declarations or the topology change.
+                                    Err(error) if error.is::<SharedIfConfigConflict>() => {
+                                        Err(RouteStatus::Rejected(error.to_string().into()))
+                                    }
+                                    // The binding was current, valid and open, so
+                                    // this is a real failed prepare the caller may
+                                    // retry.
+                                    Err(error) => Err(RouteStatus::Pending {
+                                        error: Some(error.to_string().into()),
+                                    }),
+                                }
+                            }
+                        }
+                    }
+                }
+            };
+            match admission {
+                Ok(_claims) => {
+                    for (route, declaration) in candidates {
+                        planned.insert((*run, declaration.clone()), route.clone());
+                        claims
+                            .entry(RouteKey::of(route))
+                            .or_default()
+                            .push((route.clone(), *run));
+                    }
+                }
+                Err(status) => {
+                    if let Some(registration) = registration {
+                        if let Some(failures) = admission_failures.as_deref_mut() {
+                            failures.insert((*run, registration), (prefixes, status.clone()));
+                        }
+                        for (route, declaration) in candidates {
+                            admission_failed.insert(
+                                (*run, declaration.clone()),
+                                (route.clone(), registration, status.clone()),
+                            );
                         }
                     }
                 }
             }
         }
 
-        // 2. Business slots
-        for weak in &self.slots {
-            let Some(slot) = weak.upgrade() else {
+        // E. One complete row per physical key. The row already installed wins
+        // while it is still a candidate; otherwise the first claim in stable
+        // run and declaration order does. Different keys coexist, so a metric
+        // never acts as a per-prefix selector.
+        let mut desired: BTreeMap<RouteKey, (RouteSpec<u32>, BTreeSet<Uuid>)> = BTreeMap::new();
+        for (key, mut key_claims) in claims {
+            key_claims.sort_by_key(|(_, run)| *run);
+            let winner = applied
+                .get(&key)
+                .map(|row| row.route.clone())
+                .filter(|current| key_claims.iter().any(|(route, _)| route == current))
+                .or_else(|| key_claims.first().map(|(route, _)| route.clone()));
+            let Some(winner) = winner else {
                 continue;
             };
-            let run = slot.instance();
-            let is_auto_suppressed = slot.is_auto_proxy()
-                && self.instances.get(&run).is_some_and(|entry| {
-                    entry
-                        .routes
-                        .config()
-                        .is_some_and(|c| c.snapshot().services.manual_routes.is_some())
-                });
-
-            if is_auto_suppressed {
-                suppressed_slots.push(weak.clone());
-                continue;
-            }
-
-            for spec in slot.routes() {
-                if let Ok(metric) = validate_tun_spec(&spec) {
-                    let route = OsRoute {
-                        table: spec.table.unwrap_or(254),
-                        destination: spec.destination,
-                        metric,
-                        ifindex: active_if.ifindex,
-                        preferred_source: spec.preferred_source,
-                    };
-                    claims_by_key
-                        .entry(route.slot())
-                        .or_default()
-                        .push((metric, run, Some(weak.clone())));
-                }
-            }
-        }
-
-        // 3. Metric arbitration per slot key
-        let mut desired_routes = BTreeMap::new();
-        let mut winning_slots = Vec::new();
-
-        for (slot_key, mut claims) in claims_by_key {
-            claims.sort_by_key(|c| c.0);
-            let min_metric = claims[0].0;
-            let mut owners = BTreeSet::new();
-
-            for (metric, owner, opt_slot) in claims {
-                if metric == min_metric {
-                    owners.insert(owner);
-                    if let Some(slot) = opt_slot {
-                        winning_slots.push(slot);
-                    }
-                } else if let Some(slot) = opt_slot {
-                    suppressed_slots.push(slot);
-                }
-            }
-
-            let os_route = OsRoute {
-                table: slot_key.table,
-                destination: slot_key.destination,
-                metric: min_metric,
-                ifindex: active_if.ifindex,
-                preferred_source: None,
-            };
-            desired_routes.insert(slot_key, (os_route, owners));
-        }
-
-        // 4. Calculate Add / Remove diff against current applied
-        let mut to_remove = Vec::new();
-        let mut to_add = Vec::new();
-        let mut new_applied = AppliedRoutes::default();
-
-        let all_keys: BTreeSet<OsRouteSlotKey> = self
-            .applied
-            .keys()
-            .chain(desired_routes.keys())
-            .cloned()
-            .collect();
-
-        for slot_key in all_keys {
-            let current = self.applied.get(&slot_key);
-            let desired = desired_routes.get(&slot_key);
-
-            match (desired, current) {
-                (None, Some(applied)) => {
-                    to_remove.push(applied.route.clone());
-                }
-                (Some((route, owners)), None) => {
-                    to_add.push(route.clone());
-                    new_applied.insert(slot_key, AppliedRoute::new(route.clone(), owners.clone()));
-                }
-                (Some((route, owners)), Some(applied)) => {
-                    if applied.route.metric != route.metric
-                        || applied.route.ifindex != active_if.ifindex
-                    {
-                        to_remove.push(applied.route.clone());
-                        to_add.push(route.clone());
-                    }
-                    new_applied.insert(slot_key, AppliedRoute::new(route.clone(), owners.clone()));
-                }
-                (None, None) => {}
-            }
-        }
-
-        Some(ReconcilePlan {
-            routes_to_remove: to_remove,
-            routes_to_add: to_add,
-            slots_to_mark_ready: winning_slots,
-            slots_to_suppress: suppressed_slots,
-            closed_instances,
-            new_applied,
-        })
-    }
-
-    fn commit_plan(&mut self, plan: ReconcilePlan) {
-        self.applied = plan.new_applied;
-        for weak in plan.slots_to_mark_ready {
-            if let Some(slot) = weak.upgrade() {
-                slot.set_ready();
-            }
-        }
-        for weak in plan.slots_to_suppress {
-            if let Some(slot) = weak.upgrade() {
-                slot.set_suppressed();
-            }
-        }
-        for run in plan.closed_instances {
-            let has_routes = self
-                .slots
+            let owners: BTreeSet<Uuid> = key_claims
                 .iter()
-                .any(|w| w.upgrade().is_some_and(|s| s.instance() == run && !s.is_closed()));
-            if !has_routes {
-                self.instances.remove(&run);
+                .filter(|(route, _)| *route == winner)
+                .map(|(_, run)| *run)
+                .collect();
+            desired.insert(key, (winner, owners));
+        }
+
+        // F. Diff the target against the actual ledger. Adding and Removing
+        // effects stay unconfirmed, and the ledger itself stays untouched.
+        let mut remove = Vec::new();
+        let mut add = Vec::new();
+        for (key, row) in &applied {
+            if desired
+                .get(key)
+                .is_none_or(|(route, _)| *route != row.route)
+            {
+                remove.push(row.route.clone());
             }
         }
-    }
-}
+        for (key, (route, _)) in &desired {
+            let confirmed = applied.get(key).is_some_and(|row| {
+                row.route == *route
+                    && matches!(row.effect, RouteEffect::Owned | RouteEffect::External)
+            });
+            if !confirmed {
+                add.push(route.clone());
+            }
+        }
 
-#[cfg(mobile)]
-impl RouteController {
-    pub fn reconcile_mobile(&self) {
-        let mut rt = self.runtime.write();
-        rt.slots
-            .retain(|weak| weak.upgrade().is_some_and(|s| !s.is_closed()));
+        // Feedback. One short synchronous scope re-reads the live runtime:
+        // shutdown, the current instance records and their live slots, the
+        // current policy and bindings, and the actual ledger. Nothing awaits
+        // here, so no registry root or slot handle crosses a suspension point.
+        // Each run's temporary root lives only until that run's feedback ends.
+        {
+            let rt = self.runtime.read();
+            if !rt.shutdown {
+                // The managed set is recomputed from the current bindings and
+                // ledger, not from the copied planning inputs.
+                #[cfg(feature = "tun")]
+                let mut managed = BTreeSet::new();
+                #[cfg(feature = "tun")]
+                {
+                    for instance in rt.instances.values() {
+                        if let Some(info) = &instance.interface {
+                            managed.insert(info.ifindex);
+                        }
+                    }
+                    for row in rt.applied.values() {
+                        if !row.members.is_empty()
+                            && let Some(dev) = unicast_dev(&row.route)
+                        {
+                            managed.insert(dev);
+                        }
+                    }
+                }
 
-        let mut prefixes = BTreeSet::new();
-        for weak in &rt.slots {
-            if let Some(slot) = weak.upgrade() {
-                for spec in slot.routes() {
-                    prefixes.insert(spec.destination);
+                for (run, instance) in &rt.instances {
+                    let Some(registry) = instance.registry.upgrade() else {
+                        // The instance withdrew its inputs; no feedback.
+                        continue;
+                    };
+                    let run = *run;
+                    // A failed admission describes the whole candidate set it
+                    // prepared. If any other managed declaration of this member
+                    // changed while it awaited, that failure no longer describes
+                    // the current input and the next marked round decides.
+                    #[cfg(feature = "tun")]
+                    let admission_prefixes = admission_failed
+                        .keys()
+                        .any(|(failed_run, _)| *failed_run == run)
+                        .then(|| {
+                            let planned: BTreeSet<IpCidr> = through_tun
+                                .get(&run)
+                                .into_iter()
+                                .flatten()
+                                .map(|(route, _)| route.destination)
+                                .collect();
+                            let current: BTreeSet<IpCidr> = instance
+                                .interface
+                                .as_ref()
+                                .map_or_else(BTreeSet::new, |info| {
+                                    let dev = info.ifindex;
+                                    let (declarations, slots) =
+                                        instance.declarations().unwrap_or_default();
+                                    drop(slots);
+                                    declarations
+                                        .into_iter()
+                                        .filter_map(|declaration| declaration.resolve(Some(dev)))
+                                        .filter_map(|resolved| normalize_route(resolved).ok())
+                                        .filter(|route| unicast_dev(route) == Some(dev))
+                                        .map(|route| route.destination)
+                                        .collect()
+                                });
+                            planned == current
+                        });
+                    for weak in registry.slots() {
+                        let Some(slot) = weak.upgrade() else {
+                            continue;
+                        };
+                        let source = slot.source();
+                        slot.update_statuses(|declaration| {
+                            let manual = instance.config.as_ref().is_some_and(|store| {
+                                store.snapshot().services.manual_routes.is_some()
+                            });
+                            if source == RouteSource::AutoProxy && manual {
+                                return Some(RouteStatus::Suppressed(
+                                    "manual routes replace auto proxy declarations".into(),
+                                ));
+                            }
+
+                            // Without the TUN feature an instance has no real
+                            // device, so its `Tun` declarations stay pending.
+                            #[cfg(feature = "tun")]
+                            let tun_ifindex = instance.interface.as_ref().map(|info| info.ifindex);
+                            #[cfg(not(feature = "tun"))]
+                            let tun_ifindex = None;
+                            let Some(resolved) = declaration.clone().resolve(tun_ifindex) else {
+                                return Some(pending_status(None, errors));
+                            };
+                            let route = match normalize_route(resolved) {
+                                Ok(route) => route,
+                                Err(error) => {
+                                    return Some(RouteStatus::Rejected(error.to_string().into()));
+                                }
+                            };
+                            #[cfg(feature = "tun")]
+                            let managed_tun =
+                                unicast_dev(&route).filter(|dev| managed.contains(dev));
+                            #[cfg(feature = "tun")]
+                            if let Some(dev) = managed_tun
+                                && Some(dev) != tun_ifindex
+                            {
+                                return Some(RouteStatus::Rejected(
+                                    "route targets a managed tun interface this instance does not own"
+                                        .into(),
+                                ));
+                            }
+
+                            #[cfg(feature = "tun")]
+                            {
+                                // A declaration admitted this round keeps this round's
+                                // result. Anything else — including content that changed
+                                // while planning, or a rebinding that now resolves through
+                                // another device — waits for the next marked round.
+                                if let Some((admitted, registration, status)) =
+                                    admission_failed.get(&(run, declaration.clone()))
+                                {
+                                    // The whole candidate set that failed to prepare
+                                    // must still be exactly the current one, or this
+                                    // result describes an input that no longer exists.
+                                    let unchanged_set = admission_prefixes == Some(true);
+                                    if *admitted == route
+                                        && unchanged_set
+                                        && Some(*registration) == instance
+                                            .member
+                                            .as_ref()
+                                            .map(SharedVirtualNicMember::registration_id)
+                                    {
+                                        return Some(status.clone());
+                                    }
+                                    return Some(pending_status(Some(&route), errors));
+                                }
+                                // Admission used this round's member. If the instance
+                                // is now bound to another registration, that result
+                                // describes an old binding and cannot stand, even
+                                // when the declaration itself did not change. An
+                                // unrelated change to another run leaves this
+                                // registration intact.
+                                if managed_tun.is_some()
+                                    && members
+                                        .get(&run)
+                                        .map(SharedVirtualNicMember::registration_id)
+                                        != instance
+                                            .member
+                                            .as_ref()
+                                            .map(SharedVirtualNicMember::registration_id)
+                                {
+                                    return Some(pending_status(Some(&route), errors));
+                                }
+                            }
+                            if planned.get(&(run, declaration.clone())) != Some(&route) {
+                                return Some(pending_status(Some(&route), errors));
+                            }
+
+                            let key = RouteKey::of(&route);
+                            match desired.get(&key) {
+                                Some((target, owners)) if *target == route => {
+                                    if !owners.contains(&run) {
+                                        return Some(pending_status(Some(&route), errors));
+                                    }
+                                }
+                                Some(_) => {
+                                    return Some(RouteStatus::Suppressed(
+                                        "another declaration takes this route".into(),
+                                    ));
+                                }
+                                None => return Some(pending_status(Some(&route), errors)),
+                            }
+
+                            let Some(row) = rt.applied.get(&key) else {
+                                return Some(pending_status(Some(&route), errors));
+                            };
+                            if row.route != route
+                                || !matches!(row.effect, RouteEffect::Owned | RouteEffect::External)
+                                || !row.owners.contains(&run)
+                            {
+                                return Some(pending_status(Some(&route), errors));
+                            }
+
+                            // A managed declaration also needs this run's member
+                            // and, after execution, this round's acknowledgement.
+                            #[cfg(feature = "tun")]
+                            let status = {
+                                let Some(member) =
+                                    managed_tun.and_then(|_| instance.member.as_ref())
+                                else {
+                                    if managed_tun.is_some() {
+                                        return Some(pending_status(Some(&route), errors));
+                                    }
+                                    return Some(RouteStatus::Ready);
+                                };
+                                if member.ensure_open().is_err()
+                                    || row
+                                        .members
+                                        .get(&run)
+                                        .map(SharedVirtualNicMember::registration_id)
+                                        != Some(member.registration_id())
+                                {
+                                    return Some(pending_status(Some(&route), errors));
+                                }
+
+                                match synced {
+                                    // Planning alone must not turn an old confirmation into
+                                    // pending; the post-execution round reports the effect.
+                                    None => None,
+                                    Some(synced) => {
+                                        let acknowledged = synced
+                                            .get(&(run, member.registration_id()))
+                                            .is_some_and(|prefixes| {
+                                                prefixes.contains(&route.destination)
+                                            });
+                                        if acknowledged {
+                                            Some(RouteStatus::Ready)
+                                        } else {
+                                            Some(pending_status(Some(&route), errors))
+                                        }
+                                    }
+                                }
+                            };
+                            // Without the TUN feature no declaration reaches a
+                            // managed device, so an installed row that is the
+                            // desired target and owned by this run is ready.
+                            #[cfg(not(feature = "tun"))]
+                            let status = {
+                                let _ = synced;
+                                Some(RouteStatus::Ready)
+                            };
+                            status
+                        });
+                    }
                 }
             }
         }
 
-        rt.applied = Some(AppliedSnapshot { prefixes });
-        for weak in &rt.slots {
-            if let Some(slot) = weak.upgrade() {
-                slot.set_ready();
-            }
-        }
-    }
-
-    pub fn effective_routes_for_instance(
-        &self,
-        run: &Uuid,
-    ) -> easytier_core::host::route::RouteSet {
-        let rt = self.runtime.read();
-        let mut routes = easytier_core::host::route::RouteSet::new();
-        for weak in &rt.slots {
-            if let Some(slot) = weak.upgrade() {
-                if slot.instance() == *run {
-                    routes.extend(slot.routes());
-                }
-            }
-        }
-        routes
-    }
-
-    pub fn acknowledge_external(&self, prefixes: BTreeSet<IpCidr>) {
-        let mut rt = self.runtime.write();
-        rt.applied = Some(AppliedSnapshot { prefixes });
-        for weak in &rt.slots {
-            if let Some(slot) = weak.upgrade() {
-                slot.set_ready();
-            }
+        ReconcilePlan {
+            desired,
+            remove,
+            add,
+            slots,
+            #[cfg(feature = "tun")]
+            members,
         }
     }
 }
 
-#[cfg(test)]
+/// Bring one member's managed routes in line with its current prefixes.
+///
+/// `true` means this registration's commit really completed. `false` means the
+/// registration is gone or the NIC has already been stopped, so waiting for
+/// it any longer is pointless. An error means nothing is confirmed yet and
+/// the caller still owes a retry. Equal claims are committed again on purpose:
+/// only the commit is the acknowledgement.
+#[cfg(all(not(mobile), feature = "tun"))]
+async fn sync_member_routes(
+    member: &SharedVirtualNicMember,
+    routes: &BTreeSet<IpCidr>,
+) -> anyhow::Result<bool> {
+    let member_id = member.member_id();
+    let registration = member.registration_id();
+    let shared_nic = member.shared_nic();
+    let mut nic = tokio::time::timeout(Duration::from_secs(5), shared_nic.lock())
+        .await
+        .map_err(|_| anyhow::anyhow!("timed out locking shared NIC for member {member_id}"))?;
+
+    if !nic.is_valid() {
+        // The dispatcher and its I/O have really stopped; there is no
+        // registration left to acknowledge.
+        nic.invalidate_and_shutdown_dispatcher().await;
+        return Ok(false);
+    }
+    if !nic.is_current_member_registration(member_id, registration) {
+        // A newer registration owns the NIC now; leave it untouched.
+        return Ok(false);
+    }
+    if !routes.is_empty() {
+        // An empty set may withdraw through an already closed member.
+        member.ensure_open()?;
+    }
+
+    let claims = nic.prepare_managed_routes(member_id, registration, routes)?;
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        nic.commit_managed_routes(member_id, registration, claims),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("timed out committing routes of member {member_id}"))??;
+    Ok(true)
+}
+
+/// Every real backend call and claims read is bounded by this.
+#[cfg(not(mobile))]
+const ROUTE_IO_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// The fixed desktop audit grid. Input changes never restart it.
+#[cfg(not(mobile))]
+const AUDIT_INTERVAL: Duration = Duration::from_secs(60);
+
+/// At most this many route additions and deletions per round.
+#[cfg(not(mobile))]
+const ROUTE_OPERATION_BUDGET: u32 = 64;
+
+/// The first backoff after a failed operation.
+#[cfg(not(mobile))]
+const RETRY_INITIAL: Duration = Duration::from_millis(200);
+
+/// The largest backoff a repeating failure keeps.
+#[cfg(not(mobile))]
+const RETRY_MAX: Duration = Duration::from_secs(30);
+
+/// Backoff of the given attempt: doubling from [`RETRY_INITIAL`].
+#[cfg(not(mobile))]
+fn retry_backoff(attempt: u32) -> Duration {
+    RETRY_INITIAL
+        .saturating_mul(1u32 << attempt.saturating_sub(1).min(8))
+        .min(RETRY_MAX)
+}
+
+/// Whether this exact operation still has to wait out an earlier failure.
+///
+/// A different complete route or the other operation is a real change and is
+/// allowed to proceed; an unrelated dirty mark cannot shorten the wait.
+#[cfg(not(mobile))]
+fn route_retry_blocked(
+    retries: &BTreeMap<RouteKey, (RouteSpec<u32>, bool, tokio::time::Instant, u32, Arc<str>)>,
+    key: &RouteKey,
+    route: &RouteSpec<u32>,
+    add: bool,
+    now: tokio::time::Instant,
+) -> bool {
+    retries
+        .get(key)
+        .is_some_and(|(failed, failed_add, deadline, ..)| {
+            failed == route && *failed_add == add && *deadline > now
+        })
+}
+
+/// Record (or extend) the backoff of one failed route operation.
+#[cfg(not(mobile))]
+fn record_route_failure(
+    retries: &mut BTreeMap<RouteKey, (RouteSpec<u32>, bool, tokio::time::Instant, u32, Arc<str>)>,
+    key: RouteKey,
+    route: &RouteSpec<u32>,
+    add: bool,
+    error: Arc<str>,
+) {
+    let now = tokio::time::Instant::now();
+    match retries.get_mut(&key) {
+        Some((failed, failed_add, deadline, attempt, failed_error))
+            if failed == route && *failed_add == add =>
+        {
+            // A repeated readback failure of an operation that has not been
+            // retried keeps its original deadline.
+            if *deadline <= now {
+                *attempt = attempt.saturating_add(1);
+                *deadline = now + retry_backoff(*attempt);
+            }
+            *failed_error = error;
+        }
+        _ => {
+            retries.insert(key, (route.clone(), add, now + retry_backoff(1), 1, error));
+        }
+    }
+}
+
+/// A failed round readback: neither absence nor a confirmed effect.
+#[cfg(not(mobile))]
+fn record_read_failure(
+    confirm: &[(RouteKey, RouteSpec<u32>, bool)],
+    candidates: &[(RouteSpec<u32>, BTreeSet<Uuid>)],
+    retries: &mut BTreeMap<RouteKey, (RouteSpec<u32>, bool, tokio::time::Instant, u32, Arc<str>)>,
+    error: &anyhow::Error,
+) {
+    let error: Arc<str> = Arc::from(error.to_string());
+    for (key, route, add) in confirm {
+        record_route_failure(retries, key.clone(), route, *add, error.clone());
+    }
+    for (route, _) in candidates {
+        record_route_failure(retries, RouteKey::of(route), route, true, error.clone());
+    }
+}
+
+/// Whether this member's final target still has to wait out a failure.
+#[cfg(all(not(mobile), feature = "tun"))]
+fn member_retry_blocked(
+    retries: &BTreeMap<
+        (Uuid, Uuid),
+        (
+            SharedVirtualNicMember,
+            BTreeSet<IpCidr>,
+            tokio::time::Instant,
+            u32,
+            Arc<str>,
+        ),
+    >,
+    key: &(Uuid, Uuid),
+    target: &BTreeSet<IpCidr>,
+    now: tokio::time::Instant,
+) -> bool {
+    retries
+        .get(key)
+        .is_some_and(|(_, failed_target, deadline, ..)| failed_target == target && *deadline > now)
+}
+
+/// Record (or extend) the backoff of one member's final target.
+#[cfg(all(not(mobile), feature = "tun"))]
+fn record_member_failure(
+    retries: &mut BTreeMap<
+        (Uuid, Uuid),
+        (
+            SharedVirtualNicMember,
+            BTreeSet<IpCidr>,
+            tokio::time::Instant,
+            u32,
+            Arc<str>,
+        ),
+    >,
+    key: (Uuid, Uuid),
+    member: &SharedVirtualNicMember,
+    target: BTreeSet<IpCidr>,
+    error: &anyhow::Error,
+) {
+    let now = tokio::time::Instant::now();
+    let error: Arc<str> = Arc::from(error.to_string());
+    match retries.get_mut(&key) {
+        Some((_, failed_target, deadline, attempt, failed_error)) if *failed_target == target => {
+            if *deadline <= now {
+                *attempt = attempt.saturating_add(1);
+                *deadline = now + retry_backoff(*attempt);
+            }
+            *failed_error = error;
+        }
+        _ => {
+            retries.insert(
+                key,
+                (member.clone(), target, now + retry_backoff(1), 1, error),
+            );
+        }
+    }
+}
+
+/// The route prefixes of one member's current claims.
+#[cfg(all(not(mobile), feature = "tun"))]
+fn claim_prefixes(claims: &SharedIfConfigClaims) -> BTreeSet<IpCidr> {
+    let ipv4 = claims.ipv4_routes.iter().filter_map(|route| {
+        cidr::Ipv4Cidr::new(route.address, route.prefix)
+            .ok()
+            .map(IpCidr::V4)
+    });
+    let ipv6 = claims.ipv6_routes.iter().filter_map(|route| {
+        cidr::Ipv6Cidr::new(route.address, route.prefix)
+            .ok()
+            .map(IpCidr::V6)
+    });
+    ipv4.chain(ipv6).collect()
+}
+
+/// The interface index of a unicast route, if it has one.
+#[cfg(not(mobile))]
+fn unicast_dev(route: &RouteSpec<u32>) -> Option<u32> {
+    match &route.action {
+        RouteAction::Unicast { dev, .. } => Some(*dev),
+        _ => None,
+    }
+}
+
+/// Pending feedback, carrying this round's error for the same complete row.
+#[cfg(not(mobile))]
+fn pending_status(
+    route: Option<&RouteSpec<u32>>,
+    errors: &BTreeMap<RouteSpec<u32>, Arc<str>>,
+) -> RouteStatus {
+    RouteStatus::Pending {
+        error: route.and_then(|route| errors.get(route).cloned()),
+    }
+}
+
+/// The native desktop reconciler tests. Mobile gets its own set once the host
+/// flow is migrated.
+#[cfg(all(test, not(mobile)))]
 mod tests {
     use super::*;
     use parking_lot::Mutex;
+    use std::collections::VecDeque;
 
+    #[cfg(feature = "tun")]
+    use crate::instance::{
+        shared_virtual_nic::{SharedIpv4Route, SharedVirtualNicRegistry},
+        virtual_nic::VirtualNicConfig,
+    };
+
+    /// One recorded backend entry, in the exact order the operation started.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    enum MockOperation {
+        Add(RouteSpec<u32>),
+        Remove(RouteSpec<u32>),
+        Existing(BTreeSet<RouteSpec<u32>>),
+    }
+
+    /// A one-shot, optionally route-specific stop inside one backend call.
+    ///
+    /// `Notify` keeps one permit, so a wake that happens before the other side
+    /// actually awaits it is not lost.
+    struct MockGate {
+        route: Option<RouteSpec<u32>>,
+        entered: Arc<Notify>,
+        resume: Arc<Notify>,
+    }
+
+    impl MockGate {
+        fn new(route: Option<RouteSpec<u32>>) -> Self {
+            Self {
+                route,
+                entered: Arc::new(Notify::new()),
+                resume: Arc::new(Notify::new()),
+            }
+        }
+
+        fn matches(&self, route: &RouteSpec<u32>) -> bool {
+            self.route.as_ref().is_none_or(|expected| expected == route)
+        }
+    }
+
+    /// An entirely in-memory OS route table.
+    ///
+    /// Faults and gates are taken under a short synchronous lock and used
+    /// after it is released, so no guard is ever held across an await.
     #[derive(Default)]
     struct MockBackend {
-        routes: Mutex<BTreeSet<OsRoute>>,
+        routes: Mutex<BTreeSet<RouteSpec<u32>>>,
+        operations: Mutex<Vec<MockOperation>>,
+        add_calls: Mutex<Vec<RouteSpec<u32>>>,
+        remove_calls: Mutex<Vec<RouteSpec<u32>>>,
+        existing_batches: Mutex<Vec<BTreeSet<RouteSpec<u32>>>>,
+        add_faults: Mutex<BTreeMap<RouteSpec<u32>, VecDeque<(RouteError, bool)>>>,
+        remove_faults: Mutex<BTreeMap<RouteSpec<u32>, VecDeque<(RouteError, bool)>>>,
+        existing_errors: Mutex<VecDeque<RouteError>>,
+        add_gate: Mutex<Option<MockGate>>,
+        remove_gate: Mutex<Option<MockGate>>,
+        existing_gate: Mutex<Option<MockGate>>,
+    }
+
+    impl MockBackend {
+        fn contains(&self, route: &RouteSpec<u32>) -> bool {
+            self.routes.lock().contains(route)
+        }
+
+        fn add_count(&self) -> usize {
+            self.add_calls.lock().len()
+        }
+
+        fn remove_count(&self) -> usize {
+            self.remove_calls.lock().len()
+        }
+
+        fn existing_count(&self) -> usize {
+            self.existing_batches.lock().len()
+        }
+
+        /// Queue one outcome for this exact full route. `side_effect` applies
+        /// the mock OS change before the fault is returned.
+        fn queue_add(&self, route: &RouteSpec<u32>, error: RouteError, side_effect: bool) {
+            self.add_faults
+                .lock()
+                .entry(route.clone())
+                .or_default()
+                .push_back((error, side_effect));
+        }
+
+        fn queue_remove(&self, route: &RouteSpec<u32>, error: RouteError, side_effect: bool) {
+            self.remove_faults
+                .lock()
+                .entry(route.clone())
+                .or_default()
+                .push_back((error, side_effect));
+        }
+
+        fn queue_existing_error(&self, error: RouteError) {
+            self.existing_errors.lock().push_back(error);
+        }
+
+        fn gate_add(&self, route: Option<RouteSpec<u32>>) -> (Arc<Notify>, Arc<Notify>) {
+            let gate = MockGate::new(route);
+            let handles = (gate.entered.clone(), gate.resume.clone());
+            *self.add_gate.lock() = Some(gate);
+            handles
+        }
+
+        fn gate_remove(&self, route: Option<RouteSpec<u32>>) -> (Arc<Notify>, Arc<Notify>) {
+            let gate = MockGate::new(route);
+            let handles = (gate.entered.clone(), gate.resume.clone());
+            *self.remove_gate.lock() = Some(gate);
+            handles
+        }
+
+        fn gate_existing(&self, route: Option<RouteSpec<u32>>) -> (Arc<Notify>, Arc<Notify>) {
+            let gate = MockGate::new(route);
+            let handles = (gate.entered.clone(), gate.resume.clone());
+            *self.existing_gate.lock() = Some(gate);
+            handles
+        }
+    }
+
+    fn take_gate(
+        slot: &Mutex<Option<MockGate>>,
+        matches: impl FnOnce(&MockGate) -> bool,
+    ) -> Option<MockGate> {
+        let mut slot = slot.lock();
+        if slot.as_ref().is_some_and(matches) {
+            slot.take()
+        } else {
+            None
+        }
+    }
+
+    fn take_fault(
+        faults: &Mutex<BTreeMap<RouteSpec<u32>, VecDeque<(RouteError, bool)>>>,
+        route: &RouteSpec<u32>,
+    ) -> Option<(RouteError, bool)> {
+        faults.lock().get_mut(route).and_then(VecDeque::pop_front)
     }
 
     impl RouteBackend for Arc<MockBackend> {
-        async fn add(&mut self, route: &OsRoute) -> Result<(), RouteError> {
-            self.routes.lock().insert(route.clone());
-            Ok(())
+        async fn add(&mut self, route: &RouteSpec<u32>) -> Result<(), RouteError> {
+            self.add_calls.lock().push(route.clone());
+            self.operations
+                .lock()
+                .push(MockOperation::Add(route.clone()));
+            if let Some(gate) = take_gate(&self.add_gate, |gate| gate.matches(route)) {
+                gate.entered.notify_one();
+                gate.resume.notified().await;
+            }
+            match take_fault(&self.add_faults, route) {
+                Some((error, side_effect)) => {
+                    if side_effect {
+                        self.routes.lock().insert(route.clone());
+                    }
+                    Err(error)
+                }
+                None => {
+                    self.routes.lock().insert(route.clone());
+                    Ok(())
+                }
+            }
         }
-        async fn remove(&mut self, route: &OsRoute) -> Result<(), RouteError> {
-            self.routes.lock().remove(route);
-            Ok(())
+
+        async fn remove(&mut self, route: &RouteSpec<u32>) -> Result<(), RouteError> {
+            self.remove_calls.lock().push(route.clone());
+            self.operations
+                .lock()
+                .push(MockOperation::Remove(route.clone()));
+            if let Some(gate) = take_gate(&self.remove_gate, |gate| gate.matches(route)) {
+                gate.entered.notify_one();
+                gate.resume.notified().await;
+            }
+            match take_fault(&self.remove_faults, route) {
+                Some((error, side_effect)) => {
+                    if side_effect {
+                        self.routes.lock().remove(route);
+                    }
+                    Err(error)
+                }
+                None => {
+                    self.routes.lock().remove(route);
+                    Ok(())
+                }
+            }
         }
+
         async fn existing(
             &mut self,
-            routes: &BTreeSet<OsRoute>,
-        ) -> Result<BTreeSet<OsRoute>, RouteError> {
+            routes: &BTreeSet<RouteSpec<u32>>,
+        ) -> Result<BTreeSet<RouteSpec<u32>>, RouteError> {
+            self.existing_batches.lock().push(routes.clone());
+            self.operations
+                .lock()
+                .push(MockOperation::Existing(routes.clone()));
+            if let Some(gate) = take_gate(&self.existing_gate, |gate| {
+                gate.route
+                    .as_ref()
+                    .is_none_or(|expected| routes.contains(expected))
+            }) {
+                gate.entered.notify_one();
+                gate.resume.notified().await;
+            }
+            if let Some(error) = self.existing_errors.lock().pop_front() {
+                return Err(error);
+            }
             let current = self.routes.lock();
             Ok(routes.intersection(&current).cloned().collect())
         }
     }
 
-    fn test_route(dest: &str, metric: u32, ifindex: u32) -> OsRoute {
-        OsRoute {
-            table: 254,
-            destination: dest.parse().unwrap(),
-            metric: NonZeroU32::new(metric).unwrap(),
-            ifindex,
-            preferred_source: None,
+    type RouteRetries =
+        BTreeMap<RouteKey, (RouteSpec<u32>, bool, tokio::time::Instant, u32, Arc<str>)>;
+
+    #[cfg(feature = "tun")]
+    type MemberRetries = BTreeMap<
+        (Uuid, Uuid),
+        (
+            SharedVirtualNicMember,
+            BTreeSet<IpCidr>,
+            tokio::time::Instant,
+            u32,
+            Arc<str>,
+        ),
+    >;
+
+    /// One reconciler plus the retry maps that belong to its worker loop.
+    struct Harness {
+        controller: RouteController,
+        mock: Arc<MockBackend>,
+        reconciler: RouteReconciler<Arc<MockBackend>>,
+        route_retries: RouteRetries,
+        #[cfg(feature = "tun")]
+        member_retries: MemberRetries,
+    }
+
+    impl Harness {
+        fn new() -> Self {
+            let mock = Arc::new(MockBackend::default());
+            let controller = RouteController::new(Arc::new(DirtyFlag::new(false)));
+            let reconciler = RouteReconciler::new(controller.clone(), mock.clone());
+            Self {
+                controller,
+                mock,
+                reconciler,
+                route_retries: BTreeMap::new(),
+                #[cfg(feature = "tun")]
+                member_retries: BTreeMap::new(),
+            }
+        }
+
+        async fn round(&mut self) -> anyhow::Result<()> {
+            // The real reconcile has no overall test-facing bound; this one
+            // only turns a hung test into a diagnostic instead of a wait.
+            tokio::time::timeout(
+                Duration::from_secs(30),
+                self.reconciler.reconcile(
+                    &mut self.route_retries,
+                    #[cfg(feature = "tun")]
+                    &mut self.member_retries,
+                ),
+            )
+            .await
+            .expect("the reconcile round must finish within 30s")
+        }
+
+        async fn round_ok(&mut self) {
+            self.round()
+                .await
+                .expect("the reconcile round must not fail");
+        }
+
+        fn dirty_peek(&self) -> bool {
+            self.controller.dirty.peek()
+        }
+
+        fn applied(&self) -> AppliedRoutes {
+            self.controller.applied_routes()
+        }
+
+        fn effect(&self, route: &RouteSpec<u32>) -> Option<RouteEffect> {
+            self.applied()
+                .get(&RouteKey::of(route))
+                .filter(|row| row.route == *route)
+                .map(|row| row.effect)
         }
     }
 
-    #[tokio::test]
-    async fn multi_owner_shared_same_metric() {
-        let mock = Arc::new(MockBackend::default());
+    #[test]
+    fn controller_only_observes_the_registry_and_keeps_the_record_for_cleanup() {
+        use easytier_core::host::route::{RouteSet, RouteSource};
+
+        let dirty = Arc::new(DirtyFlag::new(false));
+        let controller = RouteController::new(dirty.clone());
+        let run = Uuid::new_v4();
+        let registry = controller.open_instance(run).unwrap();
+        let handle = registry.handle();
+        let slot = handle.open_slot(RouteSource::Additional).unwrap();
+
+        assert!(matches!(
+            controller.runtime.read().instances[&run].registry.upgrade(),
+            Some(current) if Arc::ptr_eq(&current, &registry)
+        ));
+
+        dirty.reset();
+        drop(registry);
+        assert!(
+            dirty.peek(),
+            "the last registry root must wake the controller"
+        );
+        assert!(
+            matches!(
+                handle.open_slot(RouteSource::Additional),
+                Err(easytier_core::host::route::RouteInputError::Closed)
+            ),
+            "a released registry cannot open new inputs"
+        );
+
+        let route = RouteSpec::for_tun("10.10.0.0/24".parse().unwrap());
+        slot.set_routes(RouteSet::from([route.clone()]));
+        assert_eq!(
+            slot.statuses().get(&route),
+            Some(&easytier_core::host::route::RouteStatus::Pending { error: None }),
+            "an existing slot stays mutable after its registry is gone"
+        );
+        assert!(dirty.peek(), "the orphaned slot still wakes the controller");
+        assert!(
+            controller.runtime.read().instances.contains_key(&run),
+            "the record stays for real cleanup"
+        );
+    }
+
+    #[test]
+    fn repeated_run_and_shutdown_keep_the_existing_record() {
         let dirty = Arc::new(DirtyFlag::new(false));
         let controller = RouteController::new(dirty);
-        let mut reconciler = RouteReconciler::new(controller.clone(), mock.clone());
-        let if_info = InterfaceInfo {
-            name: "tun0".into(),
-            ifindex: 10,
+        let run = Uuid::new_v4();
+        let registry = controller.open_instance(run).unwrap();
+
+        assert!(
+            controller.open_instance(run).is_err(),
+            "an existing run cannot be opened twice"
+        );
+        let current = controller.runtime.read().instances[&run]
+            .registry
+            .upgrade()
+            .unwrap();
+        assert!(
+            Arc::ptr_eq(&current, &registry),
+            "the rejected open must not replace the current registry"
+        );
+
+        let other = Uuid::new_v4();
+        controller.request_shutdown();
+        assert!(controller.is_shutdown());
+        assert!(
+            controller.open_instance(other).is_err(),
+            "shutdown rejects new registration"
+        );
+        assert!(
+            controller.runtime.read().instances.contains_key(&run),
+            "shutdown must not erase the existing record"
+        );
+        assert!(!controller.runtime.read().instances.contains_key(&other));
+    }
+
+    #[test]
+    fn config_binding_is_single_and_marks_the_shared_flag() {
+        use easytier_core::config::{
+            peers::PeerRuntimeSnapshot,
+            runtime::{CoreRuntimeConfig, CoreRuntimeConfigStore},
         };
-        controller.set_interface(Some(if_info));
 
-        let owner_a = Uuid::new_v4();
-        let owner_b = Uuid::new_v4();
-        let routes_a = controller.open_instance(owner_a, "a".into()).unwrap();
-        let routes_b = controller.open_instance(owner_b, "b".into()).unwrap();
+        let dirty = Arc::new(DirtyFlag::new(false));
+        let controller = RouteController::new(dirty.clone());
+        let run = Uuid::new_v4();
+        let _registry = controller.open_instance(run).unwrap();
+        let store = CoreRuntimeConfigStore::new(
+            CoreRuntimeConfig::default(),
+            Arc::new(PeerRuntimeSnapshot::default()),
+        );
 
-        let r1 = test_route("10.14.0.0/24", 10, 10);
-        let mut spec = RouteSpec::for_tun(r1.destination);
-        spec.metric = 10;
+        dirty.reset();
+        controller.bind_config(run, store.clone()).unwrap();
+        assert!(
+            dirty.peek(),
+            "a successful binding marks the shared route flag"
+        );
 
-        let slot_a = routes_a.handle().open_slot().unwrap();
-        slot_a.set_routes(BTreeSet::from([spec.clone()])).unwrap();
+        dirty.reset();
+        let other = CoreRuntimeConfigStore::new(
+            CoreRuntimeConfig::default(),
+            Arc::new(PeerRuntimeSnapshot::default()),
+        );
+        assert!(
+            controller.bind_config(run, other.clone()).is_err(),
+            "a second binding must fail"
+        );
+        assert!(
+            !dirty.peek(),
+            "a rejected binding does not mark the shared flag again"
+        );
 
-        reconciler.reconcile().await.unwrap();
-        assert!(mock.routes.lock().contains(&r1));
+        let replacement = Arc::new(DirtyFlag::new(false));
+        other
+            .bind_route_dirty(replacement)
+            .expect("a rejected controller binding must leave the store unclaimed");
+        assert!(
+            Arc::ptr_eq(
+                &controller.runtime.read().instances[&run]
+                    .config
+                    .as_ref()
+                    .unwrap()
+                    .snapshot(),
+                &store.snapshot()
+            ),
+            "the original config binding stays"
+        );
+    }
 
-        let slot_b = routes_b.handle().open_slot().unwrap();
-        slot_b.set_routes(BTreeSet::from([spec])).unwrap();
+    #[tokio::test]
+    async fn drain_waits_for_the_record_and_not_for_the_registry() {
+        let dirty = Arc::new(DirtyFlag::new(false));
+        let controller = RouteController::new(dirty);
+        let run = Uuid::new_v4();
+        let registry = controller.open_instance(run).unwrap();
+        drop(registry);
 
-        reconciler.reconcile().await.unwrap();
-        assert_eq!(mock.routes.lock().len(), 1);
+        let drain = controller.drain(run);
+        tokio::pin!(drain);
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), &mut drain)
+                .await
+                .is_err(),
+            "a released registry alone must not complete the drain"
+        );
+        assert!(
+            controller.runtime.read().instances.contains_key(&run),
+            "the drain wait must not remove the record"
+        );
+
+        controller.runtime.write().instances.remove(&run);
+        controller.changed().notify_waiters();
+        tokio::time::timeout(Duration::from_secs(1), drain)
+            .await
+            .expect("removing the record and notifying must complete the drain")
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn multi_owner_shared_ordinary_route_is_kept_until_the_last_owner_withdraws() {
+        let mut h = Harness::new();
+        let declaration = indexed("10.14.0.0/24", 10, None);
+        let route = resolved(&declaration);
+
+        let (run_a, _registry_a, slot_a) =
+            instance_with_slot(&h.controller, RouteSource::Additional);
+        let (run_b, _registry_b, slot_b) =
+            instance_with_slot(&h.controller, RouteSource::Additional);
+
+        slot_a.set_routes(RouteSet::from([declaration.clone()]));
+        h.round_ok().await;
+        assert_eq!(h.effect(&route), Some(RouteEffect::Owned));
+        assert!(h.mock.contains(&route));
+        assert_eq!(h.mock.add_count(), 1);
+
+        slot_b.set_routes(RouteSet::from([declaration]));
+        h.round_ok().await;
+        assert_eq!(
+            h.applied()[&RouteKey::of(&route)].owners,
+            BTreeSet::from([run_a, run_b]),
+            "both owners share the identical physical row"
+        );
+        assert_eq!(h.mock.routes.lock().len(), 1);
+        assert_eq!(
+            h.mock.add_count(),
+            1,
+            "the shared row is installed only once"
+        );
 
         drop(slot_a);
-        reconciler.reconcile().await.unwrap();
-        assert!(mock.routes.lock().contains(&r1));
+        h.round_ok().await;
+        assert_eq!(
+            h.applied()[&RouteKey::of(&route)].owners,
+            BTreeSet::from([run_b]),
+            "withdrawing one declaration keeps the other owner's row"
+        );
+        assert!(h.mock.contains(&route));
+        assert_eq!(h.mock.remove_count(), 0);
 
         drop(slot_b);
-        reconciler.reconcile().await.unwrap();
+        h.round_ok().await;
+        assert!(
+            h.applied().is_empty(),
+            "the last owner withdrawal retires the responsibility"
+        );
+        assert!(h.mock.routes.lock().is_empty());
+        assert_eq!(
+            h.mock.remove_calls.lock().clone(),
+            vec![route],
+            "the shared row is deleted exactly once"
+        );
+        assert!(h.route_retries.is_empty());
+    }
+
+    // Planning tests. Every route below uses an explicit interface index, so
+    // none of them needs a real NIC or a system call.
+
+    use crate::instance::route::AppliedRoute;
+
+    fn indexed(destination: &str, dev: u32, via: Option<&str>) -> RouteSpec<RouteDevice> {
+        RouteSpec {
+            destination: destination.parse().unwrap(),
+            action: RouteAction::Unicast {
+                dev: RouteDevice::Index(dev),
+                via: via.map(|via| via.parse().unwrap()),
+            },
+            #[cfg(any(target_os = "linux", windows))]
+            metric: 65535,
+            #[cfg(target_os = "linux")]
+            table: None,
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn indexed_with_metric(
+        destination: &str,
+        dev: u32,
+        metric: u32,
+        via: Option<&str>,
+    ) -> RouteSpec<RouteDevice> {
+        let mut route = indexed(destination, dev, via);
+        route.metric = metric;
+        route
+    }
+
+    /// The installable form of an explicit-index declaration.
+    fn resolved(declaration: &RouteSpec<RouteDevice>) -> RouteSpec<u32> {
+        normalize_route(declaration.clone().resolve(None).unwrap()).unwrap()
+    }
+
+    fn installed(declaration: &RouteSpec<RouteDevice>, run: Uuid) -> AppliedRoute {
+        AppliedRoute {
+            route: resolved(declaration),
+            owners: BTreeSet::from([run]),
+            effect: RouteEffect::Owned,
+            #[cfg(feature = "tun")]
+            members: BTreeMap::new(),
+        }
+    }
+
+    /// Open one instance and one slot. The registry root stays with the caller,
+    /// as the native instance runtime owns it in production.
+    fn instance_with_slot(
+        controller: &RouteController,
+        source: RouteSource,
+    ) -> (Uuid, Arc<Registry>, easytier_core::host::route::RouteSlot) {
+        let run = Uuid::new_v4();
+        let registry = controller.open_instance(run).unwrap();
+        let slot = registry.handle().open_slot(source).unwrap();
+        (run, registry, slot)
+    }
+
+    // Execution tests. They use the in-memory mock above only; no platform
+    // backend, TUN device or system network state is touched.
+
+    #[tokio::test]
+    async fn a_matching_preexisting_row_is_external_and_its_withdrawal_only_clears_the_ledger() {
+        let mut h = Harness::new();
+        let declaration = indexed("10.16.0.0/24", 7, None);
+        let route = resolved(&declaration);
+        h.mock.routes.lock().insert(route.clone());
+
+        let (_run, _registry, slot) = instance_with_slot(&h.controller, RouteSource::Additional);
+        slot.set_routes(RouteSet::from([declaration.clone()]));
+        h.round_ok().await;
+        assert_eq!(h.effect(&route), Some(RouteEffect::External));
+        assert_eq!(
+            h.mock.add_count(),
+            0,
+            "an existing row is never installed again"
+        );
+        assert_eq!(h.mock.remove_count(), 0);
+        assert_eq!(slot.statuses().get(&declaration), Some(&RouteStatus::Ready));
+        let reads = h.mock.existing_count();
+
+        slot.clear();
+        h.round_ok().await;
+        assert!(
+            h.applied().is_empty(),
+            "the last withdrawal releases only the ledger entry"
+        );
+        assert!(
+            h.mock.contains(&route),
+            "the external row stays physically present"
+        );
+        assert_eq!(h.mock.remove_count(), 0, "an external row is never deleted");
+        assert_eq!(
+            h.mock.existing_count(),
+            reads,
+            "releasing an external row needs no readback"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_definite_add_failure_pends_only_its_route_until_the_retry_deadline() {
+        let mut h = Harness::new();
+        let a = indexed("10.20.0.0/24", 7, None);
+        let b = indexed("10.21.0.0/24", 7, None);
+        let a_route = resolved(&a);
+        let b_route = resolved(&b);
+        h.mock.queue_add(
+            &a_route,
+            RouteError::Failed(anyhow::anyhow!("install failed")),
+            false,
+        );
+
+        let (_run, _registry, slot) = instance_with_slot(&h.controller, RouteSource::Additional);
+        slot.set_routes(RouteSet::from([a.clone(), b.clone()]));
+        h.round_ok().await;
+
+        assert_eq!(h.effect(&a_route), None);
+        assert_eq!(h.effect(&b_route), Some(RouteEffect::Owned));
+        let statuses = slot.statuses();
+        assert_eq!(
+            statuses.get(&a),
+            Some(&RouteStatus::Pending {
+                error: Some(Arc::from("route operation failed: install failed"))
+            })
+        );
+        assert_eq!(statuses.get(&b), Some(&RouteStatus::Ready));
+        let key = RouteKey::of(&a_route);
+        assert_eq!(h.route_retries[&key].0, a_route);
+        assert!(h.route_retries[&key].1, "the retry belongs to the addition");
+        assert!(h.route_retries[&key].2 > tokio::time::Instant::now());
+        assert_eq!(
+            h.mock
+                .add_calls
+                .lock()
+                .iter()
+                .filter(|route| *route == &a_route)
+                .count(),
+            1
+        );
+        let reads = h.mock.existing_count();
+
+        h.controller.dirty.mark();
+        tokio::time::advance(Duration::from_millis(100)).await;
+        h.round_ok().await;
+        assert_eq!(
+            h.mock
+                .add_calls
+                .lock()
+                .iter()
+                .filter(|route| *route == &a_route)
+                .count(),
+            1,
+            "an unrelated dirty mark must not retry the failed addition early"
+        );
+        assert_eq!(
+            h.mock.existing_count(),
+            reads,
+            "no readback is issued before the deadline"
+        );
+        assert!(matches!(
+            slot.statuses().get(&a),
+            Some(RouteStatus::Pending { error: Some(_) })
+        ));
+
+        tokio::time::advance(Duration::from_millis(100)).await;
+        h.round_ok().await;
+        assert_eq!(h.effect(&a_route), Some(RouteEffect::Owned));
+        assert_eq!(slot.statuses().get(&a), Some(&RouteStatus::Ready));
+        assert_eq!(
+            h.mock
+                .add_calls
+                .lock()
+                .iter()
+                .filter(|route| *route == &a_route)
+                .count(),
+            2,
+            "the retry runs once the deadline really passed"
+        );
+        assert!(h.route_retries.is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_definite_remove_failure_restores_owned_until_its_retry_deadline() {
+        let mut h = Harness::new();
+        let declaration = indexed("10.22.0.0/24", 7, None);
+        let route = resolved(&declaration);
+        let (_run, _registry, slot) = instance_with_slot(&h.controller, RouteSource::Additional);
+        slot.set_routes(RouteSet::from([declaration]));
+        h.round_ok().await;
+        assert_eq!(h.effect(&route), Some(RouteEffect::Owned));
+
+        h.mock.queue_remove(
+            &route,
+            RouteError::Failed(anyhow::anyhow!("delete failed")),
+            false,
+        );
+        slot.clear();
+        h.round_ok().await;
+        assert_eq!(
+            h.effect(&route),
+            Some(RouteEffect::Owned),
+            "a definite failure restores the owned effect"
+        );
+        assert!(h.mock.contains(&route));
+        assert_eq!(h.mock.remove_count(), 1);
+        let key = RouteKey::of(&route);
+        assert_eq!(h.route_retries[&key].0, route);
+        assert!(!h.route_retries[&key].1, "the retry belongs to the removal");
+        assert!(h.route_retries[&key].2 > tokio::time::Instant::now());
+
+        h.controller.dirty.mark();
+        tokio::time::advance(Duration::from_millis(100)).await;
+        h.round_ok().await;
+        assert_eq!(
+            h.mock.remove_count(),
+            1,
+            "dirty alone cannot bypass the delete backoff"
+        );
+        assert_eq!(h.effect(&route), Some(RouteEffect::Owned));
+
+        tokio::time::advance(Duration::from_millis(100)).await;
+        h.round_ok().await;
+        assert_eq!(h.mock.remove_count(), 2);
+        assert_eq!(h.effect(&route), None);
+        assert!(!h.mock.contains(&route));
+        assert!(h.route_retries.is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_unknown_removal_stays_removing_and_completes_at_the_retry() {
+        let mut h = Harness::new();
+        let declaration = indexed("10.23.0.0/24", 7, None);
+        let route = resolved(&declaration);
+        let (_run, _registry, slot) = instance_with_slot(&h.controller, RouteSource::Additional);
+        slot.set_routes(RouteSet::from([declaration]));
+        h.round_ok().await;
+        assert_eq!(h.effect(&route), Some(RouteEffect::Owned));
+
+        h.mock.queue_remove(
+            &route,
+            RouteError::Unknown(anyhow::anyhow!("unknown delete")),
+            false,
+        );
+        slot.clear();
+        h.round_ok().await;
+        assert_eq!(h.effect(&route), Some(RouteEffect::Removing));
+        assert!(h.mock.contains(&route));
+        assert_eq!(h.mock.remove_count(), 1);
+        let key = RouteKey::of(&route);
+
+        tokio::time::advance(Duration::from_millis(200)).await;
+        h.mock.queue_remove(
+            &route,
+            RouteError::Unknown(anyhow::anyhow!("unknown delete again")),
+            false,
+        );
+        h.round_ok().await;
+        assert_eq!(
+            h.effect(&route),
+            Some(RouteEffect::Removing),
+            "a present readback must not promote the uncertain removal back to Owned"
+        );
+        assert_eq!(h.mock.remove_count(), 2);
+        assert!(!h.route_retries[&key].1);
+        assert!(h.route_retries[&key].2 > tokio::time::Instant::now());
+
+        tokio::time::advance(Duration::from_millis(400)).await;
+        h.round_ok().await;
+        assert_eq!(h.effect(&route), None);
+        assert!(!h.mock.contains(&route));
+        assert_eq!(h.mock.remove_count(), 3);
+        assert!(h.route_retries.is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_unknown_removal_with_an_absent_readback_retires_the_record() {
+        let mut h = Harness::new();
+        let declaration = indexed("10.24.0.0/24", 7, None);
+        let route = resolved(&declaration);
+        let (_run, _registry, slot) = instance_with_slot(&h.controller, RouteSource::Additional);
+        slot.set_routes(RouteSet::from([declaration]));
+        h.round_ok().await;
+        assert_eq!(h.effect(&route), Some(RouteEffect::Owned));
+
+        h.mock.queue_remove(
+            &route,
+            RouteError::Unknown(anyhow::anyhow!("unknown delete")),
+            true,
+        );
+        slot.clear();
+        h.round_ok().await;
+        assert_eq!(h.effect(&route), Some(RouteEffect::Removing));
+        assert!(!h.mock.contains(&route));
+        assert_eq!(h.mock.remove_count(), 1);
+        assert!(h.route_retries.contains_key(&RouteKey::of(&route)));
+
+        tokio::time::advance(Duration::from_millis(200)).await;
+        h.round_ok().await;
+        assert_eq!(h.effect(&route), None);
+        assert!(h.route_retries.is_empty());
+        assert_eq!(
+            h.mock.remove_count(),
+            1,
+            "a confirmed absence needs no second delete"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_unknown_add_with_an_installed_row_stays_adding_and_is_never_deleted() {
+        let mut h = Harness::new();
+        let declaration = indexed("10.25.0.0/24", 7, None);
+        let route = resolved(&declaration);
+        let (_run, _registry, slot) = instance_with_slot(&h.controller, RouteSource::Additional);
+        slot.set_routes(RouteSet::from([declaration.clone()]));
+        h.mock.queue_add(
+            &route,
+            RouteError::Unknown(anyhow::anyhow!("unknown add")),
+            true,
+        );
+        h.round_ok().await;
+
+        assert_eq!(h.effect(&route), Some(RouteEffect::Adding));
+        assert!(h.mock.contains(&route));
+        assert_eq!(h.mock.add_count(), 1);
+        assert_eq!(h.mock.remove_count(), 0);
+        assert_eq!(
+            slot.statuses().get(&declaration),
+            Some(&RouteStatus::Pending {
+                error: Some(Arc::from("route operation outcome is unknown: unknown add"))
+            })
+        );
+
+        tokio::time::advance(Duration::from_millis(200)).await;
+        h.round_ok().await;
+        assert_eq!(h.effect(&route), Some(RouteEffect::Adding));
+        assert_eq!(h.mock.add_count(), 1);
+        assert!(matches!(
+            slot.statuses().get(&declaration),
+            Some(RouteStatus::Pending { error: Some(error) })
+                if error.as_ref() == "route addition is still unconfirmed"
+        ));
+
+        slot.clear();
+        tokio::time::advance(Duration::from_millis(400)).await;
+        h.round_ok().await;
+        assert_eq!(
+            h.effect(&route),
+            Some(RouteEffect::Adding),
+            "a withdrawn declaration must not delete an uncertain installation"
+        );
+        assert!(h.mock.contains(&route));
+        assert_eq!(h.mock.add_count(), 1);
+        assert_eq!(h.mock.remove_count(), 0);
+        assert!(
+            slot.statuses().is_empty(),
+            "no withdrawn entry is resurrected"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_unknown_add_retires_on_confirmed_absence_and_only_a_current_declaration_readds() {
+        let mut h = Harness::new();
+        let declaration = indexed("10.26.0.0/24", 7, None);
+        let route = resolved(&declaration);
+        let (_run, _registry, slot) = instance_with_slot(&h.controller, RouteSource::Additional);
+        slot.set_routes(RouteSet::from([declaration.clone()]));
+        h.mock.queue_add(
+            &route,
+            RouteError::Unknown(anyhow::anyhow!("unknown add")),
+            false,
+        );
+        h.round_ok().await;
+        assert_eq!(h.effect(&route), Some(RouteEffect::Adding));
+        assert!(!h.mock.contains(&route));
+        assert_eq!(h.mock.add_count(), 1);
+
+        slot.clear();
+        tokio::time::advance(Duration::from_millis(200)).await;
+        h.round_ok().await;
+        assert_eq!(h.effect(&route), None);
+        assert!(h.route_retries.is_empty());
+        assert_eq!(
+            h.mock.add_count(),
+            1,
+            "the withdrawn goal is not resurrected by the confirmed absence"
+        );
+        assert_eq!(h.mock.remove_count(), 0);
+        assert!(slot.statuses().is_empty());
+
+        slot.set_routes(RouteSet::from([declaration.clone()]));
+        h.round_ok().await;
+        assert_eq!(h.effect(&route), Some(RouteEffect::Owned));
+        assert_eq!(
+            h.mock.add_count(),
+            2,
+            "the current declaration may add again"
+        );
+        assert_eq!(slot.statuses().get(&declaration), Some(&RouteStatus::Ready));
+    }
+
+    /// A declaration that stays in its slot through an unknown addition is
+    /// confirmed absent at the retry deadline and only then really added by a
+    /// later round. The slot is never cleared or refilled to force that
+    /// wakeup.
+    #[tokio::test(start_paused = true)]
+    async fn an_unknown_add_with_a_retained_declaration_is_confirmed_absent_and_readded() {
+        let mut h = Harness::new();
+        let declaration = indexed("10.43.0.0/24", 7, None);
+        let route = resolved(&declaration);
+        let (_run, _registry, slot) = instance_with_slot(&h.controller, RouteSource::Additional);
+        slot.set_routes(RouteSet::from([declaration.clone()]));
+        h.mock.queue_add(
+            &route,
+            RouteError::Unknown(anyhow::anyhow!("unknown add")),
+            false,
+        );
+        h.round_ok().await;
+
+        assert_eq!(h.effect(&route), Some(RouteEffect::Adding));
+        assert!(
+            !h.mock.contains(&route),
+            "the unknown add left no physical row"
+        );
+        assert_eq!(h.mock.add_count(), 1);
+        assert_eq!(h.mock.remove_count(), 0);
+        assert_eq!(
+            slot.statuses().get(&declaration),
+            Some(&RouteStatus::Pending {
+                error: Some(Arc::from("route operation outcome is unknown: unknown add"))
+            }),
+            "the retained declaration carries the unconfirmed outcome"
+        );
+        let key = RouteKey::of(&route);
+        assert_eq!(h.route_retries[&key].0, route);
+        assert!(h.route_retries[&key].1, "the retry belongs to the addition");
+        assert!(h.route_retries[&key].2 > tokio::time::Instant::now());
+
+        h.controller.dirty.reset();
+        tokio::time::advance(Duration::from_millis(200)).await;
+        h.round_ok().await;
+        assert_eq!(
+            h.effect(&route),
+            None,
+            "the retry deadline confirms the absence and retires the Adding record"
+        );
+        assert!(!h.mock.contains(&route));
+        assert!(h.route_retries.is_empty());
+        assert_eq!(
+            h.mock.add_count(),
+            1,
+            "the confirmation round keeps the production batch policy"
+        );
+        assert_eq!(
+            slot.statuses().get(&declaration),
+            Some(&RouteStatus::Pending { error: None }),
+            "the retained declaration waits for the next round"
+        );
+        assert!(
+            h.dirty_peek(),
+            "the production round marks the still-actionable addition"
+        );
+
+        h.round_ok().await;
+        assert_eq!(h.effect(&route), Some(RouteEffect::Owned));
+        assert!(h.mock.contains(&route));
+        assert_eq!(slot.statuses().get(&declaration), Some(&RouteStatus::Ready));
+        assert_eq!(
+            h.mock.add_count(),
+            2,
+            "the retained declaration was really added once more"
+        );
+        assert_eq!(h.mock.remove_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_real_already_exists_with_a_matching_full_row_becomes_external() {
+        let mut h = Harness::new();
+        let declaration = indexed("10.27.0.0/24", 7, None);
+        let route = resolved(&declaration);
+        h.mock.queue_add(
+            &route,
+            RouteError::Failed(anyhow::Error::new(std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                "already present",
+            ))),
+            true,
+        );
+
+        let (_run, _registry, slot) = instance_with_slot(&h.controller, RouteSource::Additional);
+        slot.set_routes(RouteSet::from([declaration.clone()]));
+        h.round_ok().await;
+        assert_eq!(h.effect(&route), Some(RouteEffect::External));
+        assert!(h.mock.contains(&route));
+        assert_eq!(h.mock.add_count(), 1);
+        assert_eq!(h.mock.remove_count(), 0);
+        assert_eq!(slot.statuses().get(&declaration), Some(&RouteStatus::Ready));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_real_already_exists_with_a_different_full_row_of_the_same_key_is_not_external() {
+        let mut h = Harness::new();
+        let declaration = indexed_with_metric("10.28.0.0/24", 7, 77, Some("192.0.2.1"));
+        let other = indexed_with_metric("10.28.0.0/24", 7, 77, Some("192.0.2.9"));
+        let route = resolved(&declaration);
+        let other_route = resolved(&other);
+        assert_eq!(
+            RouteKey::of(&route),
+            RouteKey::of(&other_route),
+            "the two rows share the exclusive key"
+        );
+        assert_ne!(route, other_route);
+        h.mock.routes.lock().insert(other_route.clone());
+        h.mock.queue_add(
+            &route,
+            RouteError::Failed(anyhow::Error::new(std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                "already present",
+            ))),
+            false,
+        );
+
+        let (_run, _registry, slot) = instance_with_slot(&h.controller, RouteSource::Additional);
+        slot.set_routes(RouteSet::from([declaration.clone()]));
+        h.round_ok().await;
+        assert!(
+            h.applied().get(&RouteKey::of(&route)).is_none(),
+            "another full row of the same key is not the requested row"
+        );
+        assert_eq!(h.effect(&route), None);
+        assert!(h.mock.contains(&other_route));
+        assert!(!h.mock.contains(&route));
+        assert_eq!(h.mock.add_count(), 1);
+        assert_eq!(h.mock.remove_count(), 0);
+        assert!(matches!(
+            slot.statuses().get(&declaration),
+            Some(RouteStatus::Pending { error: Some(_) })
+        ));
+    }
+
+    #[tokio::test]
+    async fn an_unrelated_definite_failure_is_not_read_back_as_an_existing_row() {
+        let mut h = Harness::new();
+        let declaration = indexed("10.29.0.0/24", 7, None);
+        let route = resolved(&declaration);
+        h.mock.queue_add(
+            &route,
+            RouteError::Failed(anyhow::Error::new(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "denied",
+            ))),
+            false,
+        );
+        let (_run, _registry, slot) = instance_with_slot(&h.controller, RouteSource::Additional);
+        slot.set_routes(RouteSet::from([declaration]));
+
+        let mock = h.mock.clone();
+        let (entered, resume) = mock.gate_add(Some(route.clone()));
+        let mut round = Box::pin(h.round());
+        tokio::select! {
+            result = round.as_mut() => panic!("the failed addition finished before the gate: {result:?}"),
+            _ = entered.notified() => {}
+        }
+        // The row appears while the definite, non-AlreadyExists failure is in
+        // flight. The controller must not turn that into an External success.
+        mock.routes.lock().insert(route.clone());
+        resume.notify_one();
+        round.await.unwrap();
+
+        assert_eq!(
+            h.effect(&route),
+            None,
+            "only an AlreadyExists chain may adopt a readback"
+        );
+        assert!(h.mock.contains(&route));
+        assert_eq!(h.mock.add_count(), 1);
+        assert_eq!(
+            h.mock.existing_count(),
+            1,
+            "only the pre-add candidate readback ran; there is no post-failure probe"
+        );
+        assert_eq!(h.mock.remove_count(), 0);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test(start_paused = true)]
+    async fn replacing_an_exclusive_key_waits_for_the_old_delete_and_keeps_its_retry() {
+        let mut h = Harness::new();
+        let old = indexed_with_metric("10.30.0.0/24", 7, 91, Some("192.0.2.1"));
+        let new = indexed_with_metric("10.30.0.0/24", 7, 91, Some("192.0.2.9"));
+        let old_route = resolved(&old);
+        let new_route = resolved(&new);
+        assert_eq!(RouteKey::of(&old_route), RouteKey::of(&new_route));
+        assert_ne!(old_route, new_route);
+
+        let (_run, _registry, slot) = instance_with_slot(&h.controller, RouteSource::Additional);
+        slot.set_routes(RouteSet::from([old]));
+        h.round_ok().await;
+        assert_eq!(h.effect(&old_route), Some(RouteEffect::Owned));
+        let adds = h.mock.add_count();
+        let reads = h.mock.existing_count();
+
+        slot.set_routes(RouteSet::from([new]));
+        h.mock.queue_remove(
+            &old_route,
+            RouteError::Unknown(anyhow::anyhow!("delete outcome unknown")),
+            false,
+        );
+        h.round_ok().await;
+        let key = RouteKey::of(&old_route);
+        assert_eq!(h.effect(&old_route), Some(RouteEffect::Removing));
+        assert_eq!(
+            h.mock.add_count(),
+            adds,
+            "the new row must not be added while the old one still occupies the key"
+        );
+        assert_eq!(
+            h.mock.existing_count(),
+            reads,
+            "no readback is issued for the occupied key"
+        );
+        assert_eq!(h.mock.remove_count(), 1);
+        assert_eq!(h.route_retries[&key].0, old_route);
+        assert!(!h.route_retries[&key].1);
+
+        tokio::time::advance(Duration::from_millis(200)).await;
+        h.mock
+            .queue_existing_error(RouteError::Failed(anyhow::anyhow!("readback failed")));
+        h.round_ok().await;
+        assert_eq!(h.effect(&old_route), Some(RouteEffect::Removing));
+        assert_eq!(
+            h.route_retries[&key].0, old_route,
+            "the failed confirmation keeps the old row's retry"
+        );
+        assert!(
+            !h.route_retries[&key].1,
+            "it stays a removal retry and is not overwritten by a new addition"
+        );
+        assert_eq!(
+            h.route_retries[&key].4.as_ref(),
+            "route operation failed: readback failed"
+        );
+        assert_eq!(h.mock.add_count(), adds);
+        assert_eq!(
+            h.mock.remove_count(),
+            1,
+            "a failed batch confirmation does not delete again"
+        );
+        assert!(
+            h.mock
+                .existing_batches
+                .lock()
+                .iter()
+                .all(|batch| !batch.contains(&new_route)),
+            "no candidate readback ever asks for the new row while the key is occupied"
+        );
+
+        tokio::time::advance(Duration::from_millis(400)).await;
+        h.round_ok().await;
+        assert_eq!(h.effect(&old_route), None);
+        assert!(!h.mock.contains(&old_route));
+        assert_eq!(h.mock.remove_count(), 2);
+        assert!(
+            h.mock
+                .add_calls
+                .lock()
+                .iter()
+                .all(|route| route != &new_route),
+            "the old delete must be confirmed before the new add starts"
+        );
+
+        h.round_ok().await;
+        assert_eq!(h.effect(&new_route), Some(RouteEffect::Owned));
+        assert!(h.mock.contains(&new_route));
+        assert!(!h.mock.contains(&old_route));
+        assert_eq!(h.mock.add_count(), adds + 1);
+        let operations = h.mock.operations.lock().clone();
+        let last_old_remove = operations
+            .iter()
+            .rposition(|operation| {
+                matches!(operation, MockOperation::Remove(route) if route == &old_route)
+            })
+            .expect("the old row was removed");
+        let new_add = operations
+            .iter()
+            .position(
+                |operation| matches!(operation, MockOperation::Add(route) if route == &new_route),
+            )
+            .expect("the new row was added");
+        assert!(
+            last_old_remove < new_add,
+            "the old row's actual deletion precedes the new row's addition"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_in_flight_addition_survives_a_withdrawal_and_is_cleaned_up_next_round() {
+        let mut h = Harness::new();
+        let declaration = indexed("10.31.0.0/24", 7, None);
+        let route = resolved(&declaration);
+        let (_run, _registry, slot) = instance_with_slot(&h.controller, RouteSource::Additional);
+        slot.set_routes(RouteSet::from([declaration]));
+
+        let controller = h.controller.clone();
+        let mock = h.mock.clone();
+        let dirty = controller.dirty.clone();
+        let slot_handle = slot.clone();
+        let (entered, resume) = mock.gate_add(Some(route.clone()));
+        dirty.reset();
+        let mut round = Box::pin(h.round());
+        tokio::select! {
+            result = round.as_mut() => panic!("the addition finished before the gate: {result:?}"),
+            _ = entered.notified() => {}
+        }
+        assert!(
+            !dirty.peek(),
+            "the round itself has not changed the inputs yet"
+        );
+        slot_handle.clear();
+        assert!(
+            dirty.peek(),
+            "the withdrawal during the awaited addition marks the flag"
+        );
+        resume.notify_one();
+        round.await.unwrap();
+
+        assert_eq!(
+            h.effect(&route),
+            Some(RouteEffect::Owned),
+            "the real successful addition is recorded as Owned first"
+        );
+        assert!(h.mock.contains(&route));
+        assert_eq!(
+            h.mock.remove_count(),
+            0,
+            "no compensating delete happens in the same round"
+        );
+        assert!(
+            slot_handle.statuses().is_empty(),
+            "the withdrawn declaration is not resurrected"
+        );
+        assert!(
+            h.dirty_peek(),
+            "the mark produced during the awaited addition survived the round"
+        );
+
+        h.round_ok().await;
+        assert_eq!(h.effect(&route), None);
+        assert!(!h.mock.contains(&route));
+        assert_eq!(h.mock.remove_count(), 1);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn an_in_flight_addition_cannot_mark_a_replacement_row_ready() {
+        let mut h = Harness::new();
+        let old = indexed_with_metric("10.32.0.0/24", 7, 92, Some("192.0.2.1"));
+        let new = indexed_with_metric("10.32.0.0/24", 7, 92, Some("192.0.2.9"));
+        let old_route = resolved(&old);
+        let new_route = resolved(&new);
+        assert_eq!(RouteKey::of(&old_route), RouteKey::of(&new_route));
+        let (_run, _registry, slot) = instance_with_slot(&h.controller, RouteSource::Additional);
+        slot.set_routes(RouteSet::from([old.clone()]));
+
+        let controller = h.controller.clone();
+        let mock = h.mock.clone();
+        let dirty = controller.dirty.clone();
+        let slot_handle = slot.clone();
+        let (entered, resume) = mock.gate_add(Some(old_route.clone()));
+        dirty.reset();
+        let mut round = Box::pin(h.round());
+        tokio::select! {
+            result = round.as_mut() => panic!("the addition finished before the gate: {result:?}"),
+            _ = entered.notified() => {}
+        }
+        slot_handle.set_routes(RouteSet::from([new.clone()]));
+        assert!(dirty.peek());
+        resume.notify_one();
+        round.await.unwrap();
+
+        assert_eq!(h.effect(&old_route), Some(RouteEffect::Owned));
+        assert!(
+            h.mock.remove_calls.lock().is_empty(),
+            "no inline compensating delete happens in the same round"
+        );
+        assert_eq!(
+            slot_handle.statuses().get(&new),
+            Some(&RouteStatus::Pending { error: None }),
+            "the old row cannot mark the replacement row ready"
+        );
+        assert!(slot_handle.statuses().get(&old).is_none());
+        assert!(h.dirty_peek());
+
+        h.round_ok().await;
+        assert_eq!(h.effect(&old_route), None);
+        assert!(!h.mock.contains(&old_route));
+        assert_eq!(h.mock.remove_count(), 1);
+        h.round_ok().await;
+        assert_eq!(h.effect(&new_route), Some(RouteEffect::Owned));
+        assert!(h.mock.contains(&new_route));
+        assert_eq!(slot_handle.statuses().get(&new), Some(&RouteStatus::Ready));
+    }
+
+    #[tokio::test]
+    async fn an_in_flight_addition_can_be_ready_when_the_same_row_is_redeclared() {
+        let mut h = Harness::new();
+        let declaration = indexed("10.33.0.0/24", 7, None);
+        let route = resolved(&declaration);
+        let (_run, _registry, slot) = instance_with_slot(&h.controller, RouteSource::Additional);
+        slot.set_routes(RouteSet::from([declaration.clone()]));
+
+        let controller = h.controller.clone();
+        let mock = h.mock.clone();
+        let dirty = controller.dirty.clone();
+        let slot_handle = slot.clone();
+        let (entered, resume) = mock.gate_add(Some(route.clone()));
+        dirty.reset();
+        let mut round = Box::pin(h.round());
+        tokio::select! {
+            result = round.as_mut() => panic!("the addition finished before the gate: {result:?}"),
+            _ = entered.notified() => {}
+        }
+        slot_handle.clear();
+        slot_handle.set_routes(RouteSet::from([declaration.clone()]));
+        assert!(dirty.peek());
+        resume.notify_one();
+        round.await.unwrap();
+
+        assert_eq!(h.effect(&route), Some(RouteEffect::Owned));
+        assert_eq!(
+            slot_handle.statuses().get(&declaration),
+            Some(&RouteStatus::Ready),
+            "a remove-and-readd of the same row may reuse the new effect"
+        );
+        assert_eq!(h.mock.remove_count(), 0);
+        assert!(h.dirty_peek());
+
+        h.round_ok().await;
+        assert_eq!(h.effect(&route), Some(RouteEffect::Owned));
+        assert_eq!(h.mock.add_count(), 1);
+        assert_eq!(h.mock.remove_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn an_in_flight_addition_leaves_an_unrelated_change_dirty_and_converges_next_round() {
+        let mut h = Harness::new();
+        let a = indexed("10.34.0.0/24", 7, None);
+        let b_old = indexed("10.35.0.0/24", 7, None);
+        let b_new = indexed("10.36.0.0/24", 7, None);
+        let a_route = resolved(&a);
+        let b_old_route = resolved(&b_old);
+        let b_new_route = resolved(&b_new);
+        let (_run, _registry, slot) = instance_with_slot(&h.controller, RouteSource::Additional);
+
+        slot.set_routes(RouteSet::from([b_old.clone()]));
+        h.round_ok().await;
+        assert_eq!(h.effect(&b_old_route), Some(RouteEffect::Owned));
+
+        slot.set_routes(RouteSet::from([a.clone(), b_old.clone()]));
+        let controller = h.controller.clone();
+        let mock = h.mock.clone();
+        let dirty = controller.dirty.clone();
+        let slot_handle = slot.clone();
+        let (entered, resume) = mock.gate_add(Some(a_route.clone()));
+        dirty.reset();
+        let mut round = Box::pin(h.round());
+        tokio::select! {
+            result = round.as_mut() => panic!("the addition finished before the gate: {result:?}"),
+            _ = entered.notified() => {}
+        }
+        slot_handle.set_routes(RouteSet::from([a.clone(), b_new.clone()]));
+        assert!(dirty.peek());
+        resume.notify_one();
+        round.await.unwrap();
+
+        assert_eq!(h.effect(&a_route), Some(RouteEffect::Owned));
+        assert_eq!(
+            slot_handle.statuses().get(&a),
+            Some(&RouteStatus::Ready),
+            "the unchanged in-flight row can be ready"
+        );
+        assert_eq!(
+            h.effect(&b_old_route),
+            Some(RouteEffect::Owned),
+            "an unrelated change does not delete the old row in the same round"
+        );
+        assert!(h.mock.remove_calls.lock().is_empty());
+        assert_eq!(
+            slot_handle.statuses().get(&b_new),
+            Some(&RouteStatus::Pending { error: None })
+        );
+        assert!(h.dirty_peek());
+
+        h.round_ok().await;
+        assert_eq!(h.effect(&b_old_route), None);
+        assert_eq!(h.effect(&b_new_route), Some(RouteEffect::Owned));
+        assert_eq!(h.mock.remove_count(), 1);
+        assert_eq!(h.mock.add_count(), 3);
+        assert_eq!(
+            slot_handle.statuses().get(&b_new),
+            Some(&RouteStatus::Ready)
+        );
+    }
+
+    #[tokio::test]
+    async fn an_in_flight_addition_survives_a_released_root_and_gets_no_ready_feedback() {
+        use easytier_core::config::{
+            peers::PeerRuntimeSnapshot,
+            runtime::{CoreRuntimeConfig, CoreRuntimeConfigStore},
+        };
+
+        let mut h = Harness::new();
+        let declaration = indexed("10.37.0.0/24", 7, None);
+        let route = resolved(&declaration);
+        let run = Uuid::new_v4();
+        let registry = h.controller.open_instance(run).unwrap();
+        let store = CoreRuntimeConfigStore::new(
+            CoreRuntimeConfig::default(),
+            Arc::new(PeerRuntimeSnapshot::default()),
+        );
+        // A real, nonempty manual policy stays held by the live store. Its TUN
+        // declaration is never installed in this test; it only proves that
+        // released inputs cannot be resurrected even while this policy exists.
+        let held_manual = BTreeSet::from(["10.237.0.0/24".parse().unwrap()]);
+        store.update_services(|services| services.manual_routes = Some(held_manual.clone()));
+        h.controller.bind_config(run, store.clone()).unwrap();
+        let slot = registry
+            .handle()
+            .open_slot(RouteSource::Additional)
+            .unwrap();
+        slot.set_routes(RouteSet::from([declaration.clone()]));
+
+        let controller = h.controller.clone();
+        let mock = h.mock.clone();
+        let dirty = controller.dirty.clone();
+        let slot_handle = slot.clone();
+        let (entered, resume) = mock.gate_add(Some(route.clone()));
+        dirty.reset();
+        let mut round = Box::pin(h.round());
+        tokio::select! {
+            result = round.as_mut() => panic!("the addition finished before the gate: {result:?}"),
+            _ = entered.notified() => {}
+        }
+        drop(registry);
+        assert!(
+            dirty.peek(),
+            "releasing the root during the awaited addition marks the flag"
+        );
+        resume.notify_one();
+        round.await.unwrap();
+
+        assert_eq!(h.effect(&route), Some(RouteEffect::Owned));
+        assert!(h.mock.contains(&route));
+        assert_eq!(
+            slot_handle.statuses().get(&declaration),
+            Some(&RouteStatus::Pending { error: None }),
+            "a released root gets no ready feedback"
+        );
+        assert!(h.dirty_peek());
+        assert_eq!(
+            controller.effective_routes_for_instance(&run),
+            RouteSet::new(),
+            "the held nonempty manual configuration cannot recreate a released input"
+        );
+        assert_eq!(
+            store.snapshot().services.manual_routes,
+            Some(held_manual),
+            "the store still holds the real nonempty manual policy"
+        );
+
+        h.round_ok().await;
+        assert_eq!(h.effect(&route), None);
+        assert!(!h.mock.contains(&route));
+        assert_eq!(h.mock.remove_count(), 1);
+        assert!(
+            !controller.runtime.read().instances.contains_key(&run),
+            "the released record is eventually removed"
+        );
+    }
+
+    /// A manual policy committed while an AutoProxy addition is awaited must be
+    /// acted on by later production rounds, not by the in-flight addition.
+    #[tokio::test]
+    async fn manual_policy_commit_during_awaited_add_keeps_owned_row_until_next_round() {
+        use easytier_core::config::{
+            peers::PeerRuntimeSnapshot,
+            runtime::{CoreRuntimeConfig, CoreRuntimeConfigStore},
+        };
+
+        let mut h = Harness::new();
+        let declaration = indexed("10.44.0.0/24", 7, None);
+        let route = resolved(&declaration);
+        let run = Uuid::new_v4();
+        let registry = h.controller.open_instance(run).unwrap();
+        let store = CoreRuntimeConfigStore::new(
+            CoreRuntimeConfig::default(),
+            Arc::new(PeerRuntimeSnapshot::default()),
+        );
+        h.controller.bind_config(run, store.clone()).unwrap();
+        assert!(
+            store.snapshot().services.manual_routes.is_none(),
+            "the fixture starts in automatic mode"
+        );
+        let slot = registry.handle().open_slot(RouteSource::AutoProxy).unwrap();
+        slot.set_routes(RouteSet::from([declaration.clone()]));
+
+        let controller = h.controller.clone();
+        let mock = h.mock.clone();
+        let dirty = controller.dirty.clone();
+        let (entered, resume) = mock.gate_add(Some(route.clone()));
+        dirty.reset();
+        let mut round = Box::pin(h.round());
+        tokio::select! {
+            result = round.as_mut() => panic!("the addition finished before the gate: {result:?}"),
+            _ = entered.notified() => {}
+        }
+        // The live store commits the policy the way production configuration
+        // does; that commit must mark the shared flag by itself.
+        store.update_services(|services| services.manual_routes = Some(BTreeSet::new()));
+        assert!(
+            dirty.peek(),
+            "the configuration commit marks the shared route flag itself"
+        );
+        assert_eq!(
+            store.snapshot().services.manual_routes,
+            Some(BTreeSet::new())
+        );
+        resume.notify_one();
+        round.await.unwrap();
+
+        assert_eq!(
+            h.effect(&route),
+            Some(RouteEffect::Owned),
+            "the real successful addition is recorded before the policy is applied"
+        );
+        assert!(h.mock.contains(&route));
+        assert_eq!(
+            h.mock.remove_count(),
+            0,
+            "the awaited addition is not compensated in the same round"
+        );
+        assert!(
+            matches!(
+                slot.statuses().get(&declaration),
+                Some(RouteStatus::Suppressed(_))
+            ),
+            "the current manual policy suppresses the AutoProxy declaration instead of reporting ready"
+        );
+        assert!(
+            h.dirty_peek(),
+            "the configuration mark survives the awaited round"
+        );
+
+        h.round_ok().await;
+        assert_eq!(
+            h.effect(&route),
+            None,
+            "the next round applies the current empty manual policy"
+        );
+        assert!(!h.mock.contains(&route));
+        assert_eq!(
+            h.mock.add_count(),
+            1,
+            "the suppressed declaration is not added again"
+        );
+        assert_eq!(h.mock.remove_count(), 1);
+        assert!(
+            matches!(
+                slot.statuses().get(&declaration),
+                Some(RouteStatus::Suppressed(_))
+            ),
+            "the slot stays suppressed after its installed row is deleted"
+        );
+        assert_eq!(
+            store.snapshot().services.manual_routes,
+            Some(BTreeSet::new()),
+            "the store stayed alive and kept the committed policy"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_awaited_removal_rechecks_fresh_declarations_before_deleting_a_later_row() {
+        let mut h = Harness::new();
+        let a = indexed("10.38.0.0/24", 7, None);
+        let b = indexed("10.39.0.0/24", 7, None);
+        let a_route = resolved(&a);
+        let b_route = resolved(&b);
+        let (_run, _registry, slot) = instance_with_slot(&h.controller, RouteSource::Additional);
+        slot.set_routes(RouteSet::from([a, b.clone()]));
+        h.round_ok().await;
+        assert_eq!(h.effect(&a_route), Some(RouteEffect::Owned));
+        assert_eq!(h.effect(&b_route), Some(RouteEffect::Owned));
+
+        slot.clear();
+        let controller = h.controller.clone();
+        let mock = h.mock.clone();
+        let dirty = controller.dirty.clone();
+        let slot_handle = slot.clone();
+        let (entered, resume) = mock.gate_remove(Some(a_route.clone()));
+        dirty.reset();
+        let mut round = Box::pin(h.round());
+        tokio::select! {
+            result = round.as_mut() => panic!("the removals finished before the gate: {result:?}"),
+            _ = entered.notified() => {}
+        }
+        slot_handle.set_routes(RouteSet::from([b.clone()]));
+        assert!(dirty.peek());
+        resume.notify_one();
+        round.await.unwrap();
+
+        assert_eq!(h.effect(&a_route), None, "the awaited removal completed");
+        assert_eq!(
+            h.effect(&b_route),
+            Some(RouteEffect::Owned),
+            "the fresh check at execution time keeps the redeclared row"
+        );
+        assert!(
+            !h.mock
+                .remove_calls
+                .lock()
+                .iter()
+                .any(|route| route == &b_route),
+            "the collection-time decision must not delete the redeclared row"
+        );
+        assert_eq!(h.mock.remove_count(), 1);
+        assert!(h.mock.contains(&b_route));
+        assert!(!h.mock.contains(&a_route));
+        assert_eq!(slot_handle.statuses().get(&b), Some(&RouteStatus::Ready));
+        assert!(
+            h.dirty_peek(),
+            "the slot mark made during the awaited removal survived the round"
+        );
+
+        h.round_ok().await;
+        assert_eq!(h.effect(&b_route), Some(RouteEffect::Owned));
+        assert_eq!(h.mock.remove_count(), 1);
+    }
+
+    #[cfg(all(target_os = "linux", feature = "tun"))]
+    #[tokio::test]
+    async fn device_less_actions_stay_ordinary_for_a_bound_member_without_an_interface() {
+        let mut h = Harness::new();
+        let run = Uuid::new_v4();
+        let mut fixture = ManagedNicFixture::new(run);
+        let member = fixture.create_member();
+        let registry = h.controller.open_instance(run).unwrap();
+        h.controller.bind_member(run, &member).unwrap();
+        let slot = registry
+            .handle()
+            .open_slot(RouteSource::Additional)
+            .unwrap();
+        let blackhole = RouteSpec::<RouteDevice> {
+            destination: "10.40.0.0/24".parse().unwrap(),
+            action: RouteAction::Blackhole,
+            metric: 5,
+            table: None,
+        };
+        let unreachable = RouteSpec::<RouteDevice> {
+            destination: "10.41.0.0/24".parse().unwrap(),
+            action: RouteAction::Unreachable,
+            metric: 5,
+            table: None,
+        };
+        let unresolved_tun = RouteSpec::for_tun("10.42.0.0/24".parse().unwrap());
+        slot.set_routes(RouteSet::from([
+            blackhole.clone(),
+            unreachable.clone(),
+            unresolved_tun.clone(),
+        ]));
+        h.round_ok().await;
+
+        let blackhole_route = resolved(&blackhole);
+        let unreachable_route = resolved(&unreachable);
+        assert_eq!(h.effect(&blackhole_route), Some(RouteEffect::Owned));
+        assert_eq!(h.effect(&unreachable_route), Some(RouteEffect::Owned));
+        assert!(h.mock.contains(&blackhole_route));
+        assert!(h.mock.contains(&unreachable_route));
+        assert_eq!(slot.statuses().get(&blackhole), Some(&RouteStatus::Ready));
+        assert_eq!(slot.statuses().get(&unreachable), Some(&RouteStatus::Ready));
+        assert_eq!(
+            slot.statuses().get(&unresolved_tun),
+            Some(&RouteStatus::Pending { error: None }),
+            "a tun declaration without a bound interface stays unresolved"
+        );
+        assert_eq!(h.mock.add_count(), 2);
+        assert!(
+            h.controller.runtime.read().instances[&run]
+                .interface
+                .is_none(),
+            "no device was ever recorded for the bound member"
+        );
+    }
+
+    #[tokio::test]
+    async fn planning_merges_the_same_row_and_drops_the_withdrawn_declaration() {
+        let controller = RouteController::new(Arc::new(DirtyFlag::new(false)));
+        let (p_run, _p_registry, p_slot) = instance_with_slot(&controller, RouteSource::AutoProxy);
+        let (q_run, _q_registry, q_slot) = instance_with_slot(&controller, RouteSource::AutoProxy);
+
+        let a = indexed("10.1.0.0/24", 7, None);
+        let b = indexed("10.2.0.0/24", 7, None);
+        let c = indexed("10.3.0.0/24", 7, None);
+        p_slot.set_routes(RouteSet::from([a.clone(), b.clone()]));
+        q_slot.set_routes(RouteSet::from([b.clone()]));
+
+        let b_route = resolved(&b);
+        let c_route = resolved(&c);
+        let a_route = resolved(&a);
+
+        let plan = controller
+            .plan_reconciliation(None, &BTreeMap::new(), None)
+            .await;
+        assert_eq!(
+            plan.desired.get(&RouteKey::of(&b_route)),
+            Some(&(b_route.clone(), BTreeSet::from([p_run, q_run]))),
+            "the same complete row merges its owners"
+        );
+        assert!(plan.add.contains(&a_route) && plan.add.contains(&b_route));
+        assert!(plan.remove.is_empty());
+
+        // P replaces {A, B} with {C}; Q still declares B. A disappears only
+        // because no current input needs it, and B keeps Q as its owner.
+        p_slot.set_routes(RouteSet::from([c.clone()]));
+        let plan = controller
+            .plan_reconciliation(None, &BTreeMap::new(), None)
+            .await;
+        assert_eq!(plan.desired.len(), 2, "only the current B and C remain");
+        assert_eq!(
+            plan.desired.get(&RouteKey::of(&b_route)),
+            Some(&(b_route.clone(), BTreeSet::from([q_run])))
+        );
+        assert_eq!(
+            plan.desired
+                .get(&RouteKey::of(&c_route))
+                .map(|(route, _)| route),
+            Some(&c_route)
+        );
+        assert!(!plan.add.contains(&a_route), "A is no longer a target");
+        assert!(plan.remove.is_empty(), "nothing was installed yet");
+        assert_eq!(
+            p_slot.statuses().get(&a),
+            None,
+            "the withdrawn declaration holds no feedback entry"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn different_linux_metrics_coexist_and_keep_the_installed_occupant() {
+        let controller = RouteController::new(Arc::new(DirtyFlag::new(false)));
+        let (run, _registry, slot) = instance_with_slot(&controller, RouteSource::Additional);
+
+        let zero = indexed_with_metric("10.5.0.0/24", 7, 0, None);
+        let ten = indexed_with_metric("10.5.0.0/24", 7, 10, None);
+        slot.set_routes(RouteSet::from([zero.clone(), ten.clone()]));
+        let plan = controller
+            .plan_reconciliation(None, &BTreeMap::new(), None)
+            .await;
+        assert_eq!(
+            plan.desired.len(),
+            2,
+            "different legal metrics are different keys and coexist"
+        );
+        assert!(plan.desired.contains_key(&RouteKey::of(&resolved(&zero))));
+        assert!(plan.desired.contains_key(&RouteKey::of(&resolved(&ten))));
+
+        // Two declarations of one key differ in their gateway. The row already
+        // installed wins while it is still a candidate.
+        let first = indexed("10.6.0.0/24", 7, Some("192.0.2.1"));
+        let second = indexed("10.6.0.0/24", 7, Some("192.0.2.9"));
+        slot.set_routes(RouteSet::from([first.clone(), second.clone()]));
+        let row = installed(&first, run);
+        let stable_route = row.route.clone();
+        controller
+            .runtime
+            .write()
+            .applied
+            .insert(RouteKey::of(&stable_route), row);
+
+        let plan = controller
+            .plan_reconciliation(None, &BTreeMap::new(), None)
+            .await;
+        assert_eq!(
+            plan.desired
+                .get(&RouteKey::of(&stable_route))
+                .map(|(route, _)| route),
+            Some(&stable_route),
+            "an installed candidate stays the occupant"
+        );
+        assert!(plan.add.is_empty(), "the installed row needs no addition");
+        assert!(plan.remove.is_empty(), "the installed row stays");
+        let statuses = slot.statuses();
+        assert_eq!(statuses.get(&first), Some(&RouteStatus::Ready));
+        assert!(
+            matches!(statuses.get(&second), Some(RouteStatus::Suppressed(_))),
+            "the competing declaration is suppressed"
+        );
+
+        // Once the installed row is withdrawn, the stable first candidate wins
+        // and the complete parameter change yields both remove and add.
+        slot.set_routes(RouteSet::from([second.clone()]));
+        let plan = controller
+            .plan_reconciliation(None, &BTreeMap::new(), None)
+            .await;
+        let second_route = resolved(&second);
+        assert_eq!(
+            plan.desired
+                .get(&RouteKey::of(&stable_route))
+                .map(|(route, _)| route),
+            Some(&second_route)
+        );
+        assert!(
+            plan.remove.contains(&stable_route),
+            "the changed row is removed"
+        );
+        assert!(plan.add.contains(&second_route), "the new row is added");
+    }
+
+    #[tokio::test]
+    async fn manual_policy_decides_auto_proxy_and_keeps_additional() {
+        use easytier_core::config::{
+            peers::PeerRuntimeSnapshot,
+            runtime::{CoreRuntimeConfig, CoreRuntimeConfigStore},
+        };
+
+        let controller = RouteController::new(Arc::new(DirtyFlag::new(false)));
+        let run = Uuid::new_v4();
+        let registry = controller.open_instance(run).unwrap();
+        let store = CoreRuntimeConfigStore::new(
+            CoreRuntimeConfig::default(),
+            Arc::new(PeerRuntimeSnapshot::default()),
+        );
+        controller.bind_config(run, store.clone()).unwrap();
+        let auto = registry.handle().open_slot(RouteSource::AutoProxy).unwrap();
+        let additional = registry
+            .handle()
+            .open_slot(RouteSource::Additional)
+            .unwrap();
+        let auto_route = indexed("10.7.0.0/24", 7, None);
+        let additional_route = indexed("10.8.0.0/24", 7, None);
+        auto.set_routes(RouteSet::from([auto_route.clone()]));
+        additional.set_routes(RouteSet::from([additional_route.clone()]));
+
+        // None: AutoProxy contributes, so the exported candidates hold both,
+        // even though no NIC is bound.
+        let exported = controller.effective_routes_for_instance(&run);
+        assert_eq!(
+            exported,
+            RouteSet::from([auto_route.clone(), additional_route.clone()])
+        );
+        let plan = controller
+            .plan_reconciliation(None, &BTreeMap::new(), None)
+            .await;
+        assert_eq!(plan.desired.len(), 2);
+
+        // Some(empty): no manual route is generated and AutoProxy is
+        // suppressed without touching any slot.
+        store.update_services(|services| services.manual_routes = Some(BTreeSet::new()));
+        assert_eq!(
+            controller.effective_routes_for_instance(&run),
+            RouteSet::from([additional_route.clone()]),
+            "a configured manual policy suppresses every AutoProxy declaration"
+        );
+        let plan = controller
+            .plan_reconciliation(None, &BTreeMap::new(), None)
+            .await;
+        assert_eq!(plan.desired.len(), 1, "AutoProxy is no longer a target");
+        assert!(matches!(
+            auto.statuses().get(&auto_route),
+            Some(RouteStatus::Suppressed(_))
+        ));
+        assert!(!matches!(
+            additional.statuses().get(&additional_route),
+            Some(RouteStatus::Suppressed(_))
+        ));
+
+        // Some(nonempty): the manual list itself becomes the TUN target. Its
+        // `Tun` device stays unresolved without a binding, so only the normal
+        // indexed route reaches this round's target.
+        store.update_services(|services| {
+            services.manual_routes = Some(BTreeSet::from(["10.9.0.0/24".parse().unwrap()]));
+        });
+        assert_eq!(
+            controller.effective_routes_for_instance(&run),
+            RouteSet::from([
+                RouteSpec::for_tun("10.9.0.0/24".parse().unwrap()),
+                additional_route.clone(),
+            ]),
+            "manual routes replace auto proxy and Additional stays"
+        );
+        assert_eq!(
+            controller.effective_routes_for_instance(&Uuid::new_v4()),
+            RouteSet::new(),
+            "an unknown run contributes nothing"
+        );
+    }
+
+    #[tokio::test]
+    async fn dropped_registry_plans_nothing_and_keeps_the_ledger() {
+        let controller = RouteController::new(Arc::new(DirtyFlag::new(false)));
+        let run = Uuid::new_v4();
+        let registry = controller.open_instance(run).unwrap();
+        let slot = registry
+            .handle()
+            .open_slot(RouteSource::Additional)
+            .unwrap();
+        let declaration = indexed("10.11.0.0/24", 7, None);
+        slot.set_routes(RouteSet::from([declaration.clone()]));
+        let row = installed(&declaration, run);
+        let planned = row.route.clone();
+        controller
+            .runtime
+            .write()
+            .applied
+            .insert(RouteKey::of(&planned), row);
+
+        drop(registry);
+        slot.set_routes(RouteSet::from([indexed("10.12.0.0/24", 7, None)]));
+        let plan = controller
+            .plan_reconciliation(None, &BTreeMap::new(), None)
+            .await;
+        assert!(plan.desired.is_empty(), "a released registry plans nothing");
+        assert!(plan.slots.is_empty());
+        assert_eq!(plan.remove, vec![planned.clone()]);
+        assert!(plan.add.is_empty());
+        assert_eq!(
+            controller
+                .applied_routes()
+                .get(&RouteKey::of(&planned))
+                .map(|row| (&row.route, row.effect)),
+            Some((&planned, RouteEffect::Owned)),
+            "planning never replaces or clears the applied ledger"
+        );
+
+        controller.request_shutdown();
+        let plan = controller
+            .plan_reconciliation(None, &BTreeMap::new(), None)
+            .await;
+        assert!(plan.desired.is_empty(), "shutdown clears every target");
+        assert!(!controller.applied_routes().is_empty());
+        assert_eq!(
+            controller.effective_routes_for_instance(&run),
+            RouteSet::new()
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn feedback_reports_each_row_of_one_slot_separately() {
+        let controller = RouteController::new(Arc::new(DirtyFlag::new(false)));
+        let (run, _registry, slot) = instance_with_slot(&controller, RouteSource::Additional);
+
+        let ready = indexed("10.13.0.0/24", 7, None);
+        let pending = indexed("10.14.0.0/24", 7, None);
+        let winner = indexed("10.15.0.0/24", 7, Some("192.0.2.1"));
+        let loser = indexed("10.15.0.0/24", 7, Some("192.0.2.2"));
+        slot.set_routes(RouteSet::from([
+            ready.clone(),
+            pending.clone(),
+            winner.clone(),
+            loser.clone(),
+        ]));
+        let ready_row = installed(&ready, run);
+        let ready_route = ready_row.route.clone();
+        controller
+            .runtime
+            .write()
+            .applied
+            .insert(RouteKey::of(&ready_route), ready_row);
+
+        let plan = controller
+            .plan_reconciliation(None, &BTreeMap::new(), None)
+            .await;
+        assert_eq!(
+            plan.desired
+                .get(&RouteKey::of(&ready_route))
+                .map(|(route, _)| route),
+            Some(&ready_route)
+        );
+        // The stable first candidate owns the key but has no confirmed effect
+        // yet; the other declaration of that key loses the competition.
+        let statuses = slot.statuses();
+        assert_eq!(statuses.get(&ready), Some(&RouteStatus::Ready));
+        assert_eq!(
+            statuses.get(&pending),
+            Some(&RouteStatus::Pending { error: None })
+        );
+        assert_eq!(
+            statuses.get(&winner),
+            Some(&RouteStatus::Pending { error: None })
+        );
+        assert!(matches!(
+            statuses.get(&loser),
+            Some(RouteStatus::Suppressed(_))
+        ));
+
+        // A failure for the exact same complete row is reported on that row
+        // only; it cannot override the confirmed row.
+        let pending_route = resolved(&pending);
+        let mut errors = BTreeMap::new();
+        errors.insert(pending_route, Arc::<str>::from("install failed"));
+        controller.plan_reconciliation(None, &errors, None).await;
+        let statuses = slot.statuses();
+        assert_eq!(
+            statuses.get(&pending),
+            Some(&RouteStatus::Pending {
+                error: Some(Arc::<str>::from("install failed"))
+            })
+        );
+        assert_eq!(statuses.get(&ready), Some(&RouteStatus::Ready));
+
+        // A different complete row never inherits another row's error.
+        let mut errors = BTreeMap::new();
+        errors.insert(
+            resolved(&indexed("10.99.0.0/24", 7, None)),
+            Arc::<str>::from("unrelated"),
+        );
+        controller.plan_reconciliation(None, &errors, None).await;
+        assert_eq!(
+            slot.statuses().get(&pending),
+            Some(&RouteStatus::Pending { error: None })
+        );
+    }
+
+    // The managed-routes NIC fixture is entirely in memory: the registry only
+    // builds a NIC descriptor that its members share, so nothing here creates
+    // a TUN device or touches a system address or route. The namespace handle
+    // is an opaque external reference that no code path here enters, and the
+    // dispatcher stays absent because no device is ever created.
+    #[cfg(feature = "tun")]
+    const MANAGED_NIC_NAME: &str = "et-route-test";
+
+    #[cfg(feature = "tun")]
+    fn managed_virtual_nic_config() -> VirtualNicConfig {
+        VirtualNicConfig::new(
+            MANAGED_NIC_NAME.to_owned(),
+            1500,
+            NetNS::from_host_reference("route-controller-test"),
+        )
+        .with_routes_managed(true)
+    }
+
+    #[cfg(feature = "tun")]
+    struct ManagedNicFixture {
+        run: Uuid,
+        registry: SharedVirtualNicRegistry,
+    }
+
+    #[cfg(feature = "tun")]
+    impl ManagedNicFixture {
+        fn new(run: Uuid) -> Self {
+            Self {
+                run,
+                registry: SharedVirtualNicRegistry::new(),
+            }
+        }
+
+        /// A fresh registration for this run. Both members share one NIC;
+        /// only the registration identity differs.
+        fn create_member(&mut self) -> SharedVirtualNicMember {
+            self.registry
+                .try_create_member(
+                    MANAGED_NIC_NAME.to_owned(),
+                    managed_virtual_nic_config(),
+                    self.run,
+                    Arc::new(Notify::new()),
+                )
+                .unwrap()
+        }
+    }
+
+    /// Attach the member's registration under the NIC lock, as device creation
+    /// does. No device is created here.
+    #[cfg(feature = "tun")]
+    async fn attach_member(member: &SharedVirtualNicMember) {
+        let shared_nic = member.shared_nic();
+        let mut nic = shared_nic.lock().await;
+        nic.attach_member_registration(member.member_id(), member.registration_id())
+            .await
+            .unwrap();
+    }
+
+    /// A registration replaced by a newer one for the same run cannot confirm
+    /// a sync, and that refusal must leave the current registration's claims
+    /// alone. The current claims start nonempty so a mistaken withdrawal is
+    /// observable.
+    #[cfg(feature = "tun")]
+    #[tokio::test]
+    async fn superseded_registration_sync_reports_false_and_keeps_current_claims() {
+        let mut fixture = ManagedNicFixture::new(Uuid::new_v4());
+        let old_member = fixture.create_member();
+        attach_member(&old_member).await;
+        let new_member = fixture.create_member();
+        attach_member(&new_member).await;
+
+        let prefix: IpCidr = "10.42.0.0/24".parse().unwrap();
+        let expected_claims =
+            BTreeSet::from([SharedIpv4Route::new("10.42.0.0".parse().unwrap(), 24, None)]);
+        assert!(
+            sync_member_routes(&new_member, &BTreeSet::from([prefix]))
+                .await
+                .unwrap(),
+            "the current registration commits and acknowledges"
+        );
+        assert_eq!(
+            new_member.claims().await.ipv4_routes,
+            expected_claims,
+            "the fixture must start from a nonempty claim set"
+        );
+
+        assert!(
+            !sync_member_routes(&old_member, &BTreeSet::new())
+                .await
+                .unwrap(),
+            "a superseded registration must not confirm a sync"
+        );
+        assert_eq!(
+            new_member.claims().await.ipv4_routes,
+            expected_claims,
+            "the stale sync must not clear the current registration's claims"
+        );
+    }
+
+    /// Closing marks the member before it can take the NIC lock, yet an empty
+    /// sync still withdraws through it. Both finish once the lock is released;
+    /// the test never waits while holding the lock.
+    #[cfg(feature = "tun")]
+    #[tokio::test]
+    async fn closed_member_can_still_sync_an_empty_route_set() {
+        let mut fixture = ManagedNicFixture::new(Uuid::new_v4());
+        let member = fixture.create_member();
+        attach_member(&member).await;
+
+        let shared_nic = member.shared_nic();
+        let guard = shared_nic.lock().await;
+
+        let empty = BTreeSet::new();
+        let sync = sync_member_routes(&member, &empty);
+        tokio::pin!(sync);
+        assert!(
+            futures::poll!(&mut sync).is_pending(),
+            "the sync waits for the held NIC lock"
+        );
+
+        let close = member.close();
+        tokio::pin!(close);
+        assert!(
+            futures::poll!(&mut close).is_pending(),
+            "close sets the flag and then waits for the same NIC lock"
+        );
+        assert!(
+            member.ensure_open().is_err(),
+            "close marks the member closed before it touches the NIC"
+        );
+
+        drop(guard);
+
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), sync)
+                .await
+                .expect("the empty sync must not wait for the NIC forever")
+                .expect("an empty sync may withdraw through an already closed member"),
+            "the withdrawal commit still completed"
+        );
+        tokio::time::timeout(Duration::from_secs(1), close)
+            .await
+            .expect("close must finish once the NIC lock is free")
+            .expect("closing the member must not fail");
+    }
+
+    /// The bounded NIC lock wait of the sync helper reports the exact member it
+    /// timed out on instead of waiting forever.
+    #[cfg(feature = "tun")]
+    #[tokio::test(start_paused = true)]
+    async fn nic_lock_timeout_is_reported_by_the_sync_helper() {
+        let mut fixture = ManagedNicFixture::new(Uuid::new_v4());
+        let member = fixture.create_member();
+        attach_member(&member).await;
+
+        let shared_nic = member.shared_nic();
+        let guard = shared_nic.lock().await;
+
+        let empty = BTreeSet::new();
+        let sync = sync_member_routes(&member, &empty);
+        tokio::pin!(sync);
+        assert!(
+            futures::poll!(&mut sync).is_pending(),
+            "the helper waits for the held NIC lock"
+        );
+
+        tokio::time::advance(Duration::from_secs(5)).await;
+
+        let error = tokio::time::timeout(Duration::from_secs(1), sync)
+            .await
+            .expect("the helper must not wait past its own NIC lock timeout")
+            .expect_err("the bounded NIC lock wait must expire");
+        assert_eq!(
+            error.to_string(),
+            format!("timed out locking shared NIC for member {}", fixture.run)
+        );
+        drop(guard);
+    }
+
+    /// One member admission waiting on the NIC lock must not stall the rest of
+    /// the round. After the wait expires, the affected managed declaration
+    /// reports that timeout while an ordinary declaration on another device
+    /// still reaches the target.
+    #[cfg(feature = "tun")]
+    #[tokio::test(start_paused = true)]
+    async fn nic_lock_timeout_only_pends_the_managed_declaration() {
+        let run = Uuid::new_v4();
+        let mut fixture = ManagedNicFixture::new(run);
+        let member = fixture.create_member();
+        attach_member(&member).await;
+
+        let controller = RouteController::new(Arc::new(DirtyFlag::new(false)));
+        let registry = controller.open_instance(run).unwrap();
+        controller.bind_member(run, &member).unwrap();
+        assert!(
+            controller
+                .ready(
+                    run,
+                    &member,
+                    InterfaceInfo {
+                        name: MANAGED_NIC_NAME.into(),
+                        ifindex: 7,
+                    },
+                )
+                .unwrap(),
+            "the fixture interface is the bound member's device"
+        );
+        let slot = registry
+            .handle()
+            .open_slot(RouteSource::Additional)
+            .unwrap();
+        let managed = RouteSpec::for_tun("10.61.0.0/24".parse().unwrap());
+        let ordinary = indexed("10.62.0.0/24", 9, None);
+        slot.set_routes(RouteSet::from([managed.clone(), ordinary.clone()]));
+
+        let shared_nic = member.shared_nic();
+        let guard = shared_nic.lock().await;
+
+        let errors = BTreeMap::new();
+        let plan = controller.plan_reconciliation(None, &errors, None);
+        tokio::pin!(plan);
+        assert!(
+            futures::poll!(&mut plan).is_pending(),
+            "the managed admission waits for the held NIC lock"
+        );
+
+        tokio::time::advance(Duration::from_secs(5)).await;
+        let plan = tokio::time::timeout(Duration::from_secs(1), plan)
+            .await
+            .expect("the round must finish after the bounded NIC lock wait");
+
+        let ordinary_route = resolved(&ordinary);
+        assert_eq!(
+            plan.desired.get(&RouteKey::of(&ordinary_route)),
+            Some(&(ordinary_route.clone(), BTreeSet::from([run]))),
+            "the ordinary declaration is not blocked by the NIC lock"
+        );
+        assert_eq!(
+            plan.desired.len(),
+            1,
+            "the timed out managed declaration is not a target"
+        );
+        assert_eq!(
+            slot.statuses().get(&managed),
+            Some(&RouteStatus::Pending {
+                error: Some(Arc::<str>::from(format!(
+                    "timed out locking shared NIC for member {run}"
+                )))
+            }),
+            "the managed declaration reports the NIC lock timeout"
+        );
+        drop(guard);
+    }
+
+    // Planning-await tests. Each one uses the shared NIC's async lock as a
+    // controlled pause: the real planner is polled until it is suspended in
+    // member admission, exactly the state the post-await feedback rechecks is
+    // changed, and only then is the lock released. No controller, slot or
+    // registry synchronous guard is held across an await, and every wait is
+    // bounded.
+
+    /// The applied row of a managed declaration, including the registration
+    /// that really acknowledged it.
+    #[cfg(feature = "tun")]
+    fn managed_installed(
+        declaration: &RouteSpec<RouteDevice>,
+        ifindex: u32,
+        run: Uuid,
+        member: &SharedVirtualNicMember,
+    ) -> AppliedRoute {
+        AppliedRoute {
+            route: normalize_route(declaration.clone().resolve(Some(ifindex)).unwrap()).unwrap(),
+            owners: BTreeSet::from([run]),
+            effect: RouteEffect::Owned,
+            members: BTreeMap::from([(run, member.clone())]),
+        }
+    }
+
+    /// The real prefix set a member currently claims, read through its NIC.
+    #[cfg(feature = "tun")]
+    async fn member_claim_prefixes(member: &SharedVirtualNicMember) -> BTreeSet<IpCidr> {
+        claim_prefixes(&member.claims().await)
+    }
+
+    /// Dropping the only registry root while a managed admission waits on the
+    /// NIC lock must not let the suspended plan write ready feedback when it
+    /// resumes. The held manual policy proves the empty input is the released
+    /// root, not a configuration change.
+    #[cfg(feature = "tun")]
+    #[tokio::test]
+    async fn a_dropped_registry_during_nic_admission_gets_no_ready_feedback() {
+        use easytier_core::config::{
+            peers::PeerRuntimeSnapshot,
+            runtime::{CoreRuntimeConfig, CoreRuntimeConfigStore},
+        };
+
+        let controller = RouteController::new(Arc::new(DirtyFlag::new(false)));
+        let run = Uuid::new_v4();
+        let registry = controller.open_instance(run).unwrap();
+        let store = CoreRuntimeConfigStore::new(
+            CoreRuntimeConfig::default(),
+            Arc::new(PeerRuntimeSnapshot::default()),
+        );
+        let held_manual = BTreeSet::from(["10.70.0.0/24".parse().unwrap()]);
+        store.update_services(|services| services.manual_routes = Some(held_manual.clone()));
+        controller.bind_config(run, store.clone()).unwrap();
+
+        let mut fixture = ManagedNicFixture::new(run);
+        let member = fixture.create_member();
+        attach_member(&member).await;
+        controller.bind_member(run, &member).unwrap();
+        assert!(
+            controller
+                .ready(
+                    run,
+                    &member,
+                    InterfaceInfo {
+                        name: MANAGED_NIC_NAME.into(),
+                        ifindex: 7,
+                    },
+                )
+                .unwrap(),
+            "the fixture interface is the bound member's device"
+        );
+
+        let slot = registry
+            .handle()
+            .open_slot(RouteSource::Additional)
+            .unwrap();
+        let managed = RouteSpec::for_tun("10.71.0.0/24".parse().unwrap());
+        let ordinary = indexed("10.72.0.0/24", 9, None);
+        slot.set_routes(RouteSet::from([managed.clone(), ordinary.clone()]));
+        let ordinary_route = resolved(&ordinary);
+        controller
+            .runtime
+            .write()
+            .applied
+            .insert(RouteKey::of(&ordinary_route), installed(&ordinary, run));
+
+        let shared_nic = member.shared_nic();
+        let guard = shared_nic.lock().await;
+        controller.dirty.reset();
+        let errors = BTreeMap::new();
+        let plan = controller.plan_reconciliation(None, &errors, None);
+        tokio::pin!(plan);
+        assert!(
+            futures::poll!(&mut plan).is_pending(),
+            "the managed admission waits for the held NIC lock"
+        );
+
+        drop(registry);
+        assert!(
+            controller.runtime.read().instances[&run]
+                .registry
+                .upgrade()
+                .is_none(),
+            "the test held the only strong root"
+        );
+        assert!(
+            controller.dirty.peek(),
+            "dropping the last root marks the route inputs dirty before the wait ends"
+        );
+
+        drop(guard);
+        let plan = tokio::time::timeout(Duration::from_secs(10), plan)
+            .await
+            .expect("the paused plan must finish once the NIC lock is free");
+
+        assert_eq!(
+            slot.statuses().get(&ordinary),
+            Some(&RouteStatus::Pending { error: None }),
+            "the old plan must not write ready feedback for a released input"
+        );
+        assert_eq!(
+            slot.statuses().get(&managed),
+            Some(&RouteStatus::Pending { error: None }),
+            "the managed declaration keeps its original pending status"
+        );
+        assert!(
+            plan.desired.contains_key(&RouteKey::of(&ordinary_route)),
+            "the plan still carries the rows it copied before the wait"
+        );
+        assert_eq!(
+            controller.effective_routes_for_instance(&run),
+            RouteSet::new(),
+            "a released registry has no current inputs, even with retained manual policy"
+        );
+        assert_eq!(
+            store.snapshot().services.manual_routes,
+            Some(held_manual),
+            "the store really still holds the nonempty manual policy"
+        );
+
+        let fresh = controller.plan_reconciliation(None, &errors, None).await;
+        assert!(
+            fresh.desired.is_empty(),
+            "the next round plans from the now-empty input directory"
+        );
+        assert!(
+            controller
+                .applied_routes()
+                .get(&RouteKey::of(&ordinary_route))
+                .is_some_and(|row| row.effect == RouteEffect::Owned && row.owners.contains(&run)),
+            "planning never clears or replaces the actual owned ledger row"
+        );
+    }
+
+    /// Run the old admission to completion against a binding and ledger that
+    /// changed while it waited, then check the fresh round is really ready.
+    #[cfg(feature = "tun")]
+    async fn assert_stale_admission_pends_for_the_new_registration(old_rejects: bool) {
+        let run = Uuid::new_v4();
+        let mut old_fixture = ManagedNicFixture::new(run);
+        let old_member = old_fixture.create_member();
+        attach_member(&old_member).await;
+        let mut new_fixture = ManagedNicFixture::new(run);
+        let new_member = new_fixture.create_member();
+        attach_member(&new_member).await;
+
+        let managed = RouteSpec::for_tun("10.80.0.0/24".parse().unwrap());
+        let prefix: IpCidr = managed.destination;
+
+        // Dropping a member withdraws its claims asynchronously, so the
+        // conflict must be held past the old plan and its feedback: otherwise
+        // the admission under test would really succeed and this variant would
+        // prove nothing.
+        let mut conflicting_member: Option<SharedVirtualNicMember> = None;
+        if old_rejects {
+            // The old NIC has a real overlapping claim from another run, so
+            // the prepare that runs after the release really fails. The new
+            // NIC has no such conflict.
+            let other_run = Uuid::new_v4();
+            let other_member = old_fixture
+                .registry
+                .try_create_member(
+                    MANAGED_NIC_NAME.to_owned(),
+                    managed_virtual_nic_config(),
+                    other_run,
+                    Arc::new(Notify::new()),
+                )
+                .unwrap();
+            attach_member(&other_member).await;
+            assert!(
+                sync_member_routes(
+                    &other_member,
+                    &BTreeSet::from(["10.80.0.0/25".parse::<IpCidr>().unwrap()]),
+                )
+                .await
+                .unwrap(),
+                "the conflicting member commits a claim that overlaps the prefix"
+            );
+            conflicting_member = Some(other_member);
+        }
+
+        assert!(
+            sync_member_routes(&new_member, &BTreeSet::from([prefix]))
+                .await
+                .unwrap(),
+            "the new registration really acknowledges the managed prefix"
+        );
+
+        let controller = RouteController::new(Arc::new(DirtyFlag::new(false)));
+        let registry = controller.open_instance(run).unwrap();
+        controller.bind_member(run, &old_member).unwrap();
+        assert!(
+            controller
+                .ready(
+                    run,
+                    &old_member,
+                    InterfaceInfo {
+                        name: MANAGED_NIC_NAME.into(),
+                        ifindex: 7,
+                    },
+                )
+                .unwrap()
+        );
+        let slot = registry
+            .handle()
+            .open_slot(RouteSource::Additional)
+            .unwrap();
+        slot.set_routes(RouteSet::from([managed.clone()]));
+
+        let row = managed_installed(&managed, 7, run, &new_member);
+        let route = row.route.clone();
+        let synced = BTreeMap::from([(
+            (run, new_member.registration_id()),
+            BTreeSet::from([prefix]),
+        )]);
+
+        let shared_nic = old_member.shared_nic();
+        let guard = shared_nic.lock().await;
+        let errors = BTreeMap::new();
+        let mut admission_failures = BTreeMap::new();
+        let mut plan = Box::pin(controller.plan_reconciliation(
+            Some(&synced),
+            &errors,
+            Some(&mut admission_failures),
+        ));
+        assert!(
+            futures::poll!(&mut plan).is_pending(),
+            "the old admission waits for the held old NIC lock"
+        );
+
+        // The binding and the actual ledger change while the old admission is
+        // suspended. Neither may be borrowed to confirm the old result.
+        controller.bind_member(run, &new_member).unwrap();
+        assert!(
+            controller
+                .ready(
+                    run,
+                    &new_member,
+                    InterfaceInfo {
+                        name: MANAGED_NIC_NAME.into(),
+                        ifindex: 7,
+                    },
+                )
+                .unwrap(),
+            "the new registration owns the same interface index"
+        );
+        controller
+            .runtime
+            .write()
+            .applied
+            .insert(RouteKey::of(&route), row);
+
+        drop(guard);
+        let plan = tokio::time::timeout(Duration::from_secs(10), plan)
+            .await
+            .expect("the paused plan must finish once the old NIC lock is free");
+
+        // The timeout consumed and dropped the pinned future, so this is the
+        // old plan's own record of what really happened on its captured member.
+        if old_rejects {
+            let (failed_prefixes, failed_status) = admission_failures
+                .get(&(run, old_member.registration_id()))
+                .expect("the old plan really failed admission for the old registration");
+            assert_eq!(
+                failed_prefixes,
+                &BTreeSet::from([prefix]),
+                "the old plan reports exactly the prefix it captured"
+            );
+            assert!(
+                matches!(failed_status, RouteStatus::Rejected(_)),
+                "the conflicting member's claim is a real rejection"
+            );
+        } else {
+            assert!(
+                admission_failures.is_empty(),
+                "a successful old admission reports no failure"
+            );
+            assert!(
+                plan.desired.contains_key(&RouteKey::of(&route)),
+                "the old plan really admitted and captured the managed prefix"
+            );
+        }
+
+        let status = slot.statuses().get(&managed).cloned();
+        assert_eq!(
+            status,
+            Some(RouteStatus::Pending { error: None }),
+            "an old admission result cannot answer for the new registration"
+        );
+        assert!(
+            !matches!(status, Some(RouteStatus::Rejected(_))),
+            "an old rejection must not be reported on the new registration"
+        );
+
+        let fresh = controller
+            .plan_reconciliation(Some(&synced), &errors, None)
+            .await;
+        assert_eq!(
+            slot.statuses().get(&managed),
+            Some(&RouteStatus::Ready),
+            "the same acknowledgement is valid for the current registration"
+        );
+        assert!(
+            fresh.desired.contains_key(&RouteKey::of(&route)),
+            "the current registration still targets the managed prefix"
+        );
+
+        // Release the conflict only now that the old plan and the fresh round
+        // have both been observed.
+        drop(conflicting_member);
+    }
+
+    /// An old successful admission cannot confirm the new registration's row.
+    #[cfg(feature = "tun")]
+    #[tokio::test]
+    async fn an_old_successful_admission_pends_for_the_new_registration() {
+        assert_stale_admission_pends_for_the_new_registration(false).await;
+    }
+
+    /// An old rejected admission cannot report its conflict on the new one.
+    #[cfg(feature = "tun")]
+    #[tokio::test]
+    async fn an_old_rejected_admission_pends_for_the_new_registration() {
+        assert_stale_admission_pends_for_the_new_registration(true).await;
+    }
+
+    /// The whole-set admission really fails on the captured P+Q set, but the
+    /// slot shrank to P while it waited. That failure describes inputs that no
+    /// longer exist and must only wait for the next round, not reject P.
+    #[cfg(feature = "tun")]
+    #[tokio::test]
+    async fn a_whole_set_admission_failure_goes_stale_with_its_captured_set() {
+        let run = Uuid::new_v4();
+        let other_run = Uuid::new_v4();
+        let mut fixture = ManagedNicFixture::new(run);
+        let member = fixture.create_member();
+        attach_member(&member).await;
+        let other_member = fixture
+            .registry
+            .try_create_member(
+                MANAGED_NIC_NAME.to_owned(),
+                managed_virtual_nic_config(),
+                other_run,
+                Arc::new(Notify::new()),
+            )
+            .unwrap();
+        attach_member(&other_member).await;
+
+        let p = RouteSpec::for_tun("10.90.0.0/24".parse().unwrap());
+        let q = RouteSpec::for_tun("10.91.0.0/24".parse().unwrap());
+        let p_prefix: IpCidr = p.destination;
+        let q_prefix: IpCidr = q.destination;
+        assert!(
+            sync_member_routes(&member, &BTreeSet::from([p_prefix]))
+                .await
+                .unwrap(),
+            "the current NIC member owns P"
+        );
+        assert!(
+            sync_member_routes(&other_member, &BTreeSet::from([q_prefix]))
+                .await
+                .unwrap(),
+            "the other member owns the disjoint Q"
+        );
+
+        let controller = RouteController::new(Arc::new(DirtyFlag::new(false)));
+        let registry = controller.open_instance(run).unwrap();
+        controller.bind_member(run, &member).unwrap();
+        assert!(
+            controller
+                .ready(
+                    run,
+                    &member,
+                    InterfaceInfo {
+                        name: MANAGED_NIC_NAME.into(),
+                        ifindex: 7,
+                    },
+                )
+                .unwrap()
+        );
+        let slot = registry
+            .handle()
+            .open_slot(RouteSource::Additional)
+            .unwrap();
+        slot.set_routes(RouteSet::from([p.clone(), q.clone()]));
+        let row = managed_installed(&p, 7, run, &member);
+        let route = row.route.clone();
+        controller
+            .runtime
+            .write()
+            .applied
+            .insert(RouteKey::of(&route), row);
+
+        let shared_nic = member.shared_nic();
+        let guard = shared_nic.lock().await;
+        let errors = BTreeMap::new();
+        let mut admission_failures = BTreeMap::new();
+        let mut plan =
+            Box::pin(controller.plan_reconciliation(None, &errors, Some(&mut admission_failures)));
+        assert!(
+            futures::poll!(&mut plan).is_pending(),
+            "the whole-set admission waits for the held NIC lock"
+        );
+
+        // The captured set was P+Q, and Q really conflicts with the other
+        // member. Shrinking the current declaration set makes that result
+        // stale without touching the other member or the captured candidates.
+        slot.set_routes(RouteSet::from([p.clone()]));
+
+        drop(guard);
+        let _plan = tokio::time::timeout(Duration::from_secs(10), plan)
+            .await
+            .expect("the paused plan must finish once the NIC lock is free");
+
+        let (failed_prefixes, failed_status) = admission_failures
+            .get(&(run, member.registration_id()))
+            .expect("the captured whole-set admission really failed for this registration");
+        assert_eq!(
+            failed_prefixes,
+            &BTreeSet::from([p_prefix, q_prefix]),
+            "the observed failure describes exactly the captured P+Q set"
+        );
+        assert!(
+            matches!(failed_status, RouteStatus::Rejected(_)),
+            "the overlap with the other member's Q is a real rejection"
+        );
+
+        assert_eq!(
+            slot.statuses().get(&p),
+            Some(&RouteStatus::Pending { error: None }),
+            "a failure of the captured whole set cannot reject the current input"
+        );
+        assert!(
+            !matches!(slot.statuses().get(&p), Some(RouteStatus::Rejected(_))),
+            "the stale whole-set failure must not surface as a rejection"
+        );
+        assert!(
+            slot.statuses().get(&q).is_none(),
+            "the withdrawn Q has no status entry to resurrect"
+        );
+
+        let synced =
+            BTreeMap::from([((run, member.registration_id()), BTreeSet::from([p_prefix]))]);
+        let fresh = controller
+            .plan_reconciliation(Some(&synced), &errors, None)
+            .await;
+        assert_eq!(
+            slot.statuses().get(&p),
+            Some(&RouteStatus::Ready),
+            "the fresh single-prefix admission is disjoint from the other member"
+        );
+        assert!(
+            fresh.desired.contains_key(&RouteKey::of(&route)),
+            "the fresh plan still targets P"
+        );
+    }
+
+    /// A valid managed acknowledgement survives an unrelated run's input
+    /// change; that other run's new row has no actual effect and stays
+    /// pending.
+    #[cfg(feature = "tun")]
+    #[tokio::test]
+    async fn an_unrelated_run_change_preserves_a_valid_managed_feedback() {
+        let run = Uuid::new_v4();
+        let mut fixture = ManagedNicFixture::new(run);
+        let member = fixture.create_member();
+        attach_member(&member).await;
+        let managed = RouteSpec::for_tun("10.100.0.0/24".parse().unwrap());
+        let prefix: IpCidr = managed.destination;
+        assert!(
+            sync_member_routes(&member, &BTreeSet::from([prefix]))
+                .await
+                .unwrap(),
+            "the member really acknowledges P"
+        );
+
+        let controller = RouteController::new(Arc::new(DirtyFlag::new(false)));
+        let registry = controller.open_instance(run).unwrap();
+        controller.bind_member(run, &member).unwrap();
+        assert!(
+            controller
+                .ready(
+                    run,
+                    &member,
+                    InterfaceInfo {
+                        name: MANAGED_NIC_NAME.into(),
+                        ifindex: 7,
+                    },
+                )
+                .unwrap()
+        );
+        let slot = registry
+            .handle()
+            .open_slot(RouteSource::Additional)
+            .unwrap();
+        slot.set_routes(RouteSet::from([managed.clone()]));
+        let row = managed_installed(&managed, 7, run, &member);
+        let route = row.route.clone();
+        controller
+            .runtime
+            .write()
+            .applied
+            .insert(RouteKey::of(&route), row);
+
+        let other_run = Uuid::new_v4();
+        let other_registry = controller.open_instance(other_run).unwrap();
+        let other_slot = other_registry
+            .handle()
+            .open_slot(RouteSource::Additional)
+            .unwrap();
+        let before = indexed("10.101.0.0/24", 9, None);
+        let after = indexed("10.102.0.0/24", 9, None);
+        other_slot.set_routes(RouteSet::from([before.clone()]));
+        let after_route = resolved(&after);
+
+        let synced = BTreeMap::from([((run, member.registration_id()), BTreeSet::from([prefix]))]);
+
+        let shared_nic = member.shared_nic();
+        let guard = shared_nic.lock().await;
+        let errors = BTreeMap::new();
+        let plan = controller.plan_reconciliation(Some(&synced), &errors, None);
+        tokio::pin!(plan);
+        assert!(
+            futures::poll!(&mut plan).is_pending(),
+            "the managed admission waits for the held NIC lock"
+        );
+
+        other_slot.set_routes(RouteSet::from([after.clone()]));
+
+        drop(guard);
+        let _plan = tokio::time::timeout(Duration::from_secs(10), plan)
+            .await
+            .expect("the paused plan must finish once the NIC lock is free");
+
+        assert_eq!(
+            slot.statuses().get(&managed),
+            Some(&RouteStatus::Ready),
+            "an unrelated run's change cannot invalidate this acknowledgement"
+        );
+        assert_eq!(
+            other_slot.statuses().get(&after),
+            Some(&RouteStatus::Pending { error: None }),
+            "the new unrelated row has no actual effect and is not ready"
+        );
+        assert!(
+            other_slot.statuses().get(&before).is_none(),
+            "the replaced declaration leaves no status entry"
+        );
+        assert!(
+            !controller
+                .applied_routes()
+                .contains_key(&RouteKey::of(&after_route)),
+            "the new unrelated row was never installed"
+        );
+    }
+
+    /// Two instances share one managed NIC and one MagicDNS row, but each
+    /// member acknowledges independently. A backoff on one member neither
+    /// blocks the other's real withdrawal nor lets the intersection stage
+    /// clear the final target; once its deadline passes the second member
+    /// commits the same shared row and only then becomes ready.
+    #[cfg(feature = "tun")]
+    #[tokio::test(start_paused = true)]
+    async fn shared_magic_dns_row_keeps_independent_member_confirmations() {
+        use crate::instance::dns_server::MAGIC_DNS_FAKE_IP;
+
+        let mut h = Harness::new();
+        let run_a = Uuid::new_v4();
+        let run_b = Uuid::new_v4();
+        let mut fixture = ManagedNicFixture::new(run_a);
+        let member_a = fixture.create_member();
+        attach_member(&member_a).await;
+        let member_b = fixture
+            .registry
+            .try_create_member(
+                MANAGED_NIC_NAME.to_owned(),
+                managed_virtual_nic_config(),
+                run_b,
+                Arc::new(Notify::new()),
+            )
+            .unwrap();
+        attach_member(&member_b).await;
+
+        let registry_a = h.controller.open_instance(run_a).unwrap();
+        let registry_b = h.controller.open_instance(run_b).unwrap();
+        h.controller.bind_member(run_a, &member_a).unwrap();
+        h.controller.bind_member(run_b, &member_b).unwrap();
+        for (run, member) in [(run_a, &member_a), (run_b, &member_b)] {
+            assert!(
+                h.controller
+                    .ready(
+                        run,
+                        member,
+                        InterfaceInfo {
+                            name: MANAGED_NIC_NAME.into(),
+                            ifindex: 7,
+                        },
+                    )
+                    .unwrap(),
+                "both members bind the same managed device"
+            );
+        }
+
+        let fake: RouteSpec<RouteDevice> =
+            RouteSpec::for_tun(format!("{MAGIC_DNS_FAKE_IP}/32").parse().unwrap());
+        let prefix: IpCidr = fake.destination;
+        let route = normalize_route(fake.clone().resolve(Some(7)).unwrap()).unwrap();
+        let slot_a = registry_a
+            .handle()
+            .open_slot(RouteSource::Additional)
+            .unwrap();
+        let slot_b = registry_b
+            .handle()
+            .open_slot(RouteSource::Additional)
+            .unwrap();
+        slot_a.set_routes(RouteSet::from([fake.clone()]));
+        slot_b.set_routes(RouteSet::from([fake.clone()]));
+
+        // The ordinary member retry tuple of B: a real earlier ACK failure for
+        // its full final target. No per-route Ready state is fabricated.
+        let retry_deadline = tokio::time::Instant::now() + Duration::from_millis(200);
+        h.member_retries.insert(
+            (run_b, member_b.registration_id()),
+            (
+                member_b.clone(),
+                BTreeSet::from([prefix]),
+                retry_deadline,
+                1,
+                Arc::from("previous member acknowledgement failed"),
+            ),
+        );
+
+        h.round_ok().await;
+
+        assert_eq!(h.effect(&route), Some(RouteEffect::Owned));
+        assert!(h.mock.contains(&route));
+        assert_eq!(
+            h.mock.add_count(),
+            1,
+            "the two members share one physical row"
+        );
+        let row = h
+            .applied()
+            .get(&RouteKey::of(&route))
+            .cloned()
+            .expect("the shared row is in the actual ledger");
+        assert_eq!(row.owners, BTreeSet::from([run_a, run_b]));
+        assert_eq!(
+            row.members.keys().copied().collect::<BTreeSet<_>>(),
+            BTreeSet::from([run_a]),
+            "only the member that really acknowledged is recorded"
+        );
+        assert_eq!(
+            row.members[&run_a].registration_id(),
+            member_a.registration_id()
+        );
+        assert_eq!(slot_a.statuses().get(&fake), Some(&RouteStatus::Ready));
+        assert!(
+            matches!(
+                slot_b.statuses().get(&fake),
+                Some(RouteStatus::Pending { error: Some(_) })
+            ),
+            "the backed-off member stays pending with its real error"
+        );
+        assert_eq!(
+            member_claim_prefixes(&member_a).await,
+            BTreeSet::from([prefix])
+        );
+        assert!(
+            member_claim_prefixes(&member_b).await.is_empty(),
+            "the backed-off member has not confirmed anything"
+        );
+        {
+            let (_, target, deadline, attempt, _) =
+                &h.member_retries[&(run_b, member_b.registration_id())];
+            assert_eq!(target, &BTreeSet::from([prefix]));
+            assert_eq!(*deadline, retry_deadline);
+            assert_eq!(*attempt, 1);
+        }
+
+        // Only A's input root disappears. Its fixture member stays alive, so
+        // the claims survive until the controller really acknowledges them.
+        drop(registry_a);
+        assert!(
+            h.controller.runtime.read().instances[&run_a]
+                .registry
+                .upgrade()
+                .is_none(),
+            "the test held A's only registry root"
+        );
+
+        h.round_ok().await;
+
+        let row = h
+            .applied()
+            .get(&RouteKey::of(&route))
+            .cloned()
+            .expect("the shared physical row stays for B");
+        assert_eq!(row.effect, RouteEffect::Owned);
+        assert_eq!(
+            row.owners,
+            BTreeSet::from([run_b]),
+            "A's owner responsibility is really released"
+        );
+        assert!(
+            row.members.is_empty(),
+            "B has no acknowledgement and must not be recorded as a member"
+        );
+        assert_eq!(
+            h.mock.add_count(),
+            1,
+            "the unchanged intersection must not add the row again"
+        );
+        assert_eq!(h.mock.remove_count(), 0, "the row is still B's target");
+        assert!(h.mock.contains(&route));
+        assert!(
+            matches!(
+                slot_b.statuses().get(&fake),
+                Some(RouteStatus::Pending { error: Some(_) })
+            ),
+            "B is still waiting for its own ACK"
+        );
+        {
+            let (_, target, deadline, attempt, _) =
+                &h.member_retries[&(run_b, member_b.registration_id())];
+            assert_eq!(target, &BTreeSet::from([prefix]));
+            assert_eq!(
+                *deadline, retry_deadline,
+                "the intersection stage must not replace the final target's deadline"
+            );
+            assert_eq!(*attempt, 1, "no attempt was started while backing off");
+        }
+        assert!(
+            member_claim_prefixes(&member_a).await.is_empty(),
+            "A's empty ACK really withdrew its shared prefix"
+        );
+        assert!(
+            member_claim_prefixes(&member_b).await.is_empty(),
+            "B still has no confirmed claim"
+        );
+        assert!(
+            !h.controller.runtime.read().instances.contains_key(&run_a),
+            "A's finished record is pruned"
+        );
+        tokio::time::timeout(Duration::from_secs(1), h.controller.drain(run_a))
+            .await
+            .expect("drain A must complete once its record is gone")
+            .expect("drain A must not fail");
+
+        let remaining = retry_deadline.saturating_duration_since(tokio::time::Instant::now());
+        tokio::time::advance(remaining).await;
+        h.round_ok().await;
+
+        let row = h
+            .applied()
+            .get(&RouteKey::of(&route))
+            .cloned()
+            .expect("the shared row is still owned");
+        assert_eq!(row.effect, RouteEffect::Owned);
+        assert_eq!(row.owners, BTreeSet::from([run_b]));
+        assert_eq!(
+            row.members
+                .get(&run_b)
+                .map(SharedVirtualNicMember::registration_id),
+            Some(member_b.registration_id()),
+            "the due member commit confirms B's own registration"
+        );
+        assert_eq!(slot_b.statuses().get(&fake), Some(&RouteStatus::Ready));
+        assert!(
+            h.member_retries.is_empty(),
+            "the confirmed member goal clears its retry"
+        );
+        assert_eq!(
+            h.mock.add_count(),
+            1,
+            "B's confirmation reuses the already installed physical row"
+        );
+        assert_eq!(h.mock.remove_count(), 0);
+        assert_eq!(
+            member_claim_prefixes(&member_b).await,
+            BTreeSet::from([prefix])
+        );
+    }
+
+    /// The old registration really acknowledged its prefix before the backend
+    /// readback, then the run rebinds to another NIC while that readback is
+    /// still in flight. The old candidate cannot add through the new binding,
+    /// and the old nonempty acknowledgement must survive as an orphan
+    /// withdrawal retry that the next round really completes.
+    #[cfg(feature = "tun")]
+    #[tokio::test(start_paused = true)]
+    async fn replaced_member_after_ack_keeps_an_orphan_withdrawal_retry() {
+        let mut h = Harness::new();
+        let run = Uuid::new_v4();
+        let mut old_fixture = ManagedNicFixture::new(run);
+        let old_member = old_fixture.create_member();
+        attach_member(&old_member).await;
+        let mut new_fixture = ManagedNicFixture::new(run);
+        let new_member = new_fixture.create_member();
+        attach_member(&new_member).await;
+
+        let registry = h.controller.open_instance(run).unwrap();
+        h.controller.bind_member(run, &old_member).unwrap();
+        assert!(
+            h.controller
+                .ready(
+                    run,
+                    &old_member,
+                    InterfaceInfo {
+                        name: MANAGED_NIC_NAME.into(),
+                        ifindex: 7,
+                    },
+                )
+                .unwrap()
+        );
+        let slot = registry
+            .handle()
+            .open_slot(RouteSource::Additional)
+            .unwrap();
+        let p: RouteSpec<RouteDevice> = RouteSpec::for_tun("10.110.0.0/24".parse().unwrap());
+        let prefix: IpCidr = p.destination;
+        slot.set_routes(RouteSet::from([p.clone()]));
+        let old_route = normalize_route(p.clone().resolve(Some(7)).unwrap()).unwrap();
+        let new_route = normalize_route(p.clone().resolve(Some(8)).unwrap()).unwrap();
+        assert_ne!(old_route, new_route);
+
+        let controller = h.controller.clone();
+        let mock = h.mock.clone();
+        let dirty = controller.dirty.clone();
+        let slot_handle = slot.clone();
+        let (entered, resume) = mock.gate_existing(Some(old_route.clone()));
+        dirty.reset();
+        let mut round = Box::pin(h.round());
+        tokio::select! {
+            result = round.as_mut() => panic!("the candidate readback finished before the gate: {result:?}"),
+            _ = entered.notified() => {}
+        }
+
+        assert_eq!(
+            member_claim_prefixes(&old_member).await,
+            BTreeSet::from([prefix]),
+            "reaching the readback proves the old prefix ACK really completed"
+        );
+        assert!(
+            old_member.ensure_open().is_ok(),
+            "the old NIC and registration stay valid while the rebind happens"
+        );
+
+        // A new registration on a different NIC replaces the binding while
+        // the old readback waits. The old NIC is deliberately left untouched,
+        // so its nonempty claims are still real cleanup work.
+        controller.bind_member(run, &new_member).unwrap();
+        assert!(
+            controller
+                .ready(
+                    run,
+                    &new_member,
+                    InterfaceInfo {
+                        name: MANAGED_NIC_NAME.into(),
+                        ifindex: 8,
+                    },
+                )
+                .unwrap()
+        );
+        // Only the production work of this round may remain marked.
+        dirty.reset();
+        resume.notify_one();
+        round.await.unwrap();
+
+        assert_eq!(
+            h.mock.add_count(),
+            0,
+            "the old candidate cannot add through the new binding"
+        );
+        assert!(!h.mock.contains(&old_route), "no old physical row exists");
+        assert!(h.applied().is_empty());
+        assert!(matches!(
+            slot_handle.statuses().get(&p),
+            Some(RouteStatus::Pending { .. })
+        ));
+
+        let orphan_key = (run, old_member.registration_id());
+        {
+            let (retained, target, _, attempt, _) = h
+                .member_retries
+                .get(&orphan_key)
+                .expect("the old registration is retained for its real withdrawal");
+            assert_eq!(
+                retained.registration_id(),
+                old_member.registration_id(),
+                "the cleanup handle is the old registration"
+            );
+            assert!(
+                target.is_empty(),
+                "the orphan target is empty; the nonempty ACK belongs to the withdrawal"
+            );
+            assert_eq!(*attempt, 0, "an orphan cleanup starts no failed attempt");
+        }
+        assert!(
+            dirty.peek(),
+            "the remaining orphan withdrawal is actionable in this round"
+        );
+        assert_eq!(
+            member_claim_prefixes(&old_member).await,
+            BTreeSet::from([prefix]),
+            "the old prefix is not withdrawn until the retry really runs"
+        );
+
+        h.controller.dirty.reset();
+        h.round_ok().await;
+
+        assert_eq!(h.effect(&new_route), Some(RouteEffect::Owned));
+        assert!(h.mock.contains(&new_route));
+        assert!(!h.mock.contains(&old_route));
+        assert_eq!(h.mock.add_count(), 1);
+        assert_eq!(h.mock.remove_count(), 0);
+        assert_eq!(slot_handle.statuses().get(&p), Some(&RouteStatus::Ready));
+        assert!(
+            h.member_retries.is_empty(),
+            "the old withdrawal completed and removed the orphan retry"
+        );
+        assert!(
+            member_claim_prefixes(&old_member).await.is_empty(),
+            "the old registration really withdrew its prefix"
+        );
+        assert_eq!(
+            member_claim_prefixes(&new_member).await,
+            BTreeSet::from([prefix]),
+            "the new registration confirms the prefix itself"
+        );
+    }
+
+    /// A whole-member rejection makes its owner give up the old full row of a
+    /// shared physical key. The fresh negative proof deletes that row first;
+    /// only the next normal pass may add the other member's full row of the
+    /// same key.
+    #[cfg(all(feature = "tun", target_os = "linux"))]
+    #[tokio::test]
+    async fn rejected_owner_releases_its_same_key_row_before_the_other_full_row_is_added() {
+        let mut h = Harness::new();
+        let run_a = Uuid::new_v4();
+        let run_b = Uuid::new_v4();
+        let run_c = Uuid::new_v4();
+        let mut fixture = ManagedNicFixture::new(run_a);
+        let member_a = fixture.create_member();
+        attach_member(&member_a).await;
+        let member_c = fixture
+            .registry
+            .try_create_member(
+                MANAGED_NIC_NAME.to_owned(),
+                managed_virtual_nic_config(),
+                run_c,
+                Arc::new(Notify::new()),
+            )
+            .unwrap();
+        attach_member(&member_c).await;
+
+        let p: RouteSpec<RouteDevice> = RouteSpec::for_tun("10.112.0.0/24".parse().unwrap());
+        let q: RouteSpec<RouteDevice> = RouteSpec::for_tun("10.113.0.0/24".parse().unwrap());
+        let p_prefix: IpCidr = p.destination;
+        let q_prefix: IpCidr = q.destination;
+        assert!(
+            sync_member_routes(&member_a, &BTreeSet::from([p_prefix]))
+                .await
+                .unwrap(),
+            "A really claims P"
+        );
+        assert!(
+            sync_member_routes(&member_c, &BTreeSet::from([q_prefix]))
+                .await
+                .unwrap(),
+            "the fixture blocker C really claims Q"
+        );
+
+        let registry_a = h.controller.open_instance(run_a).unwrap();
+        h.controller.bind_member(run_a, &member_a).unwrap();
+        assert!(
+            h.controller
+                .ready(
+                    run_a,
+                    &member_a,
+                    InterfaceInfo {
+                        name: MANAGED_NIC_NAME.into(),
+                        ifindex: 7,
+                    },
+                )
+                .unwrap()
+        );
+        let slot_a = registry_a
+            .handle()
+            .open_slot(RouteSource::Additional)
+            .unwrap();
+        slot_a.set_routes(RouteSet::from([p.clone()]));
+
+        let registry_b = h.controller.open_instance(run_b).unwrap();
+        let slot_b = registry_b
+            .handle()
+            .open_slot(RouteSource::Additional)
+            .unwrap();
+        let row2_declaration = indexed("10.112.0.0/24", 8, None);
+        let row2_route = resolved(&row2_declaration);
+        slot_b.set_routes(RouteSet::from([row2_declaration.clone()]));
+
+        let row1 = managed_installed(&p, 7, run_a, &member_a);
+        let row1_route = row1.route.clone();
+        assert_eq!(
+            RouteKey::of(&row1_route),
+            RouteKey::of(&row2_route),
+            "the two full rows share the exclusive key"
+        );
+        assert_ne!(row1_route, row2_route);
+        h.mock.routes.lock().insert(row1_route.clone());
+        h.controller
+            .runtime
+            .write()
+            .applied
+            .insert(RouteKey::of(&row1_route), row1);
+
+        h.round_ok().await;
+        assert_eq!(slot_a.statuses().get(&p), Some(&RouteStatus::Ready));
+        assert!(
+            matches!(
+                slot_b.statuses().get(&row2_declaration),
+                Some(RouteStatus::Suppressed(_))
+            ),
+            "the installed row still occupies the shared key"
+        );
+        assert_eq!(h.mock.add_count(), 0);
+        assert_eq!(h.mock.remove_count(), 0);
+
+        // Adding Q makes A's whole candidate set conflict with C's Q. A raw P
+        // declaration no longer proves ownership of row 1.
+        slot_a.set_routes(RouteSet::from([p.clone(), q.clone()]));
+        h.round_ok().await;
+
+        assert!(matches!(
+            slot_a.statuses().get(&p),
+            Some(RouteStatus::Rejected(_))
+        ));
+        assert!(matches!(
+            slot_a.statuses().get(&q),
+            Some(RouteStatus::Rejected(_))
+        ));
+        assert_eq!(
+            h.effect(&row1_route),
+            None,
+            "the rejected owner's old full row is really deleted"
+        );
+        assert!(!h.mock.contains(&row1_route));
+        assert_eq!(h.mock.remove_count(), 1);
+        assert_eq!(
+            h.mock.add_count(),
+            0,
+            "the other full row waits for a normal pass after the deletion"
+        );
+        assert!(
+            member_claim_prefixes(&member_a).await.is_empty(),
+            "the whole-member rejection still acknowledges the real withdrawal"
+        );
+        assert_eq!(
+            member_claim_prefixes(&member_c).await,
+            BTreeSet::from([q_prefix]),
+            "the fixture blocker outside the controller is untouched"
+        );
+
+        h.round_ok().await;
+
+        assert_eq!(h.effect(&row2_route), Some(RouteEffect::Owned));
+        assert!(h.mock.contains(&row2_route));
+        assert_eq!(h.mock.add_count(), 1);
+        let row = h
+            .applied()
+            .get(&RouteKey::of(&row2_route))
+            .cloned()
+            .expect("the other full row is installed");
+        assert_eq!(
+            row.owners,
+            BTreeSet::from([run_b]),
+            "the rejected owner does not steal the new row"
+        );
+        assert!(row.members.is_empty());
+        assert_eq!(
+            slot_b.statuses().get(&row2_declaration),
+            Some(&RouteStatus::Ready)
+        );
+        assert!(matches!(
+            slot_a.statuses().get(&p),
+            Some(RouteStatus::Rejected(_))
+        ));
+        assert!(matches!(
+            slot_a.statuses().get(&q),
+            Some(RouteStatus::Rejected(_))
+        ));
+
+        let operations = h.mock.operations.lock().clone();
+        let removed = operations
+            .iter()
+            .position(
+                |operation| matches!(operation, MockOperation::Remove(route) if route == &row1_route),
+            )
+            .expect("the old same-key row was really removed");
+        let added = operations
+            .iter()
+            .position(
+                |operation| matches!(operation, MockOperation::Add(route) if route == &row2_route),
+            )
+            .expect("the other same-key row was really added");
+        assert!(
+            removed < added,
+            "the old same-key row must be deleted before the new one is added"
+        );
+    }
+
+    /// Transient admission failures keep the member's real claims, record one
+    /// retry for the full target and never turn into an empty withdrawal. A
+    /// dirty round before that deadline cannot bypass it; the due round then
+    /// commits the current prefix, installs the row and becomes ready.
+    #[cfg(feature = "tun")]
+    #[tokio::test(start_paused = true)]
+    async fn transient_admission_failure_preserves_claims_and_schedules_progress() {
+        let mut h = Harness::new();
+        let run_a = Uuid::new_v4();
+        let mut fixture = ManagedNicFixture::new(run_a);
+        let member = fixture.create_member();
+        attach_member(&member).await;
+
+        let p: RouteSpec<RouteDevice> = RouteSpec::for_tun("10.114.0.0/24".parse().unwrap());
+        let prefix: IpCidr = p.destination;
+        let p_route = normalize_route(p.clone().resolve(Some(7)).unwrap()).unwrap();
+        assert!(
+            sync_member_routes(&member, &BTreeSet::from([prefix]))
+                .await
+                .unwrap(),
+            "the fixture starts from a real current claim"
+        );
+
+        let registry_a = h.controller.open_instance(run_a).unwrap();
+        h.controller.bind_member(run_a, &member).unwrap();
+        assert!(
+            h.controller
+                .ready(
+                    run_a,
+                    &member,
+                    InterfaceInfo {
+                        name: MANAGED_NIC_NAME.into(),
+                        ifindex: 7,
+                    },
+                )
+                .unwrap()
+        );
+        let slot_a = registry_a
+            .handle()
+            .open_slot(RouteSource::Additional)
+            .unwrap();
+        slot_a.set_routes(RouteSet::from([p.clone()]));
+
+        let run_b = Uuid::new_v4();
+        let registry_b = h.controller.open_instance(run_b).unwrap();
+        let slot_b = registry_b
+            .handle()
+            .open_slot(RouteSource::Additional)
+            .unwrap();
+        let b_declaration = indexed("10.115.0.0/24", 9, None);
+        let b_route = resolved(&b_declaration);
+        slot_b.set_routes(RouteSet::from([b_declaration.clone()]));
+
+        let shared_nic = member.shared_nic();
+        let guard = shared_nic.lock().await;
+        {
+            let mut round = Box::pin(h.round());
+            let mut advances = 0;
+            loop {
+                match futures::poll!(&mut round) {
+                    std::task::Poll::Ready(result) => {
+                        result.expect("the reconcile round must not fail");
+                        break;
+                    }
+                    std::task::Poll::Pending => {
+                        assert!(
+                            advances < 4,
+                            "the round must finish after its bounded planning attempts"
+                        );
+                        advances += 1;
+                        // Each held-NIC admission has its own bounded wait;
+                        // advancing the paused clock expires the current one.
+                        tokio::time::advance(Duration::from_secs(5)).await;
+                    }
+                }
+            }
+        }
+        drop(guard);
+
+        assert!(
+            matches!(
+                slot_a.statuses().get(&p),
+                Some(RouteStatus::Pending { error: Some(error) })
+                    if error.contains("timed out locking shared NIC")
+            ),
+            "the held NIC reports its bounded admission timeout"
+        );
+        assert_eq!(h.effect(&p_route), None);
+        assert!(
+            !h.mock
+                .add_calls
+                .lock()
+                .iter()
+                .any(|route| route == &p_route),
+            "a timed-out admission never installs its row"
+        );
+        assert_eq!(
+            slot_b.statuses().get(&b_declaration),
+            Some(&RouteStatus::Ready)
+        );
+        assert_eq!(h.effect(&b_route), Some(RouteEffect::Owned));
+        assert_eq!(
+            member_claim_prefixes(&member).await,
+            BTreeSet::from([prefix]),
+            "the failed admission must not withdraw the real claim"
+        );
+        let member_key = (run_a, member.registration_id());
+        let deadline = {
+            let (_, target, deadline, attempt, _) = h
+                .member_retries
+                .get(&member_key)
+                .expect("the failed admission records its retry");
+            assert_eq!(target, &BTreeSet::from([prefix]));
+            assert!(*attempt >= 1);
+            assert!(*deadline > tokio::time::Instant::now());
+            *deadline
+        };
+        let attempt_before = h.member_retries[&member_key].3;
+
+        // A dirty round before the deadline must not start the member commit.
+        h.controller.dirty.mark();
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        tokio::time::advance(remaining / 2).await;
+        h.round_ok().await;
+
+        assert_eq!(
+            h.effect(&p_route),
+            None,
+            "the member backoff still owns this row"
+        );
+        assert!(
+            !h.mock
+                .add_calls
+                .lock()
+                .iter()
+                .any(|route| route == &p_route)
+        );
+        assert_eq!(
+            member_claim_prefixes(&member).await,
+            BTreeSet::from([prefix]),
+            "no false empty withdrawal before the deadline"
+        );
+        {
+            let (_, _, deadline_now, attempt_now, _) = &h.member_retries[&member_key];
+            assert_eq!(*deadline_now, deadline);
+            assert_eq!(*attempt_now, attempt_before);
+        }
+
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        tokio::time::advance(remaining + Duration::from_millis(1)).await;
+        h.round_ok().await;
+
+        assert_eq!(h.effect(&p_route), Some(RouteEffect::Owned));
+        assert!(h.mock.contains(&p_route));
+        assert_eq!(slot_a.statuses().get(&p), Some(&RouteStatus::Ready));
+        assert!(
+            h.member_retries.is_empty(),
+            "the due commit clears the member retry"
+        );
+        assert_eq!(
+            member_claim_prefixes(&member).await,
+            BTreeSet::from([prefix]),
+            "the committed prefix is still the current one"
+        );
+    }
+
+    /// A rejected owner keeps the physical row absent, and the round ends with
+    /// an empty ACK for its member. When the conflicting fixture member
+    /// releases its claim during that same round, the fresh planning admits
+    /// the member again. Since this round's ACK was empty it cannot be ready,
+    /// but the remaining member goal must leave the controller dirty so the
+    /// next round runs without waiting for another input mark.
+    #[cfg(feature = "tun")]
+    #[tokio::test]
+    async fn admission_recovery_after_empty_ack_keeps_actionable_dirty() {
+        let mut h = Harness::new();
+        let run_a = Uuid::new_v4();
+        let run_c = Uuid::new_v4();
+        let mut fixture = ManagedNicFixture::new(run_a);
+        let member_a = fixture.create_member();
+        attach_member(&member_a).await;
+        let member_c = fixture
+            .registry
+            .try_create_member(
+                MANAGED_NIC_NAME.to_owned(),
+                managed_virtual_nic_config(),
+                run_c,
+                Arc::new(Notify::new()),
+            )
+            .unwrap();
+        attach_member(&member_c).await;
+
+        let p: RouteSpec<RouteDevice> = RouteSpec::for_tun("10.116.0.0/24".parse().unwrap());
+        let q: RouteSpec<RouteDevice> = RouteSpec::for_tun("10.117.0.0/24".parse().unwrap());
+        let p_prefix: IpCidr = p.destination;
+        let q_prefix: IpCidr = q.destination;
+        let p_route = normalize_route(p.clone().resolve(Some(7)).unwrap()).unwrap();
+        let q_route = normalize_route(q.clone().resolve(Some(7)).unwrap()).unwrap();
+        assert!(
+            sync_member_routes(&member_a, &BTreeSet::from([p_prefix]))
+                .await
+                .unwrap()
+        );
+        assert!(
+            sync_member_routes(&member_c, &BTreeSet::from([q_prefix]))
+                .await
+                .unwrap(),
+            "the fixture blocker really claims Q"
+        );
+
+        let registry_a = h.controller.open_instance(run_a).unwrap();
+        h.controller.bind_member(run_a, &member_a).unwrap();
+        assert!(
+            h.controller
+                .ready(
+                    run_a,
+                    &member_a,
+                    InterfaceInfo {
+                        name: MANAGED_NIC_NAME.into(),
+                        ifindex: 7,
+                    },
+                )
+                .unwrap()
+        );
+        let slot_a = registry_a
+            .handle()
+            .open_slot(RouteSource::Additional)
+            .unwrap();
+        slot_a.set_routes(RouteSet::from([p.clone(), q.clone()]));
+
+        let run_b = Uuid::new_v4();
+        let registry_b = h.controller.open_instance(run_b).unwrap();
+        let slot_b = registry_b
+            .handle()
+            .open_slot(RouteSource::Additional)
+            .unwrap();
+        let b_declaration = indexed("10.118.0.0/24", 9, None);
+        let b_route = resolved(&b_declaration);
+        slot_b.set_routes(RouteSet::from([b_declaration.clone()]));
+
+        let controller = h.controller.clone();
+        let dirty = controller.dirty.clone();
+        let mock = h.mock.clone();
+        let (entered, resume) = mock.gate_add(Some(b_route.clone()));
+        dirty.reset();
+        let mut round = Box::pin(h.round());
+        tokio::select! {
+            result = round.as_mut() => panic!("the ordinary addition finished before the gate: {result:?}"),
+            _ = entered.notified() => {}
+        }
+
+        assert!(
+            member_claim_prefixes(&member_a).await.is_empty(),
+            "the rejected whole member still acknowledged the empty target"
+        );
+        assert_eq!(
+            member_claim_prefixes(&member_c).await,
+            BTreeSet::from([q_prefix])
+        );
+        assert!(
+            !dirty.peek(),
+            "the member withdrawal and the fixture claims mark no controller input"
+        );
+
+        // The fixture blocker releases its claim while the ordinary addition
+        // waits. No controller slot or configuration changes, so no input mark
+        // is produced by this recovery.
+        assert!(
+            sync_member_routes(&member_c, &BTreeSet::new())
+                .await
+                .unwrap()
+        );
+        assert!(
+            !dirty.peek(),
+            "the fixture-only claim release marks no controller input"
+        );
+
+        resume.notify_one();
+        round.await.unwrap();
+
+        assert_eq!(
+            slot_b.statuses().get(&b_declaration),
+            Some(&RouteStatus::Ready)
+        );
+        assert_eq!(h.effect(&b_route), Some(RouteEffect::Owned));
+        assert!(
+            matches!(slot_a.statuses().get(&p), Some(RouteStatus::Pending { .. })),
+            "the recovered admission has no row in this round"
+        );
+        assert!(
+            matches!(slot_a.statuses().get(&q), Some(RouteStatus::Pending { .. })),
+            "the empty ACK of this round cannot make the recovered member ready"
+        );
+        assert!(
+            !h.applied().contains_key(&RouteKey::of(&p_route)),
+            "the fresh final planning never installs during this round"
+        );
+        assert!(!h.applied().contains_key(&RouteKey::of(&q_route)));
+        assert!(
+            dirty.peek(),
+            "the unconfirmed recovered member goal is actionable without another input mark"
+        );
+
+        h.controller.dirty.reset();
+        h.round_ok().await;
+
+        assert_eq!(h.effect(&p_route), Some(RouteEffect::Owned));
+        assert_eq!(h.effect(&q_route), Some(RouteEffect::Owned));
+        assert_eq!(slot_a.statuses().get(&p), Some(&RouteStatus::Ready));
+        assert_eq!(slot_a.statuses().get(&q), Some(&RouteStatus::Ready));
+        assert_eq!(
+            member_claim_prefixes(&member_a).await,
+            BTreeSet::from([p_prefix, q_prefix]),
+            "the next round commits the whole current member target"
+        );
+    }
+
+    // Audit tests. Every one drives the real `RouteReconciler::audit` through
+    // the mock backend and the same retry maps of the worker loop; none of
+    // them starts the platform backend or enters a real namespace.
+
+    impl Harness {
+        /// One real audit with a test-only overall bound. It only turns a hung
+        /// test into a diagnostic; the production I/O bounds are inside.
+        async fn audit(&mut self) -> anyhow::Result<bool> {
+            tokio::time::timeout(
+                Duration::from_secs(10),
+                self.reconciler.audit(
+                    &mut self.route_retries,
+                    #[cfg(feature = "tun")]
+                    &mut self.member_retries,
+                ),
+            )
+            .await
+            .expect("the audit must finish within 10s")
+        }
+    }
+
+    /// Every actual fact an audit must not clear: key, full route, effect,
+    /// owners and the registration behind each recorded member.
+    #[cfg(feature = "tun")]
+    fn applied_evidence(
+        applied: &AppliedRoutes,
+    ) -> Vec<(
+        RouteKey,
+        RouteSpec<u32>,
+        RouteEffect,
+        BTreeSet<Uuid>,
+        Vec<(Uuid, Uuid)>,
+    )> {
+        applied
+            .iter()
+            .map(|(key, row)| {
+                let members = row
+                    .members
+                    .iter()
+                    .map(|(run, member)| (*run, member.registration_id()))
+                    .collect();
+                (
+                    key.clone(),
+                    row.route.clone(),
+                    row.effect,
+                    row.owners.clone(),
+                    members,
+                )
+            })
+            .collect()
+    }
+
+    /// A healthy managed row and an absent ordinary row are read back in one
+    /// batch. The audit must not drive the planner or touch the healthy
+    /// member's NIC: only the next normal round restores the missing row.
+    #[cfg(feature = "tun")]
+    #[tokio::test(start_paused = true)]
+    async fn a_batch_audit_retires_only_the_absent_row_without_waiting_for_the_healthy_nic() {
+        let mut h = Harness::new();
+        let run = Uuid::new_v4();
+        let mut fixture = ManagedNicFixture::new(run);
+        let member = fixture.create_member();
+        attach_member(&member).await;
+
+        let registry = h.controller.open_instance(run).unwrap();
+        h.controller.bind_member(run, &member).unwrap();
+        assert!(
+            h.controller
+                .ready(
+                    run,
+                    &member,
+                    InterfaceInfo {
+                        name: MANAGED_NIC_NAME.into(),
+                        ifindex: 7,
+                    },
+                )
+                .unwrap()
+        );
+        let slot = registry
+            .handle()
+            .open_slot(RouteSource::Additional)
+            .unwrap();
+
+        let managed: RouteSpec<RouteDevice> = RouteSpec::for_tun("10.130.0.0/24".parse().unwrap());
+        let managed_route = normalize_route(managed.clone().resolve(Some(7)).unwrap()).unwrap();
+        let ordinary_declaration = indexed("10.131.0.0/24", 9, None);
+        let ordinary_route = resolved(&ordinary_declaration);
+        h.mock.routes.lock().insert(ordinary_route.clone());
+        slot.set_routes(RouteSet::from([
+            managed.clone(),
+            ordinary_declaration.clone(),
+        ]));
+
+        h.round_ok().await;
+        assert_eq!(h.effect(&managed_route), Some(RouteEffect::Owned));
+        assert_eq!(h.effect(&ordinary_route), Some(RouteEffect::External));
+        assert_eq!(slot.statuses().get(&managed), Some(&RouteStatus::Ready));
+        assert_eq!(
+            slot.statuses().get(&ordinary_declaration),
+            Some(&RouteStatus::Ready)
+        );
+        assert_eq!(
+            member_claim_prefixes(&member).await,
+            BTreeSet::from([managed.destination])
+        );
+        let evidence_before = applied_evidence(&h.applied());
+        let managed_evidence = evidence_before
+            .iter()
+            .find(|row| row.0 == RouteKey::of(&managed_route))
+            .cloned()
+            .expect("the managed row is installed");
+        let add_calls = h.mock.add_count();
+        let remove_calls = h.mock.remove_count();
+
+        // Only the ordinary row is physically gone. The managed member's NIC
+        // lock is held for the whole audit: a planner call inside the audit
+        // would wait on member admission instead of returning immediately.
+        h.mock.routes.lock().remove(&ordinary_route);
+        let shared_nic = member.shared_nic();
+        let guard = shared_nic.lock().await;
+        h.controller.dirty.reset();
+        let removed = tokio::time::timeout(Duration::from_millis(100), h.audit())
+            .await
+            .expect("the audit must not wait for the healthy member's NIC")
+            .expect("the audit readback is complete");
+        assert!(removed);
+
+        assert_eq!(
+            h.mock.existing_batches.lock().last().cloned(),
+            Some(BTreeSet::from([
+                managed_route.clone(),
+                ordinary_route.clone()
+            ])),
+            "one batch contains the exact full rows of both effects"
+        );
+        assert_eq!(
+            applied_evidence(&h.applied()),
+            vec![managed_evidence],
+            "the healthy row and its member registration are untouched"
+        );
+        assert_eq!(slot.statuses().get(&managed), Some(&RouteStatus::Ready));
+        assert_eq!(
+            slot.statuses().get(&ordinary_declaration),
+            Some(&RouteStatus::Pending { error: None }),
+            "the missing ordinary declaration waits for the normal round"
+        );
+        assert!(h.dirty_peek());
+        assert_eq!(h.mock.add_count(), add_calls);
+        assert_eq!(h.mock.remove_count(), remove_calls);
+        drop(guard);
+
+        h.round_ok().await;
+        assert_eq!(h.effect(&ordinary_route), Some(RouteEffect::Owned));
+        assert!(h.mock.contains(&ordinary_route));
+        assert_eq!(
+            slot.statuses().get(&ordinary_declaration),
+            Some(&RouteStatus::Ready)
+        );
+        assert_eq!(
+            h.mock.add_count(),
+            add_calls + 1,
+            "the normal round, not the audit, really adds the missing row"
+        );
+        assert_eq!(h.mock.remove_count(), remove_calls);
+    }
+
+    /// A failed or timed-out batch readback proves nothing: every actual row,
+    /// effect, owner, member registration and status stays exactly as it was,
+    /// and the audit itself performs no CRUD. Only a complete present readback
+    /// ends the audit without changing the ledger.
+    #[cfg(feature = "tun")]
+    #[tokio::test(start_paused = true)]
+    async fn a_failed_or_timed_out_readback_keeps_every_actual_fact() {
+        let mut h = Harness::new();
+        let run = Uuid::new_v4();
+        let mut fixture = ManagedNicFixture::new(run);
+        let member = fixture.create_member();
+        attach_member(&member).await;
+
+        let registry = h.controller.open_instance(run).unwrap();
+        h.controller.bind_member(run, &member).unwrap();
+        assert!(
+            h.controller
+                .ready(
+                    run,
+                    &member,
+                    InterfaceInfo {
+                        name: MANAGED_NIC_NAME.into(),
+                        ifindex: 7,
+                    },
+                )
+                .unwrap()
+        );
+        let slot = registry
+            .handle()
+            .open_slot(RouteSource::Additional)
+            .unwrap();
+
+        let owned: RouteSpec<RouteDevice> = RouteSpec::for_tun("10.132.0.0/24".parse().unwrap());
+        let owned_route = normalize_route(owned.clone().resolve(Some(7)).unwrap()).unwrap();
+        let external_declaration = indexed("10.133.0.0/24", 8, None);
+        let external_route = resolved(&external_declaration);
+        h.mock.routes.lock().insert(external_route.clone());
+        slot.set_routes(RouteSet::from([
+            owned.clone(),
+            external_declaration.clone(),
+        ]));
+
+        h.round_ok().await;
+        assert_eq!(h.effect(&owned_route), Some(RouteEffect::Owned));
+        assert_eq!(h.effect(&external_route), Some(RouteEffect::External));
+        assert_eq!(slot.statuses().get(&owned), Some(&RouteStatus::Ready));
+        assert_eq!(
+            slot.statuses().get(&external_declaration),
+            Some(&RouteStatus::Ready)
+        );
+        assert_eq!(
+            member_claim_prefixes(&member).await,
+            BTreeSet::from([owned.destination])
+        );
+
+        let evidence = applied_evidence(&h.applied());
+        assert!(
+            evidence
+                .iter()
+                .any(|row| row.0 == RouteKey::of(&owned_route) && !row.4.is_empty()),
+            "the evidence really includes the acknowledged member registration"
+        );
+        let statuses = slot.statuses();
+        let add_calls = h.mock.add_count();
+        let remove_calls = h.mock.remove_count();
+
+        // A complete readback error is an audit error, not an empty table.
+        h.mock
+            .queue_existing_error(RouteError::Failed(anyhow::anyhow!("readback failed")));
+        h.controller.dirty.reset();
+        assert!(h.audit().await.is_err());
+        assert_eq!(applied_evidence(&h.applied()), evidence);
+        assert_eq!(slot.statuses(), statuses);
+        assert_eq!(h.mock.add_count(), add_calls);
+        assert_eq!(h.mock.remove_count(), remove_calls);
+        assert!(!h.dirty_peek(), "a failed read is not progress");
+        assert!(h.route_retries.is_empty());
+
+        // A readback that never completes is also not an absence. The gate is
+        // entered and then the audit's real 5s I/O bound expires under paused
+        // time; the test's own outer bound keeps the wait finite.
+        let (entered, resume) = h.mock.gate_existing(None);
+        h.controller.dirty.reset();
+        let mut audit = Box::pin(h.audit());
+        tokio::select! {
+            result = audit.as_mut() => panic!("the gated readback finished before the gate: {result:?}"),
+            _ = entered.notified() => {}
+        }
+        tokio::time::advance(Duration::from_secs(5)).await;
+        let error = tokio::time::timeout(Duration::from_secs(1), audit)
+            .await
+            .expect("the audit's own I/O bound must stop the wait")
+            .expect_err("an incomplete readback is an audit error");
+        assert!(
+            error
+                .to_string()
+                .contains("timed out reading existing routes"),
+            "the honest timeout stays the audit error: {error}"
+        );
+        resume.notify_one();
+        assert_eq!(applied_evidence(&h.applied()), evidence);
+        assert_eq!(slot.statuses(), statuses);
+        assert_eq!(h.mock.add_count(), add_calls);
+        assert_eq!(h.mock.remove_count(), remove_calls);
+        assert!(!h.dirty_peek());
+        assert!(h.route_retries.is_empty());
+
+        assert!(
+            !h.audit().await.expect("a complete readback succeeds"),
+            "present rows need no repair"
+        );
+        assert_eq!(applied_evidence(&h.applied()), evidence);
+        assert_eq!(slot.statuses(), statuses);
+        assert_eq!(h.mock.add_count(), add_calls);
+        assert_eq!(h.mock.remove_count(), remove_calls);
+        assert!(!h.dirty_peek());
+    }
+
+    /// The root is released while a batch readback is gated. The confirmed
+    /// absence may retire the old row, but neither the audit nor the next
+    /// normal round may recreate it from the still-held slot or manual policy.
+    #[tokio::test(start_paused = true)]
+    async fn a_released_root_during_a_gated_audit_is_never_revived_by_old_inputs() {
+        use easytier_core::config::{
+            peers::PeerRuntimeSnapshot,
+            runtime::{CoreRuntimeConfig, CoreRuntimeConfigStore},
+        };
+
+        let mut h = Harness::new();
+        let declaration = indexed("10.134.0.0/24", 7, None);
+        let route = resolved(&declaration);
+        let run = Uuid::new_v4();
+        let registry = h.controller.open_instance(run).unwrap();
+        let store = CoreRuntimeConfigStore::new(
+            CoreRuntimeConfig::default(),
+            Arc::new(PeerRuntimeSnapshot::default()),
+        );
+        let held_manual = BTreeSet::from(["10.135.0.0/24".parse().unwrap()]);
+        store.update_services(|services| services.manual_routes = Some(held_manual.clone()));
+        h.controller.bind_config(run, store.clone()).unwrap();
+        let slot = registry
+            .handle()
+            .open_slot(RouteSource::Additional)
+            .unwrap();
+        slot.set_routes(RouteSet::from([declaration.clone()]));
+
+        h.round_ok().await;
+        assert_eq!(h.effect(&route), Some(RouteEffect::Owned));
+        assert_eq!(slot.statuses().get(&declaration), Some(&RouteStatus::Ready));
+        assert!(h.mock.contains(&route));
+        let add_calls = h.mock.add_count();
+        let status_before = slot.statuses();
+
+        h.mock.routes.lock().remove(&route);
+        let (entered, resume) = h.mock.gate_existing(Some(route.clone()));
+        let controller = h.controller.clone();
+        let dirty = controller.dirty.clone();
+        let slot_handle = slot.clone();
+        dirty.reset();
+        let mut audit = Box::pin(h.audit());
+        tokio::select! {
+            result = audit.as_mut() => panic!("the gated readback finished before the gate: {result:?}"),
+            _ = entered.notified() => {}
+        }
+
+        // Only the root is released. The slot and the nonempty manual policy
+        // stay held, so they are the stale inputs that must not resurrect.
+        drop(registry);
+        assert!(
+            controller.runtime.read().instances[&run]
+                .registry
+                .upgrade()
+                .is_none(),
+            "the controller only observes the released root weakly"
+        );
+        assert!(dirty.peek(), "releasing the root marks the route inputs");
+        assert_eq!(
+            controller.effective_routes_for_instance(&run),
+            RouteSet::new(),
+            "the held manual policy cannot outlive the released input directory"
+        );
+
+        resume.notify_one();
+        let removed = tokio::time::timeout(Duration::from_secs(1), audit)
+            .await
+            .expect("the audit must finish once the readback is released")
+            .expect("a complete absence readback succeeds");
+        assert!(removed);
+
+        assert_eq!(
+            h.effect(&route),
+            None,
+            "the confirmed absence retires the old Owned row"
+        );
+        assert!(!h.mock.contains(&route));
+        assert_eq!(
+            slot_handle.statuses().get(&declaration),
+            status_before.get(&declaration),
+            "feedback for the released root is skipped, not rewritten"
+        );
+        assert_eq!(h.mock.add_count(), add_calls, "the audit never adds");
+        assert_eq!(h.mock.remove_count(), 0, "the audit never deletes");
+        assert_eq!(
+            store.snapshot().services.manual_routes,
+            Some(held_manual),
+            "the real nonempty manual policy is still there"
+        );
+
+        h.controller.dirty.reset();
+        h.round_ok().await;
+
+        assert!(
+            !h.mock.contains(&route),
+            "the normal round must not recreate the released input"
+        );
+        assert_eq!(
+            h.mock.add_count(),
+            add_calls,
+            "neither the old slot nor the manual policy becomes a target"
+        );
+        assert!(h.applied().is_empty());
+        assert!(
+            !h.controller.runtime.read().instances.contains_key(&run),
+            "a released record is pruned once no cleanup is owed"
+        );
+        tokio::time::timeout(Duration::from_secs(1), h.controller.drain(run))
+            .await
+            .expect("the released record's drain completes after cleanup")
+            .expect("drain must not fail");
+    }
+
+    /// A present readback never promotes an unconfirmed addition, and a
+    /// complete absence retires exactly that record and its retry. The audit
+    /// never performs the add; the next normal round decides from current
+    /// input.
+    #[tokio::test]
+    async fn a_present_adding_row_stays_unconfirmed_and_a_confirmed_absence_retires_it() {
+        let mut h = Harness::new();
+        let declaration = indexed("10.136.0.0/24", 7, None);
+        let route = resolved(&declaration);
+        let (_run, _registry, slot) = instance_with_slot(&h.controller, RouteSource::Additional);
+        slot.set_routes(RouteSet::from([declaration.clone()]));
+        h.mock.queue_add(
+            &route,
+            RouteError::Unknown(anyhow::anyhow!("unknown add")),
+            false,
+        );
+        h.round_ok().await;
+
+        assert_eq!(h.effect(&route), Some(RouteEffect::Adding));
+        assert!(!h.mock.contains(&route));
+        let key = RouteKey::of(&route);
+        let retry_before = h.route_retries[&key].clone();
+        let add_calls = h.mock.add_count();
+        let remove_calls = h.mock.remove_count();
+        let unknown_status = RouteStatus::Pending {
+            error: Some(Arc::from("route operation outcome is unknown: unknown add")),
+        };
+        assert_eq!(slot.statuses().get(&declaration), Some(&unknown_status));
+
+        // The row is physically there now, yet the effect is still unconfirmed.
+        h.mock.routes.lock().insert(route.clone());
+        h.controller.dirty.reset();
+        assert!(!h.audit().await.expect("the present readback is complete"));
+        assert_eq!(
+            h.effect(&route),
+            Some(RouteEffect::Adding),
+            "a present row is not proof that this addition completed"
+        );
+        assert_eq!(slot.statuses().get(&declaration), Some(&unknown_status));
+        assert_eq!(h.route_retries[&key], retry_before);
+        assert_eq!(h.mock.add_count(), add_calls);
+        assert_eq!(h.mock.remove_count(), remove_calls);
+        assert!(!h.dirty_peek());
+
+        // A complete absence is real progress for exactly this addition.
+        h.mock.routes.lock().remove(&route);
+        h.controller.dirty.reset();
+        assert!(h.audit().await.expect("the absence readback is complete"));
+        assert_eq!(h.effect(&route), None);
+        assert!(!h.route_retries.contains_key(&key));
+        assert_eq!(
+            slot.statuses().get(&declaration),
+            Some(&RouteStatus::Pending { error: None })
+        );
+        assert!(h.dirty_peek());
+        assert_eq!(h.mock.add_count(), add_calls, "the audit never adds");
+        assert_eq!(h.mock.remove_count(), remove_calls);
+
+        // The current declaration is still a target; the next normal round
+        // really installs it from the fresh input.
+        h.round_ok().await;
+        assert_eq!(h.effect(&route), Some(RouteEffect::Owned));
+        assert_eq!(slot.statuses().get(&declaration), Some(&RouteStatus::Ready));
+        assert_eq!(h.mock.add_count(), add_calls + 1);
+    }
+
+    /// A present readback keeps an uncertain removal and its delete retry; a
+    /// complete absence retires exactly that record and retry. The audit never
+    /// performs the delete.
+    #[tokio::test]
+    async fn a_present_removing_row_keeps_its_delete_responsibility_until_the_absence_proof() {
+        let mut h = Harness::new();
+        let declaration = indexed("10.137.0.0/24", 7, None);
+        let route = resolved(&declaration);
+        let (_run, _registry, slot) = instance_with_slot(&h.controller, RouteSource::Additional);
+        slot.set_routes(RouteSet::from([declaration]));
+        h.round_ok().await;
+        assert_eq!(h.effect(&route), Some(RouteEffect::Owned));
+
+        h.mock.queue_remove(
+            &route,
+            RouteError::Unknown(anyhow::anyhow!("unknown delete")),
+            false,
+        );
+        slot.clear();
+        h.round_ok().await;
+        assert_eq!(h.effect(&route), Some(RouteEffect::Removing));
+        assert!(
+            h.mock.contains(&route),
+            "the unknown delete left the physical row"
+        );
+        let key = RouteKey::of(&route);
+        let retry_before = h.route_retries[&key].clone();
+        let add_calls = h.mock.add_count();
+        let remove_calls = h.mock.remove_count();
+        assert!(slot.statuses().is_empty());
+
+        // Present readback: the delete is not confirmed and its retry and
+        // cleanup responsibility stay.
+        h.controller.dirty.reset();
+        assert!(!h.audit().await.expect("the present readback is complete"));
+        assert_eq!(
+            h.effect(&route),
+            Some(RouteEffect::Removing),
+            "a present row must not promote an uncertain removal to Owned"
+        );
+        assert_eq!(h.route_retries[&key], retry_before);
+        assert_eq!(
+            h.mock.remove_count(),
+            remove_calls,
+            "the audit never deletes"
+        );
+        assert_eq!(h.mock.add_count(), add_calls);
+        assert!(!h.dirty_peek());
+
+        // Only the positive absence proof retires the record and its retry.
+        h.mock.routes.lock().remove(&route);
+        h.controller.dirty.reset();
+        assert!(h.audit().await.expect("the absence readback is complete"));
+        assert_eq!(h.effect(&route), None);
+        assert!(!h.route_retries.contains_key(&key));
+        assert!(h.dirty_peek());
+        assert_eq!(h.mock.remove_count(), remove_calls);
+        assert_eq!(h.mock.add_count(), add_calls);
+
+        h.round_ok().await;
+        assert!(h.applied().is_empty());
+        assert_eq!(h.mock.remove_count(), remove_calls);
+        assert_eq!(h.mock.add_count(), add_calls);
+    }
+
+    /// The audit's absence proof retires an old managed row while the run
+    /// rebinds. The old registration and its real prefix stay in the retry map
+    /// as an empty-goal cleanup; the new binding is ready only after its own
+    /// acknowledgement and installation, never from the old read or ACK.
+    #[cfg(feature = "tun")]
+    #[tokio::test(start_paused = true)]
+    async fn an_audit_keeps_the_old_member_cleanup_across_a_rebind() {
+        let mut h = Harness::new();
+        let run = Uuid::new_v4();
+        let mut old_fixture = ManagedNicFixture::new(run);
+        let old_member = old_fixture.create_member();
+        attach_member(&old_member).await;
+        let mut new_fixture = ManagedNicFixture::new(run);
+        let new_member = new_fixture.create_member();
+        attach_member(&new_member).await;
+
+        let registry = h.controller.open_instance(run).unwrap();
+        h.controller.bind_member(run, &old_member).unwrap();
+        assert!(
+            h.controller
+                .ready(
+                    run,
+                    &old_member,
+                    InterfaceInfo {
+                        name: MANAGED_NIC_NAME.into(),
+                        ifindex: 7,
+                    },
+                )
+                .unwrap()
+        );
+        let slot = registry
+            .handle()
+            .open_slot(RouteSource::Additional)
+            .unwrap();
+        let p: RouteSpec<RouteDevice> = RouteSpec::for_tun("10.138.0.0/24".parse().unwrap());
+        let prefix: IpCidr = p.destination;
+        slot.set_routes(RouteSet::from([p.clone()]));
+
+        h.round_ok().await;
+        let old_route = normalize_route(p.clone().resolve(Some(7)).unwrap()).unwrap();
+        let new_route = normalize_route(p.clone().resolve(Some(8)).unwrap()).unwrap();
+        assert_ne!(old_route, new_route);
+        assert_eq!(h.effect(&old_route), Some(RouteEffect::Owned));
+        assert!(
+            h.applied()[&RouteKey::of(&old_route)]
+                .members
+                .get(&run)
+                .is_some_and(|member| member.registration_id() == old_member.registration_id())
+        );
+        assert_eq!(slot.statuses().get(&p), Some(&RouteStatus::Ready));
+        assert_eq!(
+            member_claim_prefixes(&old_member).await,
+            BTreeSet::from([prefix])
+        );
+
+        // The old physical row disappears and its readback is held. The new
+        // registration is bound to a different NIC and device while the audit
+        // awaits; the old NIC is deliberately not attached to it.
+        h.mock.routes.lock().remove(&old_route);
+        let (entered, resume) = h.mock.gate_existing(Some(old_route.clone()));
+        let controller = h.controller.clone();
+        let dirty = controller.dirty.clone();
+        let slot_handle = slot.clone();
+        let mock = h.mock.clone();
+        dirty.reset();
+        let mut audit = Box::pin(h.audit());
+        tokio::select! {
+            result = audit.as_mut() => panic!("the old row readback finished before the gate: {result:?}"),
+            _ = entered.notified() => {}
+        }
+
+        controller.bind_member(run, &new_member).unwrap();
+        assert!(
+            controller
+                .ready(
+                    run,
+                    &new_member,
+                    InterfaceInfo {
+                        name: MANAGED_NIC_NAME.into(),
+                        ifindex: 8,
+                    },
+                )
+                .unwrap()
+        );
+        // The rebind's own marks must not hide the audit outcome; the audit
+        // marks dirty again when it retires the row.
+        dirty.reset();
+        resume.notify_one();
+        let removed = tokio::time::timeout(Duration::from_secs(1), audit)
+            .await
+            .expect("the audit must finish once the readback is released")
+            .expect("the complete absence readback succeeds");
+        assert!(removed);
+
+        assert!(!h.mock.contains(&old_route));
+        assert!(
+            h.applied().get(&RouteKey::of(&new_route)).is_none(),
+            "the old readback or ACK cannot install the new binding's row"
+        );
+        assert!(h.applied().is_empty());
+        assert!(
+            member_claim_prefixes(&new_member).await.is_empty(),
+            "the new registration has no claim before its own acknowledgement"
+        );
+        assert_eq!(
+            member_claim_prefixes(&old_member).await,
+            BTreeSet::from([prefix]),
+            "the old registration really still owns the prefix it must withdraw"
+        );
+        let orphan_key = (run, old_member.registration_id());
+        {
+            let (retained, target, deadline, attempt, _) = h
+                .member_retries
+                .get(&orphan_key)
+                .expect("the old registration is retained for its real withdrawal");
+            assert_eq!(retained.registration_id(), old_member.registration_id());
+            assert!(target.is_empty(), "the orphan goal is empty");
+            assert_eq!(*attempt, 0, "an orphan cleanup starts no failed attempt");
+            assert!(
+                *deadline <= tokio::time::Instant::now(),
+                "the orphan withdrawal is due immediately"
+            );
+        }
+        assert!(h.dirty_peek());
+
+        // The next normal round first withdraws the old registration's prefix
+        // and only then installs the new binding's own row.
+        let (add_entered, add_resume) = mock.gate_add(Some(new_route.clone()));
+        let mut round = Box::pin(h.round());
+        tokio::select! {
+            result = round.as_mut() => panic!("the new addition finished before the gate: {result:?}"),
+            _ = add_entered.notified() => {}
+        }
+        assert!(
+            member_claim_prefixes(&new_member).await.contains(&prefix),
+            "the new registration's own acknowledgement precedes its addition"
+        );
+        assert!(
+            member_claim_prefixes(&old_member).await.is_empty(),
+            "the old registration really withdrew the prefix before the addition"
+        );
+        assert!(
+            matches!(
+                slot_handle.statuses().get(&p),
+                Some(RouteStatus::Pending { .. })
+            ),
+            "the new binding is not ready before its row is confirmed"
+        );
+        assert_eq!(
+            controller
+                .applied_routes()
+                .get(&RouteKey::of(&new_route))
+                .map(|row| row.effect),
+            Some(RouteEffect::Adding)
+        );
+        add_resume.notify_one();
+        round.await.unwrap();
+
+        assert_eq!(h.effect(&new_route), Some(RouteEffect::Owned));
+        assert_eq!(slot_handle.statuses().get(&p), Some(&RouteStatus::Ready));
+        assert!(h.member_retries.is_empty(), "the old cleanup completed");
+        assert!(
+            member_claim_prefixes(&old_member).await.is_empty(),
+            "the old registration's prefix was really withdrawn"
+        );
+        assert_eq!(
+            member_claim_prefixes(&new_member).await,
+            BTreeSet::from([prefix])
+        );
+        assert_eq!(h.mock.remove_count(), 0);
+        assert!(!h.mock.contains(&old_route));
+        assert!(h.mock.contains(&new_route));
+    }
+
+    // Scheduler tests. They drive the real `RouteReconciler::run` worker on the
+    // in-memory backend, so no platform backend, TUN device or system route
+    // state is touched. They never call the static `RouteController::start`.
+
+    /// Wait for an observable condition for a fixed number of scheduler turns.
+    ///
+    /// A paused-clock test cannot make progress while a task spins on
+    /// `yield_now`, so wrapping an unbounded yield loop in a paused timeout
+    /// would hang instead of failing. The bound is finite and the condition is
+    /// asserted once it is exhausted.
+    async fn yield_until(mut condition: impl FnMut() -> bool) {
+        for _ in 0..1000 {
+            if condition() {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            condition(),
+            "the observable condition did not appear within 1000 scheduler turns"
+        );
+    }
+
+    /// Continuous dirty input never moves or starves the fixed audit grid.
+    ///
+    /// Dirty marks at every second before the first grid point may run normal
+    /// rounds, but only the real 60s deadline performs the one full readback of
+    /// the actual row, and neither CRUD nor the reported status flaps.
+    #[tokio::test(start_paused = true)]
+    async fn continuous_dirty_input_never_moves_the_fixed_audit_grid() {
+        let Harness {
+            controller,
+            mock,
+            reconciler,
+            ..
+        } = Harness::new();
+        let declaration = indexed("10.150.0.0/24", 7, None);
+        let route = resolved(&declaration);
+        let (_run, _registry, slot) = instance_with_slot(&controller, RouteSource::Additional);
+        slot.set_routes(RouteSet::from([declaration.clone()]));
+
+        let mut task = tokio::spawn(reconciler.run());
+        yield_until(|| {
+            slot.statuses().get(&declaration) == Some(&RouteStatus::Ready)
+                && controller
+                    .applied_routes()
+                    .get(&RouteKey::of(&route))
+                    .is_some_and(|row| row.effect == RouteEffect::Owned)
+        })
+        .await;
+        assert!(mock.contains(&route), "the real mock row stays present");
+        let baseline_readbacks = mock.existing_count();
+        assert_eq!(mock.add_count(), 1);
+        assert_eq!(mock.remove_count(), 0);
+
+        for second in 1..=59 {
+            tokio::time::advance(Duration::from_secs(1)).await;
+            controller.dirty.mark();
+            yield_until(|| !controller.dirty.peek()).await;
+            assert_eq!(
+                mock.existing_count(),
+                baseline_readbacks,
+                "the audit read the table before 60s at second {second}"
+            );
+            assert_eq!(
+                mock.add_count(),
+                1,
+                "no addition is repeated at second {second}"
+            );
+            assert_eq!(
+                mock.remove_count(),
+                0,
+                "no deletion is issued at second {second}"
+            );
+            assert_eq!(slot.statuses().get(&declaration), Some(&RouteStatus::Ready));
+        }
+
+        // The grid point is due while an ordinary dirty mark is still set: the
+        // fixed audit must still win and read the exact full actual row once.
+        controller.dirty.mark();
+        tokio::time::advance(Duration::from_secs(1)).await;
+        yield_until(|| mock.existing_count() > baseline_readbacks).await;
+
+        assert_eq!(
+            mock.existing_count(),
+            baseline_readbacks + 1,
+            "exactly one full audit readback after 60s"
+        );
+        assert_eq!(
+            mock.existing_batches.lock().last().cloned(),
+            Some(BTreeSet::from([route.clone()])),
+            "the audit requests exactly the actual full row"
+        );
+        assert_eq!(mock.add_count(), 1, "the audit never adds");
+        assert_eq!(mock.remove_count(), 0, "the audit never deletes");
+        assert_eq!(
+            controller
+                .applied_routes()
+                .get(&RouteKey::of(&route))
+                .map(|row| row.effect),
+            Some(RouteEffect::Owned)
+        );
+        assert_eq!(
+            slot.statuses().get(&declaration),
+            Some(&RouteStatus::Ready),
+            "a present full row keeps Ready without a status flap"
+        );
+
+        controller.request_shutdown();
+        let joined = tokio::time::timeout(Duration::from_secs(5), &mut task)
+            .await
+            .expect("the real worker must finish its cleanup")
+            .expect("the worker task must not panic");
+        joined.expect("a genuine shutdown returns Ok");
+        assert!(controller.runtime.read().instances.is_empty());
+        assert!(controller.applied_routes().is_empty());
+        assert!(!mock.contains(&route));
+        assert_eq!(mock.remove_count(), 1);
+    }
+
+    /// An unrelated dirty mark cannot jump a failed addition's backoff. Only
+    /// the real 200ms deadline retries the operation, and that retry succeeds
+    /// without any manual wake.
+    #[tokio::test(start_paused = true)]
+    async fn unrelated_dirty_marks_cannot_bypass_the_failed_add_backoff() {
+        let Harness {
+            controller,
+            mock,
+            reconciler,
+            ..
+        } = Harness::new();
+        let declaration = indexed("10.151.0.0/24", 7, None);
+        let route = resolved(&declaration);
+        mock.queue_add(
+            &route,
+            RouteError::Failed(anyhow::anyhow!("install failed")),
+            false,
+        );
+        let (_run, _registry, slot) = instance_with_slot(&controller, RouteSource::Additional);
+        slot.set_routes(RouteSet::from([declaration.clone()]));
+
+        let mut task = tokio::spawn(reconciler.run());
+        yield_until(|| {
+            matches!(
+                slot.statuses().get(&declaration),
+                Some(RouteStatus::Pending { error: Some(_) })
+            )
+        })
+        .await;
+        let adds_for_route = || {
+            mock.add_calls
+                .lock()
+                .iter()
+                .filter(|called| *called == &route)
+                .count()
+        };
+        assert_eq!(adds_for_route(), 1);
+        assert_eq!(
+            controller
+                .applied_routes()
+                .get(&RouteKey::of(&route))
+                .map(|row| row.effect),
+            None
+        );
+
+        for _ in 0..3 {
+            controller.dirty.mark();
+            yield_until(|| !controller.dirty.peek()).await;
+            tokio::time::advance(Duration::from_millis(50)).await;
+            for _ in 0..32 {
+                tokio::task::yield_now().await;
+            }
+            assert_eq!(
+                adds_for_route(),
+                1,
+                "dirty input before 200ms must not retry the addition"
+            );
+            assert!(
+                matches!(
+                    slot.statuses().get(&declaration),
+                    Some(RouteStatus::Pending { error: Some(_) })
+                ),
+                "the failed addition stays pending before its deadline"
+            );
+        }
+
+        // 200ms after the real failure, the worker's own deadline is due. No
+        // dirty mark is issued here: the retry wakes by time alone.
+        tokio::time::advance(Duration::from_millis(50)).await;
+        yield_until(|| slot.statuses().get(&declaration) == Some(&RouteStatus::Ready)).await;
+        assert_eq!(adds_for_route(), 2, "the real retry runs once due");
+        assert_eq!(
+            controller
+                .applied_routes()
+                .get(&RouteKey::of(&route))
+                .map(|row| row.effect),
+            Some(RouteEffect::Owned)
+        );
+
+        controller.request_shutdown();
+        let joined = tokio::time::timeout(Duration::from_secs(5), &mut task)
+            .await
+            .expect("the real worker must finish its cleanup")
+            .expect("the worker task must not panic");
+        joined.expect("a genuine shutdown returns Ok");
+        assert!(controller.runtime.read().instances.is_empty());
+        assert!(controller.applied_routes().is_empty());
+        assert!(!mock.contains(&route));
+    }
+
+    /// A shutdown during a real addition keeps waiting for that operation.
+    ///
+    /// The in-flight record is not cancelled or pretend-never-happened: the
+    /// completed addition is recorded, and the same run's next round really
+    /// deletes it before the task returns.
+    #[tokio::test(start_paused = true)]
+    async fn a_shutdown_during_a_real_add_await_keeps_the_actual_operation() {
+        let Harness {
+            controller,
+            mock,
+            reconciler,
+            ..
+        } = Harness::new();
+        let declaration = indexed("10.152.0.0/24", 7, None);
+        let route = resolved(&declaration);
+        let (_run, _registry, slot) = instance_with_slot(&controller, RouteSource::Additional);
+        slot.set_routes(RouteSet::from([declaration.clone()]));
+        let (entered, resume) = mock.gate_add(Some(route.clone()));
+
+        let mut task = tokio::spawn(reconciler.run());
+        tokio::time::timeout(Duration::from_secs(1), entered.notified())
+            .await
+            .expect("the real addition must reach the held backend call");
+        assert_eq!(mock.add_count(), 1);
+        assert!(
+            !task.is_finished(),
+            "the worker is still inside the real OS call"
+        );
+        assert_eq!(
+            controller
+                .applied_routes()
+                .get(&RouteKey::of(&route))
+                .map(|row| row.effect),
+            Some(RouteEffect::Adding),
+            "the in-flight addition is recorded before its result"
+        );
+
+        slot.clear();
+        controller.request_shutdown();
+        for _ in 0..32 {
+            tokio::task::yield_now().await;
+        }
+        assert!(controller.is_shutdown());
+        assert_eq!(
+            mock.add_count(),
+            1,
+            "shutdown must not start another addition"
+        );
+        assert_eq!(
+            mock.remove_count(),
+            0,
+            "shutdown must not pretend the blocked addition never happened"
+        );
+        assert!(!task.is_finished());
+        assert_eq!(
+            controller
+                .applied_routes()
+                .get(&RouteKey::of(&route))
+                .map(|row| row.effect),
+            Some(RouteEffect::Adding),
+            "the blocked call keeps its in-flight record"
+        );
+
+        resume.notify_one();
+        let joined = tokio::time::timeout(Duration::from_secs(5), &mut task)
+            .await
+            .expect("the completed addition must lead to genuine cleanup")
+            .expect("the worker task must not panic");
+        joined.expect("a genuine shutdown returns Ok after real cleanup");
+
+        let effect_operations: Vec<MockOperation> = mock
+            .operations
+            .lock()
+            .iter()
+            .filter(|operation| {
+                matches!(operation, MockOperation::Add(_) | MockOperation::Remove(_))
+            })
+            .cloned()
+            .collect();
+        assert_eq!(
+            effect_operations,
+            vec![
+                MockOperation::Add(route.clone()),
+                MockOperation::Remove(route.clone())
+            ],
+            "the completed addition is recorded and only then really deleted"
+        );
+        assert_eq!(mock.add_count(), 1);
+        assert_eq!(mock.remove_count(), 1);
+        assert!(!mock.contains(&route));
+        assert!(controller.applied_routes().is_empty());
+        assert!(controller.runtime.read().instances.is_empty());
+    }
+
+    /// A failed delete during shutdown waits for its real retry deadline.
+    ///
+    /// The failed removal restores the actual Owned row; neither shutdown nor
+    /// the retry before 200ms may drop it. The due retry deletes it for real,
+    /// and only then does the worker return.
+    #[tokio::test(start_paused = true)]
+    async fn shutdown_delete_failure_waits_for_its_real_retry() {
+        let Harness {
+            controller,
+            mock,
+            reconciler,
+            ..
+        } = Harness::new();
+        let declaration = indexed("10.153.0.0/24", 7, None);
+        let route = resolved(&declaration);
+        let (run, _registry, slot) = instance_with_slot(&controller, RouteSource::Additional);
+        slot.set_routes(RouteSet::from([declaration.clone()]));
+
+        let mut task = tokio::spawn(reconciler.run());
+        yield_until(|| {
+            slot.statuses().get(&declaration) == Some(&RouteStatus::Ready) && mock.contains(&route)
+        })
+        .await;
+        let add_calls = mock.add_count();
+
+        mock.queue_remove(
+            &route,
+            RouteError::Failed(anyhow::anyhow!("delete failed")),
+            false,
+        );
+        controller.request_shutdown();
+        yield_until(|| {
+            mock.remove_count() == 1
+                && controller
+                    .applied_routes()
+                    .get(&RouteKey::of(&route))
+                    .is_some_and(|row| row.effect == RouteEffect::Owned)
+        })
+        .await;
+
+        tokio::time::advance(Duration::from_millis(100)).await;
+        for _ in 0..32 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            !task.is_finished(),
+            "the worker must wait for the actual retry deadline"
+        );
+        assert!(
+            mock.contains(&route),
+            "a failed delete leaves the real row present"
+        );
+        assert_eq!(
+            mock.remove_count(),
+            1,
+            "nothing before the deadline retries the deletion"
+        );
+        assert_eq!(
+            controller
+                .applied_routes()
+                .get(&RouteKey::of(&route))
+                .map(|row| row.effect),
+            Some(RouteEffect::Owned),
+            "the definite failure restores the actual Owned record"
+        );
+        assert!(controller.runtime.read().instances.contains_key(&run));
+
+        // No dirty mark and no local retry map injection: the worker's own
+        // 200ms deadline wakes it, and the real deletion then succeeds.
+        tokio::time::advance(Duration::from_millis(100)).await;
+        let joined = tokio::time::timeout(Duration::from_secs(5), &mut task)
+            .await
+            .expect("the due retry must finish the real cleanup")
+            .expect("the worker task must not panic");
+        joined.expect("a genuine shutdown returns Ok after cleanup");
+
+        assert_eq!(mock.remove_count(), 2, "the deletion is really retried");
+        assert_eq!(mock.add_count(), add_calls);
+        assert!(!mock.contains(&route));
+        assert!(controller.applied_routes().is_empty());
+        assert!(controller.runtime.read().instances.is_empty());
+    }
+
+    /// An unknown deletion stays outstanding past the drain timeout.
+    ///
+    /// Many unknown outcomes keep the real row and Removing record alive for
+    /// longer than 30s. `drain` reports its real timeout and residual detail
+    /// while the worker still runs; only a real absence proof retires the
+    /// responsibility and lets the worker return.
+    #[tokio::test(start_paused = true)]
+    async fn an_unknown_deletion_survives_the_drain_timeout_until_absence_is_proven() {
+        let Harness {
+            controller,
+            mock,
+            reconciler,
+            ..
+        } = Harness::new();
+        let declaration = indexed("10.154.0.0/24", 7, None);
+        let route = resolved(&declaration);
+        let (run, _registry, slot) = instance_with_slot(&controller, RouteSource::Additional);
+        slot.set_routes(RouteSet::from([declaration.clone()]));
+
+        let mut task = tokio::spawn(reconciler.run());
+        yield_until(|| {
+            slot.statuses().get(&declaration) == Some(&RouteStatus::Ready) && mock.contains(&route)
+        })
+        .await;
+
+        for _ in 0..32 {
+            mock.queue_remove(
+                &route,
+                RouteError::Unknown(anyhow::anyhow!("unknown delete")),
+                false,
+            );
+        }
+        controller.request_shutdown();
+
+        let error = controller
+            .drain(run)
+            .await
+            .expect_err("an outstanding unknown deletion keeps drain incomplete");
+        assert!(
+            error
+                .downcast_ref::<tokio::time::error::Elapsed>()
+                .is_some(),
+            "the real 30s drain timeout stays in the chain: {error:#}"
+        );
+        let detail = format!("{error:#}");
+        assert!(
+            detail.contains("timed out waiting for route cleanup of instance"),
+            "the residual record is reported: {detail}"
+        );
+        assert!(
+            detail.contains("effect Removing"),
+            "the row is still Removing in the residual detail: {detail}"
+        );
+        assert!(controller.runtime.read().instances.contains_key(&run));
+        assert_eq!(
+            controller
+                .applied_routes()
+                .get(&RouteKey::of(&route))
+                .map(|row| row.effect),
+            Some(RouteEffect::Removing)
+        );
+        assert!(
+            mock.contains(&route),
+            "the real OS row is still present at the timeout"
+        );
+        assert!(
+            !task.is_finished(),
+            "the real worker is still cleaning up after the drain timeout"
+        );
+        let remove_calls_at_timeout = mock.remove_count();
+
+        // Delete the Mock OS row directly to simulate an external change to
+        // the OS table. The Controller ledger is not manually cleared here:
+        // the next ordinary retry/audit must prove the complete absence, and
+        // no completion is faked.
+        mock.routes.lock().remove(&route);
+        tokio::time::advance(Duration::from_secs(30)).await;
+        let joined = tokio::time::timeout(Duration::from_secs(5), &mut task)
+            .await
+            .expect("the absence proof must finish the real cleanup")
+            .expect("the worker task must not panic");
+        joined.expect("genuine cleanup returns Ok");
+
+        assert_eq!(
+            mock.remove_count(),
+            remove_calls_at_timeout,
+            "the absence proof retires the row without another delete"
+        );
+        assert!(!mock.contains(&route));
+        assert!(controller.applied_routes().is_empty());
+        assert!(controller.runtime.read().instances.is_empty());
+    }
+
+    // Deadline-crossing scheduler tests. Each one drives the real
+    // `RouteReconciler::run` worker with the paused Tokio clock, so both the
+    // audit grid and every retry deadline belong to the production loop. No
+    // local retry map is injected and no operation is completed by hand.
+
+    /// Real backend calls for one exact route.
+    fn backend_calls(calls: &Mutex<Vec<RouteSpec<u32>>>, route: &RouteSpec<u32>) -> usize {
+        calls
+            .lock()
+            .iter()
+            .filter(|called| *called == route)
+            .count()
+    }
+
+    /// Give the real worker a bounded number of scheduler turns without
+    /// moving the paused clock.
+    async fn yield_turns(turns: usize) {
+        for _ in 0..turns {
+            tokio::task::yield_now().await;
+        }
+    }
+
+    /// Poll a one-shot backend gate without moving the paused clock.
+    async fn wait_for_gate(entered: Arc<Notify>) {
+        let notified = entered.notified();
+        tokio::pin!(notified);
+        for _ in 0..1000 {
+            if futures::poll!(&mut notified).is_ready() {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+        panic!("the backend gate was not reached within 1000 scheduler turns");
+    }
+
+    /// A retry that becomes due while an unrelated addition is held must be
+    /// retried by the next ordinary pass, not stranded until the next audit.
+    ///
+    /// B really fails at t=0. At t=100ms the later-sorted A is declared and its
+    /// addition held; this pass checks B first and skips it as still backed
+    /// off. The clock then passes B's 200ms deadline while A is still held, so
+    /// resuming A must leave B's now-due retry actionable without any new
+    /// input mark.
+    #[tokio::test(start_paused = true)]
+    async fn a_retry_that_becomes_due_during_a_held_addition_runs_in_the_next_pass() {
+        let Harness {
+            controller,
+            mock,
+            reconciler,
+            ..
+        } = Harness::new();
+        let b_declaration = indexed("10.200.0.0/24", 9, None);
+        let b_route = resolved(&b_declaration);
+        mock.queue_add(
+            &b_route,
+            RouteError::Failed(anyhow::anyhow!("install failed")),
+            false,
+        );
+        let (_run_b, _registry_b, slot_b) =
+            instance_with_slot(&controller, RouteSource::Additional);
+        slot_b.set_routes(RouteSet::from([b_declaration.clone()]));
+
+        let mut task = tokio::spawn(reconciler.run());
+        yield_until(|| {
+            matches!(
+                slot_b.statuses().get(&b_declaration),
+                Some(RouteStatus::Pending { error: Some(_) })
+            )
+        })
+        .await;
+        assert_eq!(
+            backend_calls(&mock.add_calls, &b_route),
+            1,
+            "the first real attempt fails"
+        );
+        assert_eq!(
+            controller
+                .applied_routes()
+                .get(&RouteKey::of(&b_route))
+                .map(|row| row.effect),
+            None,
+            "a definite failure leaves no actual effect"
+        );
+
+        // t=100ms: A sorts after B, so this pass considers B first and skips it
+        // inside its backoff before reaching A's held addition.
+        tokio::time::advance(Duration::from_millis(100)).await;
+        let a_declaration = indexed("10.201.0.0/24", 9, None);
+        let a_route = resolved(&a_declaration);
+        let (_run_a, _registry_a, slot_a) =
+            instance_with_slot(&controller, RouteSource::Additional);
+        let (a_entered, a_resume) = mock.gate_add(Some(a_route.clone()));
+        slot_a.set_routes(RouteSet::from([a_declaration.clone()]));
+        wait_for_gate(a_entered).await;
+        assert_eq!(
+            backend_calls(&mock.add_calls, &b_route),
+            1,
+            "B was checked before A and is still inside its backoff"
+        );
+
+        // The deadline passes while A's addition is still held. No extra dirty
+        // mark is issued: the due retry must survive A's completion and run in
+        // the immediately following pass.
+        tokio::time::advance(Duration::from_millis(100)).await;
+        a_resume.notify_one();
+        yield_until(|| {
+            slot_a.statuses().get(&a_declaration) == Some(&RouteStatus::Ready)
+                && slot_b.statuses().get(&b_declaration) == Some(&RouteStatus::Ready)
+        })
+        .await;
+
+        assert_eq!(
+            backend_calls(&mock.add_calls, &b_route),
+            2,
+            "the due retry is really retried right after the held addition"
+        );
+        assert_eq!(backend_calls(&mock.add_calls, &a_route), 1);
+        assert_eq!(
+            controller
+                .applied_routes()
+                .get(&RouteKey::of(&b_route))
+                .map(|row| row.effect),
+            Some(RouteEffect::Owned),
+            "the retried addition is the real conflicting effect"
+        );
+        assert!(mock.contains(&b_route));
+        assert_eq!(
+            slot_b.statuses().get(&b_declaration),
+            Some(&RouteStatus::Ready),
+            "the retried row is really acknowledged as ready"
+        );
+
+        controller.request_shutdown();
+        let joined = tokio::time::timeout(Duration::from_secs(5), &mut task)
+            .await
+            .expect("the real worker must finish its cleanup")
+            .expect("the worker task must not panic");
+        joined.expect("a genuine shutdown returns Ok");
+        assert!(controller.runtime.read().instances.is_empty());
+        assert!(controller.applied_routes().is_empty());
         assert!(mock.routes.lock().is_empty());
+    }
+
+    /// A due OS retry that cannot act in this round must wait for the member
+    /// acknowledgement deadline and then run, rather than being stranded by
+    /// the batch-start horizon.
+    ///
+    /// A really acknowledges its prefix at t=0 and then its addition fails, so
+    /// its own retry is due at 200ms. The A NIC lock is held and the clock is
+    /// advanced to that deadline; the batch that starts there spends two
+    /// bounded admission attempts on A and then holds the real ordinary B
+    /// addition. B is declared during that wait, so the fresh replan sees it.
+    /// Releasing the NIC and B lets the final planner admit A, but this round
+    /// has no A acknowledgement, so nothing is added early. The old due retry
+    /// then runs only once the member's own backoff is due.
+    #[cfg(feature = "tun")]
+    #[tokio::test(start_paused = true)]
+    async fn a_due_os_retry_waits_for_the_member_deadline_and_then_runs() {
+        let Harness {
+            controller,
+            mock,
+            reconciler,
+            ..
+        } = Harness::new();
+        let run_a = Uuid::new_v4();
+        let mut fixture = ManagedNicFixture::new(run_a);
+        let member = fixture.create_member();
+        attach_member(&member).await;
+
+        let p: RouteSpec<RouteDevice> = RouteSpec::for_tun("10.116.0.0/24".parse().unwrap());
+        let prefix: IpCidr = p.destination;
+        let p_route = normalize_route(p.clone().resolve(Some(7)).unwrap()).unwrap();
+        let registry_a = controller.open_instance(run_a).unwrap();
+        controller.bind_member(run_a, &member).unwrap();
+        assert!(
+            controller
+                .ready(
+                    run_a,
+                    &member,
+                    InterfaceInfo {
+                        name: MANAGED_NIC_NAME.into(),
+                        ifindex: 7,
+                    },
+                )
+                .unwrap(),
+            "the fixture interface is the bound member's device"
+        );
+        let slot_a = registry_a
+            .handle()
+            .open_slot(RouteSource::Additional)
+            .unwrap();
+        slot_a.set_routes(RouteSet::from([p.clone()]));
+        mock.queue_add(
+            &p_route,
+            RouteError::Failed(anyhow::anyhow!("install failed")),
+            false,
+        );
+
+        let mut task = tokio::spawn(reconciler.run());
+        yield_until(|| {
+            matches!(
+                slot_a.statuses().get(&p),
+                Some(RouteStatus::Pending { error: Some(_) })
+            )
+        })
+        .await;
+        assert_eq!(
+            backend_calls(&mock.add_calls, &p_route),
+            1,
+            "the real addition failed after a real prefix acknowledgement"
+        );
+
+        // Hold the real NIC admission, then let the 200ms route retry become
+        // due so the batch that starts at that deadline already owns it.
+        let shared_nic = member.shared_nic();
+        let guard = shared_nic.lock().await;
+        let b_declaration = indexed("10.117.0.0/24", 9, None);
+        let b_route = resolved(&b_declaration);
+        let (b_entered, b_resume) = mock.gate_add(Some(b_route.clone()));
+        tokio::time::advance(Duration::from_millis(200)).await;
+
+        // Declare the independent ordinary B while A is waiting in admission.
+        let (_run_b, _registry_b, slot_b) =
+            instance_with_slot(&controller, RouteSource::Additional);
+        slot_b.set_routes(RouteSet::from([b_declaration.clone()]));
+
+        // The ordinary B gate follows the member stage: two bounded admission
+        // attempts and the second failure's 400ms member backoff.
+        let notified = b_entered.notified();
+        tokio::pin!(notified);
+        let mut advances = 0u32;
+        loop {
+            if futures::poll!(&mut notified).is_ready() {
+                break;
+            }
+            assert!(
+                advances < 4,
+                "the ordinary B gate must be reached within four bounded admission waits"
+            );
+            advances += 1;
+            tokio::time::advance(Duration::from_secs(5)).await;
+            yield_turns(32).await;
+        }
+        assert_eq!(
+            advances, 2,
+            "the B gate follows exactly two bounded admission attempts"
+        );
+        assert!(
+            matches!(
+                slot_a.statuses().get(&p),
+                Some(RouteStatus::Pending { error: Some(error) })
+                    if error.contains("timed out locking shared NIC")
+            ),
+            "A really passed its bounded NIC lock timeout"
+        );
+        assert_eq!(
+            backend_calls(&mock.add_calls, &p_route),
+            1,
+            "the due OS retry had no acknowledged member and must not add early"
+        );
+
+        // Release the NIC and let B finish without moving the clock. The final
+        // planner now admits A, but this round has no A acknowledgement.
+        drop(guard);
+        b_resume.notify_one();
+        yield_until(|| slot_b.statuses().get(&b_declaration) == Some(&RouteStatus::Ready)).await;
+        yield_turns(32).await;
+        assert_eq!(
+            backend_calls(&mock.add_calls, &p_route),
+            1,
+            "the final planner admitted A but this round had no member acknowledgement"
+        );
+        assert!(
+            matches!(slot_a.statuses().get(&p), Some(RouteStatus::Pending { .. })),
+            "A stays pending while its member retry is in the future"
+        );
+
+        // Before the member retry deadline nothing adds A.
+        tokio::time::advance(Duration::from_millis(200)).await;
+        yield_turns(32).await;
+        assert_eq!(
+            backend_calls(&mock.add_calls, &p_route),
+            1,
+            "no early addition before the member retry deadline"
+        );
+        assert!(
+            matches!(slot_a.statuses().get(&p), Some(RouteStatus::Pending { .. })),
+            "A stays pending before its member retry deadline"
+        );
+
+        // At the member deadline the worker wakes by itself, really
+        // acknowledges the prefix and performs the long-overdue OS add.
+        tokio::time::advance(Duration::from_millis(200)).await;
+        yield_until(|| slot_a.statuses().get(&p) == Some(&RouteStatus::Ready)).await;
+        assert_eq!(
+            backend_calls(&mock.add_calls, &p_route),
+            2,
+            "the due old OS retry runs once the member acknowledgement succeeds"
+        );
+        assert_eq!(
+            controller
+                .applied_routes()
+                .get(&RouteKey::of(&p_route))
+                .map(|row| row.effect),
+            Some(RouteEffect::Owned)
+        );
+        assert_eq!(
+            member_claim_prefixes(&member).await,
+            BTreeSet::from([prefix])
+        );
+
+        controller.request_shutdown();
+        let joined = tokio::time::timeout(Duration::from_secs(5), &mut task)
+            .await
+            .expect("the real worker must finish its cleanup")
+            .expect("the worker task must not panic");
+        joined.expect("a genuine shutdown returns Ok");
+        assert!(controller.runtime.read().instances.is_empty());
+        assert!(controller.applied_routes().is_empty());
+        assert!(mock.routes.lock().is_empty());
+    }
+
+    /// The 64-operation budget must not strand a later-sorted due deletion
+    /// retry. The production dirty mark from the exhausted budget, not any new
+    /// input, drives the passes that really finish every deletion.
+    #[tokio::test(start_paused = true)]
+    async fn the_operation_budget_cannot_strand_a_due_deletion_retry() {
+        let Harness {
+            controller,
+            mock,
+            reconciler,
+            ..
+        } = Harness::new();
+        let ordinary: Vec<RouteSpec<RouteDevice>> = (1..=66)
+            .map(|index| indexed(&format!("10.0.0.{index}/32"), 9, None))
+            .collect();
+        let late = indexed("10.255.255.255/32", 9, None);
+        let late_route = resolved(&late);
+        let first_route = resolved(&ordinary[0]);
+        let all: RouteSet = ordinary
+            .iter()
+            .cloned()
+            .chain(std::iter::once(late.clone()))
+            .collect();
+        let remaining: RouteSet = ordinary.iter().cloned().collect();
+
+        let (_run, _registry, slot) = instance_with_slot(&controller, RouteSource::Additional);
+        slot.set_routes(all);
+
+        let mut task = tokio::spawn(reconciler.run());
+        // The real budget splits this into several ordinary passes.
+        yield_until(|| {
+            let statuses = slot.statuses();
+            ordinary
+                .iter()
+                .all(|declaration| statuses.get(declaration) == Some(&RouteStatus::Ready))
+                && statuses.get(&late) == Some(&RouteStatus::Ready)
+        })
+        .await;
+        assert_eq!(mock.add_count(), 67, "every row is really installed once");
+        assert_eq!(mock.remove_count(), 0);
+        assert_eq!(controller.applied_routes().len(), 67);
+
+        // Withdraw only the last-sorted row and let its first real delete fail,
+        // so the worker itself records the 200ms backoff.
+        mock.queue_remove(
+            &late_route,
+            RouteError::Failed(anyhow::anyhow!("delete failed")),
+            false,
+        );
+        slot.set_routes(remaining);
+        yield_until(|| {
+            backend_calls(&mock.remove_calls, &late_route) == 1
+                && controller
+                    .applied_routes()
+                    .get(&RouteKey::of(&late_route))
+                    .map(|row| row.effect)
+                    == Some(RouteEffect::Owned)
+        })
+        .await;
+        assert!(
+            mock.contains(&late_route),
+            "a failed delete leaves the real row present"
+        );
+        let failure_at = tokio::time::Instant::now();
+
+        // Clear the other 66 and advance to the late retry deadline in one
+        // synchronous step: no scheduler turn separates them, so the next batch
+        // starts exactly at the already-due retry with 66 deletions pending.
+        let (first_entered, first_resume) = mock.gate_remove(Some(first_route.clone()));
+        slot.clear();
+        tokio::time::advance(Duration::from_millis(200)).await;
+        wait_for_gate(first_entered).await;
+
+        assert_eq!(
+            tokio::time::Instant::now(),
+            failure_at + Duration::from_millis(200),
+            "the batch begins exactly at the recorded retry deadline"
+        );
+        assert_eq!(
+            backend_calls(&mock.remove_calls, &late_route),
+            1,
+            "the late retry is still only once attempted when the budget batch starts"
+        );
+        first_resume.notify_one();
+
+        // The first batch spends its full budget; the production dirty mark
+        // must finish the rest without any new input or ledger edit.
+        yield_until(|| mock.routes.lock().is_empty() && controller.applied_routes().is_empty())
+            .await;
+
+        assert_eq!(
+            backend_calls(&mock.remove_calls, &late_route),
+            2,
+            "the due late retry really succeeds on its second attempt"
+        );
+        assert_eq!(
+            mock.remove_count(),
+            68,
+            "66 rows plus the late row's failed and successful delete"
+        );
+        assert_eq!(mock.add_count(), 67, "no row is added again during cleanup");
+
+        let remove_ops: Vec<RouteSpec<u32>> = mock
+            .operations
+            .lock()
+            .iter()
+            .filter_map(|operation| match operation {
+                MockOperation::Remove(route) => Some(route.clone()),
+                _ => None,
+            })
+            .collect();
+        let late_positions: Vec<usize> = remove_ops
+            .iter()
+            .enumerate()
+            .filter(|(_, route)| **route == late_route)
+            .map(|(index, _)| index)
+            .collect();
+        assert_eq!(late_positions.len(), 2);
+        let other_before = remove_ops[..late_positions[1]]
+            .iter()
+            .filter(|route| **route != late_route)
+            .count();
+        assert!(
+            other_before >= 64,
+            "at least 64 other real deletions precede the retried late row, got {other_before}"
+        );
+
+        controller.request_shutdown();
+        let joined = tokio::time::timeout(Duration::from_secs(5), &mut task)
+            .await
+            .expect("the real worker must finish its cleanup")
+            .expect("the worker task must not panic");
+        joined.expect("a genuine shutdown returns Ok");
+        assert!(controller.runtime.read().instances.is_empty());
+        assert!(controller.applied_routes().is_empty());
+        assert!(mock.routes.lock().is_empty());
+    }
+
+    /// The audit's own failure backoff crosses the fixed grid: the nine real
+    /// failures retry at their own doubling deadlines, the original 120s grid
+    /// point does not read through a pending backoff, and the 141s retry
+    /// succeeds even though the next grid point is already 180s.
+    #[tokio::test(start_paused = true)]
+    async fn audit_failure_backoff_crosses_the_fixed_grid() {
+        let Harness {
+            controller,
+            mock,
+            reconciler,
+            ..
+        } = Harness::new();
+        let declaration = indexed("10.160.0.0/24", 7, None);
+        let route = resolved(&declaration);
+        let (_run, _registry, slot) = instance_with_slot(&controller, RouteSource::Additional);
+        slot.set_routes(RouteSet::from([declaration.clone()]));
+
+        let mut task = tokio::spawn(reconciler.run());
+        yield_until(|| {
+            slot.statuses().get(&declaration) == Some(&RouteStatus::Ready) && mock.contains(&route)
+        })
+        .await;
+        let baseline = mock.existing_count();
+        assert_eq!(mock.add_count(), 1);
+        assert_eq!(mock.remove_count(), 0);
+
+        for _ in 0..9 {
+            mock.queue_existing_error(RouteError::Failed(anyhow::anyhow!("audit read failed")));
+        }
+
+        // Each real failure doubles from 200ms: 60, 60.2, 60.6, 61.4, 63,
+        // 66.2, 72.6, 85.4, 111. Every step requires the previous audit to have
+        // really completed before the next deadline is reached.
+        let steps = [
+            Duration::from_secs(60),
+            Duration::from_millis(200),
+            Duration::from_millis(400),
+            Duration::from_millis(800),
+            Duration::from_millis(1600),
+            Duration::from_millis(3200),
+            Duration::from_millis(6400),
+            Duration::from_millis(12800),
+            Duration::from_millis(25600),
+        ];
+        for (failed, step) in steps.iter().enumerate() {
+            tokio::time::advance(*step).await;
+            yield_until(|| mock.existing_count() >= baseline + failed + 1).await;
+            assert_eq!(
+                mock.existing_count(),
+                baseline + failed + 1,
+                "exactly one audit readback at failure {}",
+                failed + 1
+            );
+            assert_eq!(
+                slot.statuses().get(&declaration),
+                Some(&RouteStatus::Ready),
+                "a failed audit keeps the reported Ready status"
+            );
+            assert_eq!(
+                controller
+                    .applied_routes()
+                    .get(&RouteKey::of(&route))
+                    .map(|row| row.effect),
+                Some(RouteEffect::Owned),
+                "a failed audit keeps the actual ledger"
+            );
+            assert_eq!(mock.add_count(), 1);
+            assert_eq!(mock.remove_count(), 0);
+        }
+        assert_eq!(mock.existing_count(), baseline + 9);
+
+        // The original fixed 120s grid point falls inside the 141s backoff: it
+        // must not read through it.
+        tokio::time::advance(Duration::from_secs(9)).await;
+        yield_turns(32).await;
+        assert_eq!(
+            mock.existing_count(),
+            baseline + 9,
+            "the fixed 120s grid must not read during the pending backoff"
+        );
+        assert_eq!(slot.statuses().get(&declaration), Some(&RouteStatus::Ready));
+        assert_eq!(
+            controller
+                .applied_routes()
+                .get(&RouteKey::of(&route))
+                .map(|row| row.effect),
+            Some(RouteEffect::Owned)
+        );
+
+        // The audit's own 141s retry really succeeds, although the next fixed
+        // grid point is already 180s: the grid is not restarted from the retry.
+        tokio::time::advance(Duration::from_secs(21)).await;
+        yield_until(|| mock.existing_count() >= baseline + 10).await;
+        assert_eq!(mock.existing_count(), baseline + 10);
+        assert_eq!(
+            mock.existing_batches.lock().last().cloned(),
+            Some(BTreeSet::from([route.clone()])),
+            "the successful retry reads exactly the actual full row"
+        );
+
+        // The original 180s grid still performs its own audit.
+        tokio::time::advance(Duration::from_secs(39)).await;
+        yield_until(|| mock.existing_count() >= baseline + 11).await;
+        assert_eq!(mock.existing_count(), baseline + 11);
+
+        controller.request_shutdown();
+        let joined = tokio::time::timeout(Duration::from_secs(5), &mut task)
+            .await
+            .expect("the real worker must finish its cleanup")
+            .expect("the worker task must not panic");
+        joined.expect("a genuine shutdown returns Ok");
+        assert_eq!(mock.remove_count(), 1);
+        assert!(!mock.contains(&route));
+        assert!(controller.runtime.read().instances.is_empty());
+        assert!(controller.applied_routes().is_empty());
     }
 }

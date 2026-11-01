@@ -464,42 +464,70 @@ fn registry_replaces_invalid_devices() {
 #[tokio::test]
 async fn managed_route_admission_keeps_previous_claims_on_rejection_and_withdraws_without_os_writes()
  {
-    use easytier_core::host::route::{RouteSet, RouteSpec};
     let config = virtual_nic_config(1500, None).with_routes_managed(true);
     let mut nic = SharedVirtualNic::new(config);
     nic.member_registrations.insert(MEMBER, REGISTRATION);
-    nic.ifcfg
-        .apply_member_claims(MEMBER, address_claims("10.50.0.2/24"));
+    let mut initial = address_claims("10.50.0.2/24");
+    initial.mtu = Some(1400);
+    nic.ifcfg.apply_member_claims(MEMBER, initial.clone());
     nic.ifcfg
         .apply_member_claims(uuid::Uuid::from_u128(2), address_claims("10.60.0.2/24"));
     let ifcfg = RecordingIfConfiger::default();
     set_ifcfg(&nic, ifcfg.clone()).await;
-    let wanted = RouteSet::from([RouteSpec::for_tun("10.70.0.0/24".parse().unwrap())]);
+
+    let wanted: BTreeSet<IpCidr> = BTreeSet::from([
+        "10.70.0.0/24".parse().unwrap(),
+        "fd00:70::/64".parse().unwrap(),
+    ]);
     let claims = nic
         .prepare_managed_routes(MEMBER, REGISTRATION, &wanted)
         .unwrap();
+    assert_eq!(
+        claims.ipv4_routes,
+        BTreeSet::from([SharedIpv4Route::new("10.70.0.0".parse().unwrap(), 24, None)])
+    );
+    assert_eq!(
+        claims.ipv6_routes,
+        BTreeSet::from([SharedIpv6Route::new("fd00:70::".parse().unwrap(), 64, None)])
+    );
     nic.commit_managed_routes(MEMBER, REGISTRATION, claims)
         .await
         .unwrap();
+
     let accepted = nic.ifcfg.claims_of(MEMBER);
     assert_eq!(accepted.ipv4_routes.len(), 1);
-    let conflict = RouteSet::from([RouteSpec::for_tun("10.60.0.0/24".parse().unwrap())]);
+    assert_eq!(accepted.ipv6_routes.len(), 1);
+    assert_eq!(accepted.ipv4_addresses, initial.ipv4_addresses);
+    assert_eq!(accepted.mtu, initial.mtu);
+
+    // A superseded registration must neither plan nor commit over the current member.
+    let stale = uuid::Uuid::from_u128(9);
+    assert!(nic.prepare_managed_routes(MEMBER, stale, &wanted).is_err());
+    assert!(
+        nic.commit_managed_routes(MEMBER, stale, accepted.clone())
+            .await
+            .is_err()
+    );
+    assert_eq!(nic.ifcfg.claims_of(MEMBER), accepted);
+
+    let conflict: BTreeSet<IpCidr> = BTreeSet::from(["10.60.0.0/24".parse().unwrap()]);
     assert!(
         nic.prepare_managed_routes(MEMBER, REGISTRATION, &conflict)
             .is_err()
     );
     assert_eq!(nic.ifcfg.claims_of(MEMBER), accepted);
+
     let withdraw = nic
-        .prepare_managed_routes(MEMBER, REGISTRATION, &RouteSet::new())
+        .prepare_managed_routes(MEMBER, REGISTRATION, &BTreeSet::new())
         .unwrap();
     nic.commit_managed_routes(MEMBER, REGISTRATION, withdraw)
         .await
         .unwrap();
-    assert!(nic.ifcfg.claims_of(MEMBER).ipv4_routes.is_empty());
-    assert_eq!(
-        nic.ifcfg.claims_of(MEMBER).ipv4_addresses,
-        accepted.ipv4_addresses
-    );
+    let withdrawn = nic.ifcfg.claims_of(MEMBER);
+    assert!(withdrawn.ipv4_routes.is_empty());
+    assert!(withdrawn.ipv6_routes.is_empty());
+    assert_eq!(withdrawn.ipv4_addresses, accepted.ipv4_addresses);
+    assert_eq!(withdrawn.mtu, accepted.mtu);
     assert!(ifcfg.routes.lock().unwrap().is_empty());
 }
 

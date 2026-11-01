@@ -9,6 +9,9 @@ use std::{
     },
 };
 
+#[cfg(any(not(mobile), feature = "tun"))]
+use std::time::Duration;
+
 use async_trait::async_trait;
 use easytier_core::{
     connectivity::{composite::ConnectorRuntime, transport::ConnectedByteStream},
@@ -25,7 +28,7 @@ use easytier_core::{
 use guarden::guard;
 use guarden::guard::boxed::BoxSyncGuard;
 use hashbrown::HashSet;
-#[cfg(feature = "tun")]
+#[cfg(any(not(mobile), feature = "tun"))]
 use tokio::sync::Mutex as AsyncMutex;
 use tokio::{
     net::UdpSocket,
@@ -55,9 +58,12 @@ use crate::instance::shared_virtual_nic::{ArcSharedVirtualNicRegistry, SharedVir
 #[educe(PartialEq, Eq, Hash)]
 pub struct NativeNetNSServices {
     net_ns: NetNS,
-    #[cfg(feature = "tun")]
+    #[cfg(any(not(mobile), feature = "tun"))]
     #[educe(PartialEq(ignore), Hash(ignore))]
     routes: crate::instance::route::RouteController,
+    #[cfg(any(not(mobile), feature = "tun"))]
+    #[educe(PartialEq(ignore), Hash(ignore))]
+    route_task: AsyncMutex<Option<tokio::task::JoinHandle<anyhow::Result<()>>>>,
     #[educe(PartialEq(ignore), Hash(ignore))]
     dns: RuntimeDnsResolver,
     #[cfg(feature = "tun")]
@@ -82,8 +88,8 @@ impl Deref for NativeNetNSServices {
 
 impl NativeNetNSServices {
     fn new(net_ns: NetNS) -> io::Result<Self> {
-        #[cfg(feature = "tun")]
-        let routes = {
+        #[cfg(any(not(mobile), feature = "tun"))]
+        let (routes, route_task) = {
             let shared = native_host_runtime()
                 .shared_executor()
                 .map_err(|e| io::Error::other(e.to_string()))?;
@@ -93,8 +99,10 @@ impl NativeNetNSServices {
 
         Ok(Self {
             dns: RuntimeDnsResolver::in_net_ns(net_ns.clone()),
-            #[cfg(feature = "tun")]
+            #[cfg(any(not(mobile), feature = "tun"))]
             routes,
+            #[cfg(any(not(mobile), feature = "tun"))]
+            route_task: AsyncMutex::new(Some(route_task)),
             #[cfg(feature = "tun")]
             nics: Arc::new(AsyncMutex::new(SharedVirtualNicRegistry::in_domain(
                 net_ns.clone(),
@@ -103,7 +111,7 @@ impl NativeNetNSServices {
         })
     }
 
-    #[cfg(feature = "tun")]
+    #[cfg(any(not(mobile), feature = "tun"))]
     pub(crate) fn route_controller(
         &self,
     ) -> anyhow::Result<crate::instance::route::RouteController> {
@@ -111,13 +119,76 @@ impl NativeNetNSServices {
         Ok(self.routes.clone())
     }
 
+    /// Admission shared by every bound factory.
+    ///
+    /// Route cleanup may still need the underlying namespace after the stop
+    /// request, so a shut-down controller closes new I/O here without closing
+    /// `NetNS` itself.
+    pub(crate) fn ensure_open(&self) -> io::Result<()> {
+        #[cfg(any(not(mobile), feature = "tun"))]
+        if self.routes.is_shutdown() {
+            return Err(io::Error::other(
+                "native network namespace services are closing",
+            ));
+        }
+        self.net_ns.ensure_open()
+    }
+
+    pub(crate) fn validate_context(&self, context: &SocketContext) -> io::Result<()> {
+        self.ensure_open()?;
+        self.net_ns.validate_context(context)
+    }
+
     pub(crate) fn request_service_shutdown(&self) {
-        self.net_ns.close();
-        #[cfg(feature = "tun")]
+        #[cfg(any(not(mobile), feature = "tun"))]
         self.routes.request_shutdown();
+        // Without route cleanup there is nothing that still needs the domain.
+        #[cfg(all(mobile, not(feature = "tun")))]
+        self.net_ns.close();
     }
 
     pub(crate) async fn wait_services_stopped(&self) -> anyhow::Result<()> {
+        self.request_service_shutdown();
+        #[cfg(any(not(mobile), feature = "tun"))]
+        {
+            let mut route_task = self.route_task.lock().await;
+            if let Some(task) = route_task.as_mut() {
+                match tokio::time::timeout(Duration::from_secs(30), &mut *task).await {
+                    Ok(joined) => {
+                        // The task really finished; consume the handle exactly once
+                        // and carry its own failure to the caller.
+                        let _ = route_task.take();
+                        let result = match joined {
+                            Ok(result) => result,
+                            Err(error) => Err(anyhow::Error::new(error)
+                                .context("route worker task stopped without a result")),
+                        };
+                        result?;
+                        // A consumed handle is not proof of success: confirm the
+                        // controller's real records before touching device state.
+                        self.routes.ensure_drained()?;
+                    }
+                    Err(elapsed) => {
+                        // Keep both the handle and the running task. The error
+                        // chain keeps `Elapsed` so the Host can keep waiting.
+                        let residual = match self.routes.ensure_drained() {
+                            Ok(()) => "route controller reports no residual records".to_owned(),
+                            Err(error) => format!("route controller residual: {error:#}"),
+                        };
+                        return Err(anyhow::Error::new(elapsed).context(format!(
+                            "timed out waiting for the route worker to finish: {residual}"
+                        )));
+                    }
+                }
+            } else {
+                // The handle may have been consumed by an earlier wait. Real
+                // completion still needs the controller's own predicate.
+                self.routes.ensure_drained()?;
+            }
+            // Route cleanup is finished; release the handle lock before any
+            // destructive NIC or namespace teardown.
+            drop(route_task);
+        }
         #[cfg(feature = "tun")]
         {
             let nics = self.nics.lock().await.take_for_shutdown();
@@ -125,10 +196,19 @@ impl NativeNetNSServices {
                 nic.lock().await.invalidate_and_shutdown_dispatcher().await;
             }
         }
-        #[cfg(feature = "tun")]
-        self.routes.request_shutdown();
+        self.net_ns.close();
         Ok(())
     }
+}
+
+/// Whether a cleanup failure is only the bounded wait expiring.
+///
+/// The waiters keep the real resources alive and try again; a real task error
+/// is returned to the caller instead.
+pub(crate) fn cleanup_timed_out(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .any(|cause| cause.is::<tokio::time::error::Elapsed>())
 }
 
 pub(crate) fn net_ns_services(net_ns: &NetNS) -> io::Result<Arc<NativeNetNSServices>> {
@@ -240,22 +320,52 @@ impl NativeHostRuntime {
         for net_ns in &net_ns {
             net_ns.request_service_shutdown();
         }
-        let host = self.clone();
-        let interrupted = guard!([host = host.clone()] {
-            host.request_executor_shutdown();
-            host.shutdown_result.send_replace(Some(Err("native service shutdown was interrupted".into())));
+        // The guard only reports the loss of the real cleanup future. Normal
+        // failures keep the executor serving whatever route work is still owed.
+        let interrupted = guard!([result = self.shutdown_result.clone()] {
+            result.send_replace(Some(Err(
+                "native service shutdown was interrupted".into()
+            )));
         });
         match self.shared_executor() {
             Ok(shared) => {
+                let result = self.shutdown_result.clone();
+                let cleanup_host = self.clone();
                 shared.spawn(async move {
                     use futures::stream::{FuturesUnordered, StreamExt};
                     let mut pending = net_ns
                         .into_iter()
-                        .map(|net_ns| async move {
-                            net_ns
-                                .wait_services_stopped()
-                                .await
-                                .map_err(|error| format!("{:?}: {error:#}", net_ns.id()))
+                        .map(|net_ns| {
+                            let result = result.clone();
+                            async move {
+                                loop {
+                                    match net_ns.wait_services_stopped().await {
+                                        Ok(()) => return Ok::<(), String>(()),
+                                        Err(error)
+                                            if crate::host_runtime::cleanup_timed_out(&error) =>
+                                        {
+                                            // A bounded wait elapsed, not a real
+                                            // failure: report the residual and keep
+                                            // the same cleanup future alive.
+                                            let detail = format!("{:?}: {error:#}", net_ns.id());
+                                            result.send_replace(Some(Err(detail.clone().into())));
+                                            tracing::warn!(
+                                                namespace = ?net_ns.id(),
+                                                %error,
+                                                "namespace cleanup is still in progress"
+                                            );
+                                        }
+                                        Err(error) => {
+                                            // Publish the real failure now instead of
+                                            // waiting for every namespace to finish;
+                                            // the final report still joins all errors.
+                                            let detail = format!("{:?}: {error:#}", net_ns.id());
+                                            result.send_replace(Some(Err(detail.clone().into())));
+                                            return Err(detail);
+                                        }
+                                    }
+                                }
+                            }
                         })
                         .collect::<FuturesUnordered<_>>();
                     let mut errors = Vec::new();
@@ -264,18 +374,22 @@ impl NativeHostRuntime {
                             errors.push(error);
                         }
                     }
-                    let outcome = if errors.is_empty() {
-                        Ok(())
+                    if errors.is_empty() {
+                        // Every namespace really closed: stop the executor last
+                        // and publish the only success result.
+                        cleanup_host.request_executor_shutdown();
+                        result.send_replace(Some(Ok(())));
                     } else {
-                        Err(errors.join("; ").into())
-                    };
-                    host.request_executor_shutdown();
-                    host.shutdown_result.send_replace(Some(outcome));
+                        // Keep `closing` set and the executor alive for the
+                        // unfinished cleanup; never reopen the domain directory.
+                        result.send_replace(Some(Err(errors.join("; ").into())));
+                    }
                     let _ = interrupted.defuse();
                 });
             }
             Err(error) => {
-                self.request_executor_shutdown();
+                // No cleanup future exists to own the executor. Report the real
+                // error and preserve every resource that is still live.
                 self.shutdown_result
                     .send_replace(Some(Err(error.to_string().into())));
                 let _ = interrupted.defuse();
@@ -619,23 +733,45 @@ mod tests {
             shared.metrics().num_workers(),
             if cfg!(mobile) { 1 } else { 2 }
         );
-        // Hold the asynchronous NIC directory, so the cleanup remains pending
-        // while checking the synchronous close boundary.
-        #[cfg(feature = "tun")]
+        // Hold the asynchronous route-task directory, so cleanup stays pending
+        // while checking the synchronous admission boundary.
+        #[cfg(any(not(mobile), feature = "tun"))]
         let services = host.services(&net_ns).unwrap();
-        #[cfg(feature = "tun")]
-        let permit = services.nics.lock().await;
+        #[cfg(any(not(mobile), feature = "tun"))]
+        let route_task = services.route_task.lock().await;
         host.request_service_shutdown();
+        #[cfg(any(not(mobile), feature = "tun"))]
+        {
+            assert!(
+                services.ensure_open().is_err(),
+                "bound services must reject new I/O as soon as cleanup starts"
+            );
+            assert!(
+                net_ns.ensure_open().is_ok(),
+                "the core namespace stays open while cleanup is still owed"
+            );
+            assert!(
+                services
+                    .validate_context(&SocketContext::default())
+                    .is_err()
+            );
+        }
+        #[cfg(all(mobile, not(feature = "tun")))]
         assert!(net_ns.ensure_open().is_err());
         assert!(host.capture_default_net_ns().is_err());
+        // Without route cleanup the Host may already have stopped the executor
+        // by this point; only the routed path keeps it alive for the pending
+        // task and NIC teardown.
+        #[cfg(any(not(mobile), feature = "tun"))]
         assert!(host.shared_executor().is_ok());
-        #[cfg(feature = "tun")]
-        drop(permit);
+        #[cfg(any(not(mobile), feature = "tun"))]
+        drop(route_task);
         tokio::time::timeout(Duration::from_secs(5), host.shutdown())
             .await
             .unwrap()
             .unwrap();
         assert!(host.shared_executor().is_err());
+        assert!(net_ns.ensure_open().is_err());
         assert!(host.net_ns(&SocketContext::default()).is_err());
         host.shutdown().await.unwrap();
     }
@@ -645,6 +781,20 @@ mod tests {
         let platform = PlatformNetNS::thread().unwrap();
         let net_ns = NativeNetNSServices::new(NetNS::new(platform.id(), platform)).unwrap();
         net_ns.request_service_shutdown();
+        assert!(
+            net_ns.ensure_open().is_err(),
+            "services must reject new admission once cleanup starts"
+        );
+        #[cfg(any(not(mobile), feature = "tun"))]
+        assert!(
+            net_ns.net_ns.ensure_open().is_ok(),
+            "the core namespace itself stays open for cleanup"
+        );
+        #[cfg(all(mobile, not(feature = "tun")))]
+        assert!(
+            net_ns.net_ns.ensure_open().is_err(),
+            "without route cleanup the stop request closes the core namespace"
+        );
         let closing =
             |error: anyhow::Error| assert!(error.to_string().contains("closing"), "{error:#}");
         closing(
@@ -692,25 +842,99 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "tun")]
+    #[cfg(any(not(mobile), feature = "tun"))]
     #[tokio::test]
     async fn terminal_cleanup_survives_the_shutdown_waiter_being_cancelled() {
         let host = Arc::new(NativeHostRuntime::new());
         let net_ns = host.capture_default_net_ns().unwrap();
         let services = host.services(&net_ns).unwrap();
-        #[cfg(feature = "tun")]
-        let permit = services.nics.lock().await;
+        // Keep the real cleanup future pending while the first waiter dies.
+        let route_task = services.route_task.lock().await;
         let waiting = host.clone();
         let waiter = tokio::spawn(async move { waiting.shutdown().await });
         tokio::task::yield_now().await;
         waiter.abort();
         let _ = waiter.await;
-        drop(permit);
+        drop(route_task);
         tokio::time::timeout(std::time::Duration::from_secs(5), host.shutdown())
             .await
             .unwrap()
             .unwrap();
         assert!(host.shared_executor().is_err());
+    }
+
+    #[cfg(any(not(mobile), feature = "tun"))]
+    #[tokio::test(start_paused = true)]
+    async fn route_task_timeout_keeps_resources_until_the_real_cleanup_finishes() {
+        use std::time::Duration;
+        use tokio::sync::Notify;
+
+        let platform = PlatformNetNS::thread().unwrap();
+        let net_ns = NetNS::new(platform.id(), platform);
+        let routes = crate::instance::route::RouteController::new(Arc::new(
+            crate::utils::dirty::DirtyFlag::new(false),
+        ));
+        let release = Arc::new(Notify::new());
+        let waiting = release.clone();
+        let task = tokio::spawn(async move {
+            waiting.notified().await;
+            Ok::<(), anyhow::Error>(())
+        });
+        let services = NativeNetNSServices {
+            net_ns: net_ns.clone(),
+            routes,
+            route_task: AsyncMutex::new(Some(task)),
+            dns: RuntimeDnsResolver::in_net_ns(net_ns.clone()),
+            #[cfg(feature = "tun")]
+            nics: Arc::new(AsyncMutex::new(SharedVirtualNicRegistry::in_domain(
+                net_ns.clone(),
+            ))),
+        };
+
+        let error = tokio::time::timeout(Duration::from_secs(60), services.wait_services_stopped())
+            .await
+            .expect("the route worker wait must time out on its own")
+            .expect_err("a paused worker must not be reported as drained");
+        assert!(
+            cleanup_timed_out(&error),
+            "the bounded wait must stay in the error chain: {error:#}"
+        );
+        assert!(
+            services.route_task.lock().await.is_some(),
+            "the real task must stay owned after the waiter times out"
+        );
+        assert!(
+            net_ns.ensure_open().is_ok(),
+            "the core namespace must stay open while the route task is owed"
+        );
+        #[cfg(feature = "tun")]
+        {
+            let mut nics = services.nics.lock().await;
+            let member = nics
+                .try_create_member(
+                    "paused-timeout".into(),
+                    crate::instance::virtual_nic::VirtualNicConfig::new(
+                        "paused-timeout".into(),
+                        1400,
+                        net_ns.clone(),
+                    ),
+                    uuid::Uuid::new_v4(),
+                    Arc::new(Notify::new()),
+                )
+                .expect("NIC admission must stay open before the real cleanup");
+            drop(member);
+        }
+
+        release.notify_waiters();
+        services
+            .wait_services_stopped()
+            .await
+            .expect("releasing the worker must let the same cleanup finish");
+        assert!(services.route_task.lock().await.is_none());
+        assert!(
+            net_ns.ensure_open().is_err(),
+            "a successful wait closes the namespace only at the end"
+        );
     }
 
     #[cfg(target_os = "linux")]
@@ -834,25 +1058,29 @@ mod tests {
 
         assert!(local_addr.is_ipv4());
     }
-    #[cfg(feature = "tun")]
+    #[cfg(any(not(mobile), feature = "tun"))]
     #[tokio::test]
     async fn concurrent_route_service_initialization_has_one_owner_and_close_is_final() {
         let platform = PlatformNetNS::thread().unwrap();
-        let net_ns = Arc::new(
-            NativeNetNSServices::new(NetNS::new(platform.id(), platform)).unwrap(),
-        );
+        let net_ns =
+            Arc::new(NativeNetNSServices::new(NetNS::new(platform.id(), platform)).unwrap());
         let controller = net_ns.route_controller().unwrap();
-        let owner = controller
-            .open_instance(uuid::Uuid::new_v4(), String::new())
+        let run = uuid::Uuid::new_v4();
+        let owner = controller.open_instance(run).unwrap();
+        controller
+            .bind_config(
+                run,
+                easytier_core::config::runtime::CoreRuntimeConfigStore::new(
+                    easytier_core::config::runtime::CoreRuntimeConfig::default(),
+                    Arc::new(easytier_core::config::peers::PeerRuntimeSnapshot::default()),
+                ),
+            )
             .unwrap();
-        owner
-            .bind_config(easytier_core::config::runtime::CoreRuntimeConfigStore::new(
-                easytier_core::config::runtime::CoreRuntimeConfig::default(),
-                Arc::new(easytier_core::config::peers::PeerRuntimeSnapshot::default()),
-            ))
+        let slot = owner
+            .handle()
+            .open_slot(easytier_core::host::route::RouteSource::Additional)
             .unwrap();
-        let slot = owner.handle().open_slot().unwrap();
-        slot.set_routes(Default::default()).unwrap();
+        slot.set_routes(easytier_core::host::route::RouteSet::new());
         net_ns.request_service_shutdown();
         tokio::time::timeout(
             std::time::Duration::from_secs(3),
@@ -862,11 +1090,7 @@ mod tests {
         .unwrap()
         .unwrap();
         assert!(net_ns.route_controller().is_err());
-        assert!(
-            controller
-                .open_instance(uuid::Uuid::new_v4(), String::new())
-                .is_err()
-        );
+        assert!(controller.open_instance(uuid::Uuid::new_v4()).is_err());
         assert!(net_ns.validate_context(&SocketContext::default()).is_err());
     }
 }

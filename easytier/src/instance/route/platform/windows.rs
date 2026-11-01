@@ -1,8 +1,8 @@
 //! Windows IP Helper adapter. The shared controller owns policy and effects;
 //! this backend only creates, reads and removes exact static forwarding rows.
 
-use super::{OsRoute, RouteBackend, RouteError};
-use crate::common::net_ns::NetNS;
+use super::{RouteBackend, RouteError};
+use crate::{common::net_ns::NetNS, instance::route::normalize_route};
 use ::windows::Win32::{
     Foundation::{
         ERROR_ALREADY_EXISTS, ERROR_NOT_FOUND, ERROR_OBJECT_ALREADY_EXISTS, NO_ERROR, WIN32_ERROR,
@@ -12,11 +12,12 @@ use ::windows::Win32::{
         GetIpForwardTable2, InitializeIpForwardEntry, MIB_IPFORWARD_ROW2, MIB_IPFORWARD_TABLE2,
     },
     Networking::WinSock::{
-        ADDRESS_FAMILY, AF_INET, AF_INET6, AF_UNSPEC, IN6_ADDR, IN6_ADDR_0, IN_ADDR, IN_ADDR_0,
+        ADDRESS_FAMILY, AF_INET, AF_INET6, AF_UNSPEC, IN_ADDR, IN_ADDR_0, IN6_ADDR, IN6_ADDR_0,
         MIB_IPPROTO_NETMGMT, SOCKADDR_IN, SOCKADDR_IN6, SOCKADDR_INET,
     },
 };
 use cidr::IpCidr;
+use easytier_core::host::route::{RouteAction, RouteSpec};
 use guarden::guarded;
 use std::{
     collections::BTreeSet,
@@ -35,10 +36,6 @@ impl PlatformRouteBackend {
         net_ns.ensure_open()?;
         Ok(Self)
     }
-}
-
-fn unsupported(what: &'static str) -> RouteError {
-    RouteError::Failed(io::Error::new(io::ErrorKind::Unsupported, what).into())
 }
 
 fn sockaddr(ip: IpAddr) -> SOCKADDR_INET {
@@ -91,48 +88,50 @@ fn unspecified(destination: IpCidr) -> IpAddr {
     }
 }
 
-/// The on-link row for an accepted route. Every forwarding field the kernel
-/// acts on is explicit so readback compares the actual row, not just its key.
-fn row(route: &OsRoute) -> Result<MIB_IPFORWARD_ROW2, RouteError> {
-    if route.table != 254 {
-        return Err(unsupported("non-main route tables are not supported"));
-    }
-    if route.preferred_source.is_some() {
-        return Err(unsupported(
-            "this platform cannot set a route-specific preferred source",
-        ));
-    }
-    if route.ifindex == 0 {
-        return Err(RouteError::Failed(
-            io::Error::new(io::ErrorKind::InvalidInput, "route interface index is zero").into(),
-        ));
-    }
+/// The complete static row an accepted route describes.
+///
+/// Normalization rejects real input errors (a zero interface index or a
+/// gateway of another address family) and folds an unspecified gateway into
+/// the direct route. Every forwarding field the kernel acts on is explicit so
+/// readback compares the actual row, not just its lookup key.
+fn row(route: &RouteSpec<u32>) -> Result<MIB_IPFORWARD_ROW2, RouteError> {
+    let RouteSpec {
+        destination,
+        action,
+        metric,
+    } = normalize_route(route.clone())?;
+    let RouteAction::Unicast { dev, via } = action;
     let mut row = MIB_IPFORWARD_ROW2::default();
     // SAFETY: initializes every field of this default-initialized row.
     unsafe { InitializeIpForwardEntry(&mut row) };
-    row.InterfaceIndex = route.ifindex;
-    row.DestinationPrefix.Prefix = sockaddr(route.destination.first_address());
-    row.DestinationPrefix.PrefixLength = route.destination.network_length();
-    row.SitePrefixLength = route.destination.network_length();
-    row.NextHop = sockaddr(unspecified(route.destination));
-    row.Metric = route.metric.get();
+    row.InterfaceIndex = dev;
+    row.DestinationPrefix.Prefix = sockaddr(destination.first_address());
+    row.DestinationPrefix.PrefixLength = destination.network_length();
+    row.SitePrefixLength = destination.network_length();
+    row.NextHop = sockaddr(via.unwrap_or_else(|| unspecified(destination)));
+    row.Metric = metric;
     row.Protocol = MIB_IPPROTO_NETMGMT;
     row.ValidLifetime = u32::MAX;
     row.PreferredLifetime = u32::MAX;
     Ok(row)
 }
 
-/// A row is this effect only when it is the on-link static route with the same
-/// interface, prefix, next hop and metric. IP Helper lookups key on interface,
-/// prefix and next hop only, so a changed metric or a gateway route must never
-/// satisfy the comparison.
-fn same_row(row: &MIB_IPFORWARD_ROW2, route: &OsRoute) -> bool {
-    row.InterfaceIndex == route.ifindex
-        && row.Metric == route.metric.get()
-        && row.Protocol == MIB_IPPROTO_NETMGMT
-        && row.DestinationPrefix.PrefixLength == route.destination.network_length()
-        && address(&row.DestinationPrefix.Prefix) == Some(route.destination.first_address())
-        && address(&row.NextHop) == Some(unspecified(route.destination))
+/// A row is this effect only when it is the same static route: interface,
+/// destination and prefix, next hop and metric must all match.
+///
+/// The expected row already carries the normalized next hop, so a direct
+/// declaration requires the unspecified next hop while a gateway declaration
+/// requires exactly its gateway. IP Helper lookups key on interface, prefix
+/// and next hop only, so a changed metric or a gateway row must never satisfy
+/// the comparison.
+fn same_row(installed: &MIB_IPFORWARD_ROW2, expected: &MIB_IPFORWARD_ROW2) -> bool {
+    installed.InterfaceIndex == expected.InterfaceIndex
+        && installed.Metric == expected.Metric
+        && installed.Protocol == MIB_IPPROTO_NETMGMT
+        && installed.DestinationPrefix.PrefixLength == expected.DestinationPrefix.PrefixLength
+        && address(&installed.DestinationPrefix.Prefix)
+            == address(&expected.DestinationPrefix.Prefix)
+        && address(&installed.NextHop) == address(&expected.NextHop)
 }
 
 fn failed(status: WIN32_ERROR) -> RouteError {
@@ -153,14 +152,11 @@ fn failed(status: WIN32_ERROR) -> RouteError {
     RouteError::Failed(error.into())
 }
 
-fn absent(route: &OsRoute) -> RouteError {
+fn absent(route: &RouteSpec<u32>) -> RouteError {
     RouteError::Failed(
         io::Error::new(
             io::ErrorKind::NotFound,
-            format!(
-                "no installed route matches {} exactly",
-                route.destination
-            ),
+            format!("no installed route matches {} exactly", route.destination),
         )
         .into(),
     )
@@ -168,7 +164,10 @@ fn absent(route: &OsRoute) -> RouteError {
 
 /// Enumerate every forwarding row of one family in a single kernel snapshot.
 /// The table allocation is released on all paths by the scope guard.
-fn visit(family: ADDRESS_FAMILY, mut inspect: impl FnMut(&MIB_IPFORWARD_ROW2)) -> Result<(), RouteError> {
+fn visit(
+    family: ADDRESS_FAMILY,
+    mut inspect: impl FnMut(&MIB_IPFORWARD_ROW2),
+) -> Result<(), RouteError> {
     let mut table = std::ptr::null_mut::<MIB_IPFORWARD_TABLE2>();
     // SAFETY: `table` is a valid out pointer; ownership of the allocation is
     // released below.
@@ -203,8 +202,9 @@ fn visit(family: ADDRESS_FAMILY, mut inspect: impl FnMut(&MIB_IPFORWARD_ROW2)) -
 /// The exact installed row for this route, if one is present. A row another
 /// writer changed is reported as absent: it is not this effect and cannot
 /// grant deletion authority.
-fn lookup(route: &OsRoute) -> Result<Option<MIB_IPFORWARD_ROW2>, RouteError> {
-    let mut found = row(route)?;
+fn lookup(route: &RouteSpec<u32>) -> Result<Option<MIB_IPFORWARD_ROW2>, RouteError> {
+    let expected = row(route)?;
+    let mut found = expected;
     // SAFETY: `found` is a fully initialized lookup key.
     let status = unsafe { GetIpForwardEntry2(&mut found) };
     if status == ERROR_NOT_FOUND {
@@ -213,11 +213,11 @@ fn lookup(route: &OsRoute) -> Result<Option<MIB_IPFORWARD_ROW2>, RouteError> {
     if status != NO_ERROR {
         return Err(failed(status));
     }
-    Ok(same_row(&found, route).then_some(found))
+    Ok(same_row(&found, &expected).then_some(found))
 }
 
 impl RouteBackend for PlatformRouteBackend {
-    async fn add(&mut self, route: &OsRoute) -> Result<(), RouteError> {
+    async fn add(&mut self, route: &RouteSpec<u32>) -> Result<(), RouteError> {
         let row = row(route)?;
         // SAFETY: the kernel copies the row; it only needs to outlive the call.
         let status = unsafe { CreateIpForwardEntry2(&row) };
@@ -228,11 +228,11 @@ impl RouteBackend for PlatformRouteBackend {
         }
     }
 
-    async fn remove(&mut self, route: &OsRoute) -> Result<(), RouteError> {
+    async fn remove(&mut self, route: &RouteSpec<u32>) -> Result<(), RouteError> {
         let Some(row) = lookup(route)? else {
             return Err(absent(route));
         };
-        // SAFETY: the row was read back and Outlives the call.
+        // SAFETY: the row was read back and outlives the call.
         let status = unsafe { DeleteIpForwardEntry2(&row) };
         match status {
             NO_ERROR => Ok(()),
@@ -243,20 +243,135 @@ impl RouteBackend for PlatformRouteBackend {
 
     async fn existing(
         &mut self,
-        routes: &BTreeSet<OsRoute>,
-    ) -> Result<BTreeSet<OsRoute>, RouteError> {
-        // Reject unsupported parameters even when nothing is installed.
+        routes: &BTreeSet<RouteSpec<u32>>,
+    ) -> Result<BTreeSet<RouteSpec<u32>>, RouteError> {
+        if routes.is_empty() {
+            return Ok(BTreeSet::new());
+        }
+        // Reject invalid input and normalize each expected row once, before
+        // the single table scan.
+        let mut expected = Vec::with_capacity(routes.len());
         for route in routes {
-            row(route)?;
+            expected.push((row(route)?, route));
         }
         let mut present = BTreeSet::new();
-        visit(AF_UNSPEC, |row| {
-            for route in routes {
-                if same_row(row, route) {
-                    present.insert(route.clone());
+        visit(AF_UNSPEC, |installed| {
+            for (wanted, route) in &expected {
+                if same_row(installed, wanted) {
+                    present.insert((*route).clone());
                 }
             }
         })?;
         Ok(present)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ::windows::Win32::Networking::WinSock::MIB_IPPROTO_LOCAL;
+
+    fn route(destination: &str, dev: u32, via: Option<&str>, metric: u32) -> RouteSpec<u32> {
+        RouteSpec {
+            destination: destination.parse().unwrap(),
+            action: RouteAction::Unicast {
+                dev,
+                via: via.map(|via| via.parse().unwrap()),
+            },
+            metric,
+        }
+    }
+
+    #[test]
+    fn direct_and_gateway_rows_carry_every_forwarding_field() {
+        for (destination, direct_next_hop, gateway) in [
+            ("10.0.0.0/24", "0.0.0.0", "192.0.2.1"),
+            ("2001:db8:1::/64", "::", "2001:db8::1"),
+        ] {
+            let direct = route(destination, 7, None, 100);
+            let expected = row(&direct).unwrap();
+            let direct_next_hop: IpAddr = direct_next_hop.parse().unwrap();
+            assert_eq!(expected.InterfaceIndex, 7);
+            assert_eq!(expected.Metric, 100);
+            assert_eq!(expected.Protocol, MIB_IPPROTO_NETMGMT);
+            assert_eq!(
+                expected.DestinationPrefix.PrefixLength,
+                direct.destination.network_length()
+            );
+            assert_eq!(
+                address(&expected.DestinationPrefix.Prefix),
+                Some(direct.destination.first_address())
+            );
+            assert_eq!(address(&expected.NextHop), Some(direct_next_hop));
+            assert!(same_row(&expected, &expected));
+
+            let routed = route(destination, 7, Some(gateway), 100);
+            let expected = row(&routed).unwrap();
+            assert_eq!(
+                address(&expected.NextHop),
+                Some(gateway.parse::<IpAddr>().unwrap())
+            );
+            assert!(same_row(&expected, &expected));
+        }
+    }
+
+    #[test]
+    fn complete_comparison_rejects_every_field_difference() {
+        let expected = row(&route("10.10.0.0/24", 7, Some("192.0.2.1"), 100)).unwrap();
+
+        let other_device = row(&route("10.10.0.0/24", 8, Some("192.0.2.1"), 100)).unwrap();
+        assert!(!same_row(&other_device, &expected));
+
+        let other_gateway = row(&route("10.10.0.0/24", 7, Some("192.0.2.2"), 100)).unwrap();
+        assert!(!same_row(&other_gateway, &expected));
+
+        let direct = row(&route("10.10.0.0/24", 7, None, 100)).unwrap();
+        assert!(
+            !same_row(&direct, &expected),
+            "a direct row cannot satisfy a gateway declaration"
+        );
+        assert!(
+            !same_row(&expected, &direct),
+            "a gateway row cannot satisfy a direct declaration"
+        );
+
+        let other_metric = row(&route("10.10.0.0/24", 7, Some("192.0.2.1"), 99)).unwrap();
+        assert!(!same_row(&other_metric, &expected));
+
+        let other_destination = row(&route("10.11.0.0/24", 7, Some("192.0.2.1"), 100)).unwrap();
+        assert!(!same_row(&other_destination, &expected));
+
+        let other_prefix = row(&route("10.10.0.0/23", 7, Some("192.0.2.1"), 100)).unwrap();
+        assert!(!same_row(&other_prefix, &expected));
+
+        let mut local = expected;
+        local.Protocol = MIB_IPPROTO_LOCAL;
+        assert!(
+            !same_row(&local, &expected),
+            "a non-static row is not this effect"
+        );
+    }
+
+    #[test]
+    fn invalid_parameters_are_rejected_before_comparison() {
+        for invalid in [
+            route("10.0.0.0/24", 0, None, 100),
+            route("10.0.0.0/24", 7, Some("2001:db8::1"), 100),
+            route("2001:db8::/64", 7, Some("192.0.2.1"), 100),
+        ] {
+            assert!(row(&invalid).is_err());
+        }
+    }
+
+    #[test]
+    fn unspecified_gateway_normalizes_to_the_direct_route() {
+        for (destination, unspecified) in [("10.20.0.0/24", "0.0.0.0"), ("2001:db8:20::/64", "::")]
+        {
+            let direct = row(&route(destination, 7, None, 100)).unwrap();
+            let explicit = row(&route(destination, 7, Some(unspecified), 100)).unwrap();
+            assert_eq!(address(&explicit.NextHop), address(&direct.NextHop));
+            assert!(same_row(&explicit, &direct));
+            assert!(same_row(&direct, &explicit));
+        }
     }
 }

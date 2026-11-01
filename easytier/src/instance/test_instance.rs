@@ -66,7 +66,7 @@ impl TestInstance {
             process_runtime,
             runtime_host.clone(),
         );
-        #[cfg(feature = "tun")]
+        #[cfg(any(not(mobile), feature = "tun"))]
         if let Some(routes) = runtime_host.route_context() {
             adapters.routes = Some(routes.handle.clone());
             #[cfg(feature = "public-ipv6-provider")]

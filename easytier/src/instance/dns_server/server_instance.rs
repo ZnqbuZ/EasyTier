@@ -396,16 +396,7 @@ impl MagicDnsServerInstance {
         tun_inet: Ipv4Inet,
         fake_ip: Ipv4Addr,
     ) -> Result<Self, anyhow::Error> {
-        Self::new_inner(
-            packet_plane,
-            global_ctx,
-            tun_dev,
-            tun_inet,
-            fake_ip,
-            true,
-            std::future::ready(Ok(())),
-        )
-        .await
+        Self::new_inner(packet_plane, global_ctx, tun_dev, tun_inet, fake_ip, true).await
     }
 
     pub(crate) async fn new_with_external_fake_ip_route(
@@ -415,36 +406,7 @@ impl MagicDnsServerInstance {
         tun_inet: Ipv4Inet,
         fake_ip: Ipv4Addr,
     ) -> Result<Self, anyhow::Error> {
-        Self::new_inner(
-            packet_plane,
-            global_ctx,
-            tun_dev,
-            tun_inet,
-            fake_ip,
-            false,
-            std::future::ready(Ok(())),
-        )
-        .await
-    }
-
-    pub(crate) async fn new_with_route_ready(
-        packet_plane: Arc<CorePacketPlane>,
-        global_ctx: ArcGlobalCtx,
-        tun_dev: Option<String>,
-        tun_inet: Ipv4Inet,
-        fake_ip: Ipv4Addr,
-        ready: impl std::future::Future<Output = anyhow::Result<()>>,
-    ) -> anyhow::Result<Self> {
-        Self::new_inner(
-            packet_plane,
-            global_ctx,
-            tun_dev,
-            tun_inet,
-            fake_ip,
-            false,
-            ready,
-        )
-        .await
+        Self::new_inner(packet_plane, global_ctx, tun_dev, tun_inet, fake_ip, false).await
     }
 
     async fn new_inner(
@@ -454,7 +416,6 @@ impl MagicDnsServerInstance {
         tun_inet: Ipv4Inet,
         fake_ip: Ipv4Addr,
         manage_fake_ip_route: bool,
-        route_ready: impl std::future::Future<Output = anyhow::Result<()>>,
     ) -> Result<Self, anyhow::Error> {
         let tcp_listener = net_ns_rpc_listener(
             global_ctx.net_ns.clone(),
@@ -464,11 +425,9 @@ impl MagicDnsServerInstance {
         rpc_server.serve().await?;
         // Reserve the per-domain server role before publishing a route. Client
         // instances must not compete for the fake IP through a different TUN.
-        // No resolver or system DNS configuration is visible before readiness.
-        if let Err(error) = route_ready.await {
-            rpc_server.shutdown().await;
-            return Err(error);
-        }
+        // The returned server is prepared only: its resolver is running but
+        // system DNS is not applied until `apply_system_config` is called after
+        // route readiness.
 
         let dns_config = RunConfigBuilder::default()
             .general(GeneralConfigBuilder::default().build()?)
@@ -517,11 +476,6 @@ impl MagicDnsServerInstance {
             .await
             .context("Failed to initialize DNS zone")?;
 
-        let data_clone = data.clone();
-        tokio::task::spawn_blocking(move || data_clone.do_system_config(&tld_dns_zone_clone))
-            .await
-            .context("Failed to configure system")??;
-
         // Install the resolver only after all fallible initialization has
         // completed, so construction failure cannot leave a managed pipeline
         // registration that never reaches async cleanup.
@@ -535,6 +489,14 @@ impl MagicDnsServerInstance {
             packet_filter,
             tun_inet,
         })
+    }
+
+    pub(crate) async fn apply_system_config(&self, zone: String) -> anyhow::Result<()> {
+        let data_clone = self.data.clone();
+        tokio::task::spawn_blocking(move || data_clone.do_system_config(&zone))
+            .await
+            .context("Failed to configure system")??;
+        Ok(())
     }
 
     pub async fn clean_env(&mut self) {
@@ -560,74 +522,5 @@ impl MagicDnsServerInstance {
 impl Drop for MagicDnsServerInstance {
     fn drop(&mut self) {
         println!("MagicDnsServerInstance dropped");
-    }
-}
-
-#[cfg(all(test, target_os = "linux"))]
-mod route_ready_tests {
-    use super::*;
-    use crate::instance::{
-        composition::{NativeCoreInstance, runtime_core_host_adapters},
-        config::test_core_instance_config,
-    };
-    use easytier_core::{
-        host::packet::HostPacketChannelSink, process_runtime::CoreProcessRuntime,
-        socket::SocketListener,
-    };
-    use std::sync::atomic::{AtomicBool, Ordering};
-
-    #[tokio::test]
-    #[ignore = "run inside an isolated user+network namespace"]
-    async fn server_role_precedes_route_publication_and_failed_readiness_releases_role() {
-        let ctx = crate::common::global_ctx::tests::get_mock_global_ctx();
-        let (sender, _receiver) = tokio::sync::mpsc::channel(8);
-        let adapters = runtime_core_host_adapters(
-            ctx.clone(),
-            CoreProcessRuntime::new(),
-            Arc::new(HostPacketChannelSink::new(sender)),
-        );
-        let core = NativeCoreInstance::new(test_core_instance_config(&ctx), adapters).unwrap();
-        let entered = AtomicBool::new(false);
-        let readiness = || async {
-            entered.store(true, Ordering::Release);
-            anyhow::bail!("route not ready")
-        };
-        let address = MAGIC_DNS_INSTANCE_SOCKET_ADDR.parse().unwrap();
-        let mut occupied = net_ns_rpc_listener(ctx.net_ns.clone(), address).unwrap();
-        occupied.listen().await.unwrap();
-        let result = MagicDnsServerInstance::new_with_route_ready(
-            core.packet_plane(),
-            ctx.clone(),
-            None,
-            "10.50.0.1/24".parse().unwrap(),
-            "100.100.100.100".parse().unwrap(),
-            readiness(),
-        )
-        .await;
-        assert!(result.is_err());
-        assert!(
-            !entered.load(Ordering::Acquire),
-            "an RPC client must not publish a server route"
-        );
-        drop(occupied);
-        let result = MagicDnsServerInstance::new_with_route_ready(
-            core.packet_plane(),
-            ctx.clone(),
-            None,
-            "10.50.0.1/24".parse().unwrap(),
-            "100.100.100.100".parse().unwrap(),
-            readiness(),
-        )
-        .await;
-        assert!(
-            result
-                .err()
-                .expect("readiness must fail")
-                .to_string()
-                .contains("route not ready")
-        );
-        assert!(entered.load(Ordering::Acquire));
-        let mut available = net_ns_rpc_listener(ctx.net_ns.clone(), address).unwrap();
-        available.listen().await.unwrap();
     }
 }

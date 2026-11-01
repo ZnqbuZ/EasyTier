@@ -57,7 +57,7 @@ pub(crate) struct NativeInstanceRuntimeState {
     tun: Arc<NativeTunRuntime>,
     cleanup_started: AtomicBool,
     cleanup_result: watch::Sender<Option<Result<(), Arc<str>>>>,
-    #[cfg(feature = "tun")]
+    #[cfg(any(not(mobile), feature = "tun"))]
     routes: Option<Arc<super::route::runtime::NativeRouteRuntime>>,
     executor: Option<NativeInstanceExecutor>,
 }
@@ -72,10 +72,28 @@ impl NativeInstanceRuntimeHost {
         global_ctx: ArcGlobalCtx,
         executor: Option<NativeInstanceExecutor>,
     ) -> anyhow::Result<Arc<Self>> {
-        #[cfg(feature = "tun")]
-        let routes = (!global_ctx.no_tun())
-            .then(|| super::route::runtime::NativeRouteRuntime::new(&global_ctx).map(Arc::new))
-            .transpose()?;
+        #[cfg(any(not(mobile), feature = "tun"))]
+        let routes = {
+            #[cfg(mobile)]
+            {
+                // A TUN-enabled mobile instance owns its route inputs even
+                // before the platform provides a TUN FD, so the initial export
+                // can use them; no_tun instances create none.
+                (!global_ctx.no_tun())
+                    .then(|| {
+                        super::route::runtime::NativeRouteRuntime::new(&global_ctx).map(Arc::new)
+                    })
+                    .transpose()?
+            }
+            #[cfg(not(mobile))]
+            {
+                // A desktop namespace always accepts ordinary system routes,
+                // whether or not its instance also creates a TUN.
+                Some(Arc::new(super::route::runtime::NativeRouteRuntime::new(
+                    &global_ctx,
+                )?))
+            }
+        };
         let cancel = CancellationToken::new();
         let tun = Arc::new(NativeTunRuntime::new(
             global_ctx.clone(),
@@ -98,7 +116,7 @@ impl NativeInstanceRuntimeHost {
             executor,
             cleanup_started: AtomicBool::new(false),
             cleanup_result: watch::channel(None).0,
-            #[cfg(feature = "tun")]
+            #[cfg(any(not(mobile), feature = "tun"))]
             routes,
         };
         Ok(Arc::new(Self {
@@ -113,11 +131,11 @@ impl NativeInstanceRuntimeHost {
     ) -> anyhow::Result<Option<Arc<dyn DhcpHost>>> {
         let _operation = self.operation.lock().await;
         anyhow::ensure!(!self.cancel.is_cancelled(), "instance runtime is closing");
-        #[cfg(feature = "tun")]
+        #[cfg(any(not(mobile), feature = "tun"))]
         if let Some(routes) = &self.routes {
             routes.bind_config(runtime_config)?;
         }
-        #[cfg(not(feature = "tun"))]
+        #[cfg(all(mobile, not(feature = "tun")))]
         let _ = runtime_config;
         anyhow::ensure!(!self.cancel.is_cancelled(), "instance runtime is closing");
         self.event_journal.start(self.cancel.clone()).await;
@@ -145,7 +163,7 @@ impl NativeInstanceRuntimeHost {
             .map(ToString::to_string)
     }
 
-    #[cfg(feature = "tun")]
+    #[cfg(any(not(mobile), feature = "tun"))]
     pub(super) fn route_context(&self) -> Option<Arc<super::route::runtime::NativeRouteContext>> {
         self.routes.as_ref().map(|routes| routes.context())
     }
@@ -270,11 +288,14 @@ impl NativeInstanceRuntimeHost {
 
 impl NativeInstanceRuntimeState {
     fn request_runtime_shutdown(&self) {
-        self.cancel.cancel();
-        #[cfg(feature = "tun")]
+        // Withdraw the instance's whole route input first, then stop the
+        // business producers. The cleanup below still waits for the real
+        // controller cleanup before touching the TUN.
+        #[cfg(any(not(mobile), feature = "tun"))]
         if let Some(routes) = &self.routes {
             routes.request_close();
         }
+        self.cancel.cancel();
         if self.cleanup_started.swap(true, Ordering::AcqRel) {
             return;
         }
@@ -282,19 +303,13 @@ impl NativeInstanceRuntimeState {
         let journal = self.event_journal.clone();
         let tun = self.tun.clone();
         let result = self.cleanup_result.clone();
-        #[cfg(feature = "tun")]
+        #[cfg(any(not(mobile), feature = "tun"))]
         let routes = self.routes.clone();
         // Created before spawn so loss of an unpolled cleanup is visible too.
         let on_interrupted = {
             let result = result.clone();
-            #[cfg(feature = "tun")]
-            let routes = routes.clone();
             move || {
                 let reason: Arc<str> = "native runtime cleanup was interrupted".into();
-                #[cfg(feature = "tun")]
-                if let Some(routes) = routes {
-                    routes.abandon(reason.clone());
-                }
                 result.send_replace(Some(Err(reason)));
             }
         };
@@ -304,27 +319,52 @@ impl NativeInstanceRuntimeState {
                 shared.spawn(async move {
                     let _operation = operation.lock().await;
                     journal.stop().await;
-                    tun.shutdown().await;
-                    #[cfg(feature = "tun")]
+                    #[cfg(any(not(mobile), feature = "tun"))]
                     let drained = match routes {
-                        Some(routes) => routes
-                            .drain()
-                            .await
-                            .map_err(|error| Arc::<str>::from(format!("{error:#}"))),
+                        Some(routes) => loop {
+                            match routes.drain().await {
+                                Ok(()) => break Ok(()),
+                                Err(error) if crate::host_runtime::cleanup_timed_out(&error) => {
+                                    // The record still owes real cleanup. Report
+                                    // the residual but keep this same future and
+                                    // its captures waiting; the TUN stays alive.
+                                    tracing::warn!(
+                                        %error,
+                                        "native route cleanup is still in progress"
+                                    );
+                                    result.send_replace(Some(Err(Arc::from(format!(
+                                        "native route cleanup is still in progress: {error:#}"
+                                    )))));
+                                }
+                                Err(error) => break Err(error),
+                            }
+                        },
                         None => Ok(()),
                     };
-                    #[cfg(not(feature = "tun"))]
-                    let drained = Ok(());
+                    #[cfg(all(mobile, not(feature = "tun")))]
+                    let drained: anyhow::Result<()> = Ok(());
+                    if drained.is_ok() {
+                        // Routes are really drained; only now may the existing
+                        // NIC/TUN shutdown withdraw members and the device.
+                        tun.shutdown().await;
+                    }
                     if let Err(error) = &drained {
                         tracing::warn!(%error, "native runtime cleanup incomplete");
                     }
-                    result.send_replace(Some(drained));
+                    result.send_replace(Some(
+                        drained.map_err(|error| Arc::<str>::from(format!("{error:#}"))),
+                    ));
                     let _ = interrupted.defuse();
                 });
             }
             Err(error) => {
                 tracing::error!(?error, "native cleanup executor unavailable");
-                drop(interrupted);
+                // Publish the concrete failure and defuse the generic guard so
+                // the real cause is not overwritten by "interrupted".
+                result.send_replace(Some(Err(Arc::from(format!(
+                    "native cleanup executor unavailable: {error}"
+                )))));
+                let _ = interrupted.defuse();
             }
         }
     }
@@ -357,6 +397,26 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(host.cleanup_result.borrow().as_ref(), Some(&Ok(())));
+    }
+
+    #[cfg(not(mobile))]
+    #[tokio::test]
+    async fn desktop_route_context_exists_without_tun() {
+        let global_ctx = Arc::new(GlobalCtx::new(TomlConfig::default()));
+        let mut flags = global_ctx.get_flags();
+        flags.no_tun = true;
+        global_ctx.set_flags(flags);
+        let host = runtime_host(global_ctx);
+        let context = host
+            .route_context()
+            .expect("desktop instances own route inputs even with no_tun");
+        // Only an empty Additional slot: publishing Index declarations here
+        // would ask the real Host worker to modify the system routing table.
+        let slot = context
+            .handle
+            .open_slot(easytier_core::host::route::RouteSource::Additional)
+            .unwrap();
+        drop(slot);
     }
 
     #[cfg(feature = "web-client")]

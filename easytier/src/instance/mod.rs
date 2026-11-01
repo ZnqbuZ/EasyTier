@@ -25,7 +25,7 @@ pub mod shared_virtual_nic;
 #[cfg(feature = "tun")]
 pub mod virtual_nic;
 
-#[cfg(feature = "tun")]
+#[cfg(any(not(mobile), feature = "tun"))]
 pub(crate) mod route;
 
 #[cfg(any(all(windows, feature = "tun"), test))]

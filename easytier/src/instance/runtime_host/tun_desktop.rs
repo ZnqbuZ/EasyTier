@@ -109,12 +109,17 @@ impl NativeTunRuntime {
                     )
                     .await;
                 if let Err(error) = result {
+                    // A stop request is not an interface failure. Leave the
+                    // current NIC state to the existing Host cleanup, which
+                    // first waits for route drain and only then runs
+                    // `tun.shutdown`.
+                    if cancel.is_cancelled() {
+                        Self::report_static_ip_cancelled(&mut output);
+                        return;
+                    }
                     nic_state.stop().await;
                     if let Some(output) = output.take() {
                         let _ = output.send(Err(error.into()));
-                        return;
-                    }
-                    if cancel.is_cancelled() {
                         return;
                     }
                     tracing::error!(?error, "failed to create native interface");

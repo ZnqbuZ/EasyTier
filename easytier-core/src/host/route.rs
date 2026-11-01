@@ -1,69 +1,141 @@
-//! Instance-owned route inputs and route slot coordination.
-//! No backend, task, TUN resource or derived registry lives here.
+//! Instance-owned route declarations and route slot coordination.
+//!
+//! Business components publish `RouteSpec<RouteDevice>` values through a
+//! [`RouteSlot`]; the instance-side [`Registry`] only registers weak references
+//! to those slots. No backend, task, TUN resource or derived registry lives
+//! here.
 
 use std::{
-    collections::BTreeSet,
-    net::IpAddr,
-    sync::{
-        Arc, Weak,
-        atomic::{AtomicBool, AtomicU8, Ordering},
-    },
+    collections::{BTreeMap, BTreeSet},
+    sync::{Arc, Weak},
 };
 
+#[cfg(not(mobile))]
+use std::net::IpAddr;
+
 use cidr::IpCidr;
+use parking_lot::Mutex;
+use tokio::sync::Notify;
 
-use crate::config::runtime::CoreRuntimeConfigStore;
+use crate::foundation::dirty::DirtyFlag;
 
-pub type RouteSet = BTreeSet<RouteSpec>;
+/// The declaration set published by one slot.
+pub type RouteSet = BTreeSet<RouteSpec<RouteDevice>>;
 
+/// Device selection inside a declaration.
+///
+/// Only [`RouteAction::Unicast`] uses it; platform actions without a device do
+/// not invent one. Desktop callers resolve an interface name to
+/// [`RouteDevice::Index`] before declaring it.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub struct RouteSpec {
+pub enum RouteDevice {
+    Tun,
+    #[cfg(not(mobile))]
+    Index(u32),
+}
+
+/// One route declaration. The same shape describes declarations
+/// (`RouteSpec<RouteDevice>`) and installable routes (`RouteSpec<u32>`).
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct RouteSpec<D> {
     pub destination: IpCidr,
+    pub action: RouteAction<D>,
+
+    #[cfg(all(not(mobile), any(target_os = "linux", windows)))]
     pub metric: u32,
+    #[cfg(all(not(mobile), target_os = "linux"))]
     pub table: Option<u32>,
-    pub preferred_source: Option<IpAddr>,
-    pub action: RouteAction,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub enum DeviceSelector {
-    InstanceTun,
-    Named(String),
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub enum RouteAction {
+pub enum RouteAction<D> {
     Unicast {
-        device: Option<DeviceSelector>,
+        dev: D,
+        #[cfg(not(mobile))]
         via: Option<IpAddr>,
     },
+    #[cfg(all(not(mobile), target_os = "linux"))]
     Blackhole,
+    #[cfg(all(not(mobile), target_os = "linux"))]
     Unreachable,
 }
 
-impl RouteSpec {
+impl RouteSpec<RouteDevice> {
+    /// A direct route through this instance's TUN device.
     pub fn for_tun(destination: IpCidr) -> Self {
         Self {
             destination,
-            metric: 65535,
-            table: None,
-            preferred_source: None,
             action: RouteAction::Unicast {
-                device: Some(DeviceSelector::InstanceTun),
+                dev: RouteDevice::Tun,
+                #[cfg(not(mobile))]
                 via: None,
             },
+            #[cfg(all(not(mobile), any(target_os = "linux", windows)))]
+            metric: 65535,
+            #[cfg(all(not(mobile), target_os = "linux"))]
+            table: None,
         }
     }
 
+    /// Whether this declaration needs the instance TUN device to resolve.
     pub fn needs_default_device(&self) -> bool {
         matches!(
             self.action,
             RouteAction::Unicast {
-                device: Some(DeviceSelector::InstanceTun),
+                dev: RouteDevice::Tun,
                 ..
             }
         )
     }
+
+    /// Resolve the declaration into an installable route.
+    ///
+    /// Only the device selection changes: `Tun` becomes the current instance
+    /// interface index (or `None` while no interface is ready), `Index(n)`
+    /// stays `n`, and actions without a device pass through unchanged. Every
+    /// other field is moved over as-is; normalization and platform validation
+    /// belong to the execution side.
+    #[cfg(not(mobile))]
+    pub fn resolve(self, tun_ifindex: Option<u32>) -> Option<RouteSpec<u32>> {
+        let action = match self.action {
+            RouteAction::Unicast { dev, via } => RouteAction::Unicast {
+                dev: match dev {
+                    RouteDevice::Tun => tun_ifindex?,
+                    RouteDevice::Index(index) => index,
+                },
+                via,
+            },
+            #[cfg(target_os = "linux")]
+            RouteAction::Blackhole => RouteAction::Blackhole,
+            #[cfg(target_os = "linux")]
+            RouteAction::Unreachable => RouteAction::Unreachable,
+        };
+        Some(RouteSpec {
+            destination: self.destination,
+            action,
+            #[cfg(any(target_os = "linux", windows))]
+            metric: self.metric,
+            #[cfg(target_os = "linux")]
+            table: self.table,
+        })
+    }
+}
+
+/// Per-declaration execution status, kept next to the declaration in a slot.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RouteStatus {
+    Pending { error: Option<Arc<str>> },
+    Ready,
+    Suppressed(Arc<str>),
+    Rejected(Arc<str>),
+    Failed(Arc<str>),
+}
+
+/// The fixed origin of a slot's declarations.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RouteSource {
+    AutoProxy,
+    Additional,
 }
 
 #[derive(Clone, Debug, thiserror::Error, PartialEq, Eq)]
@@ -74,410 +146,494 @@ pub enum RouteInputError {
     AlreadyBound,
 }
 
-#[derive(Clone, Debug, thiserror::Error, PartialEq, Eq)]
-pub enum RouteWaitError {
-    #[error("route input is closed")]
-    Closed,
-    #[error("automatic route is suppressed by manual policy")]
-    Suppressed,
-    #[error("route rejected: {0}")]
-    Rejected(Arc<str>),
-    #[error("route executor failed: {0}")]
-    Failed(Arc<str>),
+/// Instance-side strong owner of the route inputs.
+///
+/// The registry only keeps weak references to slots, so it does not extend a
+/// slot's declaration lifetime. Dropping the last strong reference wakes the
+/// controller, which re-reads the now-empty input set.
+pub struct Registry {
+    slots: Mutex<Vec<Weak<RouteSlotInner>>>,
+    dirty: Arc<DirtyFlag>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum RouteSlotStatus {
-    Pending,
-    Ready,
-    Suppressed,
-    Closed,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum InstanceRouteStatus {
-    Active,
-    Draining { remaining: Option<usize> },
-    Drained,
-    Failed(Arc<str>),
-}
-
-pub struct RouteSlotInner {
-    instance: uuid::Uuid,
-    is_auto_proxy: AtomicBool,
-    routes: parking_lot::Mutex<RouteSet>,
-    status: AtomicU8, // 0: Pending, 1: Ready, 2: Suppressed, 3: Closed
-    error: parking_lot::Mutex<Option<Arc<str>>>,
-    notify: tokio::sync::Notify,
-    wake: Arc<dyn Fn() + Send + Sync>,
-    closed: AtomicBool,
-}
-
-impl RouteSlotInner {
-    pub fn instance(&self) -> uuid::Uuid {
-        self.instance
+impl Registry {
+    pub fn new(dirty: Arc<DirtyFlag>) -> Self {
+        Self {
+            slots: Mutex::new(Vec::new()),
+            dirty,
+        }
     }
 
-    pub fn is_auto_proxy(&self) -> bool {
-        self.is_auto_proxy.load(Ordering::Acquire)
+    pub fn handle(self: &Arc<Self>) -> RouteHandle {
+        RouteHandle {
+            registry: Arc::downgrade(self),
+        }
     }
 
-    pub fn routes(&self) -> RouteSet {
-        self.routes.lock().clone()
-    }
-
-    pub fn is_closed(&self) -> bool {
-        self.closed.load(Ordering::Acquire)
-    }
-
-    pub fn set_ready(&self) {
-        self.status.store(1, Ordering::Release);
-        self.notify.notify_waiters();
-    }
-
-    pub fn set_suppressed(&self) {
-        self.status.store(2, Ordering::Release);
-        self.notify.notify_waiters();
-    }
-
-    pub fn set_failed(&self, error: Arc<str>) {
-        *self.error.lock() = Some(error);
-        self.status.store(3, Ordering::Release);
-        self.notify.notify_waiters();
+    /// Weak references to the slots that are still alive.
+    ///
+    /// Dead entries are pruned and the list is copied under one short lock;
+    /// callers upgrade and release the returned references without holding it.
+    pub fn slots(&self) -> Vec<Weak<RouteSlotInner>> {
+        let mut slots = self.slots.lock();
+        slots.retain(|slot| slot.upgrade().is_some());
+        slots.clone()
     }
 }
 
-/// A lightweight slot handle held by business components (OSPF, Public IPv6, Magic DNS).
-/// Dropping it automatically marks it closed and notifies the controller.
+impl Drop for Registry {
+    fn drop(&mut self) {
+        self.dirty.mark();
+    }
+}
+
+/// Cloneable handle used to open route slots for one instance.
+///
+/// The handle observes the registry's lifetime only; it is not an input
+/// directory of its own.
+#[derive(Clone)]
+pub struct RouteHandle {
+    registry: Weak<Registry>,
+}
+
+impl RouteHandle {
+    /// Open an empty slot with a fixed source.
+    ///
+    /// Fails with [`RouteInputError::Closed`] once the registry has been
+    /// released: the creation entry is gone and no new input can be attached
+    /// to that instance. The registry is marked dirty after the new slot is
+    /// registered.
+    pub fn open_slot(&self, source: RouteSource) -> Result<RouteSlot, RouteInputError> {
+        let registry = self.registry.upgrade().ok_or(RouteInputError::Closed)?;
+        let inner = Arc::new(RouteSlotInner {
+            source,
+            routes: Mutex::new(BTreeMap::new()),
+            dirty: registry.dirty.clone(),
+            changed: Notify::new(),
+        });
+        registry.slots.lock().push(Arc::downgrade(&inner));
+        drop(registry);
+        inner.dirty.mark();
+        Ok(RouteSlot { inner })
+    }
+}
+
+/// Business-facing handle to one shared declaration set and its statuses.
+///
+/// Clones share the same `RouteSlotInner`; there is no per-clone lifetime.
 #[derive(Clone)]
 pub struct RouteSlot {
     inner: Arc<RouteSlotInner>,
 }
 
 impl RouteSlot {
-    pub fn new(
-        instance: uuid::Uuid,
-        is_auto_proxy: bool,
-        wake: Arc<dyn Fn() + Send + Sync>,
-    ) -> Self {
-        Self {
-            inner: Arc::new(RouteSlotInner {
-                instance,
-                is_auto_proxy: AtomicBool::new(is_auto_proxy),
-                routes: parking_lot::Mutex::new(RouteSet::new()),
-                status: AtomicU8::new(0),
-                error: parking_lot::Mutex::new(None),
-                notify: tokio::sync::Notify::new(),
-                wake,
-                closed: AtomicBool::new(false),
-            }),
-        }
+    /// Replace the whole declaration set.
+    ///
+    /// Runs under the same map lock that holds the statuses: declarations that
+    /// remain keep their status, new declarations start as `Pending`, and
+    /// withdrawn declarations are removed. An unchanged set changes nothing.
+    /// An actual input change marks the shared dirty flag and notifies
+    /// [`changed`](Self::changed) once, after the lock is released.
+    pub fn set_routes(&self, routes: RouteSet) {
+        self.inner.set_routes(routes);
     }
 
-    pub fn instance(&self) -> uuid::Uuid {
-        self.inner.instance
+    /// Edit the declaration set through `f`, then apply the same replacement
+    /// rules as [`set_routes`](Self::set_routes).
+    ///
+    /// `f` runs while the map is locked: it must only perform set operations,
+    /// without I/O or re-entering this slot. The closure's result is returned.
+    pub fn modify<R>(&self, f: impl FnOnce(&mut RouteSet) -> R) -> R {
+        self.inner.modify(f)
     }
 
-    pub fn is_auto_proxy(&self) -> bool {
-        self.inner.is_auto_proxy()
+    /// Withdraw every declaration; same rules as [`set_routes`](Self::set_routes)
+    /// with an empty set.
+    pub fn clear(&self) {
+        self.inner.set_routes(RouteSet::new());
     }
 
+    /// Copy of the current per-declaration statuses.
+    ///
+    /// A missing entry means the declaration has been withdrawn, not that it is
+    /// still being installed or uninstalled.
+    pub fn statuses(&self) -> BTreeMap<RouteSpec<RouteDevice>, RouteStatus> {
+        self.inner.statuses()
+    }
+
+    /// Notification that declarations or their statuses actually changed.
+    ///
+    /// Create `notified()` before reading statuses so a notification between
+    /// the read and the await is not lost; the notification carries no route
+    /// data and does not mean installation succeeded.
+    pub fn changed(&self) -> &Notify {
+        &self.inner.changed
+    }
+}
+
+/// Shared storage behind a [`RouteSlot`].
+pub struct RouteSlotInner {
+    source: RouteSource,
+    routes: Mutex<BTreeMap<RouteSpec<RouteDevice>, RouteStatus>>,
+    dirty: Arc<DirtyFlag>,
+    changed: Notify,
+}
+
+impl RouteSlotInner {
+    pub fn source(&self) -> RouteSource {
+        self.source
+    }
+
+    /// Copy of the current declaration keys.
     pub fn routes(&self) -> RouteSet {
-        self.inner.routes()
+        self.routes.lock().keys().cloned().collect()
     }
 
-    pub fn set_routes(&self, routes: RouteSet) -> Result<(), RouteInputError> {
-        if self.inner.closed.load(Ordering::Acquire) {
-            return Err(RouteInputError::Closed);
-        }
-        *self.inner.routes.lock() = routes;
-        self.inner.status.store(0, Ordering::Release);
-        *self.inner.error.lock() = None;
-        (self.inner.wake)();
-        Ok(())
-    }
-
-    pub fn replace(&self, routes: RouteSet) -> Result<(), RouteInputError> {
-        self.set_routes(routes)
-    }
-
-    pub fn modify<F, R>(&self, f: F) -> Result<R, RouteInputError>
-    where
-        F: FnOnce(&mut RouteSet) -> R,
-    {
-        if self.inner.closed.load(Ordering::Acquire) {
-            return Err(RouteInputError::Closed);
-        }
-        let ret = {
-            let mut guard = self.inner.routes.lock();
-            f(&mut guard)
+    /// Recompute statuses for all currently declared routes.
+    ///
+    /// The callback runs under the declaration lock, once per entry that still
+    /// exists. Returning `None` keeps the old status; returning `Some` replaces
+    /// it when it differs from the old one. Withdrawn declarations are never
+    /// presented, so they cannot be resurrected. The lock is released after
+    /// the batch; only an actual status change calls
+    /// [`changed`](RouteSlot::changed) waiters, and the dirty flag is left
+    /// alone because status feedback is not an input change.
+    ///
+    /// The callback must not perform I/O or re-enter the slot. The caller is
+    /// responsible for computing the status from the current policy, bindings
+    /// and observed effect.
+    pub fn update_statuses(
+        &self,
+        mut f: impl FnMut(&RouteSpec<RouteDevice>) -> Option<RouteStatus>,
+    ) {
+        let changed = {
+            let mut routes = self.routes.lock();
+            let mut changed = false;
+            for (route, status) in routes.iter_mut() {
+                let Some(next) = f(route) else { continue };
+                if *status != next {
+                    *status = next;
+                    changed = true;
+                }
+            }
+            changed
         };
-        self.inner.status.store(0, Ordering::Release);
-        *self.inner.error.lock() = None;
-        (self.inner.wake)();
-        Ok(ret)
-    }
-
-    pub fn clear(&self) -> Result<(), RouteInputError> {
-        self.set_routes(RouteSet::new())
-    }
-
-    pub fn status(&self) -> RouteSlotStatus {
-        if self.inner.closed.load(Ordering::Acquire) {
-            return RouteSlotStatus::Closed;
-        }
-        match self.inner.status.load(Ordering::Acquire) {
-            1 => RouteSlotStatus::Ready,
-            2 => RouteSlotStatus::Suppressed,
-            3 => RouteSlotStatus::Closed,
-            _ => RouteSlotStatus::Pending,
+        if changed {
+            self.changed.notify_waiters();
         }
     }
 
-    pub fn is_closed(&self) -> bool {
-        self.inner.closed.load(Ordering::Acquire)
-    }
-
-    pub fn set_ready(&self) {
-        self.inner.set_ready();
-    }
-
-    pub fn set_suppressed(&self) {
-        self.inner.set_suppressed();
-    }
-
-    pub fn set_failed(&self, error: Arc<str>) {
-        self.inner.set_failed(error);
-    }
-
-    pub async fn wait_ready(&self) -> Result<(), RouteWaitError> {
-        loop {
-            if self.inner.closed.load(Ordering::Acquire) {
-                return Err(RouteWaitError::Closed);
-            }
-            if let Some(err) = self.inner.error.lock().clone() {
-                return Err(RouteWaitError::Failed(err));
-            }
-            match self.status() {
-                RouteSlotStatus::Ready => return Ok(()),
-                RouteSlotStatus::Suppressed => return Err(RouteWaitError::Suppressed),
-                RouteSlotStatus::Closed => return Err(RouteWaitError::Closed),
-                RouteSlotStatus::Pending => {}
-            }
-            self.inner.notify.notified().await;
+    fn set_routes(&self, routes: RouteSet) {
+        let changed = {
+            let mut current = self.routes.lock();
+            Self::replace_locked(&mut current, routes)
+        };
+        if changed {
+            self.dirty.mark();
+            self.changed.notify_waiters();
         }
     }
 
-    pub fn downgrade(&self) -> Weak<RouteSlotInner> {
-        Arc::downgrade(&self.inner)
+    fn modify<R>(&self, f: impl FnOnce(&mut RouteSet) -> R) -> R {
+        let (result, changed) = {
+            let mut current = self.routes.lock();
+            let mut routes: RouteSet = current.keys().cloned().collect();
+            let result = f(&mut routes);
+            let changed = Self::replace_locked(&mut current, routes);
+            (result, changed)
+        };
+        if changed {
+            self.dirty.mark();
+            self.changed.notify_waiters();
+        }
+        result
+    }
+
+    fn statuses(&self) -> BTreeMap<RouteSpec<RouteDevice>, RouteStatus> {
+        self.routes.lock().clone()
+    }
+
+    /// Apply a whole-set replacement under an already held lock.
+    ///
+    /// Returns whether the declaration set actually changed. Retained entries
+    /// keep their status; new entries start pending.
+    fn replace_locked(
+        current: &mut BTreeMap<RouteSpec<RouteDevice>, RouteStatus>,
+        routes: RouteSet,
+    ) -> bool {
+        if current.len() == routes.len() && routes.iter().all(|route| current.contains_key(route)) {
+            return false;
+        }
+        let previous = std::mem::take(current);
+        current.extend(routes.into_iter().map(|route| {
+            let status = previous
+                .get(&route)
+                .cloned()
+                .unwrap_or(RouteStatus::Pending { error: None });
+            (route, status)
+        }));
+        true
     }
 }
 
-impl Drop for RouteSlot {
+impl Drop for RouteSlotInner {
     fn drop(&mut self) {
-        if Arc::strong_count(&self.inner) == 1 {
-            self.inner.closed.store(true, Ordering::Release);
-            self.inner.notify.notify_waiters();
-            (self.inner.wake)();
-        }
-    }
-}
-
-/// Immutable, cloneable handle passed to business components to allocate route slots.
-#[derive(Clone)]
-pub struct RouteHandle {
-    open_fn: Arc<dyn Fn(bool) -> Result<RouteSlot, RouteInputError> + Send + Sync>,
-}
-
-impl RouteHandle {
-    pub fn new<F>(f: F) -> Self
-    where
-        F: Fn(bool) -> Result<RouteSlot, RouteInputError> + Send + Sync + 'static,
-    {
-        Self {
-            open_fn: Arc::new(f),
-        }
-    }
-
-    /// Allocate a new empty slot from the controller.
-    pub fn open_slot(&self) -> Result<RouteSlot, RouteInputError> {
-        (self.open_fn)(false)
-    }
-
-    /// Allocate a new empty slot designated for automatic proxy routes.
-    pub fn open_auto_proxy_slot(&self) -> Result<RouteSlot, RouteInputError> {
-        (self.open_fn)(true)
-    }
-}
-
-struct InstanceRoutesInner {
-    run: uuid::Uuid,
-    handle: RouteHandle,
-    config: parking_lot::Mutex<Option<CoreRuntimeConfigStore>>,
-    closed: AtomicBool,
-    wake: Arc<dyn Fn() + Send + Sync>,
-}
-
-/// Unique instance route close authority.
-#[derive(Clone)]
-pub struct InstanceRoutes {
-    inner: Arc<InstanceRoutesInner>,
-}
-
-impl InstanceRoutes {
-    pub fn new(wake: Arc<dyn Fn() + Send + Sync>) -> Self {
-        let run = uuid::Uuid::new_v4();
-        let wake_clone = wake.clone();
-        let handle = RouteHandle::new(move |is_auto_proxy| {
-            Ok(RouteSlot::new(run, is_auto_proxy, wake_clone.clone()))
-        });
-        Self {
-            inner: Arc::new(InstanceRoutesInner {
-                run,
-                handle,
-                config: parking_lot::Mutex::new(None),
-                closed: AtomicBool::new(false),
-                wake,
-            }),
-        }
-    }
-
-    pub fn with_handle(
-        run: uuid::Uuid,
-        handle: RouteHandle,
-        wake: Arc<dyn Fn() + Send + Sync>,
-    ) -> Self {
-        Self {
-            inner: Arc::new(InstanceRoutesInner {
-                run,
-                handle,
-                config: parking_lot::Mutex::new(None),
-                closed: AtomicBool::new(false),
-                wake,
-            }),
-        }
-    }
-
-    pub fn run(&self) -> uuid::Uuid {
-        self.inner.run
-    }
-
-    pub fn handle(&self) -> RouteHandle {
-        self.inner.handle.clone()
-    }
-
-    pub fn open_slot(&self) -> Result<RouteSlot, RouteInputError> {
-        self.inner.handle.open_slot()
-    }
-
-    pub fn open_auto_proxy_slot(&self) -> Result<RouteSlot, RouteInputError> {
-        self.inner.handle.open_auto_proxy_slot()
-    }
-
-    pub fn bind_config(&self, config: CoreRuntimeConfigStore) -> Result<(), RouteInputError> {
-        if self.inner.closed.load(Ordering::Acquire) {
-            return Err(RouteInputError::Closed);
-        }
-        let wake = self.inner.wake.clone();
-        config
-            .set_route_invalidator(Arc::new(move || {
-                wake();
-            }))
-            .map_err(|_| RouteInputError::AlreadyBound)?;
-        *self.inner.config.lock() = Some(config);
-        (self.inner.wake)();
-        Ok(())
-    }
-
-    pub fn config(&self) -> Option<CoreRuntimeConfigStore> {
-        self.inner.config.lock().clone()
-    }
-
-    pub fn is_closed(&self) -> bool {
-        self.inner.closed.load(Ordering::Acquire)
-    }
-
-    pub fn request_close(&self) {
-        if !self.inner.closed.swap(true, Ordering::AcqRel) {
-            (self.inner.wake)();
-        }
-    }
-
-    pub fn status(&self) -> InstanceRouteStatus {
-        if self.is_closed() {
-            InstanceRouteStatus::Drained
-        } else {
-            InstanceRouteStatus::Active
-        }
-    }
-
-    pub async fn status_changed(&mut self) -> Result<InstanceRouteStatus, RouteWaitError> {
-        Ok(self.status())
+        self.dirty.mark();
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{peers::PeerRuntimeSnapshot, runtime::CoreRuntimeConfig};
+    use std::time::Duration;
 
-    fn config() -> CoreRuntimeConfigStore {
-        CoreRuntimeConfigStore::new(
-            CoreRuntimeConfig::default(),
-            Arc::new(PeerRuntimeSnapshot::default()),
-        )
+    fn registry() -> (Arc<Registry>, Arc<DirtyFlag>) {
+        let dirty = Arc::new(DirtyFlag::new(false));
+        (Arc::new(Registry::new(dirty.clone())), dirty)
+    }
+
+    fn route(destination: &str) -> RouteSpec<RouteDevice> {
+        RouteSpec::for_tun(destination.parse().unwrap())
     }
 
     #[test]
-    fn slot_replace_and_close() {
-        let owner = InstanceRoutes::new(Arc::new(|| {}));
-        let slot = owner.handle().open_slot().unwrap();
-        assert_eq!(slot.status(), RouteSlotStatus::Pending);
+    fn full_replacement_preserves_unchanged_statuses() {
+        let (registry, dirty) = registry();
+        let slot = registry.handle().open_slot(RouteSource::AutoProxy).unwrap();
+        let clone = slot.clone();
 
-        let routes = RouteSet::from([RouteSpec::for_tun("10.0.0.0/24".parse().unwrap())]);
-        slot.set_routes(routes.clone()).unwrap();
-        assert_eq!(slot.routes(), routes);
+        let a = route("10.0.0.0/24");
+        let b = route("10.1.0.0/24");
+        let c = route("10.2.0.0/24");
 
-        slot.inner.set_ready();
-        assert_eq!(slot.status(), RouteSlotStatus::Ready);
+        slot.set_routes(RouteSet::from([a.clone(), b.clone()]));
+        slot.inner
+            .update_statuses(|route| (route == &a).then_some(RouteStatus::Ready));
+        assert_eq!(clone.statuses().get(&a), Some(&RouteStatus::Ready));
+
+        dirty.reset();
+        // Re-publishing the same declaration set changes nothing.
+        clone.set_routes(RouteSet::from([a.clone(), b.clone()]));
+        assert!(!dirty.peek());
+        assert_eq!(slot.statuses().get(&a), Some(&RouteStatus::Ready));
+
+        // {a, b} -> {a, c}: a keeps its feedback, c starts pending, b is gone.
+        clone.set_routes(RouteSet::from([a.clone(), c.clone()]));
+        let statuses = slot.statuses();
+        assert_eq!(statuses.get(&a), Some(&RouteStatus::Ready));
+        assert_eq!(statuses.get(&b), None);
+        assert_eq!(
+            statuses.get(&c),
+            Some(&RouteStatus::Pending { error: None })
+        );
+        assert!(dirty.peek());
+    }
+
+    #[test]
+    fn last_inner_arc_release_marks_after_slot_clones_drop() {
+        let (registry, dirty) = registry();
+        let slot = registry
+            .handle()
+            .open_slot(RouteSource::Additional)
+            .unwrap();
+        let clone = slot.clone();
+        slot.set_routes(RouteSet::from([route("10.0.0.0/24")]));
+        let upgraded = registry.slots()[0].upgrade().unwrap();
+
+        dirty.reset();
+        drop(clone);
+        assert!(
+            !dirty.peek(),
+            "dropping one clone must not withdraw the slot"
+        );
+
+        slot.inner.update_statuses(|_| Some(RouteStatus::Ready));
+        assert!(!dirty.peek(), "status feedback alone must not mark dirty");
 
         drop(slot);
-        assert!(owner.handle().open_slot().is_ok());
+        assert!(
+            !dirty.peek(),
+            "a temporary inner handle still holds the input"
+        );
+
+        drop(upgraded);
+        assert!(
+            dirty.peek(),
+            "the final inner release must wake the controller"
+        );
+    }
+
+    #[test]
+    fn registry_release_requires_last_strong_arc_and_keeps_slots_usable() {
+        let (registry, dirty) = registry();
+        let handle = registry.handle();
+        let slot = handle.open_slot(RouteSource::Additional).unwrap();
+        let temporary = Arc::downgrade(&registry).upgrade().unwrap();
+
+        dirty.reset();
+        drop(registry);
+        assert!(
+            !dirty.peek(),
+            "a temporary registry handle still keeps the input alive"
+        );
+
+        drop(temporary);
+        assert!(
+            dirty.peek(),
+            "the final registry release must wake the controller"
+        );
+
+        assert!(matches!(
+            handle.open_slot(RouteSource::Additional),
+            Err(RouteInputError::Closed)
+        ));
+
+        dirty.reset();
+        let target = route("10.9.0.0/24");
+        slot.set_routes(RouteSet::from([target.clone()]));
+        assert_eq!(slot.inner.routes(), RouteSet::from([target]));
+        assert!(dirty.peek(), "an orphaned slot still wakes the controller");
     }
 
     #[tokio::test]
-    async fn slot_wait_ready_notification() {
-        let dirty_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let dc = dirty_count.clone();
-        let slot = RouteSlot::new(
-            uuid::Uuid::new_v4(),
-            false,
-            Arc::new(move || {
-                dc.fetch_add(1, Ordering::SeqCst);
-            }),
-        );
+    async fn status_updates_target_current_entries_and_notify_once() {
+        let (registry, dirty) = registry();
+        let slot = registry.handle().open_slot(RouteSource::AutoProxy).unwrap();
+        let a = route("10.0.0.0/24");
+        let b = route("10.1.0.0/24");
+        let withdrawn = route("10.2.0.0/24");
+        slot.set_routes(RouteSet::from([a.clone(), b.clone()]));
+        dirty.reset();
 
-        let slot_clone = slot.clone();
-        tokio::spawn(async move {
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-            slot_clone.inner.set_ready();
+        // A waiter created before the batch must still observe the
+        // notification even though it only awaits after the status write.
+        let notified = slot.changed().notified();
+        tokio::pin!(notified);
+
+        slot.inner.update_statuses(|route| {
+            if route == &a {
+                Some(RouteStatus::Ready)
+            } else if route == &b {
+                Some(RouteStatus::Suppressed("policy".into()))
+            } else if route == &withdrawn {
+                Some(RouteStatus::Ready)
+            } else {
+                None
+            }
         });
 
-        let res = slot.wait_ready().await;
-        assert!(res.is_ok(), "got err: {:?}", res);
-        assert_eq!(slot.status(), RouteSlotStatus::Ready);
+        let statuses = slot.statuses();
+        assert_eq!(statuses.get(&a), Some(&RouteStatus::Ready));
+        assert_eq!(
+            statuses.get(&b),
+            Some(&RouteStatus::Suppressed("policy".into()))
+        );
+        assert_eq!(
+            statuses.get(&withdrawn),
+            None,
+            "a withdrawn declaration must not be resurrected"
+        );
+        assert!(
+            !dirty.peek(),
+            "status feedback must not wake the controller"
+        );
+        notified.await;
+
+        // Rewriting equal statuses neither notifies nor marks.
+        let notified = slot.changed().notified();
+        tokio::pin!(notified);
+        slot.inner.update_statuses(|route| {
+            if route == &a {
+                Some(RouteStatus::Ready)
+            } else {
+                None
+            }
+        });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), notified)
+                .await
+                .is_err(),
+            "unchanged statuses must not notify"
+        );
+        assert!(!dirty.peek());
     }
 
+    #[cfg(not(mobile))]
     #[test]
-    fn bind_config_stores_and_invalidates() {
-        let dirty_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let dc = dirty_count.clone();
-        let owner = InstanceRoutes::new(Arc::new(move || {
-            dc.fetch_add(1, Ordering::SeqCst);
-        }));
+    fn resolve_translates_only_the_device() {
+        let tun = RouteSpec::for_tun("10.0.0.0/24".parse().unwrap());
+        assert_eq!(tun.clone().resolve(None), None);
 
-        let store = config();
-        owner.bind_config(store.clone()).unwrap();
-        assert!(dirty_count.load(Ordering::SeqCst) > 0);
+        let resolved = tun.resolve(Some(7)).unwrap();
+        assert_eq!(
+            resolved.destination,
+            "10.0.0.0/24".parse::<IpCidr>().unwrap()
+        );
+        match resolved.action {
+            RouteAction::Unicast { dev, via } => {
+                assert_eq!(dev, 7);
+                assert_eq!(via, None);
+            }
+            _ => panic!("expected a unicast action"),
+        }
+
+        let indexed = RouteSpec::<RouteDevice> {
+            destination: "10.1.0.0/24".parse().unwrap(),
+            action: RouteAction::Unicast {
+                dev: RouteDevice::Index(9),
+                via: Some("192.0.2.1".parse().unwrap()),
+            },
+            #[cfg(any(target_os = "linux", windows))]
+            metric: 10,
+            #[cfg(target_os = "linux")]
+            table: Some(100),
+        };
+        let resolved = indexed.clone().resolve(None).unwrap();
+        assert_eq!(
+            resolved.action,
+            RouteAction::Unicast {
+                dev: 9,
+                via: Some("192.0.2.1".parse().unwrap()),
+            },
+            "an explicit interface index must not need a bound tun device"
+        );
+        #[cfg(any(target_os = "linux", windows))]
+        assert_eq!(resolved.metric, 10);
+        #[cfg(target_os = "linux")]
+        assert_eq!(resolved.table, Some(100));
+
+        #[cfg(target_os = "linux")]
+        {
+            let blackhole = RouteSpec::<RouteDevice> {
+                destination: "10.2.0.0/24".parse().unwrap(),
+                action: RouteAction::Blackhole,
+                metric: 5,
+                table: None,
+            };
+            let resolved = blackhole.clone().resolve(None).unwrap();
+            assert_eq!(resolved.action, RouteAction::Blackhole);
+
+            // A single set may mix tun, indexed and device-less actions.
+            let mixed = RouteSet::from([
+                RouteSpec::for_tun("10.3.0.0/24".parse().unwrap()),
+                indexed,
+                blackhole,
+            ]);
+            let resolved: Vec<_> = mixed
+                .into_iter()
+                .map(|route| route.resolve(Some(3)).expect("every entry resolves"))
+                .collect();
+            assert_eq!(resolved.len(), 3);
+            assert_eq!(
+                resolved
+                    .iter()
+                    .filter(|route| matches!(
+                        &route.action,
+                        RouteAction::Unicast { dev, .. } if *dev == 3
+                    ))
+                    .count(),
+                1
+            );
+        }
     }
 }

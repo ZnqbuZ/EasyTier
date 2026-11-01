@@ -35,7 +35,7 @@ use crate::{
     config::PeerId,
     config::peers::PeerGroupIdentity,
     foundation::small_map_shard_amount,
-    host::route::{RouteHandle, RouteInputError, RouteSet, RouteSlot, RouteSpec},
+    host::route::{RouteHandle, RouteSet, RouteSlot, RouteSource, RouteSpec},
     peers::{
         PeerPacketFilter,
         context::{
@@ -2859,11 +2859,9 @@ impl PeerRouteServiceImpl {
                 .into_iter()
                 .map(|p| RouteSpec::for_tun(p.into()))
                 .collect();
-            if let Err(error) = slot.set_routes(routes)
-                && !matches!(error, RouteInputError::Closed)
-            {
-                tracing::error!(?error, "failed to publish committed host route snapshot");
-            }
+            // Replace the whole committed snapshot; the slot owns per-entry
+            // status and the dirty wake-up.
+            slot.set_routes(routes);
         }
     }
 
@@ -4360,18 +4358,16 @@ impl PeerRoute {
             "peer routes are stopped"
         );
         anyhow::ensure!(publication.is_none(), "host routes are already bound");
-        let slot = routes.open_auto_proxy_slot()?;
+        let slot = routes.open_slot(RouteSource::AutoProxy)?;
         let prefixes = self
             .service_impl
             .route_table
             .list_proxy_cidrs_excluding(self.my_peer_id);
-        if !prefixes.is_empty() {
-            let routes = prefixes
-                .into_iter()
-                .map(|p| RouteSpec::for_tun(p.into()))
-                .collect();
-            slot.set_routes(routes)?;
-        }
+        let published: RouteSet = prefixes
+            .into_iter()
+            .map(|p| RouteSpec::for_tun(p.into()))
+            .collect();
+        slot.set_routes(published);
         self.public_ipv6_service.bind_host_routes(routes)?;
         *publication = Some(slot);
         Ok(())
@@ -6568,8 +6564,10 @@ mod tests {
     }
     #[tokio::test]
     async fn committed_topology_publishes_raw_host_routes_and_stop_withdraws_them() {
-        use crate::host::route::InstanceRoutes;
-        let owner = InstanceRoutes::new(Arc::new(|| {}));
+        use crate::foundation::dirty::DirtyFlag;
+        use crate::host::route::Registry;
+        let registry = Arc::new(Registry::new(Arc::new(DirtyFlag::new(false))));
+        let handle = registry.handle();
         let rpc = Arc::new(PeerRpcManager::new(TestPeerRpcTransport));
         let route = PeerRoute::new(
             1,
@@ -6577,15 +6575,15 @@ mod tests {
             Arc::new(TestPublicIpv6Runtime),
             rpc,
         );
-        route.bind_host_routes(&owner.handle()).unwrap();
-        assert!(route.bind_host_routes(&owner.handle()).is_err());
+        route.bind_host_routes(&handle).unwrap();
+        assert!(route.bind_host_routes(&handle).is_err());
         let raw = || {
             route
                 .service_impl
                 .host_routes
                 .lock()
                 .as_ref()
-                .map(|slot| slot.routes())
+                .map(|slot| slot.statuses().into_keys().collect::<RouteSet>())
                 .unwrap_or_default()
         };
         assert!(raw().is_empty());
@@ -6638,6 +6636,10 @@ mod tests {
         assert!(raw().is_empty());
         route.stop().await;
         assert!(route.service_impl.host_routes.lock().is_none());
-        assert!(route.bind_host_routes(&owner.handle()).is_err());
+        assert!(
+            registry.slots().is_empty(),
+            "the stopped producer must leave no input for the registry"
+        );
+        assert!(route.bind_host_routes(&handle).is_err());
     }
 }

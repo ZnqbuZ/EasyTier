@@ -1,7 +1,7 @@
-use super::{OsRoute, RouteBackend, RouteError};
+use super::{RouteBackend, RouteError};
 
 cfg_select! {
-    target_os = "linux" => {
+    all(target_os = "linux", feature = "linux-netlink") => {
         mod linux;
         pub(crate) use linux::PlatformRouteBackend;
     },

@@ -14,6 +14,7 @@ use super::{
     gateway::{GatewayRuntimeConfig, ProxyRuntimeConfig},
     peers::{AclRuleConfig, PeerRuntimeSnapshot, PublicIpv6ProviderConfig},
 };
+use crate::foundation::dirty::DirtyFlag;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CoreRuntimeConfig {
@@ -66,7 +67,7 @@ struct CoreRuntimeConfigStoreInner {
     update: Mutex<()>,
     peer_changes: tokio::sync::watch::Sender<u64>,
     service_changes: tokio::sync::watch::Sender<u64>,
-    route_invalidator: OnceLock<Arc<dyn Fn() + Send + Sync>>,
+    route_dirty: OnceLock<Arc<DirtyFlag>>,
 }
 
 /// Atomic configuration authority shared by one core instance and its peer
@@ -86,7 +87,7 @@ impl CoreRuntimeConfigStore {
                 update: Mutex::new(()),
                 peer_changes,
                 service_changes,
-                route_invalidator: OnceLock::new(),
+                route_dirty: OnceLock::new(),
             }),
         }
     }
@@ -95,16 +96,19 @@ impl CoreRuntimeConfigStore {
         self.inner.snapshot.load_full()
     }
 
-    pub(crate) fn set_route_invalidator(
-        &self,
-        invalidate: Arc<dyn Fn() + Send + Sync>,
-    ) -> Result<(), ()> {
-        self.inner.route_invalidator.set(invalidate).map_err(|_| ())
+    /// Binds the shared route dirty flag to this store. Only the first binding
+    /// succeeds; a rejected binding neither replaces nor marks the passed flag.
+    /// The bound flag is marked so routes read any policy configured before the
+    /// binding.
+    pub fn bind_route_dirty(&self, dirty: Arc<DirtyFlag>) -> Result<(), ()> {
+        self.inner.route_dirty.set(dirty).map_err(|_| ())?;
+        self.invalidate_routes();
+        Ok(())
     }
 
     fn invalidate_routes(&self) {
-        if let Some(invalidate) = self.inner.route_invalidator.get() {
-            invalidate();
+        if let Some(dirty) = self.inner.route_dirty.get() {
+            dirty.mark();
         }
     }
 
@@ -193,47 +197,90 @@ impl CoreRuntimeConfigStore {
 mod tests {
     use super::*;
 
-    #[test]
-    fn route_invalidation_follows_service_commits_outside_the_update_lock() {
-        use std::sync::atomic::{AtomicUsize, Ordering};
+    #[tokio::test]
+    async fn route_dirty_flag_follows_service_commits() {
+        async fn marked(dirty: &DirtyFlag, message: &str) {
+            tokio::time::timeout(std::time::Duration::from_secs(1), dirty.wait())
+                .await
+                .unwrap_or_else(|_| panic!("{message}"));
+        }
+
+        let manual_routes: BTreeSet<Ipv4Cidr> = BTreeSet::from(["10.20.0.0/16".parse().unwrap()]);
         let store = CoreRuntimeConfigStore::new(
-            CoreRuntimeConfig::default(),
+            CoreRuntimeConfig {
+                manual_routes: Some(manual_routes.clone()),
+                ..Default::default()
+            },
             Arc::new(PeerRuntimeSnapshot::default()),
         );
-        let calls = Arc::new(AtomicUsize::new(0));
-        let observed = calls.clone();
-        let weak = Arc::downgrade(&store.inner);
+        let dirty = Arc::new(DirtyFlag::new(false));
+        let replacement = Arc::new(DirtyFlag::new(false));
+
+        store.bind_route_dirty(dirty.clone()).unwrap();
         assert!(
-            store
-                .set_route_invalidator(Arc::new(move || {
-                    let inner = weak.upgrade().unwrap();
-                    assert!(
-                        inner.update.try_lock().is_some(),
-                        "callback must not run under the config write lock"
-                    );
-                    let _committed = inner.snapshot.load_full();
-                    observed.fetch_add(1, Ordering::Relaxed);
-                }))
-                .is_ok()
+            dirty.peek(),
+            "binding must mark so policy configured before it is read"
+        );
+        assert_eq!(
+            store.snapshot().services.manual_routes,
+            Some(manual_routes),
+            "policy configured before binding must be readable"
         );
         assert!(
-            store
-                .set_route_invalidator(Arc::new(|| panic!("must not replace the fixed callback")))
-                .is_err()
+            store.bind_route_dirty(replacement.clone()).is_err(),
+            "only one binding may succeed"
         );
+        assert!(
+            !replacement.peek(),
+            "a rejected binding must not mark the passed flag"
+        );
+
+        dirty.reset();
         store.update_services(|services| services.manual_routes = Some(BTreeSet::new()));
-        assert_eq!(calls.load(Ordering::Relaxed), 1);
-        store.replace(store.snapshot().as_ref().clone());
-        assert_eq!(calls.load(Ordering::Relaxed), 2);
-        store.replace_with_current(store.snapshot().as_ref().clone(), |_, config| {
-            config.services.dhcp_ipv4 = true
+        marked(&dirty, "update_services must mark after publishing").await;
+        assert_eq!(
+            store.snapshot().services.manual_routes,
+            Some(BTreeSet::new()),
+            "update_services publishes before marking"
+        );
+        assert!(!replacement.peek());
+
+        let mut replaced_services = store.snapshot().services.clone();
+        replaced_services.manual_routes = None;
+        replaced_services.dhcp_ipv4 = true;
+        dirty.reset();
+        store.replace(CoreInstanceRuntimeConfig {
+            services: replaced_services,
+            peer: Arc::new(PeerRuntimeSnapshot::default()),
         });
-        assert_eq!(calls.load(Ordering::Relaxed), 3);
+        marked(&dirty, "replace must mark after publishing").await;
+        let replaced = store.snapshot();
+        assert!(replaced.services.dhcp_ipv4);
+        assert_eq!(replaced.services.manual_routes, None);
+        assert!(!replacement.peek());
+
+        dirty.reset();
+        store.replace_with_current(
+            CoreInstanceRuntimeConfig {
+                services: CoreRuntimeConfig::default(),
+                peer: Arc::new(PeerRuntimeSnapshot::default()),
+            },
+            |_, config| config.services.dhcp_ipv6 = true,
+        );
+        marked(&dirty, "replace_with_current must mark after publishing").await;
+        assert!(store.snapshot().services.dhcp_ipv6);
+        assert!(!replacement.peek());
+
+        dirty.reset();
         store.update_peer(Arc::new(PeerRuntimeSnapshot::default()));
         store.update_peer_with(|peer| {
             peer.runtime.core.node.hostname = Some("peer-only".to_owned())
         });
-        assert_eq!(calls.load(Ordering::Relaxed), 3);
+        assert!(
+            !dirty.peek(),
+            "peer-only commits must not mark the route policy flag"
+        );
+        assert!(!replacement.peek());
     }
 
     #[test]

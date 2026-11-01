@@ -10,7 +10,7 @@ use std::{
     },
 };
 
-use cidr::{Ipv4Inet, Ipv6Inet};
+use cidr::{IpCidr, Ipv4Inet, Ipv6Inet};
 use tokio::sync::{Mutex, Notify};
 
 use crate::common::error::Error;
@@ -25,7 +25,6 @@ mod dispatcher;
 mod ifcfg;
 
 pub(crate) use ifcfg::SharedIfConfig;
-#[cfg(any(mobile, test))]
 pub(crate) use ifcfg::SharedIfConfigConflict;
 use ifcfg::SharedIfConfigDelta;
 pub use ifcfg::{SharedIfConfigClaims, SharedIpv4Route, SharedIpv6Route};
@@ -81,7 +80,7 @@ impl SharedVirtualNic {
         &self,
         member: SharedVirtualNicMemberId,
         registration: SharedVirtualNicMemberRegistrationId,
-        routes: &easytier_core::host::route::RouteSet,
+        routes: &BTreeSet<IpCidr>,
     ) -> anyhow::Result<SharedIfConfigClaims> {
         anyhow::ensure!(
             self.managed_routes,
@@ -95,33 +94,16 @@ impl SharedVirtualNic {
         let mut claims = self.ifcfg.claims_of(member);
         claims.ipv4_routes.clear();
         claims.ipv6_routes.clear();
-        let assigned = self.ifcfg.effective();
-        for route in routes {
-            crate::instance::route::validate_tun_spec(route).map_err(anyhow::Error::msg)?;
-            if let Some(source) = route.preferred_source {
-                anyhow::ensure!(
-                    match source {
-                        std::net::IpAddr::V4(ip) => assigned
-                            .ipv4_addresses
-                            .iter()
-                            .any(|address| address.address() == ip),
-                        std::net::IpAddr::V6(ip) => assigned
-                            .ipv6_addresses
-                            .iter()
-                            .any(|address| address.address() == ip),
-                    },
-                    "preferred source is not a known assigned address"
-                );
-            }
-            match route.destination {
-                cidr::IpCidr::V4(prefix) => {
+        for prefix in routes {
+            match prefix {
+                IpCidr::V4(prefix) => {
                     claims.ipv4_routes.insert(SharedIpv4Route::new(
                         prefix.first_address(),
                         prefix.network_length(),
                         None,
                     ));
                 }
-                cidr::IpCidr::V6(prefix) => {
+                IpCidr::V6(prefix) => {
                     claims.ipv6_routes.insert(SharedIpv6Route::new(
                         prefix.first_address(),
                         prefix.network_length(),
@@ -204,7 +186,7 @@ impl SharedVirtualNic {
         Ok(())
     }
 
-    fn is_current_member_registration(
+    pub(crate) fn is_current_member_registration(
         &self,
         member_id: SharedVirtualNicMemberId,
         registration_id: SharedVirtualNicMemberRegistrationId,
@@ -662,11 +644,19 @@ pub struct SharedVirtualNicMember {
 }
 
 impl SharedVirtualNicMember {
-    fn ensure_open(&self) -> Result<(), Error> {
+    pub(crate) fn ensure_open(&self) -> Result<(), Error> {
         if self.registration.closed.load(Ordering::Acquire) {
             return Err(anyhow::anyhow!("shared NIC member is closed").into());
         }
         Ok(())
+    }
+
+    pub(crate) fn member_id(&self) -> SharedVirtualNicMemberId {
+        self.member_id
+    }
+
+    pub(crate) fn registration_id(&self) -> SharedVirtualNicMemberRegistrationId {
+        self.registration.registration_id
     }
 
     pub(crate) async fn close(&self) -> Result<(), Error> {
@@ -705,7 +695,6 @@ impl SharedVirtualNicMember {
         }
     }
 
-    #[cfg(mobile)]
     pub(crate) async fn claims(&self) -> SharedIfConfigClaims {
         self.shared_nic.lock().await.ifcfg.claims_of(self.member_id)
     }

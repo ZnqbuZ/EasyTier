@@ -2,17 +2,22 @@
 
 use easytier_core::{
     config::runtime::CoreRuntimeConfigStore,
-    host::route::{InstanceRouteStatus, InstanceRoutes, RouteHandle},
+    host::route::{Registry, RouteHandle},
 };
-use guarden::guard;
 use parking_lot::Mutex;
-use std::{sync::Arc, time::Duration};
+use std::sync::Arc;
 use uuid::Uuid;
 
-use super::{InterfaceInfo, RouteController};
+use super::RouteController;
+#[cfg(all(feature = "tun", not(mobile)))]
+use super::{InterfaceInfo, interface_index};
 use crate::{
-    common::{global_ctx::ArcGlobalCtx, net_ns::NetNS},
+    common::global_ctx::ArcGlobalCtx,
     host_runtime::{NativeNetNSServices, net_ns_services},
+};
+#[cfg(feature = "tun")]
+use crate::{
+    common::net_ns::NetNS,
     instance::{shared_virtual_nic::SharedVirtualNicMember, virtual_nic::VirtualNicConfig},
 };
 
@@ -31,16 +36,19 @@ impl NativeRouteContext {
         self.controller.ensure_instance_open(self.run)
     }
 
+    #[cfg(feature = "tun")]
     pub(crate) fn config(&self, mtu: u32) -> VirtualNicConfig {
         VirtualNicConfig::new(self.name.clone(), mtu, NetNS::clone(&self.net_ns))
             .with_routes_managed(true)
     }
 
-    pub(crate) fn bind_member(&self, _member: &SharedVirtualNicMember) -> anyhow::Result<()> {
+    #[cfg(feature = "tun")]
+    pub(crate) fn bind_member(&self, member: &SharedVirtualNicMember) -> anyhow::Result<()> {
         self.ensure_open()?;
-        Ok(())
+        self.controller.bind_member(self.run, member)
     }
 
+    #[cfg(all(feature = "tun", not(mobile)))]
     pub(crate) async fn ready(
         &self,
         member: &SharedVirtualNicMember,
@@ -53,34 +61,28 @@ impl NativeRouteContext {
         let ifname = member
             .ifname()
             .await
-            .unwrap_or_else(|| "synthetic".to_string());
-        let ifindex = crate::instance::route::interface_index(&self.net_ns, &ifname).unwrap_or(42);
-        let info = InterfaceInfo {
-            name: ifname,
-            ifindex,
-        };
-        self.controller.set_interface(Some(info));
-        Ok(true)
+            .ok_or_else(|| anyhow::anyhow!("shared NIC member has no interface name"))?;
+        let ifindex = interface_index(&self.net_ns, &ifname)?;
+        // The address intent may have moved while the device was queried; only
+        // the intent that is still current may confirm this configuration.
+        let intent = self.public_address.lock();
+        if *intent != applied_public_address {
+            return Ok(false);
+        }
+        self.controller.ready(
+            self.run,
+            member,
+            InterfaceInfo {
+                name: ifname,
+                ifindex,
+            },
+        )
     }
 
     #[cfg(mobile)]
     pub(crate) fn external_routes(&self) -> anyhow::Result<easytier_core::host::route::RouteSet> {
         self.ensure_open()?;
-        let routes = self.controller.effective_routes_for_instance(&self.run);
-        for route in &routes {
-            super::validate_tun_spec(route).map_err(anyhow::Error::msg)?;
-        }
-        Ok(routes)
-    }
-
-    #[cfg(mobile)]
-    pub(crate) fn acknowledge_external(
-        &self,
-        prefixes: std::collections::BTreeSet<cidr::IpCidr>,
-    ) -> anyhow::Result<()> {
-        self.ensure_open()?;
-        self.controller.acknowledge_external(prefixes);
-        Ok(())
+        Ok(self.controller.effective_routes_for_instance(&self.run))
     }
 
     pub(crate) fn public_address(&self) -> Option<cidr::Ipv6Inet> {
@@ -96,17 +98,14 @@ impl NativeRouteContext {
         }
     }
 
-    pub(crate) async fn unready(&self, _member: &SharedVirtualNicMember) {
-        self.controller.set_interface(None);
-    }
-
-    pub(crate) fn abandon(&self, reason: Arc<str>) {
-        self.controller.abandon_instance(self.run, reason);
+    #[cfg(feature = "tun")]
+    pub(crate) async fn unready(&self, member: &SharedVirtualNicMember) {
+        self.controller.unready(self.run, member.registration_id());
     }
 }
 
 pub(crate) struct NativeRouteRuntime {
-    owner: Mutex<Option<InstanceRoutes>>,
+    owner: Mutex<Option<Arc<Registry>>>,
     context: Arc<NativeRouteContext>,
 }
 
@@ -116,7 +115,7 @@ impl NativeRouteRuntime {
         let run = global_ctx.key();
         let name = global_ctx.get_flags().dev_name.clone();
         let controller = net_ns.route_controller()?;
-        let owner = controller.open_instance(run, name.clone())?;
+        let owner = controller.open_instance(run)?;
         let handle = owner.handle();
         let context = Arc::new(NativeRouteContext {
             net_ns,
@@ -138,42 +137,26 @@ impl NativeRouteRuntime {
 
     pub(crate) fn bind_config(&self, config: CoreRuntimeConfigStore) -> anyhow::Result<()> {
         let owner = self.owner.lock();
-        owner
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("native routes are closing"))?
-            .bind_config(config)?;
-        Ok(())
+        anyhow::ensure!(owner.is_some(), "native routes are closing");
+        // Hold the guard across the bind so a concurrent request_close cannot
+        // release the root while the first configuration is being applied.
+        self.context
+            .controller
+            .bind_config(self.context.run, config)
     }
 
     pub(crate) fn request_close(&self) {
-        if let Some(owner) = self.owner.lock().as_ref() {
-            owner.request_close();
-        }
+        let owner = self.owner.lock().take();
+        // Release the root reference outside the owner lock; its final drop
+        // wakes the controller.
+        drop(owner);
     }
 
     pub(crate) async fn drain(&self) -> anyhow::Result<()> {
         self.request_close();
-        let Some(owner) = self.owner.lock().take() else {
-            return Ok(());
-        };
-        close_owner(owner, self.context()).await
-    }
-
-    pub(crate) fn abandon(&self, reason: Arc<str>) {
-        let owner = self.owner.lock().take();
-        if let Some(owner) = owner.as_ref() {
-            owner.request_close();
-        }
-        self.context.abandon(reason);
-        drop(owner);
-    }
-}
-
-impl Drop for NativeRouteRuntime {
-    fn drop(&mut self) {
-        if let Some(owner) = self.owner.lock().take() {
-            close_runtime(owner, self.context.clone());
-        }
+        // A released root is not proof of cleanup: the existing reconciler
+        // still has to finish the actual work for this run.
+        self.context.controller.drain(self.context.run).await
     }
 }
 
@@ -207,135 +190,167 @@ impl easytier_core::peers::public_ipv6::PublicIpv6Host for NativePublicIpv6Host 
     }
 }
 
-fn close_runtime(owner: InstanceRoutes, context: Arc<NativeRouteContext>) {
-    owner.request_close();
-    match crate::host_runtime::native_host_runtime().shared_executor() {
-        Ok(shared) => {
-            let lost = guard!([context = context.clone()] {
-                context.abandon("native route cleanup executor disappeared".into());
-            });
-            shared.spawn(async move {
-                if let Err(error) = close_owner(owner, context).await {
-                    tracing::warn!(?error, "native route cleanup incomplete");
-                }
-                lost.defuse();
-            });
-        }
-        Err(error) => context.abandon(error.to_string().into()),
-    }
-}
-
-async fn close_owner(
-    mut owner: InstanceRoutes,
-    context: Arc<NativeRouteContext>,
-) -> anyhow::Result<()> {
-    owner.request_close();
-    let abandoned = guard!([context = context.clone()] {
-        context.abandon("native route cleanup was interrupted".into());
-    });
-    let result = wait_for_cleanup(&mut owner, Duration::from_secs(30)).await;
-    if let Err(error) = &result {
-        context.abandon(error.to_string().into());
-    }
-    abandoned.defuse();
-    drop(owner);
-    context.abandon("drained".into());
-    result
-}
-
-async fn wait_for_cleanup(owner: &mut InstanceRoutes, stall: Duration) -> anyhow::Result<()> {
-    let mut deadline = tokio::time::Instant::now() + stall;
-    let mut least_remaining = None;
-    loop {
-        match owner.status() {
-            InstanceRouteStatus::Drained => return Ok(()),
-            InstanceRouteStatus::Failed(error) => anyhow::bail!("{error}"),
-            InstanceRouteStatus::Draining {
-                remaining: Some(remaining),
-            } if least_remaining.is_none_or(|least| remaining < least) => {
-                least_remaining = Some(remaining);
-                deadline = tokio::time::Instant::now() + stall;
-            }
-            _ => {}
-        }
-        match tokio::time::timeout_at(deadline, owner.status_changed()).await {
-            Ok(changed) => {
-                changed?;
-            }
-            Err(_) => {
-                if matches!(owner.status(), InstanceRouteStatus::Drained) {
-                    return Ok(());
-                }
-                anyhow::bail!("host route cleanup made no progress for {stall:?}");
-            }
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use easytier_core::config::{peers::PeerRuntimeSnapshot, runtime::CoreRuntimeConfig};
+    use crate::{common::config::TomlConfig, utils::dirty::DirtyFlag};
+    use easytier_core::{
+        config::{
+            peers::PeerRuntimeSnapshot,
+            runtime::{CoreRuntimeConfig, CoreRuntimeConfigStore},
+        },
+        host::route::{RouteInputError, RouteSet, RouteSource, RouteSpec, RouteStatus},
+    };
+    use std::time::Duration;
+    use tokio::sync::Notify;
 
-    #[cfg(feature = "public-ipv6-provider")]
-    #[tokio::test]
-    async fn newer_public_address_intent_rejects_old_configuration_completion() {
-        let global = Arc::new(crate::common::global_ctx::GlobalCtx::new(
-            crate::common::config::TomlConfig::default(),
+    fn global_ctx() -> ArcGlobalCtx {
+        Arc::new(crate::common::global_ctx::GlobalCtx::new(
+            TomlConfig::default(),
+        ))
+    }
+
+    fn config_store() -> CoreRuntimeConfigStore {
+        CoreRuntimeConfigStore::new(
+            CoreRuntimeConfig::default(),
+            Arc::new(PeerRuntimeSnapshot::default()),
+        )
+    }
+
+    /// A controller without a worker: nothing removes the instance record, so
+    /// cleanup stays outstanding for the whole test.
+    fn runtime_without_worker(global: &ArcGlobalCtx) -> NativeRouteRuntime {
+        let net_ns = net_ns_services(&global.net_ns).unwrap();
+        let controller = RouteController::new(Arc::new(DirtyFlag::new(false)));
+        let run = global.key();
+        let owner = controller.open_instance(run).unwrap();
+        let handle = owner.handle();
+        let context = Arc::new(NativeRouteContext {
+            net_ns,
+            run,
+            name: global.get_flags().dev_name.clone(),
+            public_address: Mutex::new(None),
+            handle,
+            controller,
+        });
+        NativeRouteRuntime {
+            owner: Mutex::new(Some(owner)),
+            context,
+        }
+    }
+
+    #[test]
+    fn releasing_the_native_root_closes_new_slots_and_keeps_old_slots_mutable() {
+        let global = global_ctx();
+        let runtime = runtime_without_worker(&global);
+        let context = runtime.context();
+        runtime.bind_config(config_store()).unwrap();
+        let slot = context.handle.open_slot(RouteSource::Additional).unwrap();
+
+        runtime.request_close();
+
+        assert!(
+            context.ensure_open().is_err(),
+            "the context must not keep the released registry alive"
+        );
+        assert!(
+            matches!(
+                context.handle.open_slot(RouteSource::Additional),
+                Err(RouteInputError::Closed)
+            ),
+            "a released root cannot open new inputs"
+        );
+        assert!(
+            runtime.bind_config(config_store()).is_err(),
+            "configuration binding requires a live root"
+        );
+
+        let declaration = RouteSpec::for_tun("10.44.0.0/24".parse().unwrap());
+        slot.set_routes(RouteSet::from([declaration.clone()]));
+        assert_eq!(
+            slot.statuses().get(&declaration),
+            Some(&RouteStatus::Pending { error: None }),
+            "an existing slot stays mutable after its root is gone"
+        );
+    }
+
+    #[test]
+    fn dropping_the_native_runtime_naturally_releases_the_registry_root() {
+        let global = global_ctx();
+        let context = {
+            let runtime = runtime_without_worker(&global);
+            runtime.context()
+        };
+
+        assert!(
+            context.ensure_open().is_err(),
+            "the owner field is the only strong root"
+        );
+        assert!(matches!(
+            context.handle.open_slot(RouteSource::Additional),
+            Err(RouteInputError::Closed)
         ));
-        let runtime = NativeRouteRuntime::new(&global).unwrap();
-        let context = &runtime.context();
-        let mut registry = crate::instance::shared_virtual_nic::SharedVirtualNicRegistry::new();
-        let member = registry
+    }
+
+    #[tokio::test]
+    async fn repeated_drain_never_reports_success_while_cleanup_is_still_owed() {
+        let global = global_ctx();
+        let runtime = runtime_without_worker(&global);
+
+        for attempt in 0..2 {
+            assert!(
+                tokio::time::timeout(Duration::from_millis(100), runtime.drain())
+                    .await
+                    .is_err(),
+                "drain attempt {attempt} must wait for real cleanup instead of \
+                 treating the released root as success"
+            );
+        }
+    }
+
+    #[cfg(all(feature = "tun", not(mobile)))]
+    #[tokio::test]
+    async fn ready_rejects_stale_public_addresses_and_missing_devices() {
+        let global = global_ctx();
+        let runtime = runtime_without_worker(&global);
+        let context = runtime.context();
+        let mut nics = crate::instance::shared_virtual_nic::SharedVirtualNicRegistry::new();
+        let member = nics
             .try_create_member(
                 "synthetic".into(),
                 context.config(1400),
                 context.run,
-                Arc::new(tokio::sync::Notify::new()),
+                Arc::new(Notify::new()),
             )
             .unwrap();
         context.bind_member(&member).unwrap();
-        let first = "2001:db8::1/128".parse().unwrap();
-        let next = "2001:db8::2/128".parse().unwrap();
-        context.public_address_changing(Some(first));
-        assert!(context.ready(&member, Some(first)).await.unwrap());
-        context.public_address_changing(Some(next));
-        assert!(!context.ready(&member, Some(first)).await.unwrap());
-        assert!(context.ready(&member, Some(next)).await.unwrap());
-        runtime.request_close();
-        assert!(context.ready(&member, Some(next)).await.is_err());
-        runtime.drain().await.unwrap();
-    }
 
-    #[tokio::test]
-    async fn native_owner_binds_config_then_closes_without_context_keeping_authority_alive() {
-        let global = Arc::new(crate::common::global_ctx::GlobalCtx::new(
-            crate::common::config::TomlConfig::default(),
-        ));
-        let runtime = NativeRouteRuntime::new(&global).unwrap();
-        let context = runtime.context();
-        runtime
-            .bind_config(CoreRuntimeConfigStore::new(
-                CoreRuntimeConfig::default(),
-                Arc::new(PeerRuntimeSnapshot::default()),
-            ))
-            .unwrap();
-        runtime.request_close();
-        tokio::time::timeout(Duration::from_secs(3), runtime.drain())
+        #[cfg(feature = "public-ipv6-provider")]
+        let address: cidr::Ipv6Inet = "2001:db8::1/128".parse().unwrap();
+        #[cfg(feature = "public-ipv6-provider")]
+        {
+            context.public_address_changing(Some(address));
+            assert!(
+                !context.ready(&member, None).await.unwrap(),
+                "a callback from an older public address is not applied"
+            );
+        }
+        let error = context
+            .ready(&member, context.public_address())
             .await
-            .unwrap()
-            .unwrap();
-        assert!(context.ensure_open().is_err());
-    }
+            .expect_err("a member without a real device must not report ready");
+        assert!(
+            error.to_string().contains("interface name"),
+            "unexpected error: {error:#}"
+        );
 
-    #[tokio::test]
-    async fn dropping_the_native_owner_uses_shared_cleanup_without_a_caller_waiter() {
-        let global = Arc::new(crate::common::global_ctx::GlobalCtx::new(
-            crate::common::config::TomlConfig::default(),
-        ));
-        let runtime = NativeRouteRuntime::new(&global).unwrap();
-        let context = runtime.context();
-        drop(runtime);
-        assert!(context.ensure_open().is_err());
+        runtime.request_close();
+        assert!(
+            context
+                .ready(&member, context.public_address())
+                .await
+                .is_err(),
+            "a closed root cannot confirm a binding"
+        );
     }
 }
