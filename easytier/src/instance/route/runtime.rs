@@ -11,6 +11,8 @@ use uuid::Uuid;
 use super::RouteController;
 #[cfg(all(feature = "tun", not(mobile)))]
 use super::{InterfaceInfo, interface_index};
+#[cfg(all(feature = "tun", mobile))]
+use crate::instance::shared_virtual_nic::SharedIfConfigClaims;
 use crate::{
     common::global_ctx::ArcGlobalCtx,
     host_runtime::{NativeNetNSServices, net_ns_services},
@@ -83,6 +85,50 @@ impl NativeRouteContext {
     pub(crate) fn external_routes(&self) -> anyhow::Result<easytier_core::host::route::RouteSet> {
         self.ensure_open()?;
         Ok(self.controller.effective_routes_for_instance(&self.run))
+    }
+
+    /// Record one member's real mobile attachment.
+    ///
+    /// The validity and registration check and the Controller write happen
+    /// without an intervening await. The dispatcher marks a dead NIC invalid
+    /// before its member streams end, so a stream that really failed cannot be
+    /// recorded as attached afterwards. Root release and namespace shutdown do
+    /// not discard a genuine fact, so this does not call `ensure_open`.
+    #[cfg(all(feature = "tun", mobile))]
+    pub(crate) async fn mobile_ready(
+        &self,
+        member: &SharedVirtualNicMember,
+        attachment_id: Uuid,
+    ) -> anyhow::Result<bool> {
+        let shared_nic = member.shared_nic();
+        let guard = tokio::time::timeout(std::time::Duration::from_secs(5), shared_nic.lock())
+            .await
+            .map_err(|_| {
+                anyhow::anyhow!(
+                    "timed out locking shared NIC for member {}",
+                    member.member_id()
+                )
+            })?;
+        if member.ensure_open().is_err()
+            || !guard.is_valid()
+            || !guard.is_current_member_registration(member.member_id(), member.registration_id())
+        {
+            return Ok(false);
+        }
+        // No await between the check above and this synchronous Controller write.
+        Ok(self
+            .controller
+            .mobile_ready(self.run, member, attachment_id))
+    }
+
+    #[cfg(all(feature = "tun", mobile))]
+    pub(crate) fn mobile_dns_enabled(&self) -> bool {
+        self.controller.mobile_dns_enabled(self.run)
+    }
+
+    #[cfg(all(feature = "tun", mobile))]
+    pub(crate) fn mobile_installed_claims(&self) -> Option<SharedIfConfigClaims> {
+        self.controller.mobile_installed_claims(self.run)
     }
 
     pub(crate) fn public_address(&self) -> Option<cidr::Ipv6Inet> {

@@ -18,6 +18,7 @@ struct MobileTunAttachment {
     replace_tun_fd: bool,
     completion: Option<oneshot::Sender<anyhow::Result<()>>>,
     claims: Option<crate::instance::shared_virtual_nic::SharedIfConfigClaims>,
+    attachment_id: uuid::Uuid,
 }
 
 pub(super) struct NativeTunRuntime {
@@ -67,6 +68,7 @@ impl NativeTunRuntime {
         shared_virtual_nic_registry: ArcSharedVirtualNicRegistry,
         claims: Option<crate::instance::shared_virtual_nic::SharedIfConfigClaims>,
         routes: Option<Arc<crate::instance::route::runtime::NativeRouteContext>>,
+        attachment_id: uuid::Uuid,
     ) -> anyhow::Result<()> {
         nic_state.drain().await;
         if fd <= 0 {
@@ -89,7 +91,15 @@ impl NativeTunRuntime {
             }
         };
         nic_state
-            .configure_for_mobile(nic, global_ctx, packet_plane, fd, replace_tun_fd, claims)
+            .configure_for_mobile(
+                nic,
+                global_ctx,
+                packet_plane,
+                fd,
+                replace_tun_fd,
+                claims,
+                attachment_id,
+            )
             .await
             .context("attach mobile TUN failed")?;
         Ok(())
@@ -123,10 +133,14 @@ impl NativeTunRuntime {
                     shared_virtual_nic_registry.clone(),
                     attachment.claims,
                     routes.clone(),
+                    attachment.attachment_id,
                 )
                 .await;
                 if let Err(error) = &result {
                     tracing::error!(?error, "failed to attach mobile TUN fd");
+                    // Finish the existing NIC error cleanup before reporting
+                    // the real failure to the caller.
+                    nic_state.stop().await;
                 }
                 if let Some(completion) = attachment.completion {
                     let _ = completion.send(result);
@@ -153,12 +167,14 @@ impl NativeTunRuntime {
         fd: i32,
         replace_tun_fd: bool,
         claims: Option<crate::instance::shared_virtual_nic::SharedIfConfigClaims>,
+        attachment_id: uuid::Uuid,
     ) -> anyhow::Result<()> {
         if self.task.lock().await.is_none() {
             anyhow::bail!("mobile TUN runtime is not running");
         }
 
         let (completion, result) = oneshot::channel();
+        // Cancellation may only prevent the request from being submitted.
         tokio::select! {
             _ = self.cancel.cancelled() => anyhow::bail!("instance is closing; TUN attachment cancelled"),
             send_result = self.tun_fd.send(MobileTunAttachment {
@@ -166,14 +182,15 @@ impl NativeTunRuntime {
                 replace_tun_fd,
                 completion: Some(completion),
                 claims,
+                attachment_id,
             }) => send_result.map_err(|error| anyhow::anyhow!("failed to send TUN fd: {error}"))?,
         }
 
-        tokio::select! {
-            _ = self.cancel.cancelled() => anyhow::bail!("instance is closing; TUN attachment cancelled"),
-            result = result => result
-                .map_err(|_| anyhow::anyhow!("mobile TUN runtime stopped before attachment completed"))?,
-        }
+        // Once submitted, the real completion decides the outcome; closing the
+        // instance does not make an accepted installation end.
+        result.await.map_err(|_| {
+            anyhow::anyhow!("mobile TUN runtime stopped before attachment completed")
+        })?
     }
 
     pub(super) fn dhcp_host(
@@ -188,11 +205,5 @@ impl NativeTunRuntime {
             nic: self.nic.clone(),
             routes: self.routes.clone(),
         })
-    }
-
-    pub(super) async fn current_mobile_tun_claims(
-        &self,
-    ) -> Option<crate::instance::shared_virtual_nic::SharedIfConfigClaims> {
-        self.nic.mobile_tun_claims().await
     }
 }

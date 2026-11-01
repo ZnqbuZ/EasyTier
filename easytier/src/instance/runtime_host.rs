@@ -226,8 +226,11 @@ impl NativeInstanceRuntimeHost {
         fd: i32,
         replace_tun_fd: bool,
         claims: Option<crate::instance::shared_virtual_nic::SharedIfConfigClaims>,
+        attachment_id: uuid::Uuid,
     ) -> anyhow::Result<()> {
-        self.tun.attach_mobile_fd(fd, replace_tun_fd, claims).await
+        self.tun
+            .attach_mobile_fd(fd, replace_tun_fd, claims, attachment_id)
+            .await
     }
 
     #[cfg(all(feature = "tun", mobile))]
@@ -269,9 +272,9 @@ impl NativeInstanceRuntimeHost {
         }
         Ok((
             claims,
-            self.tun.current_mobile_tun_claims().await,
+            routes.mobile_installed_claims(),
             cfg!(feature = "magic-dns")
-                && self.global_ctx.get_flags().accept_dns
+                && routes.mobile_dns_enabled()
                 && self.global_ctx.get_ipv4().is_some(),
         ))
     }

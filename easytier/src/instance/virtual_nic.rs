@@ -1185,9 +1185,7 @@ impl NicCtx {
         Ok(nic)
     }
 
-    pub(crate) fn managed_dns_routes(
-        &self,
-    ) -> Option<easytier_core::host::route::RouteHandle> {
+    pub(crate) fn managed_dns_routes(&self) -> Option<easytier_core::host::route::RouteHandle> {
         self.routes.as_ref().map(|routes| routes.handle.clone())
     }
 
@@ -1268,6 +1266,24 @@ impl NicCtx {
         }
     }
 
+    /// The member cleanup handle used to report a real mobile forwarding end.
+    ///
+    /// It captures the member and registration this NIC was created with; a
+    /// newer binding is never consulted, so a late exit cannot be attributed
+    /// to it.
+    #[cfg(mobile)]
+    fn mobile_unready_handle(
+        &self,
+    ) -> Option<(
+        Arc<super::route::runtime::NativeRouteContext>,
+        SharedVirtualNicMember,
+    )> {
+        match (&self.routes, &self.backend) {
+            (Some(routes), NicBackend::Shared(member)) => Some((routes.clone(), member.clone())),
+            _ => None,
+        }
+    }
+
     fn do_forward_nic_to_peers_task(
         &mut self,
         mut stream: Pin<Box<dyn ZCPacketStream>>,
@@ -1275,6 +1291,8 @@ impl NicCtx {
         // read from nic and write to corresponding tunnel
         let packet_plane = self.packet_plane.clone();
         let close_notifier = self.close_notifier.clone();
+        #[cfg(mobile)]
+        let unready = self.mobile_unready_handle();
         self.tasks.spawn(async move {
             while let Some(ret) = stream.next().await {
                 if ret.is_err() {
@@ -1282,6 +1300,10 @@ impl NicCtx {
                     break;
                 }
                 Self::do_forward_nic_to_peers(ret.unwrap(), packet_plane.as_ref()).await;
+            }
+            #[cfg(mobile)]
+            if let Some((routes, member)) = unready {
+                routes.unready(&member).await;
             }
             close_notifier.notify_one();
             tracing::error!("nic closed when recving from it");
@@ -1293,6 +1315,8 @@ impl NicCtx {
     fn do_forward_peers_to_nic(&mut self, mut sink: Pin<Box<dyn ZCPacketSink>>) {
         let channel = self.peer_packet_receiver.clone();
         let close_notifier = self.close_notifier.clone();
+        #[cfg(mobile)]
+        let unready = self.mobile_unready_handle();
         self.tasks.spawn(async move {
             // unlock until coroutine finished
             let mut channel = channel.lock().await;
@@ -1304,6 +1328,13 @@ impl NicCtx {
                 let ret = sink.send(packet.into_tun_packet()).await;
                 if ret.is_err() {
                     tracing::error!(?ret, "do_forward_tunnel_to_nic sink error");
+                    // A closed sink means this member's real forwarding is
+                    // over; ordinary forwarding errors keep the existing
+                    // policy.
+                    #[cfg(mobile)]
+                    if let Some((routes, member)) = &unready {
+                        routes.unready(member).await;
+                    }
                 }
             }
             close_notifier.notify_one();
@@ -1532,6 +1563,12 @@ impl NicCtx {
         Ok(())
     }
 
+    /// Desktop managed public IPv6 address updater.
+    ///
+    /// Mobile has no desktop interface-index binding; its addresses are
+    /// installed by the external VPN owner and reconciled through the
+    /// Controller's mobile attachment record.
+    #[cfg(not(mobile))]
     async fn run_managed_public_ipv6_addr_updater(
         &mut self,
         routes: Arc<super::route::runtime::NativeRouteContext>,
@@ -1704,9 +1741,9 @@ impl NicCtx {
             self.assign_ipv6_to_tun_device(ipv6_addr).await?;
         }
 
+        #[cfg(not(mobile))]
         if let Some(routes) = self.routes.clone() {
-            self.run_managed_public_ipv6_addr_updater(routes)
-                .await?;
+            self.run_managed_public_ipv6_addr_updater(routes).await?;
             return Ok(());
         }
         self.run_proxy_cidrs_route_updater().await?;
@@ -1754,16 +1791,6 @@ impl NicCtx {
         claims
     }
 
-    #[cfg(mobile)]
-    pub(crate) async fn current_mobile_tun_claims(
-        &self,
-    ) -> Option<super::shared_virtual_nic::SharedIfConfigClaims> {
-        match &self.backend {
-            NicBackend::Shared(member) => Some(member.claims().await),
-            NicBackend::Dedicated(_) => None,
-        }
-    }
-
     #[cfg(any(mobile, test))]
     async fn apply_mobile_tun_claims(
         &self,
@@ -1791,25 +1818,11 @@ impl NicCtx {
         tun_fd: std::os::fd::RawFd,
         replace_tun_fd: bool,
         claims: super::shared_virtual_nic::SharedIfConfigClaims,
+        attachment_id: uuid::Uuid,
     ) -> Result<(), Error> {
         // These facts describe the configuration installed by the external
         // VPN owner, not the mutable dispatcher admission that the controller
         // may withdraw while this physical generation is still being created.
-        let mut prefixes = BTreeSet::new();
-        for route in &claims.ipv4_routes {
-            prefixes.insert(
-                cidr::Ipv4Cidr::new(route.address, route.prefix)
-                    .map_err(anyhow::Error::from)?
-                    .into(),
-            );
-        }
-        for route in &claims.ipv6_routes {
-            prefixes.insert(
-                cidr::Ipv6Cidr::new(route.address, route.prefix)
-                    .map_err(anyhow::Error::from)?
-                    .into(),
-            );
-        }
         let applied_public_address = self
             .routes
             .as_ref()
@@ -1819,24 +1832,20 @@ impl NicCtx {
         let ipv6_addresses = claims.ipv6_addresses.clone();
         // Reject the entire member configuration before touching the shared fd.
         self.apply_mobile_tun_claims(claims).await?;
-        let (tunnel, ifname, epoch) = match self
+        let tunnel = match self
             .backend
             .create_dev_for_mobile(tun_fd, replace_tun_fd)
             .await
         {
-            Ok((tunnel, epoch)) => {
-                let ifname = self.tun_ifname().await?;
-                (tunnel, ifname, epoch)
-            }
+            Ok(tunnel) => tunnel,
             Err(err) => {
                 self.global_ctx.set_tun_device_error(err.to_string());
                 return Err(err);
             }
         };
+        let ifname = self.tun_ifname().await?;
 
-        if let (Some(routes), NicBackend::Shared(member)) = (&self.routes, &self.backend) {
-            let epoch = epoch.ok_or_else(|| anyhow::anyhow!("mobile TUN has no physical epoch"))?;
-            routes.acknowledge_external(epoch, prefixes)?;
+        if let (Some(routes), NicBackend::Shared(_)) = (&self.routes, &self.backend) {
             if !self
                 .global_ctx
                 .get_ipv4()
@@ -1850,18 +1859,30 @@ impl NicCtx {
                     anyhow::anyhow!("mobile TUN addresses changed during attachment").into(),
                 );
             }
-            let ready = routes
-                .ready(member, epoch, applied_public_address)
-                .await?
-                .ok_or_else(|| {
-                    anyhow::anyhow!("mobile TUN public address changed during attachment")
-                })?;
-            self.ready_epoch = Some(ready);
+            // The public-address intent may have moved while the device was
+            // being created; only the intent that is still current may
+            // confirm this configuration.
+            if routes.public_address() != applied_public_address {
+                return Err(
+                    anyhow::anyhow!("mobile TUN public address changed during attachment").into(),
+                );
+            }
         }
 
         self.global_ctx.set_tun_device_ready(ifname);
 
         self.start_tunnel_forwarding(tunnel)?;
+
+        // Record the member only after forwarding really started. A stream
+        // that ended before this point has already made the NIC invalid, so
+        // the Controller check below cannot resurrect a dead attachment.
+        if let (Some(routes), NicBackend::Shared(member)) = (&self.routes, &self.backend)
+            && !routes.mobile_ready(member, attachment_id).await?
+        {
+            return Err(
+                anyhow::anyhow!("mobile TUN member is no longer the current registration").into(),
+            );
+        }
 
         Ok(())
     }

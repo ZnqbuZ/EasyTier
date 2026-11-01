@@ -113,17 +113,6 @@ impl TunNicState {
         Ok(())
     }
 
-    #[cfg(mobile)]
-    pub(super) async fn mobile_tun_claims(
-        &self,
-    ) -> Option<crate::instance::shared_virtual_nic::SharedIfConfigClaims> {
-        let nic = self.nic_ctx.lock().await;
-        match nic.as_ref()? {
-            NicCtxContainer::Active { nic_ctx, .. } => nic_ctx.current_mobile_tun_claims().await,
-            NicCtxContainer::PacketDrain(_) => None,
-        }
-    }
-
     pub(super) async fn drain(&self) {
         self.stop().await;
         let receiver = self.receiver();
@@ -149,6 +138,7 @@ impl TunNicState {
         fd: i32,
         replace_tun_fd: bool,
         claims: crate::instance::shared_virtual_nic::SharedIfConfigClaims,
+        attachment_id: uuid::Uuid,
     ) -> anyhow::Result<()> {
         self.stop().await;
         let mut slot = self.nic_ctx.lock().await;
@@ -156,7 +146,9 @@ impl TunNicState {
         let Some(NicCtxContainer::Active { nic_ctx, magic_dns }) = slot.as_mut() else {
             unreachable!()
         };
-        nic_ctx.run_for_mobile(fd, replace_tun_fd, claims).await?;
+        nic_ctx
+            .run_for_mobile(fd, replace_tun_fd, claims, attachment_id)
+            .await?;
         if let Some(ip) = global_ctx.get_ipv4() {
             *magic_dns = MagicDnsRuntime::start(
                 global_ctx,
