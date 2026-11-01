@@ -25,7 +25,7 @@ use crate::instance::shared_virtual_nic::{SharedIfConfigConflict, SharedVirtualN
 
 #[cfg(feature = "tun")]
 use super::member::{
-    claim_prefixes, member_retry_blocked, record_member_failure, sync_member_routes,
+    MemberRetry, claim_prefixes, member_retry_blocked, record_member_failure, sync_member_routes,
 };
 use super::{
     InstanceRoutes, ROUTE_IO_TIMEOUT, RouteController, RouteControllerRuntime, retry_backoff,
@@ -104,6 +104,20 @@ impl RouteController {
     }
 }
 
+/// One failed desktop route operation and its next attempt.
+///
+/// The complete failed route and operation direction are kept, so only the
+/// same failure waits out the backoff. The record belongs to the desktop
+/// reconciler's task and never becomes a target or a second ledger.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct RouteRetry {
+    pub(super) route: RouteSpec<u32>,
+    pub(super) add: bool,
+    pub(super) retry_at: tokio::time::Instant,
+    pub(super) attempts: u32,
+    pub(super) error: Arc<str>,
+}
+
 /// Dedicated desktop background reconciler actor: exclusively owns the
 /// RouteBackend (0 locks) and drives OS route reconciliation based on plans
 /// from RouteController.
@@ -113,51 +127,44 @@ impl RouteController {
 pub(super) struct RouteReconciler<B> {
     controller: RouteController,
     backend: B,
+    /// The fixed audit grid.
+    next_audit: tokio::time::Instant,
+    /// Failure backoff of the audit itself, independent of route retries.
+    audit_retry_at: Option<tokio::time::Instant>,
+    audit_attempts: u32,
+    /// Only the backoff of an operation that already failed.
+    pub(super) route_retries: BTreeMap<RouteKey, RouteRetry>,
+    #[cfg(feature = "tun")]
+    pub(super) member_retries: BTreeMap<(Uuid, Uuid), MemberRetry>,
+    /// Deadlines at or before this instant have already had their attempt.
+    retry_horizon: tokio::time::Instant,
 }
 
 impl<B: RouteBackend> RouteReconciler<B> {
     pub(super) fn new(controller: RouteController, backend: B) -> Self {
+        let now = tokio::time::Instant::now();
         Self {
             controller,
             backend,
+            next_audit: now + AUDIT_INTERVAL,
+            audit_retry_at: None,
+            audit_attempts: 0,
+            route_retries: BTreeMap::new(),
+            #[cfg(feature = "tun")]
+            member_retries: BTreeMap::new(),
+            retry_horizon: now,
         }
     }
 
     /// Desktop worker loop: fixed audit grid plus retry deadlines and dirty
     /// input changes.
     ///
-    /// All scheduling state is local to this task; nothing here is a second
+    /// The scheduling state is owned by this task; nothing here is a second
     /// ledger. The loop never cancels a shutdown: it keeps reconciling against
     /// the empty target until no record, actual effect or member cleanup is
     /// left, and only then returns `Ok`. Ordinary operation failures become
     /// retry deadlines; only a real task error is returned.
     pub(super) async fn run(mut self) -> anyhow::Result<()> {
-        let mut next_audit = tokio::time::Instant::now() + AUDIT_INTERVAL;
-        let mut audit_retry_at: Option<tokio::time::Instant> = None;
-        let mut audit_attempt: u32 = 0;
-        // Retries are only backoff for an operation that already failed. The
-        // deadlines are read after every I/O wait, never from a stale `now`.
-        let mut route_retries: BTreeMap<
-            RouteKey,
-            (RouteSpec<u32>, bool, tokio::time::Instant, u32, Arc<str>),
-        > = BTreeMap::new();
-        #[cfg(feature = "tun")]
-        let mut member_retries: BTreeMap<
-            (Uuid, Uuid),
-            (
-                SharedVirtualNicMember,
-                BTreeSet<IpCidr>,
-                tokio::time::Instant,
-                u32,
-                Arc<str>,
-            ),
-        > = BTreeMap::new();
-        // Deadlines at or before this instant have already had their attempt.
-        // A retry recorded by the attempt itself always lies in the future, so
-        // an entry this round could not act on cannot spin the loop, while an
-        // unrelated dirty mark cannot skip an operation that really is due.
-        let mut retry_horizon = tokio::time::Instant::now();
-
         // The first round reads the current inputs even without any event.
         self.controller.dirty.mark();
 
@@ -170,36 +177,29 @@ impl<B: RouteBackend> RouteReconciler<B> {
             // independent of the route and member retries. A periodic tick and
             // a due retry share one attempt; a tick that falls inside a pending
             // backoff only advances the grid, so nothing is read twice.
-            let periodic_due = next_audit <= now;
-            let retry_due = audit_retry_at.is_some_and(|retry_at| retry_at <= now);
-            let retry_pending = audit_retry_at.is_some_and(|retry_at| retry_at > now);
+            let periodic_due = self.next_audit <= now;
+            let retry_due = self.audit_retry_at.is_some_and(|retry_at| retry_at <= now);
+            let retry_pending = self.audit_retry_at.is_some_and(|retry_at| retry_at > now);
             if periodic_due {
                 // Advance on the original grid, not relative to this moment.
-                while next_audit <= now {
-                    next_audit += AUDIT_INTERVAL;
+                while self.next_audit <= now {
+                    self.next_audit += AUDIT_INTERVAL;
                 }
             }
             if retry_due || (periodic_due && !retry_pending) {
-                match self
-                    .audit(
-                        &mut route_retries,
-                        #[cfg(feature = "tun")]
-                        &mut member_retries,
-                    )
-                    .await
-                {
+                match self.audit().await {
                     Ok(removed) => {
-                        audit_attempt = 0;
-                        audit_retry_at = None;
+                        self.audit_attempts = 0;
+                        self.audit_retry_at = None;
                         audit_removed = removed;
                     }
                     Err(error) => {
                         // An incomplete read proves nothing about absence. The
                         // ledger, its effects and the slot statuses stay as
                         // they are, and only the audit itself backs off.
-                        audit_attempt = audit_attempt.saturating_add(1);
-                        audit_retry_at =
-                            Some(tokio::time::Instant::now() + retry_backoff(audit_attempt));
+                        self.audit_attempts = self.audit_attempts.saturating_add(1);
+                        self.audit_retry_at =
+                            Some(tokio::time::Instant::now() + retry_backoff(self.audit_attempts));
                         tracing::warn!(?error, "route audit failed");
                     }
                 }
@@ -207,13 +207,16 @@ impl<B: RouteBackend> RouteReconciler<B> {
 
             // 2. Re-read the current time and every due item after that I/O.
             let now = tokio::time::Instant::now();
-            let route_due = route_retries
+            let retry_horizon = self.retry_horizon;
+            let route_due = self
+                .route_retries
                 .values()
-                .any(|(_, _, deadline, ..)| *deadline > retry_horizon && *deadline <= now);
+                .any(|retry| retry.retry_at > retry_horizon && retry.retry_at <= now);
             #[cfg(feature = "tun")]
-            let member_due = member_retries
+            let member_due = self
+                .member_retries
                 .values()
-                .any(|(_, _, deadline, ..)| *deadline > retry_horizon && *deadline <= now);
+                .any(|retry| retry.retry_at > retry_horizon && retry.retry_at <= now);
             #[cfg(not(feature = "tun"))]
             let member_due = false;
 
@@ -223,13 +226,8 @@ impl<B: RouteBackend> RouteReconciler<B> {
                 // round's input, so it is never reset afterwards.
                 let batch_started = tokio::time::Instant::now();
                 self.controller.dirty.reset();
-                self.reconcile(
-                    &mut route_retries,
-                    #[cfg(feature = "tun")]
-                    &mut member_retries,
-                )
-                .await?;
-                retry_horizon = batch_started;
+                self.reconcile().await?;
+                self.retry_horizon = batch_started;
                 // A batch of purely in-memory work must still hand the
                 // executor back, even while inputs keep changing.
                 tokio::task::yield_now().await;
@@ -243,7 +241,7 @@ impl<B: RouteBackend> RouteReconciler<B> {
             {
                 let rt = self.controller.runtime.read();
                 #[cfg(feature = "tun")]
-                let members_done = member_retries.is_empty();
+                let members_done = self.member_retries.is_empty();
                 #[cfg(not(feature = "tun"))]
                 let members_done = true;
                 if rt.shutdown && rt.instances.is_empty() && rt.applied.is_empty() && members_done {
@@ -254,19 +252,19 @@ impl<B: RouteBackend> RouteReconciler<B> {
             // 4. Wait for a real event: an input mark, the pending audit retry,
             // the next fixed audit tick, or the nearest retry deadline that has
             // not been attempted yet.
-            let mut wait_until = next_audit;
-            if let Some(retry_at) = audit_retry_at {
+            let mut wait_until = self.next_audit;
+            if let Some(retry_at) = self.audit_retry_at {
                 wait_until = wait_until.min(retry_at);
             }
-            for (_, _, deadline, ..) in route_retries.values() {
-                if *deadline > now && *deadline < wait_until {
-                    wait_until = *deadline;
+            for retry in self.route_retries.values() {
+                if retry.retry_at > now && retry.retry_at < wait_until {
+                    wait_until = retry.retry_at;
                 }
             }
             #[cfg(feature = "tun")]
-            for (_, _, deadline, ..) in member_retries.values() {
-                if *deadline > now && *deadline < wait_until {
-                    wait_until = *deadline;
+            for retry in self.member_retries.values() {
+                if retry.retry_at > now && retry.retry_at < wait_until {
+                    wait_until = retry.retry_at;
                 }
             }
             tokio::select! {
@@ -280,50 +278,30 @@ impl<B: RouteBackend> RouteReconciler<B> {
 impl<B: RouteBackend> RouteReconciler<B> {
     /// One desktop reconciliation round.
     ///
-    /// The two retry maps belong to the caller's loop. They hold only the
-    /// backoff of an operation that already failed and the member handles that
-    /// still owe prefix cleanup; no input, target or second ledger is stored.
-    /// `Ok` means this round ended, not that every route finished.
-    pub(super) async fn reconcile(
-        &mut self,
-        route_retries: &mut BTreeMap<
-            RouteKey,
-            (RouteSpec<u32>, bool, tokio::time::Instant, u32, Arc<str>),
-        >,
-        #[cfg(feature = "tun")] member_retries: &mut BTreeMap<
-            (Uuid, Uuid),
-            (
-                SharedVirtualNicMember,
-                BTreeSet<IpCidr>,
-                tokio::time::Instant,
-                u32,
-                Arc<str>,
-            ),
-        >,
-    ) -> anyhow::Result<()> {
+    /// The retry records are owned by this task. They hold only the backoff of
+    /// an operation that already failed and the member handles that still owe
+    /// prefix cleanup; no input, target or second ledger is stored. `Ok` means
+    /// this round ended, not that every route finished.
+    pub(super) async fn reconcile(&mut self) -> anyhow::Result<()> {
         // A. Plan from the current inputs plus the evidence of older failures.
         // The admission record belongs to one planning call: the planner clears
         // it on entry and reports only that call's failed member admissions.
         let mut admission_failures = BTreeMap::new();
-        let errors = self.retry_errors(
-            route_retries,
-            #[cfg(feature = "tun")]
-            member_retries,
-        );
+        let errors = self.retry_errors();
         #[cfg_attr(not(feature = "tun"), allow(unused_mut))]
         let mut plan = self
             .controller
             .plan_reconciliation(None, &errors, Some(&mut admission_failures))
             .await;
         #[cfg(feature = "tun")]
-        self.record_admission_failures(&plan, &admission_failures, member_retries);
+        self.record_admission_failures(&plan, &admission_failures);
 
         #[cfg_attr(not(feature = "tun"), allow(unused_mut))]
         let mut synced: BTreeMap<(Uuid, Uuid), BTreeSet<IpCidr>> = BTreeMap::new();
         #[cfg_attr(not(feature = "tun"), allow(unused_mut))]
         let mut cleared: BTreeSet<(Uuid, Uuid)> = BTreeSet::new();
         #[cfg(feature = "tun")]
-        let mut related = self.related_members(&plan, member_retries);
+        let mut related = self.related_members(&plan);
 
         // B/C. Member prefixes first: withdraw what is no longer declared so a
         // member blocked by stale claims can be admitted again, then plan once
@@ -333,27 +311,21 @@ impl<B: RouteBackend> RouteReconciler<B> {
             self.withdraw_member_prefixes(
                 &plan,
                 &related,
-                member_retries,
                 &admission_failures,
                 &mut synced,
                 &mut cleared,
             )
             .await;
-            let errors = self.retry_errors(
-                route_retries,
-                #[cfg(feature = "tun")]
-                member_retries,
-            );
+            let errors = self.retry_errors();
             plan = self
                 .controller
                 .plan_reconciliation(None, &errors, Some(&mut admission_failures))
                 .await;
-            self.record_admission_failures(&plan, &admission_failures, member_retries);
+            self.record_admission_failures(&plan, &admission_failures);
             Self::extend_related_members(&mut related, &plan);
             self.sync_member_prefixes(
                 &plan,
                 &related,
-                member_retries,
                 &admission_failures,
                 &mut synced,
                 &mut cleared,
@@ -362,40 +334,22 @@ impl<B: RouteBackend> RouteReconciler<B> {
         }
 
         // D–H. Reconcile every actual row, its owners and the OS effects.
-        let (changed, budget_exhausted) = self
-            .reconcile_routes(
-                &plan,
-                route_retries,
-                #[cfg(feature = "tun")]
-                member_retries,
-                &synced,
-                &cleared,
-            )
-            .await;
+        let (changed, budget_exhausted) = self.reconcile_routes(&plan, &synced, &cleared).await;
 
         // I. Feed this round's real evidence back through the same planner.
-        self.prune_route_retries(route_retries, &plan.desired);
-        let errors = self.retry_errors(
-            route_retries,
-            #[cfg(feature = "tun")]
-            member_retries,
-        );
+        self.prune_route_retries(&plan.desired);
+        let errors = self.retry_errors();
         let final_plan = self
             .controller
             .plan_reconciliation(Some(&synced), &errors, Some(&mut admission_failures))
             .await;
         #[cfg(feature = "tun")]
         {
-            self.record_admission_failures(&final_plan, &admission_failures, member_retries);
+            self.record_admission_failures(&final_plan, &admission_failures);
             Self::extend_related_members(&mut related, &final_plan);
-            self.transfer_orphan_members(&related, member_retries, &synced, &cleared);
+            self.transfer_orphan_members(&related, &synced, &cleared);
         }
-        let removed = self.remove_finished_instances(
-            &synced,
-            &cleared,
-            #[cfg(feature = "tun")]
-            member_retries,
-        );
+        let removed = self.remove_finished_instances(&synced, &cleared);
         if changed || removed {
             self.controller.changed().notify_waiters();
         }
@@ -417,7 +371,7 @@ impl<B: RouteBackend> RouteReconciler<B> {
                     // This round's own commit confirmed the whole goal.
                     return false;
                 }
-                if member_retry_blocked(member_retries, key, &final_target, now) {
+                if member_retry_blocked(&self.member_retries, key, &final_target, now) {
                     // The next attempt is already scheduled.
                     return false;
                 }
@@ -426,10 +380,7 @@ impl<B: RouteBackend> RouteReconciler<B> {
         };
         #[cfg(not(feature = "tun"))]
         let member_actionable = false;
-        if budget_exhausted
-            || member_actionable
-            || self.actionable_add(&final_plan, route_retries, &synced)
-        {
+        if budget_exhausted || member_actionable || self.actionable_add(&final_plan, &synced) {
             // Work this round could not start or finish is actionable right
             // now, for example a member acknowledgement that arrived after
             // this round's plan. A future retry deadline never reaches here,
@@ -451,19 +402,9 @@ impl<B: RouteBackend> RouteReconciler<B> {
     /// a timer here.
     #[cfg(feature = "tun")]
     fn record_admission_failures(
-        &self,
+        &mut self,
         plan: &ReconcilePlan,
         admission_failures: &BTreeMap<(Uuid, Uuid), (BTreeSet<IpCidr>, RouteStatus)>,
-        member_retries: &mut BTreeMap<
-            (Uuid, Uuid),
-            (
-                SharedVirtualNicMember,
-                BTreeSet<IpCidr>,
-                tokio::time::Instant,
-                u32,
-                Arc<str>,
-            ),
-        >,
     ) {
         for ((run, registration), (prefixes, status)) in admission_failures {
             let RouteStatus::Pending { error: Some(error) } = status else {
@@ -480,7 +421,7 @@ impl<B: RouteBackend> RouteReconciler<B> {
                 continue;
             }
             record_member_failure(
-                member_retries,
+                &mut self.member_retries,
                 (*run, *registration),
                 member,
                 prefixes.clone(),
@@ -520,10 +461,6 @@ impl<B: RouteBackend> RouteReconciler<B> {
     fn actionable_add(
         &self,
         plan: &ReconcilePlan,
-        route_retries: &BTreeMap<
-            RouteKey,
-            (RouteSpec<u32>, bool, tokio::time::Instant, u32, Arc<str>),
-        >,
         synced: &BTreeMap<(Uuid, Uuid), BTreeSet<IpCidr>>,
     ) -> bool {
         let applied = self.controller.runtime.read().applied.clone();
@@ -531,7 +468,7 @@ impl<B: RouteBackend> RouteReconciler<B> {
         plan.add.iter().any(|route| {
             let key = RouteKey::of(route);
             if applied.contains_key(&key)
-                || route_retry_blocked(route_retries, &key, route, true, now)
+                || route_retry_blocked(&self.route_retries, &key, route, true, now)
             {
                 return false;
             }
@@ -548,57 +485,28 @@ impl<B: RouteBackend> RouteReconciler<B> {
     /// A retry is only backoff for an operation that already failed; it never
     /// becomes a target or an effect. Member failures reach only the rows that
     /// this registration still carries.
-    fn retry_errors(
-        &self,
-        route_retries: &BTreeMap<
-            RouteKey,
-            (RouteSpec<u32>, bool, tokio::time::Instant, u32, Arc<str>),
-        >,
-        #[cfg(feature = "tun")] member_retries: &BTreeMap<
-            (Uuid, Uuid),
-            (
-                SharedVirtualNicMember,
-                BTreeSet<IpCidr>,
-                tokio::time::Instant,
-                u32,
-                Arc<str>,
-            ),
-        >,
-    ) -> BTreeMap<RouteSpec<u32>, Arc<str>> {
+    fn retry_errors(&self) -> BTreeMap<RouteSpec<u32>, Arc<str>> {
         let mut errors = BTreeMap::new();
-        for (route, _, _, _, error) in route_retries.values() {
-            errors.insert(route.clone(), error.clone());
+        for retry in self.route_retries.values() {
+            errors.insert(retry.route.clone(), retry.error.clone());
         }
         #[cfg(feature = "tun")]
-        self.member_retry_errors(member_retries, &mut errors);
+        self.member_retry_errors(&mut errors);
         errors
     }
 
     #[cfg(feature = "tun")]
-    fn member_retry_errors(
-        &self,
-        member_retries: &BTreeMap<
-            (Uuid, Uuid),
-            (
-                SharedVirtualNicMember,
-                BTreeSet<IpCidr>,
-                tokio::time::Instant,
-                u32,
-                Arc<str>,
-            ),
-        >,
-        errors: &mut BTreeMap<RouteSpec<u32>, Arc<str>>,
-    ) {
-        for ((run, registration), (_, target, _, _, error)) in member_retries {
-            if target.is_empty() {
+    fn member_retry_errors(&self, errors: &mut BTreeMap<RouteSpec<u32>, Arc<str>>) {
+        for ((run, registration), retry) in &self.member_retries {
+            if retry.target.is_empty() {
                 continue;
             }
             let Some(routes) = self.declared_member_routes(*run, *registration) else {
                 continue;
             };
             for route in routes {
-                if target.contains(&route.destination) {
-                    errors.insert(route, error.clone());
+                if retry.target.contains(&route.destination) {
+                    errors.insert(route, retry.error.clone());
                 }
             }
         }
@@ -612,16 +520,6 @@ impl<B: RouteBackend> RouteReconciler<B> {
     fn related_members(
         &self,
         plan: &ReconcilePlan,
-        member_retries: &BTreeMap<
-            (Uuid, Uuid),
-            (
-                SharedVirtualNicMember,
-                BTreeSet<IpCidr>,
-                tokio::time::Instant,
-                u32,
-                Arc<str>,
-            ),
-        >,
     ) -> BTreeMap<(Uuid, Uuid), SharedVirtualNicMember> {
         let mut related = BTreeMap::new();
         Self::extend_related_members(&mut related, plan);
@@ -635,8 +533,8 @@ impl<B: RouteBackend> RouteReconciler<B> {
                 }
             }
         }
-        for (key, (member, ..)) in member_retries {
-            related.entry(*key).or_insert_with(|| member.clone());
+        for (key, retry) in &self.member_retries {
+            related.entry(*key).or_insert_with(|| retry.member.clone());
         }
         related
     }
@@ -699,19 +597,9 @@ impl<B: RouteBackend> RouteReconciler<B> {
     /// real claims and retry stay until a fresh round admits it.
     #[cfg(feature = "tun")]
     async fn withdraw_member_prefixes(
-        &self,
+        &mut self,
         plan: &ReconcilePlan,
         related: &BTreeMap<(Uuid, Uuid), SharedVirtualNicMember>,
-        member_retries: &mut BTreeMap<
-            (Uuid, Uuid),
-            (
-                SharedVirtualNicMember,
-                BTreeSet<IpCidr>,
-                tokio::time::Instant,
-                u32,
-                Arc<str>,
-            ),
-        >,
         admission_failures: &BTreeMap<(Uuid, Uuid), (BTreeSet<IpCidr>, RouteStatus)>,
         synced: &mut BTreeMap<(Uuid, Uuid), BTreeSet<IpCidr>>,
         cleared: &mut BTreeSet<(Uuid, Uuid)>,
@@ -723,7 +611,7 @@ impl<B: RouteBackend> RouteReconciler<B> {
                 continue;
             }
             let final_target = targets.get(key).cloned().unwrap_or_default();
-            if member_retry_blocked(member_retries, key, &final_target, now) {
+            if member_retry_blocked(&self.member_retries, key, &final_target, now) {
                 continue;
             }
             let claims = match tokio::time::timeout(ROUTE_IO_TIMEOUT, member.claims()).await {
@@ -735,7 +623,13 @@ impl<B: RouteBackend> RouteReconciler<B> {
                     );
                     synced.remove(key);
                     cleared.remove(key);
-                    record_member_failure(member_retries, *key, member, final_target, &error);
+                    record_member_failure(
+                        &mut self.member_retries,
+                        *key,
+                        member,
+                        final_target,
+                        &error,
+                    );
                     continue;
                 }
             };
@@ -753,18 +647,24 @@ impl<B: RouteBackend> RouteReconciler<B> {
                 Ok(true) => {
                     cleared.remove(key);
                     synced.insert(*key, stage);
-                    member_retries.remove(key);
+                    self.member_retries.remove(key);
                 }
                 Ok(false) => {
                     synced.remove(key);
                     cleared.insert(*key);
-                    member_retries.remove(key);
+                    self.member_retries.remove(key);
                 }
                 Err(error) => {
                     synced.remove(key);
                     cleared.remove(key);
                     tracing::warn!(?error, ?key, "failed to withdraw member routes");
-                    record_member_failure(member_retries, *key, member, final_target, &error);
+                    record_member_failure(
+                        &mut self.member_retries,
+                        *key,
+                        member,
+                        final_target,
+                        &error,
+                    );
                 }
             }
         }
@@ -778,19 +678,9 @@ impl<B: RouteBackend> RouteReconciler<B> {
     /// a dead registration records only that it is cleared.
     #[cfg(feature = "tun")]
     async fn sync_member_prefixes(
-        &self,
+        &mut self,
         plan: &ReconcilePlan,
         related: &BTreeMap<(Uuid, Uuid), SharedVirtualNicMember>,
-        member_retries: &mut BTreeMap<
-            (Uuid, Uuid),
-            (
-                SharedVirtualNicMember,
-                BTreeSet<IpCidr>,
-                tokio::time::Instant,
-                u32,
-                Arc<str>,
-            ),
-        >,
         admission_failures: &BTreeMap<(Uuid, Uuid), (BTreeSet<IpCidr>, RouteStatus)>,
         synced: &mut BTreeMap<(Uuid, Uuid), BTreeSet<IpCidr>>,
         cleared: &mut BTreeSet<(Uuid, Uuid)>,
@@ -802,11 +692,11 @@ impl<B: RouteBackend> RouteReconciler<B> {
                 continue;
             }
             let final_target = targets.get(key).cloned().unwrap_or_default();
-            if member_retry_blocked(member_retries, key, &final_target, now) {
+            if member_retry_blocked(&self.member_retries, key, &final_target, now) {
                 continue;
             }
             let target = self.fresh_member_target(*key, &final_target);
-            if synced.get(key) == Some(&target) && !member_retries.contains_key(key) {
+            if synced.get(key) == Some(&target) && !self.member_retries.contains_key(key) {
                 // This round already committed exactly this target for this
                 // registration; that commit is the acknowledgement.
                 continue;
@@ -815,18 +705,24 @@ impl<B: RouteBackend> RouteReconciler<B> {
                 Ok(true) => {
                     cleared.remove(key);
                     synced.insert(*key, target);
-                    member_retries.remove(key);
+                    self.member_retries.remove(key);
                 }
                 Ok(false) => {
                     synced.remove(key);
                     cleared.insert(*key);
-                    member_retries.remove(key);
+                    self.member_retries.remove(key);
                 }
                 Err(error) => {
                     synced.remove(key);
                     cleared.remove(key);
                     tracing::warn!(?error, ?key, "failed to sync member routes");
-                    record_member_failure(member_retries, *key, member, final_target, &error);
+                    record_member_failure(
+                        &mut self.member_retries,
+                        *key,
+                        member,
+                        final_target,
+                        &error,
+                    );
                 }
             }
         }
@@ -860,18 +756,8 @@ impl<B: RouteBackend> RouteReconciler<B> {
     /// target's backoff.
     #[cfg(feature = "tun")]
     fn transfer_orphan_members(
-        &self,
+        &mut self,
         related: &BTreeMap<(Uuid, Uuid), SharedVirtualNicMember>,
-        member_retries: &mut BTreeMap<
-            (Uuid, Uuid),
-            (
-                SharedVirtualNicMember,
-                BTreeSet<IpCidr>,
-                tokio::time::Instant,
-                u32,
-                Arc<str>,
-            ),
-        >,
         synced: &BTreeMap<(Uuid, Uuid), BTreeSet<IpCidr>>,
         cleared: &BTreeSet<(Uuid, Uuid)>,
     ) {
@@ -898,21 +784,22 @@ impl<B: RouteBackend> RouteReconciler<B> {
             if synced.get(key).is_some_and(|prefixes| prefixes.is_empty()) {
                 continue;
             }
-            if member_retries
+            if self
+                .member_retries
                 .get(key)
-                .is_some_and(|(_, target, ..)| target.is_empty())
+                .is_some_and(|retry| retry.target.is_empty())
             {
                 continue;
             }
-            member_retries.insert(
+            self.member_retries.insert(
                 *key,
-                (
-                    member.clone(),
-                    BTreeSet::new(),
-                    now,
-                    0,
-                    Arc::from("member binding withdrew before its prefixes were cleared"),
-                ),
+                MemberRetry {
+                    member: member.clone(),
+                    target: BTreeSet::new(),
+                    retry_at: now,
+                    attempts: 0,
+                    error: Arc::from("member binding withdrew before its prefixes were cleared"),
+                },
             );
         }
     }
@@ -928,16 +815,6 @@ impl<B: RouteBackend> RouteReconciler<B> {
         &self,
         synced: &BTreeMap<(Uuid, Uuid), BTreeSet<IpCidr>>,
         cleared: &BTreeSet<(Uuid, Uuid)>,
-        #[cfg(feature = "tun")] member_retries: &BTreeMap<
-            (Uuid, Uuid),
-            (
-                SharedVirtualNicMember,
-                BTreeSet<IpCidr>,
-                tokio::time::Instant,
-                u32,
-                Arc<str>,
-            ),
-        >,
     ) -> bool {
         #[cfg(not(feature = "tun"))]
         let _ = (synced, cleared);
@@ -953,7 +830,11 @@ impl<B: RouteBackend> RouteReconciler<B> {
             }
             #[cfg(feature = "tun")]
             {
-                if member_retries.keys().any(|(retry_run, _)| retry_run == run) {
+                if self
+                    .member_retries
+                    .keys()
+                    .any(|(retry_run, _)| retry_run == run)
+                {
                     continue;
                 }
                 if let Some(member) = &instance.member {
@@ -982,20 +863,6 @@ impl<B: RouteBackend> RouteReconciler<B> {
     async fn reconcile_routes(
         &mut self,
         plan: &ReconcilePlan,
-        route_retries: &mut BTreeMap<
-            RouteKey,
-            (RouteSpec<u32>, bool, tokio::time::Instant, u32, Arc<str>),
-        >,
-        #[cfg(feature = "tun")] member_retries: &mut BTreeMap<
-            (Uuid, Uuid),
-            (
-                SharedVirtualNicMember,
-                BTreeSet<IpCidr>,
-                tokio::time::Instant,
-                u32,
-                Arc<str>,
-            ),
-        >,
         synced: &BTreeMap<(Uuid, Uuid), BTreeSet<IpCidr>>,
         cleared: &BTreeSet<(Uuid, Uuid)>,
     ) -> (bool, bool) {
@@ -1073,7 +940,7 @@ impl<B: RouteBackend> RouteReconciler<B> {
                 RouteEffect::Removing => false,
                 _ => continue,
             };
-            if !route_retry_blocked(route_retries, key, &row.route, add, now) {
+            if !route_retry_blocked(&self.route_retries, key, &row.route, add, now) {
                 confirm.push((key.clone(), row.route.clone(), add));
             }
         }
@@ -1090,7 +957,7 @@ impl<B: RouteBackend> RouteReconciler<B> {
             };
             if target != route
                 || applied.contains_key(&key)
-                || route_retry_blocked(route_retries, &key, route, true, now)
+                || route_retry_blocked(&self.route_retries, &key, route, true, now)
             {
                 continue;
             }
@@ -1118,12 +985,12 @@ impl<B: RouteBackend> RouteReconciler<B> {
                 Ok(Err(failure)) => {
                     // An incomplete readback proves nothing about absence.
                     let error = anyhow::anyhow!(failure.to_string());
-                    record_read_failure(&confirm, &candidates, route_retries, &error);
+                    record_read_failure(&confirm, &candidates, &mut self.route_retries, &error);
                     None
                 }
                 Err(_) => {
                     let error = anyhow::anyhow!("timed out reading existing routes");
-                    record_read_failure(&confirm, &candidates, route_retries, &error);
+                    record_read_failure(&confirm, &candidates, &mut self.route_retries, &error);
                     None
                 }
             }
@@ -1149,12 +1016,12 @@ impl<B: RouteBackend> RouteReconciler<B> {
                     }
                     drop(rt);
                     if retire {
-                        route_retries.remove(key);
+                        self.route_retries.remove(key);
                         changed = true;
                     }
                 } else if *add {
                     record_route_failure(
-                        route_retries,
+                        &mut self.route_retries,
                         key.clone(),
                         route,
                         true,
@@ -1213,7 +1080,7 @@ impl<B: RouteBackend> RouteReconciler<B> {
                     // would bypass admission.
                     continue;
                 }
-                if route_retry_blocked(route_retries, &key, &route, true, now) {
+                if route_retry_blocked(&self.route_retries, &key, &route, true, now) {
                     continue;
                 }
                 if budget == 0 {
@@ -1229,7 +1096,7 @@ impl<B: RouteBackend> RouteReconciler<B> {
                 let result = self.add_route_effect(route.clone(), owners.clone()).await;
                 match result {
                     Ok(()) => {
-                        route_retries.remove(&key);
+                        self.route_retries.remove(&key);
                         changed = true;
                     }
                     Err(error) => {
@@ -1240,7 +1107,7 @@ impl<B: RouteBackend> RouteReconciler<B> {
                             changed = true;
                         }
                         record_route_failure(
-                            route_retries,
+                            &mut self.route_retries,
                             key,
                             &route,
                             true,
@@ -1282,18 +1149,7 @@ impl<B: RouteBackend> RouteReconciler<B> {
                             current.route == row.route && current.effect == RouteEffect::External
                         })
                     };
-                    if !current_external
-                        || !self
-                            .row_may_be_removed(
-                                row,
-                                route_retries,
-                                #[cfg(feature = "tun")]
-                                member_retries,
-                                synced,
-                                cleared,
-                            )
-                            .await
-                    {
+                    if !current_external || !self.row_may_be_removed(row, synced, cleared).await {
                         continue;
                     }
                     let mut rt = self.controller.runtime.write();
@@ -1320,7 +1176,7 @@ impl<B: RouteBackend> RouteReconciler<B> {
             // deletion keep their deadline until it really passes; an
             // unrelated dirty mark cannot shorten it.
             if route_retry_blocked(
-                route_retries,
+                &self.route_retries,
                 &key,
                 &route,
                 false,
@@ -1344,17 +1200,7 @@ impl<B: RouteBackend> RouteReconciler<B> {
                 let Some(current) = current else {
                     continue;
                 };
-                if !self
-                    .row_may_be_removed(
-                        &current,
-                        route_retries,
-                        #[cfg(feature = "tun")]
-                        member_retries,
-                        synced,
-                        cleared,
-                    )
-                    .await
-                {
+                if !self.row_may_be_removed(&current, synced, cleared).await {
                     continue;
                 }
                 // No await may separate this fresh result from the deletion:
@@ -1384,7 +1230,7 @@ impl<B: RouteBackend> RouteReconciler<B> {
             };
             match self.remove_route_effect(&route).await {
                 Ok(()) => {
-                    route_retries.remove(&key);
+                    self.route_retries.remove(&key);
                     changed = true;
                 }
                 Err(error) => {
@@ -1402,7 +1248,7 @@ impl<B: RouteBackend> RouteReconciler<B> {
                         changed = true;
                     }
                     record_route_failure(
-                        route_retries,
+                        &mut self.route_retries,
                         key,
                         &route,
                         false,
@@ -1713,37 +1559,19 @@ impl<B: RouteBackend> RouteReconciler<B> {
     /// This only plans: it records a transient admission failure in the
     /// caller's retry map, reads no OS state and changes no member claim.
     async fn row_may_be_removed(
-        &self,
+        &mut self,
         row: &AppliedRoute,
-        route_retries: &BTreeMap<
-            RouteKey,
-            (RouteSpec<u32>, bool, tokio::time::Instant, u32, Arc<str>),
-        >,
-        #[cfg(feature = "tun")] member_retries: &mut BTreeMap<
-            (Uuid, Uuid),
-            (
-                SharedVirtualNicMember,
-                BTreeSet<IpCidr>,
-                tokio::time::Instant,
-                u32,
-                Arc<str>,
-            ),
-        >,
         synced: &BTreeMap<(Uuid, Uuid), BTreeSet<IpCidr>>,
         cleared: &BTreeSet<(Uuid, Uuid)>,
     ) -> bool {
-        let errors = self.retry_errors(
-            route_retries,
-            #[cfg(feature = "tun")]
-            member_retries,
-        );
+        let errors = self.retry_errors();
         let mut admission_failures = BTreeMap::new();
         let fresh = self
             .controller
             .plan_reconciliation(None, &errors, Some(&mut admission_failures))
             .await;
         #[cfg(feature = "tun")]
-        self.record_admission_failures(&fresh, &admission_failures, member_retries);
+        self.record_admission_failures(&fresh, &admission_failures);
         #[cfg(not(feature = "tun"))]
         let _ = (&admission_failures, synced, cleared);
 
@@ -1964,31 +1792,29 @@ impl<B: RouteBackend> RouteReconciler<B> {
 
     /// Drop retries that no longer guard any uncertainty or cleanup.
     fn prune_route_retries(
-        &self,
-        retries: &mut BTreeMap<
-            RouteKey,
-            (RouteSpec<u32>, bool, tokio::time::Instant, u32, Arc<str>),
-        >,
+        &mut self,
         desired: &BTreeMap<RouteKey, (RouteSpec<u32>, BTreeSet<Uuid>)>,
     ) {
         let applied = self.controller.runtime.read().applied.clone();
-        retries.retain(|key, (route, add, _, _, _)| {
+        self.route_retries.retain(|key, retry| {
             let confirmed = applied.get(key).is_some_and(|row| {
-                row.route == *route
+                row.route == retry.route
                     && matches!(row.effect, RouteEffect::Owned | RouteEffect::External)
             });
-            let wanted = desired.get(key).is_some_and(|(target, _)| target == route);
-            if *add {
+            let wanted = desired
+                .get(key)
+                .is_some_and(|(target, _)| *target == retry.route);
+            if retry.add {
                 if confirmed {
                     return false;
                 }
                 wanted
-                    || applied
-                        .get(key)
-                        .is_some_and(|row| row.route == *route && row.effect == RouteEffect::Adding)
+                    || applied.get(key).is_some_and(|row| {
+                        row.route == retry.route && row.effect == RouteEffect::Adding
+                    })
             } else {
                 match applied.get(key) {
-                    Some(row) if row.route == *route => !(confirmed && wanted),
+                    Some(row) if row.route == retry.route => !(confirmed && wanted),
                     _ => false,
                 }
             }
@@ -2007,23 +1833,7 @@ impl<B: RouteBackend> RouteReconciler<B> {
     /// The audit never re-plans: it only invalidates the declarations this
     /// readback proved missing, so an unrelated member admission cannot turn a
     /// healthy row pending. Every other status is left for the next reconcile.
-    pub(crate) async fn audit(
-        &mut self,
-        route_retries: &mut BTreeMap<
-            RouteKey,
-            (RouteSpec<u32>, bool, tokio::time::Instant, u32, Arc<str>),
-        >,
-        #[cfg(feature = "tun")] member_retries: &mut BTreeMap<
-            (Uuid, Uuid),
-            (
-                SharedVirtualNicMember,
-                BTreeSet<IpCidr>,
-                tokio::time::Instant,
-                u32,
-                Arc<str>,
-            ),
-        >,
-    ) -> anyhow::Result<bool> {
+    pub(super) async fn audit(&mut self) -> anyhow::Result<bool> {
         // One short lock copies the complete actual rows: full route, effect,
         // owners and member registrations. No lock survives the readback.
         let observed = self.controller.runtime.read().applied.clone();
@@ -2085,11 +1895,12 @@ impl<B: RouteBackend> RouteReconciler<B> {
                 RouteEffect::Adding => add,
                 RouteEffect::Removing => !add,
             };
-            if route_retries
+            if self
+                .route_retries
                 .get(key)
-                .is_some_and(|(failed, add, ..)| failed == route && stale(*add))
+                .is_some_and(|retry| retry.route == *route && stale(retry.add))
             {
-                route_retries.remove(key);
+                self.route_retries.remove(key);
             }
             #[cfg(feature = "tun")]
             if let Some(row) = observed.get(key) {
@@ -2110,12 +1921,7 @@ impl<B: RouteBackend> RouteReconciler<B> {
         {
             let empty_synced = BTreeMap::new();
             let empty_cleared = BTreeSet::new();
-            self.transfer_orphan_members(
-                &removed_members,
-                member_retries,
-                &empty_synced,
-                &empty_cleared,
-            );
+            self.transfer_orphan_members(&removed_members, &empty_synced, &empty_cleared);
         }
 
         // Invalidate only the current declarations this readback proved
@@ -2123,11 +1929,7 @@ impl<B: RouteBackend> RouteReconciler<B> {
         // released root, a rebound device or a withdrawn slot is never
         // described by an older observation, and no slot is prepared or
         // re-planned.
-        let errors = self.retry_errors(
-            route_retries,
-            #[cfg(feature = "tun")]
-            member_retries,
-        );
+        let errors = self.retry_errors();
         {
             let rt = self.controller.runtime.read();
             if !rt.shutdown {
@@ -2932,7 +2734,7 @@ const ROUTE_OPERATION_BUDGET: u32 = 64;
 /// A different complete route or the other operation is a real change and is
 /// allowed to proceed; an unrelated dirty mark cannot shorten the wait.
 fn route_retry_blocked(
-    retries: &BTreeMap<RouteKey, (RouteSpec<u32>, bool, tokio::time::Instant, u32, Arc<str>)>,
+    retries: &BTreeMap<RouteKey, RouteRetry>,
     key: &RouteKey,
     route: &RouteSpec<u32>,
     add: bool,
@@ -2940,13 +2742,11 @@ fn route_retry_blocked(
 ) -> bool {
     retries
         .get(key)
-        .is_some_and(|(failed, failed_add, deadline, ..)| {
-            failed == route && *failed_add == add && *deadline > now
-        })
+        .is_some_and(|retry| retry.route == *route && retry.add == add && retry.retry_at > now)
 }
 /// Record (or extend) the backoff of one failed route operation.
 fn record_route_failure(
-    retries: &mut BTreeMap<RouteKey, (RouteSpec<u32>, bool, tokio::time::Instant, u32, Arc<str>)>,
+    retries: &mut BTreeMap<RouteKey, RouteRetry>,
     key: RouteKey,
     route: &RouteSpec<u32>,
     add: bool,
@@ -2954,19 +2754,26 @@ fn record_route_failure(
 ) {
     let now = tokio::time::Instant::now();
     match retries.get_mut(&key) {
-        Some((failed, failed_add, deadline, attempt, failed_error))
-            if failed == route && *failed_add == add =>
-        {
+        Some(retry) if retry.route == *route && retry.add == add => {
             // A repeated readback failure of an operation that has not been
             // retried keeps its original deadline.
-            if *deadline <= now {
-                *attempt = attempt.saturating_add(1);
-                *deadline = now + retry_backoff(*attempt);
+            if retry.retry_at <= now {
+                retry.attempts = retry.attempts.saturating_add(1);
+                retry.retry_at = now + retry_backoff(retry.attempts);
             }
-            *failed_error = error;
+            retry.error = error;
         }
         _ => {
-            retries.insert(key, (route.clone(), add, now + retry_backoff(1), 1, error));
+            retries.insert(
+                key,
+                RouteRetry {
+                    route: route.clone(),
+                    add,
+                    retry_at: now + retry_backoff(1),
+                    attempts: 1,
+                    error,
+                },
+            );
         }
     }
 }
@@ -2974,7 +2781,7 @@ fn record_route_failure(
 fn record_read_failure(
     confirm: &[(RouteKey, RouteSpec<u32>, bool)],
     candidates: &[(RouteSpec<u32>, BTreeSet<Uuid>)],
-    retries: &mut BTreeMap<RouteKey, (RouteSpec<u32>, bool, tokio::time::Instant, u32, Arc<str>)>,
+    retries: &mut BTreeMap<RouteKey, RouteRetry>,
     error: &anyhow::Error,
 ) {
     let error: Arc<str> = Arc::from(error.to_string());

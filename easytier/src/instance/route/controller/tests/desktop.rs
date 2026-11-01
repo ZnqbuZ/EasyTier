@@ -220,28 +220,11 @@ impl RouteBackend for Arc<MockBackend> {
     }
 }
 
-type RouteRetries = BTreeMap<RouteKey, (RouteSpec<u32>, bool, tokio::time::Instant, u32, Arc<str>)>;
-
-#[cfg(feature = "tun")]
-type MemberRetries = BTreeMap<
-    (Uuid, Uuid),
-    (
-        SharedVirtualNicMember,
-        BTreeSet<IpCidr>,
-        tokio::time::Instant,
-        u32,
-        Arc<str>,
-    ),
->;
-
-/// One reconciler plus the retry maps that belong to its worker loop.
+/// One reconciler; the retry records belong to the same task.
 struct Harness {
     controller: RouteController,
     mock: Arc<MockBackend>,
     reconciler: RouteReconciler<Arc<MockBackend>>,
-    route_retries: RouteRetries,
-    #[cfg(feature = "tun")]
-    member_retries: MemberRetries,
 }
 
 impl Harness {
@@ -253,25 +236,15 @@ impl Harness {
             controller,
             mock,
             reconciler,
-            route_retries: BTreeMap::new(),
-            #[cfg(feature = "tun")]
-            member_retries: BTreeMap::new(),
         }
     }
 
     async fn round(&mut self) -> anyhow::Result<()> {
         // The real reconcile has no overall test-facing bound; this one
         // only turns a hung test into a diagnostic instead of a wait.
-        tokio::time::timeout(
-            Duration::from_secs(30),
-            self.reconciler.reconcile(
-                &mut self.route_retries,
-                #[cfg(feature = "tun")]
-                &mut self.member_retries,
-            ),
-        )
-        .await
-        .expect("the reconcile round must finish within 30s")
+        tokio::time::timeout(Duration::from_secs(30), self.reconciler.reconcile())
+            .await
+            .expect("the reconcile round must finish within 30s")
     }
 
     async fn round_ok(&mut self) {
@@ -509,7 +482,7 @@ async fn multi_owner_shared_ordinary_route_is_kept_until_the_last_owner_withdraw
         vec![route],
         "the shared row is deleted exactly once"
     );
-    assert!(h.route_retries.is_empty());
+    assert!(h.reconciler.route_retries.is_empty());
 }
 
 // Planning tests. Every route below uses an explicit interface index, so
@@ -637,9 +610,12 @@ async fn a_definite_add_failure_pends_only_its_route_until_the_retry_deadline() 
     );
     assert_eq!(statuses.get(&b), Some(&RouteStatus::Ready));
     let key = RouteKey::of(&a_route);
-    assert_eq!(h.route_retries[&key].0, a_route);
-    assert!(h.route_retries[&key].1, "the retry belongs to the addition");
-    assert!(h.route_retries[&key].2 > tokio::time::Instant::now());
+    assert_eq!(h.reconciler.route_retries[&key].route, a_route);
+    assert!(
+        h.reconciler.route_retries[&key].add,
+        "the retry belongs to the addition"
+    );
+    assert!(h.reconciler.route_retries[&key].retry_at > tokio::time::Instant::now());
     assert_eq!(
         h.mock
             .add_calls
@@ -688,7 +664,7 @@ async fn a_definite_add_failure_pends_only_its_route_until_the_retry_deadline() 
         2,
         "the retry runs once the deadline really passed"
     );
-    assert!(h.route_retries.is_empty());
+    assert!(h.reconciler.route_retries.is_empty());
 }
 
 #[tokio::test(start_paused = true)]
@@ -716,9 +692,12 @@ async fn a_definite_remove_failure_restores_owned_until_its_retry_deadline() {
     assert!(h.mock.contains(&route));
     assert_eq!(h.mock.remove_count(), 1);
     let key = RouteKey::of(&route);
-    assert_eq!(h.route_retries[&key].0, route);
-    assert!(!h.route_retries[&key].1, "the retry belongs to the removal");
-    assert!(h.route_retries[&key].2 > tokio::time::Instant::now());
+    assert_eq!(h.reconciler.route_retries[&key].route, route);
+    assert!(
+        !h.reconciler.route_retries[&key].add,
+        "the retry belongs to the removal"
+    );
+    assert!(h.reconciler.route_retries[&key].retry_at > tokio::time::Instant::now());
 
     h.controller.dirty.mark();
     tokio::time::advance(Duration::from_millis(100)).await;
@@ -735,7 +714,7 @@ async fn a_definite_remove_failure_restores_owned_until_its_retry_deadline() {
     assert_eq!(h.mock.remove_count(), 2);
     assert_eq!(h.effect(&route), None);
     assert!(!h.mock.contains(&route));
-    assert!(h.route_retries.is_empty());
+    assert!(h.reconciler.route_retries.is_empty());
 }
 
 #[tokio::test(start_paused = true)]
@@ -773,15 +752,15 @@ async fn an_unknown_removal_stays_removing_and_completes_at_the_retry() {
         "a present readback must not promote the uncertain removal back to Owned"
     );
     assert_eq!(h.mock.remove_count(), 2);
-    assert!(!h.route_retries[&key].1);
-    assert!(h.route_retries[&key].2 > tokio::time::Instant::now());
+    assert!(!h.reconciler.route_retries[&key].add);
+    assert!(h.reconciler.route_retries[&key].retry_at > tokio::time::Instant::now());
 
     tokio::time::advance(Duration::from_millis(400)).await;
     h.round_ok().await;
     assert_eq!(h.effect(&route), None);
     assert!(!h.mock.contains(&route));
     assert_eq!(h.mock.remove_count(), 3);
-    assert!(h.route_retries.is_empty());
+    assert!(h.reconciler.route_retries.is_empty());
 }
 
 #[tokio::test(start_paused = true)]
@@ -804,12 +783,16 @@ async fn an_unknown_removal_with_an_absent_readback_retires_the_record() {
     assert_eq!(h.effect(&route), Some(RouteEffect::Removing));
     assert!(!h.mock.contains(&route));
     assert_eq!(h.mock.remove_count(), 1);
-    assert!(h.route_retries.contains_key(&RouteKey::of(&route)));
+    assert!(
+        h.reconciler
+            .route_retries
+            .contains_key(&RouteKey::of(&route))
+    );
 
     tokio::time::advance(Duration::from_millis(200)).await;
     h.round_ok().await;
     assert_eq!(h.effect(&route), None);
-    assert!(h.route_retries.is_empty());
+    assert!(h.reconciler.route_retries.is_empty());
     assert_eq!(
         h.mock.remove_count(),
         1,
@@ -890,7 +873,7 @@ async fn an_unknown_add_retires_on_confirmed_absence_and_only_a_current_declarat
     tokio::time::advance(Duration::from_millis(200)).await;
     h.round_ok().await;
     assert_eq!(h.effect(&route), None);
-    assert!(h.route_retries.is_empty());
+    assert!(h.reconciler.route_retries.is_empty());
     assert_eq!(
         h.mock.add_count(),
         1,
@@ -943,9 +926,12 @@ async fn an_unknown_add_with_a_retained_declaration_is_confirmed_absent_and_read
         "the retained declaration carries the unconfirmed outcome"
     );
     let key = RouteKey::of(&route);
-    assert_eq!(h.route_retries[&key].0, route);
-    assert!(h.route_retries[&key].1, "the retry belongs to the addition");
-    assert!(h.route_retries[&key].2 > tokio::time::Instant::now());
+    assert_eq!(h.reconciler.route_retries[&key].route, route);
+    assert!(
+        h.reconciler.route_retries[&key].add,
+        "the retry belongs to the addition"
+    );
+    assert!(h.reconciler.route_retries[&key].retry_at > tokio::time::Instant::now());
 
     h.controller.dirty.reset();
     tokio::time::advance(Duration::from_millis(200)).await;
@@ -956,7 +942,7 @@ async fn an_unknown_add_with_a_retained_declaration_is_confirmed_absent_and_read
         "the retry deadline confirms the absence and retires the Adding record"
     );
     assert!(!h.mock.contains(&route));
-    assert!(h.route_retries.is_empty());
+    assert!(h.reconciler.route_retries.is_empty());
     assert_eq!(
         h.mock.add_count(),
         1,
@@ -1132,8 +1118,8 @@ async fn replacing_an_exclusive_key_waits_for_the_old_delete_and_keeps_its_retry
         "no readback is issued for the occupied key"
     );
     assert_eq!(h.mock.remove_count(), 1);
-    assert_eq!(h.route_retries[&key].0, old_route);
-    assert!(!h.route_retries[&key].1);
+    assert_eq!(h.reconciler.route_retries[&key].route, old_route);
+    assert!(!h.reconciler.route_retries[&key].add);
 
     tokio::time::advance(Duration::from_millis(200)).await;
     h.mock
@@ -1141,15 +1127,15 @@ async fn replacing_an_exclusive_key_waits_for_the_old_delete_and_keeps_its_retry
     h.round_ok().await;
     assert_eq!(h.effect(&old_route), Some(RouteEffect::Removing));
     assert_eq!(
-        h.route_retries[&key].0, old_route,
+        h.reconciler.route_retries[&key].route, old_route,
         "the failed confirmation keeps the old row's retry"
     );
     assert!(
-        !h.route_retries[&key].1,
+        !h.reconciler.route_retries[&key].add,
         "it stays a removal retry and is not overwritten by a new addition"
     );
     assert_eq!(
-        h.route_retries[&key].4.as_ref(),
+        h.reconciler.route_retries[&key].error.as_ref(),
         "route operation failed: readback failed"
     );
     assert_eq!(h.mock.add_count(), adds);
@@ -2922,18 +2908,18 @@ async fn shared_magic_dns_row_keeps_independent_member_confirmations() {
     slot_a.set_routes(RouteSet::from([fake.clone()]));
     slot_b.set_routes(RouteSet::from([fake.clone()]));
 
-    // The ordinary member retry tuple of B: a real earlier ACK failure for
-    // its full final target. No per-route Ready state is fabricated.
+    // The ordinary member retry of B: a real earlier ACK failure for its
+    // full final target. No per-route Ready state is fabricated.
     let retry_deadline = tokio::time::Instant::now() + Duration::from_millis(200);
-    h.member_retries.insert(
+    h.reconciler.member_retries.insert(
         (run_b, member_b.registration_id()),
-        (
-            member_b.clone(),
-            BTreeSet::from([prefix]),
-            retry_deadline,
-            1,
-            Arc::from("previous member acknowledgement failed"),
-        ),
+        MemberRetry {
+            member: member_b.clone(),
+            target: BTreeSet::from([prefix]),
+            retry_at: retry_deadline,
+            attempts: 1,
+            error: Arc::from("previous member acknowledgement failed"),
+        },
     );
 
     h.round_ok().await;
@@ -2977,8 +2963,12 @@ async fn shared_magic_dns_row_keeps_independent_member_confirmations() {
         "the backed-off member has not confirmed anything"
     );
     {
-        let (_, target, deadline, attempt, _) =
-            &h.member_retries[&(run_b, member_b.registration_id())];
+        let MemberRetry {
+            target,
+            retry_at: deadline,
+            attempts: attempt,
+            ..
+        } = &h.reconciler.member_retries[&(run_b, member_b.registration_id())];
         assert_eq!(target, &BTreeSet::from([prefix]));
         assert_eq!(*deadline, retry_deadline);
         assert_eq!(*attempt, 1);
@@ -3027,8 +3017,12 @@ async fn shared_magic_dns_row_keeps_independent_member_confirmations() {
         "B is still waiting for its own ACK"
     );
     {
-        let (_, target, deadline, attempt, _) =
-            &h.member_retries[&(run_b, member_b.registration_id())];
+        let MemberRetry {
+            target,
+            retry_at: deadline,
+            attempts: attempt,
+            ..
+        } = &h.reconciler.member_retries[&(run_b, member_b.registration_id())];
         assert_eq!(target, &BTreeSet::from([prefix]));
         assert_eq!(
             *deadline, retry_deadline,
@@ -3073,7 +3067,7 @@ async fn shared_magic_dns_row_keeps_independent_member_confirmations() {
     );
     assert_eq!(slot_b.statuses().get(&fake), Some(&RouteStatus::Ready));
     assert!(
-        h.member_retries.is_empty(),
+        h.reconciler.member_retries.is_empty(),
         "the confirmed member goal clears its retry"
     );
     assert_eq!(
@@ -3187,7 +3181,13 @@ async fn replaced_member_after_ack_keeps_an_orphan_withdrawal_retry() {
 
     let orphan_key = (run, old_member.registration_id());
     {
-        let (retained, target, _, attempt, _) = h
+        let MemberRetry {
+            member: retained,
+            target,
+            attempts: attempt,
+            ..
+        } = h
+            .reconciler
             .member_retries
             .get(&orphan_key)
             .expect("the old registration is retained for its real withdrawal");
@@ -3222,7 +3222,7 @@ async fn replaced_member_after_ack_keeps_an_orphan_withdrawal_retry() {
     assert_eq!(h.mock.remove_count(), 0);
     assert_eq!(slot_handle.statuses().get(&p), Some(&RouteStatus::Ready));
     assert!(
-        h.member_retries.is_empty(),
+        h.reconciler.member_retries.is_empty(),
         "the old withdrawal completed and removed the orphan retry"
     );
     assert!(
@@ -3525,7 +3525,13 @@ async fn transient_admission_failure_preserves_claims_and_schedules_progress() {
     );
     let member_key = (run_a, member.registration_id());
     let deadline = {
-        let (_, target, deadline, attempt, _) = h
+        let MemberRetry {
+            target,
+            retry_at: deadline,
+            attempts: attempt,
+            ..
+        } = h
+            .reconciler
             .member_retries
             .get(&member_key)
             .expect("the failed admission records its retry");
@@ -3534,7 +3540,7 @@ async fn transient_admission_failure_preserves_claims_and_schedules_progress() {
         assert!(*deadline > tokio::time::Instant::now());
         *deadline
     };
-    let attempt_before = h.member_retries[&member_key].3;
+    let attempt_before = h.reconciler.member_retries[&member_key].attempts;
 
     // A dirty round before the deadline must not start the member commit.
     h.controller.dirty.mark();
@@ -3560,7 +3566,11 @@ async fn transient_admission_failure_preserves_claims_and_schedules_progress() {
         "no false empty withdrawal before the deadline"
     );
     {
-        let (_, _, deadline_now, attempt_now, _) = &h.member_retries[&member_key];
+        let MemberRetry {
+            retry_at: deadline_now,
+            attempts: attempt_now,
+            ..
+        } = &h.reconciler.member_retries[&member_key];
         assert_eq!(*deadline_now, deadline);
         assert_eq!(*attempt_now, attempt_before);
     }
@@ -3573,7 +3583,7 @@ async fn transient_admission_failure_preserves_claims_and_schedules_progress() {
     assert!(h.mock.contains(&p_route));
     assert_eq!(slot_a.statuses().get(&p), Some(&RouteStatus::Ready));
     assert!(
-        h.member_retries.is_empty(),
+        h.reconciler.member_retries.is_empty(),
         "the due commit clears the member retry"
     );
     assert_eq!(
@@ -3742,16 +3752,9 @@ impl Harness {
     /// One real audit with a test-only overall bound. It only turns a hung
     /// test into a diagnostic; the production I/O bounds are inside.
     async fn audit(&mut self) -> anyhow::Result<bool> {
-        tokio::time::timeout(
-            Duration::from_secs(10),
-            self.reconciler.audit(
-                &mut self.route_retries,
-                #[cfg(feature = "tun")]
-                &mut self.member_retries,
-            ),
-        )
-        .await
-        .expect("the audit must finish within 10s")
+        tokio::time::timeout(Duration::from_secs(10), self.reconciler.audit())
+            .await
+            .expect("the audit must finish within 10s")
     }
 }
 
@@ -3976,7 +3979,7 @@ async fn a_failed_or_timed_out_readback_keeps_every_actual_fact() {
     assert_eq!(h.mock.add_count(), add_calls);
     assert_eq!(h.mock.remove_count(), remove_calls);
     assert!(!h.dirty_peek(), "a failed read is not progress");
-    assert!(h.route_retries.is_empty());
+    assert!(h.reconciler.route_retries.is_empty());
 
     // A readback that never completes is also not an absence. The gate is
     // entered and then the audit's real 5s I/O bound expires under paused
@@ -4005,7 +4008,7 @@ async fn a_failed_or_timed_out_readback_keeps_every_actual_fact() {
     assert_eq!(h.mock.add_count(), add_calls);
     assert_eq!(h.mock.remove_count(), remove_calls);
     assert!(!h.dirty_peek());
-    assert!(h.route_retries.is_empty());
+    assert!(h.reconciler.route_retries.is_empty());
 
     assert!(
         !h.audit().await.expect("a complete readback succeeds"),
@@ -4152,7 +4155,7 @@ async fn a_present_adding_row_stays_unconfirmed_and_a_confirmed_absence_retires_
     assert_eq!(h.effect(&route), Some(RouteEffect::Adding));
     assert!(!h.mock.contains(&route));
     let key = RouteKey::of(&route);
-    let retry_before = h.route_retries[&key].clone();
+    let retry_before = h.reconciler.route_retries[&key].clone();
     let add_calls = h.mock.add_count();
     let remove_calls = h.mock.remove_count();
     let unknown_status = RouteStatus::Pending {
@@ -4170,7 +4173,7 @@ async fn a_present_adding_row_stays_unconfirmed_and_a_confirmed_absence_retires_
         "a present row is not proof that this addition completed"
     );
     assert_eq!(slot.statuses().get(&declaration), Some(&unknown_status));
-    assert_eq!(h.route_retries[&key], retry_before);
+    assert_eq!(h.reconciler.route_retries[&key], retry_before);
     assert_eq!(h.mock.add_count(), add_calls);
     assert_eq!(h.mock.remove_count(), remove_calls);
     assert!(!h.dirty_peek());
@@ -4180,7 +4183,7 @@ async fn a_present_adding_row_stays_unconfirmed_and_a_confirmed_absence_retires_
     h.controller.dirty.reset();
     assert!(h.audit().await.expect("the absence readback is complete"));
     assert_eq!(h.effect(&route), None);
-    assert!(!h.route_retries.contains_key(&key));
+    assert!(!h.reconciler.route_retries.contains_key(&key));
     assert_eq!(
         slot.statuses().get(&declaration),
         Some(&RouteStatus::Pending { error: None })
@@ -4223,7 +4226,7 @@ async fn a_present_removing_row_keeps_its_delete_responsibility_until_the_absenc
         "the unknown delete left the physical row"
     );
     let key = RouteKey::of(&route);
-    let retry_before = h.route_retries[&key].clone();
+    let retry_before = h.reconciler.route_retries[&key].clone();
     let add_calls = h.mock.add_count();
     let remove_calls = h.mock.remove_count();
     assert!(slot.statuses().is_empty());
@@ -4237,7 +4240,7 @@ async fn a_present_removing_row_keeps_its_delete_responsibility_until_the_absenc
         Some(RouteEffect::Removing),
         "a present row must not promote an uncertain removal to Owned"
     );
-    assert_eq!(h.route_retries[&key], retry_before);
+    assert_eq!(h.reconciler.route_retries[&key], retry_before);
     assert_eq!(
         h.mock.remove_count(),
         remove_calls,
@@ -4251,7 +4254,7 @@ async fn a_present_removing_row_keeps_its_delete_responsibility_until_the_absenc
     h.controller.dirty.reset();
     assert!(h.audit().await.expect("the absence readback is complete"));
     assert_eq!(h.effect(&route), None);
-    assert!(!h.route_retries.contains_key(&key));
+    assert!(!h.reconciler.route_retries.contains_key(&key));
     assert!(h.dirty_peek());
     assert_eq!(h.mock.remove_count(), remove_calls);
     assert_eq!(h.mock.add_count(), add_calls);
@@ -4373,7 +4376,14 @@ async fn an_audit_keeps_the_old_member_cleanup_across_a_rebind() {
     );
     let orphan_key = (run, old_member.registration_id());
     {
-        let (retained, target, deadline, attempt, _) = h
+        let MemberRetry {
+            member: retained,
+            target,
+            retry_at: deadline,
+            attempts: attempt,
+            ..
+        } = h
+            .reconciler
             .member_retries
             .get(&orphan_key)
             .expect("the old registration is retained for its real withdrawal");
@@ -4422,7 +4432,10 @@ async fn an_audit_keeps_the_old_member_cleanup_across_a_rebind() {
 
     assert_eq!(h.effect(&new_route), Some(RouteEffect::Owned));
     assert_eq!(slot_handle.statuses().get(&p), Some(&RouteStatus::Ready));
-    assert!(h.member_retries.is_empty(), "the old cleanup completed");
+    assert!(
+        h.reconciler.member_retries.is_empty(),
+        "the old cleanup completed"
+    );
     assert!(
         member_claim_prefixes(&old_member).await.is_empty(),
         "the old registration's prefix was really withdrawn"

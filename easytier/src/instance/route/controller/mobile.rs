@@ -25,7 +25,7 @@ use crate::instance::{
 };
 
 use super::member::{
-    claim_prefixes, member_retry_blocked, record_member_failure, sync_member_routes,
+    MemberRetry, claim_prefixes, member_retry_blocked, record_member_failure, sync_member_routes,
 };
 use super::{InstanceRoutes, ROUTE_IO_TIMEOUT, RouteController, RouteControllerRuntime};
 
@@ -297,11 +297,20 @@ impl RouteController {
 /// cleanup before records are removed.
 pub(super) struct RouteReconciler {
     controller: RouteController,
+    /// Only the backoff of a member synchronization that already failed; the
+    /// member handle is kept until its real withdrawal finishes.
+    pub(super) member_retries: BTreeMap<(Uuid, Uuid), MemberRetry>,
+    /// Deadlines at or before this instant have already had their attempt.
+    retry_horizon: tokio::time::Instant,
 }
 
 impl RouteReconciler {
     pub(super) fn new(controller: RouteController) -> Self {
-        Self { controller }
+        Self {
+            controller,
+            member_retries: BTreeMap::new(),
+            retry_horizon: tokio::time::Instant::now(),
+        }
     }
 
     /// Mobile worker loop.
@@ -314,19 +323,6 @@ impl RouteReconciler {
     /// outstanding request and no member cleanup left; shutdown alone never
     /// cancels that cleanup.
     pub(super) async fn run(mut self) -> anyhow::Result<()> {
-        let mut member_retries: BTreeMap<
-            (Uuid, Uuid),
-            (
-                SharedVirtualNicMember,
-                BTreeSet<IpCidr>,
-                tokio::time::Instant,
-                u32,
-                Arc<str>,
-            ),
-        > = BTreeMap::new();
-        // Deadlines at or before this instant already had their attempt.
-        let mut retry_horizon = tokio::time::Instant::now();
-
         // The first round reads the current inputs even without any event.
         self.controller.dirty.mark();
 
@@ -340,19 +336,21 @@ impl RouteReconciler {
 
             let consumed_input = self.controller.dirty.reset();
             let now = tokio::time::Instant::now();
-            let retry_due = member_retries
+            let retry_horizon = self.retry_horizon;
+            let retry_due = self
+                .member_retries
                 .values()
-                .any(|(_, _, deadline, ..)| *deadline > retry_horizon && *deadline <= now);
+                .any(|retry| retry.retry_at > retry_horizon && retry.retry_at <= now);
 
             if consumed_input || retry_due {
                 let batch_started = tokio::time::Instant::now();
-                let (removed, recovered) = self.reconcile(&mut member_retries).await;
-                retry_horizon = batch_started;
+                let (removed, recovered) = self.reconcile().await;
+                self.retry_horizon = batch_started;
 
                 if consumed_input || removed || recovered {
                     self.controller.changed().notify_waiters();
                 }
-                if self.drained(&member_retries) {
+                if self.drained() {
                     return Ok(());
                 }
                 // In-memory rounds must still hand the executor back.
@@ -362,17 +360,18 @@ impl RouteReconciler {
 
             // A wake without input (for example a compare that only cleared
             // the request mark) still gets its cleanup evaluated.
-            let removed = self.remove_finished_instances(&member_retries);
+            let removed = self.remove_finished_instances();
             if removed {
                 self.controller.changed().notify_waiters();
             }
-            if self.drained(&member_retries) {
+            if self.drained() {
                 return Ok(());
             }
 
-            let next_retry = member_retries
+            let next_retry = self
+                .member_retries
                 .values()
-                .map(|(_, _, deadline, ..)| *deadline)
+                .map(|retry| retry.retry_at)
                 .filter(|deadline| *deadline > now)
                 .min();
             match next_retry {
@@ -389,24 +388,12 @@ impl RouteReconciler {
         }
     }
 
-    fn drained(
-        &self,
-        member_retries: &BTreeMap<
-            (Uuid, Uuid),
-            (
-                SharedVirtualNicMember,
-                BTreeSet<IpCidr>,
-                tokio::time::Instant,
-                u32,
-                Arc<str>,
-            ),
-        >,
-    ) -> bool {
+    fn drained(&self) -> bool {
         let rt = self.controller.runtime.read();
         rt.shutdown
             && rt.instances.is_empty()
             && rt.applied.is_none()
-            && member_retries.is_empty()
+            && self.member_retries.is_empty()
             && rt.pending_install.is_none()
     }
 
@@ -414,23 +401,11 @@ impl RouteReconciler {
     ///
     /// Local values only: current bindings, complete member targets, this
     /// round's admissions, acknowledgements and cleared registrations. Retry
-    /// entries are the exception handed in by the caller: they carry the
-    /// failed target, its backoff and the member handle still needed for a
-    /// real withdrawal. Returns whether records were removed (visible cleanup
-    /// progress) and whether a scheduled retry recovered.
-    async fn reconcile(
-        &mut self,
-        member_retries: &mut BTreeMap<
-            (Uuid, Uuid),
-            (
-                SharedVirtualNicMember,
-                BTreeSet<IpCidr>,
-                tokio::time::Instant,
-                u32,
-                Arc<str>,
-            ),
-        >,
-    ) -> (bool, bool) {
+    /// entries are owned by this task: they carry the failed target, its
+    /// backoff and the member handle still needed for a real withdrawal.
+    /// Returns whether records were removed (visible cleanup progress) and
+    /// whether a scheduled retry recovered.
+    async fn reconcile(&mut self) -> (bool, bool) {
         let mut admission_failures: BTreeMap<(Uuid, Uuid), (BTreeSet<IpCidr>, RouteStatus)> =
             BTreeMap::new();
         let mut synced: BTreeMap<(Uuid, Uuid), BTreeSet<IpCidr>> = BTreeMap::new();
@@ -448,8 +423,8 @@ impl RouteReconciler {
                 related.insert((*run, member.registration_id()), member);
             }
         }
-        for (key, (member, ..)) in member_retries.iter() {
-            related.entry(*key).or_insert_with(|| member.clone());
+        for (key, retry) in &self.member_retries {
+            related.entry(*key).or_insert_with(|| retry.member.clone());
         }
 
         // 2. Whole-member admission against this round's complete target.
@@ -461,7 +436,7 @@ impl RouteReconciler {
             }
             let now = tokio::time::Instant::now();
             let target = self.mobile_current_target(*key).unwrap_or_default();
-            if member_retry_blocked(member_retries, key, &target, now) {
+            if member_retry_blocked(&self.member_retries, key, &target, now) {
                 continue;
             }
             let status = Self::admit_member(member, &target).await;
@@ -488,7 +463,7 @@ impl RouteReconciler {
                         ),
                     );
                     record_member_failure(
-                        member_retries,
+                        &mut self.member_retries,
                         *key,
                         member,
                         target,
@@ -510,7 +485,7 @@ impl RouteReconciler {
                 continue;
             }
             let final_target = self.mobile_current_target(*key).unwrap_or_default();
-            if member_retry_blocked(member_retries, key, &final_target, now) {
+            if member_retry_blocked(&self.member_retries, key, &final_target, now) {
                 continue;
             }
             let claims = match tokio::time::timeout(ROUTE_IO_TIMEOUT, member.claims()).await {
@@ -519,7 +494,7 @@ impl RouteReconciler {
                     synced.remove(key);
                     cleared.remove(key);
                     record_member_failure(
-                        member_retries,
+                        &mut self.member_retries,
                         *key,
                         member,
                         final_target,
@@ -544,14 +519,14 @@ impl RouteReconciler {
                 Ok(true) => {
                     cleared.remove(key);
                     synced.insert(*key, stage);
-                    if member_retries.remove(key).is_some() {
+                    if self.member_retries.remove(key).is_some() {
                         recovered = true;
                     }
                 }
                 Ok(false) => {
                     synced.remove(key);
                     cleared.insert(*key);
-                    if member_retries.remove(key).is_some() {
+                    if self.member_retries.remove(key).is_some() {
                         recovered = true;
                     }
                     self.controller.unready(key.0, key.1);
@@ -560,7 +535,13 @@ impl RouteReconciler {
                     synced.remove(key);
                     cleared.remove(key);
                     tracing::warn!(?error, ?key, "failed to withdraw member routes");
-                    record_member_failure(member_retries, *key, member, final_target, &error);
+                    record_member_failure(
+                        &mut self.member_retries,
+                        *key,
+                        member,
+                        final_target,
+                        &error,
+                    );
                 }
             }
         }
@@ -585,7 +566,7 @@ impl RouteReconciler {
             }
             let now = tokio::time::Instant::now();
             let target = self.mobile_current_target(*key).unwrap_or_default();
-            if member_retry_blocked(member_retries, key, &target, now) {
+            if member_retry_blocked(&self.member_retries, key, &target, now) {
                 continue;
             }
             let status = Self::admit_member(member, &target).await;
@@ -612,7 +593,7 @@ impl RouteReconciler {
                         ),
                     );
                     record_member_failure(
-                        member_retries,
+                        &mut self.member_retries,
                         *key,
                         member,
                         target,
@@ -634,7 +615,7 @@ impl RouteReconciler {
                 continue;
             }
             let final_target = self.mobile_current_target(*key).unwrap_or_default();
-            if member_retry_blocked(member_retries, key, &final_target, now) {
+            if member_retry_blocked(&self.member_retries, key, &final_target, now) {
                 continue;
             }
             let target = self.mobile_current_target(*key).unwrap_or_default();
@@ -644,21 +625,21 @@ impl RouteReconciler {
             ) {
                 continue;
             }
-            if !member_retries.contains_key(key) && synced.get(key) == Some(&target) {
+            if !self.member_retries.contains_key(key) && synced.get(key) == Some(&target) {
                 continue;
             }
             match sync_member_routes(member, &target).await {
                 Ok(true) => {
                     cleared.remove(key);
                     synced.insert(*key, target);
-                    if member_retries.remove(key).is_some() {
+                    if self.member_retries.remove(key).is_some() {
                         recovered = true;
                     }
                 }
                 Ok(false) => {
                     synced.remove(key);
                     cleared.insert(*key);
-                    if member_retries.remove(key).is_some() {
+                    if self.member_retries.remove(key).is_some() {
                         recovered = true;
                     }
                     self.controller.unready(key.0, key.1);
@@ -679,18 +660,24 @@ impl RouteReconciler {
                     synced.remove(key);
                     cleared.remove(key);
                     tracing::warn!(?error, ?key, "failed to sync member routes");
-                    record_member_failure(member_retries, *key, member, final_target, &error);
+                    record_member_failure(
+                        &mut self.member_retries,
+                        *key,
+                        member,
+                        final_target,
+                        &error,
+                    );
                 }
             }
         }
 
         // 5. Feedback reads the current policy and available slots again.
-        self.update_statuses(&admission_failures, member_retries, &synced);
+        self.update_statuses(&admission_failures, &synced);
 
         // 6. A member replaced during the waits still owes withdrawal.
-        self.transfer_orphan_members(&related, member_retries, &synced, &cleared);
+        self.transfer_orphan_members(&related, &synced, &cleared);
 
-        let removed = self.remove_finished_instances(member_retries);
+        let removed = self.remove_finished_instances();
         (removed, recovered)
     }
 
@@ -770,16 +757,6 @@ impl RouteReconciler {
     fn update_statuses(
         &self,
         admission_failures: &BTreeMap<(Uuid, Uuid), (BTreeSet<IpCidr>, RouteStatus)>,
-        member_retries: &BTreeMap<
-            (Uuid, Uuid),
-            (
-                SharedVirtualNicMember,
-                BTreeSet<IpCidr>,
-                tokio::time::Instant,
-                u32,
-                Arc<str>,
-            ),
-        >,
         synced: &BTreeMap<(Uuid, Uuid), BTreeSet<IpCidr>>,
     ) {
         let rt = self.controller.runtime.read();
@@ -841,10 +818,11 @@ impl RouteReconciler {
                     {
                         return Some(status.clone());
                     }
-                    let retry_error = member_retries
+                    let retry_error = self
+                        .member_retries
                         .get(&(*run, registration))
-                        .filter(|(_, failed_target, ..)| failed_target.contains(&prefix))
-                        .map(|(_, _, _, _, error)| error.clone());
+                        .filter(|retry| retry.target.contains(&prefix))
+                        .map(|retry| retry.error.clone());
                     let ready = current_member.is_some_and(|member| member.ensure_open().is_ok())
                         && synced
                             .get(&(*run, registration))
@@ -865,18 +843,8 @@ impl RouteReconciler {
 
     /// Keep an orphaned member's real cleanup responsibility.
     fn transfer_orphan_members(
-        &self,
+        &mut self,
         related: &BTreeMap<(Uuid, Uuid), SharedVirtualNicMember>,
-        member_retries: &mut BTreeMap<
-            (Uuid, Uuid),
-            (
-                SharedVirtualNicMember,
-                BTreeSet<IpCidr>,
-                tokio::time::Instant,
-                u32,
-                Arc<str>,
-            ),
-        >,
         synced: &BTreeMap<(Uuid, Uuid), BTreeSet<IpCidr>>,
         cleared: &BTreeSet<(Uuid, Uuid)>,
     ) {
@@ -900,21 +868,22 @@ impl RouteReconciler {
             if synced.get(key).is_some_and(|prefixes| prefixes.is_empty()) {
                 continue;
             }
-            if member_retries
+            if self
+                .member_retries
                 .get(key)
-                .is_some_and(|(_, target, ..)| target.is_empty())
+                .is_some_and(|retry| retry.target.is_empty())
             {
                 continue;
             }
-            member_retries.insert(
+            self.member_retries.insert(
                 *key,
-                (
-                    member.clone(),
-                    BTreeSet::new(),
-                    now,
-                    0,
-                    Arc::from("member binding withdrew before its prefixes were cleared"),
-                ),
+                MemberRetry {
+                    member: member.clone(),
+                    target: BTreeSet::new(),
+                    retry_at: now,
+                    attempts: 0,
+                    error: Arc::from("member binding withdrew before its prefixes were cleared"),
+                },
             );
         }
     }
@@ -925,19 +894,7 @@ impl RouteReconciler {
     /// installation must no longer contain the run (including a confirmed
     /// revocation that cleared the whole record), no member of the run may
     /// still owe prefix cleanup, and no whole-domain request may be pending.
-    fn remove_finished_instances(
-        &self,
-        member_retries: &BTreeMap<
-            (Uuid, Uuid),
-            (
-                SharedVirtualNicMember,
-                BTreeSet<IpCidr>,
-                tokio::time::Instant,
-                u32,
-                Arc<str>,
-            ),
-        >,
-    ) -> bool {
+    fn remove_finished_instances(&self) -> bool {
         let mut rt = self.controller.runtime.write();
         let shutdown = rt.shutdown;
         let pending = rt.pending_install.is_some();
@@ -949,7 +906,11 @@ impl RouteReconciler {
             if pending {
                 continue;
             }
-            if member_retries.keys().any(|(retry_run, _)| retry_run == run) {
+            if self
+                .member_retries
+                .keys()
+                .any(|(retry_run, _)| retry_run == run)
+            {
                 continue;
             }
             let installed = rt.applied.as_ref().is_some_and(|snapshot| {

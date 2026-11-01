@@ -55,38 +55,34 @@ pub(super) async fn sync_member_routes(
     .map_err(|_| anyhow::anyhow!("timed out committing routes of member {member_id}"))??;
     Ok(true)
 }
+/// One failed member prefix synchronization and the handle still needed for
+/// its real cleanup.
+///
+/// The complete failed target is kept so a narrower intermediate commit never
+/// shortens the deadline. The entry belongs to the platform reconciler that
+/// performs the attempt; it is not shared state.
+pub(super) struct MemberRetry {
+    pub(super) member: SharedVirtualNicMember,
+    pub(super) target: BTreeSet<IpCidr>,
+    pub(super) retry_at: tokio::time::Instant,
+    pub(super) attempts: u32,
+    pub(super) error: Arc<str>,
+}
+
 /// Whether this member's final target still has to wait out a failure.
 pub(super) fn member_retry_blocked(
-    retries: &BTreeMap<
-        (Uuid, Uuid),
-        (
-            SharedVirtualNicMember,
-            BTreeSet<IpCidr>,
-            tokio::time::Instant,
-            u32,
-            Arc<str>,
-        ),
-    >,
+    retries: &BTreeMap<(Uuid, Uuid), MemberRetry>,
     key: &(Uuid, Uuid),
     target: &BTreeSet<IpCidr>,
     now: tokio::time::Instant,
 ) -> bool {
     retries
         .get(key)
-        .is_some_and(|(_, failed_target, deadline, ..)| failed_target == target && *deadline > now)
+        .is_some_and(|retry| retry.target == *target && retry.retry_at > now)
 }
 /// Record (or extend) the backoff of one member's final target.
 pub(super) fn record_member_failure(
-    retries: &mut BTreeMap<
-        (Uuid, Uuid),
-        (
-            SharedVirtualNicMember,
-            BTreeSet<IpCidr>,
-            tokio::time::Instant,
-            u32,
-            Arc<str>,
-        ),
-    >,
+    retries: &mut BTreeMap<(Uuid, Uuid), MemberRetry>,
     key: (Uuid, Uuid),
     member: &SharedVirtualNicMember,
     target: BTreeSet<IpCidr>,
@@ -95,17 +91,23 @@ pub(super) fn record_member_failure(
     let now = tokio::time::Instant::now();
     let error: Arc<str> = Arc::from(error.to_string());
     match retries.get_mut(&key) {
-        Some((_, failed_target, deadline, attempt, failed_error)) if *failed_target == target => {
-            if *deadline <= now {
-                *attempt = attempt.saturating_add(1);
-                *deadline = now + retry_backoff(*attempt);
+        Some(retry) if retry.target == target => {
+            if retry.retry_at <= now {
+                retry.attempts = retry.attempts.saturating_add(1);
+                retry.retry_at = now + retry_backoff(retry.attempts);
             }
-            *failed_error = error;
+            retry.error = error;
         }
         _ => {
             retries.insert(
                 key,
-                (member.clone(), target, now + retry_backoff(1), 1, error),
+                MemberRetry {
+                    member: member.clone(),
+                    target,
+                    retry_at: now + retry_backoff(1),
+                    attempts: 1,
+                    error,
+                },
             );
         }
     }
