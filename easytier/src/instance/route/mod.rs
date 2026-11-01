@@ -26,7 +26,6 @@ pub(crate) mod platform;
 pub(crate) use platform::PlatformRouteBackend;
 
 #[cfg(any(not(mobile), feature = "tun"))]
-#[path = "controller.rs"]
 pub(crate) mod controller;
 #[cfg(any(not(mobile), feature = "tun"))]
 pub(crate) mod runtime;
