@@ -162,17 +162,29 @@ impl CoreRuntimeConfigStore {
     pub fn update_peer(&self, peer: Arc<PeerRuntimeSnapshot>) {
         let _update = self.inner.update.lock();
         let mut config = self.inner.snapshot.load_full().as_ref().clone();
+        let previous_peer = config.peer.clone();
         config.peer = peer;
+        let route_inputs_changed = peer_route_inputs_changed(&previous_peer, &config.peer);
         self.inner.snapshot.store(Arc::new(config));
         self.inner.peer_changes.send_modify(|version| *version += 1);
+        drop(_update);
+        if route_inputs_changed {
+            self.invalidate_routes();
+        }
     }
 
     pub(crate) fn update_peer_with(&self, update: impl FnOnce(&mut PeerRuntimeSnapshot)) {
         let _update = self.inner.update.lock();
         let mut config = self.inner.snapshot.load_full().as_ref().clone();
+        let previous_peer = config.peer.clone();
         update(Arc::make_mut(&mut config.peer));
+        let route_inputs_changed = peer_route_inputs_changed(&previous_peer, &config.peer);
         self.inner.snapshot.store(Arc::new(config));
         self.inner.peer_changes.send_modify(|version| *version += 1);
+        drop(_update);
+        if route_inputs_changed {
+            self.invalidate_routes();
+        }
     }
 
     pub fn subscribe_peer_runtime_changes(&self) -> tokio::sync::watch::Receiver<u64> {
@@ -193,18 +205,62 @@ impl CoreRuntimeConfigStore {
     }
 }
 
+/// Peer values the shared route inputs are derived from. Comparisons are by
+/// value; holding a new `Arc` for an equal snapshot is not a change.
+fn peer_route_inputs_changed(
+    previous: &PeerRuntimeSnapshot,
+    current: &PeerRuntimeSnapshot,
+) -> bool {
+    previous.flags.accept_dns != current.flags.accept_dns
+        || previous.runtime.core.routes.ipv4 != current.runtime.core.routes.ipv4
+        || previous.runtime.core.routes.ipv6 != current.runtime.core.routes.ipv6
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::IpPrefix;
+
+    async fn marked(dirty: &DirtyFlag, message: &str) {
+        tokio::time::timeout(std::time::Duration::from_secs(1), dirty.wait())
+            .await
+            .unwrap_or_else(|_| panic!("{message}"));
+    }
+
+    fn prefix(address: &str, prefix_len: u8) -> IpPrefix {
+        IpPrefix {
+            address: address.parse().unwrap(),
+            prefix_len,
+        }
+    }
+
+    fn peer(
+        accept_dns: bool,
+        ipv4: Option<IpPrefix>,
+        ipv6: Option<IpPrefix>,
+    ) -> PeerRuntimeSnapshot {
+        let mut peer = PeerRuntimeSnapshot::default();
+        peer.flags.accept_dns = accept_dns;
+        peer.runtime.core.routes.ipv4 = ipv4;
+        peer.runtime.core.routes.ipv6 = ipv6;
+        peer
+    }
+
+    /// A store whose route flag is bound and already cleared, so an assertion
+    /// does not mistake the first binding's mark for an update notification.
+    fn bound_store() -> (CoreRuntimeConfigStore, Arc<DirtyFlag>) {
+        let store = CoreRuntimeConfigStore::new(
+            CoreRuntimeConfig::default(),
+            Arc::new(PeerRuntimeSnapshot::default()),
+        );
+        let dirty = Arc::new(DirtyFlag::new(false));
+        store.bind_route_dirty(dirty.clone()).unwrap();
+        dirty.reset();
+        (store, dirty)
+    }
 
     #[tokio::test]
     async fn route_dirty_flag_follows_service_commits() {
-        async fn marked(dirty: &DirtyFlag, message: &str) {
-            tokio::time::timeout(std::time::Duration::from_secs(1), dirty.wait())
-                .await
-                .unwrap_or_else(|_| panic!("{message}"));
-        }
-
         let manual_routes: BTreeSet<Ipv4Cidr> = BTreeSet::from(["10.20.0.0/16".parse().unwrap()]);
         let store = CoreRuntimeConfigStore::new(
             CoreRuntimeConfig {
@@ -281,6 +337,173 @@ mod tests {
             "peer-only commits must not mark the route policy flag"
         );
         assert!(!replacement.peek());
+    }
+
+    #[tokio::test]
+    async fn peer_dns_flag_marks_route_inputs_through_both_entries() {
+        let (store, dirty) = bound_store();
+
+        store.update_peer(Arc::new(peer(true, None, None)));
+        marked(&dirty, "enabling accept_dns must mark the route flag").await;
+        assert!(store.snapshot().peer.flags.accept_dns);
+        dirty.reset();
+
+        store.update_peer_with(|peer| peer.flags.accept_dns = false);
+        marked(&dirty, "disabling accept_dns must mark the route flag").await;
+        assert!(!store.snapshot().peer.flags.accept_dns);
+        dirty.reset();
+    }
+
+    #[tokio::test]
+    async fn peer_ipv4_route_changes_mark_route_inputs() {
+        let (store, dirty) = bound_store();
+
+        store.update_peer(Arc::new(peer(
+            false,
+            Some(prefix("10.126.126.7", 24)),
+            None,
+        )));
+        marked(&dirty, "adding a peer IPv4 route must mark").await;
+        assert_eq!(
+            store.snapshot().peer.runtime.core.routes.ipv4,
+            Some(prefix("10.126.126.7", 24))
+        );
+        dirty.reset();
+
+        store.update_peer_with(|peer| {
+            peer.runtime.core.routes.ipv4 = Some(prefix("10.126.127.7", 24))
+        });
+        marked(&dirty, "modifying the peer IPv4 route must mark").await;
+        assert_eq!(
+            store.snapshot().peer.runtime.core.routes.ipv4,
+            Some(prefix("10.126.127.7", 24))
+        );
+        dirty.reset();
+
+        store.update_peer(Arc::new(peer(false, None, None)));
+        marked(&dirty, "withdrawing the peer IPv4 route must mark").await;
+        assert_eq!(store.snapshot().peer.runtime.core.routes.ipv4, None);
+        dirty.reset();
+    }
+
+    #[tokio::test]
+    async fn peer_ipv6_route_changes_mark_route_inputs() {
+        let (store, dirty) = bound_store();
+
+        store.update_peer_with(|peer| peer.runtime.core.routes.ipv6 = Some(prefix("fd00::7", 64)));
+        marked(&dirty, "adding a peer IPv6 route must mark").await;
+        assert_eq!(
+            store.snapshot().peer.runtime.core.routes.ipv6,
+            Some(prefix("fd00::7", 64))
+        );
+        dirty.reset();
+
+        store.update_peer(Arc::new(peer(false, None, Some(prefix("fd00:1::7", 64)))));
+        marked(&dirty, "modifying the peer IPv6 route must mark").await;
+        assert_eq!(
+            store.snapshot().peer.runtime.core.routes.ipv6,
+            Some(prefix("fd00:1::7", 64))
+        );
+        dirty.reset();
+
+        store.update_peer_with(|peer| peer.runtime.core.routes.ipv6 = None);
+        marked(&dirty, "withdrawing the peer IPv6 route must mark").await;
+        assert_eq!(store.snapshot().peer.runtime.core.routes.ipv6, None);
+        dirty.reset();
+    }
+
+    #[test]
+    fn equal_peer_route_inputs_do_not_mark_route_flag() {
+        let route = Some(prefix("10.126.126.7", 24));
+        let store = CoreRuntimeConfigStore::new(
+            CoreRuntimeConfig::default(),
+            Arc::new(peer(true, route.clone(), Some(prefix("fd00::7", 64)))),
+        );
+        let dirty = Arc::new(DirtyFlag::new(false));
+        store.bind_route_dirty(dirty.clone()).unwrap();
+        dirty.reset();
+
+        store.update_peer(Arc::new(peer(
+            true,
+            route.clone(),
+            Some(prefix("fd00::7", 64)),
+        )));
+        assert!(!dirty.peek(), "a new Arc with equal values is not a change");
+
+        store.update_peer_with(|peer| {
+            peer.flags.accept_dns = true;
+            peer.runtime.core.routes.ipv4 = route;
+            peer.runtime.core.routes.ipv6 = Some(prefix("fd00::7", 64));
+        });
+        assert!(
+            !dirty.peek(),
+            "in-place updates with equal values are not a change"
+        );
+    }
+
+    #[test]
+    fn hostname_only_peer_update_does_not_mark_route_flag() {
+        let (store, dirty) = bound_store();
+
+        store.update_peer_with(|peer| peer.runtime.core.node.hostname = Some("renamed".to_owned()));
+        assert!(!dirty.peek());
+
+        let mut renamed = PeerRuntimeSnapshot::default();
+        renamed.runtime.core.node.hostname = Some("renamed-again".to_owned());
+        store.update_peer(Arc::new(renamed));
+        assert!(!dirty.peek());
+    }
+
+    #[tokio::test]
+    async fn peer_route_update_notifies_peer_watch_but_not_service_watch() {
+        let (store, dirty) = bound_store();
+        let mut peer_changes = store.subscribe_peer_runtime_changes();
+        let service_changes = store.subscribe_service_runtime_changes();
+
+        store.update_peer(Arc::new(peer(true, None, None)));
+        tokio::time::timeout(std::time::Duration::from_secs(1), peer_changes.changed())
+            .await
+            .expect("peer watch must still be notified")
+            .expect("peer watch sender must stay alive");
+        assert!(!service_changes.has_changed().unwrap());
+        marked(&dirty, "peer route inputs must mark the route flag").await;
+        dirty.reset();
+
+        store.update_peer_with(|peer| {
+            peer.runtime.core.routes.ipv4 = Some(prefix("10.126.126.7", 24))
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(1), peer_changes.changed())
+            .await
+            .expect("peer watch must still be notified by in-place updates")
+            .expect("peer watch sender must stay alive");
+        assert!(!service_changes.has_changed().unwrap());
+        marked(&dirty, "peer route inputs must mark the route flag").await;
+    }
+
+    #[tokio::test]
+    async fn rejected_route_flag_binding_leaves_backup_untouched_by_peer_updates() {
+        let store = CoreRuntimeConfigStore::new(
+            CoreRuntimeConfig::default(),
+            Arc::new(PeerRuntimeSnapshot::default()),
+        );
+        let primary = Arc::new(DirtyFlag::new(false));
+        let backup = Arc::new(DirtyFlag::new(false));
+        store.bind_route_dirty(primary.clone()).unwrap();
+        assert!(store.bind_route_dirty(backup.clone()).is_err());
+        primary.reset();
+
+        store.update_peer(Arc::new(peer(
+            false,
+            Some(prefix("10.126.126.7", 24)),
+            None,
+        )));
+        marked(&primary, "the bound flag must still be marked").await;
+        assert!(!backup.peek());
+
+        primary.reset();
+        store.update_peer_with(|peer| peer.flags.accept_dns = true);
+        marked(&primary, "the bound flag must still be marked").await;
+        assert!(!backup.peek());
     }
 
     #[test]
