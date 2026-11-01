@@ -1,11 +1,13 @@
 #[cfg(any(mobile, test))]
 use std::collections::BTreeSet;
 
-#[cfg(mobile)]
+#[cfg(all(mobile, feature = "management-rpc"))]
 use super::{NativeInstanceManager, NativeInstanceRuntimeHost};
 #[cfg(any(mobile, test))]
 use crate::instance::shared_virtual_nic::{SharedIfConfig, SharedIfConfigClaims, SharedIpv4Route};
-#[cfg(mobile)]
+#[cfg(any(mobile, test))]
+use cidr::IpCidr;
+#[cfg(all(mobile, feature = "management-rpc"))]
 use easytier_core::instance::CoreInstanceState;
 
 #[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
@@ -26,12 +28,13 @@ pub struct MobileTunMemberError {
 }
 
 #[cfg(any(mobile, test))]
-struct MobileTunMember {
-    instance_id: uuid::Uuid,
-    run: uuid::Uuid,
-    claims: SharedIfConfigClaims,
-    current_claims: Option<SharedIfConfigClaims>,
-    dns: bool,
+#[derive(Clone)]
+pub(crate) struct MobileTunMember {
+    pub(crate) instance_id: uuid::Uuid,
+    pub(crate) run: uuid::Uuid,
+    pub(crate) claims: SharedIfConfigClaims,
+    pub(crate) current_claims: Option<SharedIfConfigClaims>,
+    pub(crate) dns: bool,
 }
 
 #[cfg(any(mobile, test))]
@@ -53,6 +56,36 @@ fn comparable_claims(mut claims: SharedIfConfigClaims) -> SharedIfConfigClaims {
         .ipv4_routes
         .retain(|route| route.address != magic_dns.address || route.prefix != magic_dns.prefix);
     claims
+}
+
+/// Prefixes contributed by one member to the exported VPN configuration.
+#[cfg(any(mobile, test))]
+pub(crate) fn member_prefixes(member: &MobileTunMember) -> BTreeSet<IpCidr> {
+    let mut prefixes = BTreeSet::new();
+    for address in &member.claims.ipv4_addresses {
+        prefixes.insert(IpCidr::V4(address.network()));
+    }
+    for address in &member.claims.ipv6_addresses {
+        prefixes.insert(IpCidr::V6(address.network()));
+    }
+    for route in &member.claims.ipv4_routes {
+        if let Ok(route) = cidr::Ipv4Inet::new(route.address, route.prefix) {
+            prefixes.insert(IpCidr::V4(route.network()));
+        }
+    }
+    for route in &member.claims.ipv6_routes {
+        if let Ok(route) = cidr::Ipv6Inet::new(route.address, route.prefix) {
+            prefixes.insert(IpCidr::V6(route.network()));
+        }
+    }
+    if member.dns {
+        let magic_dns = magic_dns_route();
+        prefixes.insert(IpCidr::V4(
+            cidr::Ipv4Cidr::new(magic_dns.address, magic_dns.prefix)
+                .expect("magic DNS fake IP prefix is valid"),
+        ));
+    }
+    prefixes
 }
 
 #[cfg(any(mobile, test))]
@@ -97,42 +130,39 @@ fn config_for_members(
     };
     let mut addresses = BTreeSet::new();
     let mut routes = BTreeSet::new();
+    // Record each member's own contribution so ownership changes alter the
+    // snapshot even when the union of addresses and routes does not.
+    let mut contributions = Vec::new();
     for member in members {
         config.instance_ids.push(member.instance_id);
+        let mut member_addresses = BTreeSet::new();
         for address in &member.claims.ipv4_addresses {
-            addresses.insert(format!("{address:#}"));
-            routes.insert(format!("{:#}", address.network()));
+            let address = format!("{address:#}");
+            addresses.insert(address.clone());
+            member_addresses.insert(address);
         }
         for address in &member.claims.ipv6_addresses {
-            addresses.insert(format!("{address:#}"));
-            routes.insert(format!("{:#}", address.network()));
+            let address = format!("{address:#}");
+            addresses.insert(address.clone());
+            member_addresses.insert(address);
         }
-        for route in &member.claims.ipv4_routes {
-            if let Ok(route) = cidr::Ipv4Inet::new(route.address, route.prefix) {
-                routes.insert(format!("{:#}", route.network()));
-            }
-        }
-        for route in &member.claims.ipv6_routes {
-            if let Ok(route) = cidr::Ipv6Inet::new(route.address, route.prefix) {
-                routes.insert(format!("{:#}", route.network()));
-            }
-        }
+        let prefixes = member_prefixes(member);
+        routes.extend(prefixes.iter().map(|prefix| format!("{prefix:#}")));
         if member.dns {
             config.dns = Some(crate::instance::dns_server::MAGIC_DNS_FAKE_IP.to_owned());
-            routes.insert(format!(
-                "{}/32",
-                crate::instance::dns_server::MAGIC_DNS_FAKE_IP
-            ));
         }
+        contributions.push((
+            member.instance_id,
+            member.run,
+            member_addresses.into_iter().collect::<Vec<_>>(),
+            prefixes,
+            member.dns,
+        ));
     }
     config.instance_ids.sort();
     config.addresses = addresses.into_iter().collect();
     config.routes = routes.into_iter().collect();
-    let mut runs = members
-        .iter()
-        .map(|member| (member.instance_id, member.run))
-        .collect::<Vec<_>>();
-    runs.sort();
+    contributions.sort();
     // Hash normalized content rather than keeping an unbounded server-side
     // snapshot cache. Identical declarations keep the same acknowledgement ID.
     config.snapshot_id = uuid::Uuid::new_v5(
@@ -144,7 +174,7 @@ fn config_for_members(
                 &config.addresses,
                 &config.routes,
                 &config.dns,
-                runs
+                contributions
             )
         )
         .as_bytes(),
@@ -152,7 +182,7 @@ fn config_for_members(
     config
 }
 
-#[cfg(mobile)]
+#[cfg(all(mobile, feature = "management-rpc"))]
 async fn collect_members(
     manager: &NativeInstanceManager,
     instance_ids: &[uuid::Uuid],
@@ -201,7 +231,7 @@ async fn collect_members(
     (members, rejected)
 }
 
-#[cfg(mobile)]
+#[cfg(all(mobile, feature = "management-rpc"))]
 pub async fn get_mobile_tun_config(
     manager: &NativeInstanceManager,
     instance_ids: &[uuid::Uuid],
@@ -218,7 +248,7 @@ fn is_claim_conflict(error: &anyhow::Error) -> bool {
         .any(|error| error.is::<crate::instance::shared_virtual_nic::SharedIfConfigConflict>())
 }
 
-#[cfg(mobile)]
+#[cfg(all(mobile, feature = "management-rpc"))]
 pub async fn attach_mobile_tun_fd(
     manager: &NativeInstanceManager,
     fd: i32,
@@ -290,7 +320,7 @@ pub async fn attach_mobile_tun_fd(
     Ok(config)
 }
 
-#[cfg(mobile)]
+#[cfg(all(mobile, feature = "management-rpc"))]
 async fn attach_member(
     manager: &NativeInstanceManager,
     instance_id: uuid::Uuid,
@@ -349,6 +379,155 @@ mod tests {
         assert_ne!(
             plain.snapshot_id,
             config_for_members(&restarted, Vec::new()).snapshot_id
+        );
+    }
+
+    #[test]
+    fn snapshot_tracks_per_member_route_ownership() {
+        let mut owner_a = member(1, "10.0.1.1/24");
+        owner_a.claims.ipv4_routes.insert(SharedIpv4Route::new(
+            "10.0.5.0".parse().unwrap(),
+            24,
+            None,
+        ));
+        let (members, rejected) =
+            select_members(vec![owner_a, member(2, "10.0.2.1/24")], Vec::new());
+        assert!(rejected.is_empty());
+        let before = config_for_members(&members, rejected);
+
+        let mut owner_b = member(2, "10.0.2.1/24");
+        owner_b.claims.ipv4_routes.insert(SharedIpv4Route::new(
+            "10.0.5.0".parse().unwrap(),
+            24,
+            None,
+        ));
+        let (members, rejected) =
+            select_members(vec![member(1, "10.0.1.1/24"), owner_b], Vec::new());
+        assert!(rejected.is_empty());
+        let after = config_for_members(&members, rejected);
+
+        assert_eq!(before.addresses, after.addresses);
+        assert_eq!(before.routes, after.routes);
+        assert_eq!(before.instance_ids, after.instance_ids);
+        assert_ne!(before.snapshot_id, after.snapshot_id);
+    }
+
+    #[test]
+    fn snapshot_tracks_dns_owner_when_union_is_unchanged() {
+        let mut first = member(1, "10.0.1.1/24");
+        first.dns = true;
+        let (members, rejected) = select_members(vec![first, member(2, "10.0.2.1/24")], Vec::new());
+        assert!(rejected.is_empty());
+        let before = config_for_members(&members, rejected);
+
+        let mut second = member(2, "10.0.2.1/24");
+        second.dns = true;
+        let (members, rejected) =
+            select_members(vec![member(1, "10.0.1.1/24"), second], Vec::new());
+        assert!(rejected.is_empty());
+        let after = config_for_members(&members, rejected);
+
+        assert_eq!(before.dns, after.dns);
+        assert_eq!(before.routes, after.routes);
+        assert_ne!(before.snapshot_id, after.snapshot_id);
+    }
+
+    #[test]
+    fn snapshot_ignores_member_input_order() {
+        let first = member(1, "10.0.1.1/24");
+        let second = member(2, "10.0.2.1/24");
+        let (members, rejected) = select_members(vec![first.clone(), second.clone()], Vec::new());
+        assert!(rejected.is_empty());
+        let forward = config_for_members(&members, rejected);
+        let (members, rejected) = select_members(vec![second, first], Vec::new());
+        assert!(rejected.is_empty());
+        let backward = config_for_members(&members, rejected);
+
+        assert_eq!(forward.routes, backward.routes);
+        assert_eq!(forward.snapshot_id, backward.snapshot_id);
+    }
+
+    #[test]
+    fn snapshot_ignores_mtu_costs_hints_and_diagnostics() {
+        let first = member(1, "10.0.1.1/24");
+        let second = member(2, "10.0.2.1/24");
+        let (members, rejected) = select_members(vec![first.clone(), second.clone()], Vec::new());
+        assert!(rejected.is_empty());
+        let base = config_for_members(&members, rejected);
+
+        let mut with_mtu = first.clone();
+        with_mtu.claims.mtu = Some(1300);
+        let (members, rejected) = select_members(vec![with_mtu, second.clone()], Vec::new());
+        assert!(rejected.is_empty());
+        assert_eq!(
+            base.snapshot_id,
+            config_for_members(&members, rejected).snapshot_id
+        );
+
+        let mut cheap = first.clone();
+        cheap.claims.ipv4_routes.insert(SharedIpv4Route::new(
+            "10.0.7.0".parse().unwrap(),
+            24,
+            Some(1),
+        ));
+        let mut expensive = cheap.clone();
+        expensive.claims.ipv4_routes = BTreeSet::from([SharedIpv4Route::new(
+            "10.0.7.0".parse().unwrap(),
+            24,
+            Some(9),
+        )]);
+        let (members, rejected) = select_members(vec![cheap, second.clone()], Vec::new());
+        assert!(rejected.is_empty());
+        let cheap = config_for_members(&members, rejected);
+        let (members, rejected) = select_members(vec![expensive, second.clone()], Vec::new());
+        assert!(rejected.is_empty());
+        let expensive = config_for_members(&members, rejected);
+        assert_eq!(cheap.routes, expensive.routes);
+        assert_eq!(cheap.snapshot_id, expensive.snapshot_id);
+
+        let mut hinted = first.clone();
+        hinted.current_claims = Some(SharedIfConfigClaims {
+            ipv4_addresses: BTreeSet::from(["10.0.9.1/24".parse().unwrap()]),
+            ..Default::default()
+        });
+        let (members, rejected) = select_members(vec![hinted, second], Vec::new());
+        assert!(rejected.is_empty());
+        assert_eq!(
+            base.snapshot_id,
+            config_for_members(&members, rejected).snapshot_id
+        );
+
+        let (members, rejected) = select_members(vec![first, member(2, "10.0.2.1/24")], Vec::new());
+        assert!(rejected.is_empty());
+        let diagnosed = config_for_members(
+            &members,
+            vec![MobileTunMemberError {
+                instance_id: uuid::Uuid::from_u128(3),
+                error: "overlapping subnet".into(),
+            }],
+        );
+        assert!(base.rejected.is_empty());
+        assert_eq!(diagnosed.rejected[0].instance_id, uuid::Uuid::from_u128(3));
+        assert_eq!(base.snapshot_id, diagnosed.snapshot_id);
+    }
+
+    #[test]
+    fn skips_invalid_claim_route_prefixes_in_member_projection() {
+        let mut invalid = member(1, "10.0.1.1/24");
+        invalid.claims.ipv4_routes.insert(SharedIpv4Route::new(
+            "10.0.9.0".parse().unwrap(),
+            33,
+            None,
+        ));
+        let (members, rejected) = select_members(vec![invalid], Vec::new());
+        assert!(rejected.is_empty());
+        assert_eq!(
+            member_prefixes(&members[0]),
+            BTreeSet::from(["10.0.1.0/24".parse().unwrap()])
+        );
+        assert_eq!(
+            config_for_members(&members, rejected).routes,
+            vec!["10.0.1.0/24"]
         );
     }
 
