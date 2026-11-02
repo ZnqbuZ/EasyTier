@@ -16,20 +16,17 @@ use easytier_core::host::route::{RouteSource, RouteStatus};
 use uuid::Uuid;
 
 use crate::instance::{
-    route::{
-        AppliedSnapshot,
-        mobile::{
-            MobilePlan, MobileTunConfig, MobileTunMember, MobileWithdraw, claims_from_facts,
-            filter_scope, magic_dns_prefix, member_prefixes, select_and_project,
-        },
+    route::mobile::{
+        MobilePlan, MobileTunConfig, MobileTunMember, MobileWithdraw, claims_from_facts,
+        filter_scope, select_and_project,
     },
     shared_virtual_nic::{SharedIfConfigClaims, SharedIfConfigConflict, SharedVirtualNicMember},
 };
 
-use super::member::{
-    MemberRetry, claim_prefixes, member_retry_blocked, record_member_failure, sync_member_routes,
+use super::member::{MemberRetry, member_retry_blocked, record_member_failure, sync_member_routes};
+use super::{
+    InstanceRoutes, ROUTE_IO_TIMEOUT, RouteController, RouteControllerRuntime, retry_backoff,
 };
-use super::{InstanceRoutes, ROUTE_IO_TIMEOUT, RouteController, RouteControllerRuntime};
 
 /// The authority values the mobile policy reads for one live instance.
 ///
@@ -71,141 +68,48 @@ struct MobileSample {
     members: Vec<SampledMobileMember>,
 }
 
+/// Local mobile attachment evidence, keyed by run and registration.
+///
+/// The value is the prefix set the execution path confirmed at attachment time.
+/// It owns no FD, system VPN, Registry or NativeRuntime.
+pub(super) type MobileInstalledRoutes = BTreeMap<(Uuid, Uuid), BTreeSet<IpCidr>>;
+
 impl RouteController {
-    /// Register a new whole-domain mobile install or withdraw request.
+    /// Record one member's real local attachment evidence.
     ///
-    /// Every accepted request gets a fresh identity even when the desired
-    /// content is unchanged. Only a domain that is shut down with nothing left
-    /// to clean up is rejected; shutdown while real cleanup is still owed must
-    /// still accept requests. The write lock covers only the request mark, and
-    /// the notification is sent after it is released without marking input
-    /// dirty.
-    pub fn request_mobile_install(&self) -> anyhow::Result<Uuid> {
-        let id = Uuid::new_v4();
-        {
-            let mut rt = self.runtime.write();
-            anyhow::ensure!(
-                !(rt.shutdown
-                    && rt.instances.is_empty()
-                    && rt.applied.is_none()
-                    && rt.pending_install.is_none()),
-                "route controller is shut down and has no outstanding cleanup"
-            );
-            rt.pending_install = Some(id);
-        }
-        self.changed.notify_waiters();
-        Ok(id)
-    }
-
-    /// Copy the latest accepted request identity without taking it.
-    pub fn pending_mobile_install(&self) -> Option<Uuid> {
-        self.runtime.read().pending_install
-    }
-
-    /// Complete the request only when it is still the latest accepted one.
-    ///
-    /// A late completion never clears a newer request. The actual installation
-    /// record and the request mark are independent, and no input is marked
-    /// dirty here.
-    pub fn complete_mobile_install(&self, id: Uuid) -> bool {
-        let completed = {
-            let mut rt = self.runtime.write();
-            if rt.pending_install != Some(id) {
-                false
-            } else {
-                rt.pending_install = None;
-                true
-            }
-        };
-        if completed {
-            self.changed.notify_waiters();
-        }
-        completed
-    }
-
-    /// The attachment identity of the system configuration the external owner
-    /// last confirmed. A pending request is not an attachment.
-    pub fn current_mobile_attachment(&self) -> Option<Uuid> {
-        self.runtime
-            .read()
-            .applied
-            .as_ref()
-            .map(|snapshot| snapshot.attachment_id)
-    }
-
-    /// Record the real system installation the external owner just completed.
-    ///
-    /// This is an observed fact, not the acceptance of a request: a late A is
-    /// recorded even after shutdown or after the latest request became D. It
-    /// never clears the request mark and never reopens an instance; whether the
-    /// exported content is still current is the caller's boundary check.
-    pub fn record_mobile_install(
-        &self,
-        attachment_id: Uuid,
-        config: MobileTunConfig,
-        members: Vec<MobileTunMember>,
-    ) {
-        let members = members
-            .into_iter()
-            .map(|mut member| {
-                // A selection hint, not part of the actual installation fact.
-                member.current_claims = None;
-                member
-            })
-            .collect();
-        {
-            let mut rt = self.runtime.write();
-            rt.applied = Some(AppliedSnapshot {
-                attachment_id,
-                config,
-                members,
-                attached_members: BTreeMap::new(),
-            });
-        }
-        self.dirty.mark();
-        self.changed.notify_waiters();
-    }
-
-    /// Confirm one member's real attachment to the recorded installation.
-    ///
-    /// Only the run's current registration and the matching attachment may
-    /// change the ledger. A late result from an older registration or an older
-    /// attachment is rejected without touching newer records. Root release and
-    /// shutdown do not erase a real I/O fact.
-    pub fn mobile_ready(
+    /// Only the run's current registration and an open member may contribute.
+    /// Root release and shutdown do not erase a real I/O fact, but a record
+    /// that has already been removed is never recreated. A repeated report is
+    /// accepted without marking or notifying again.
+    pub fn record_mobile_ready(
         &self,
         run: Uuid,
         member: &SharedVirtualNicMember,
-        attachment_id: Uuid,
+        installed_prefixes: BTreeSet<IpCidr>,
     ) -> bool {
         if member.member_id() != run || member.ensure_open().is_err() {
             return false;
         }
         let changed = {
             let mut rt = self.runtime.write();
-            let current_registration = rt
-                .instances
-                .get(&run)
-                .and_then(|instances| instances.member.as_ref())
-                .map(SharedVirtualNicMember::registration_id);
-            if current_registration != Some(member.registration_id()) {
-                return false;
-            }
-            let Some(snapshot) = rt.applied.as_mut() else {
+            let Some(instance) = rt.instances.get(&run) else {
                 return false;
             };
-            if snapshot.attachment_id != attachment_id
-                || !snapshot
-                    .members
-                    .iter()
-                    .any(|installed| installed.instance_id == run)
+            if instance
+                .member
+                .as_ref()
+                .map(SharedVirtualNicMember::registration_id)
+                != Some(member.registration_id())
             {
                 return false;
             }
-            let previous = snapshot
-                .attached_members
-                .insert(run, member.registration_id());
-            previous != Some(member.registration_id())
+            let key = (run, member.registration_id());
+            if rt.installed_routes.get(&key) == Some(&installed_prefixes) {
+                false
+            } else {
+                rt.installed_routes.insert(key, installed_prefixes);
+                true
+            }
         };
         if changed {
             self.dirty.mark();
@@ -214,80 +118,18 @@ impl RouteController {
         true
     }
 
-    /// Cleanup handles of the recorded installation when it is still the actual
-    /// one. Runs whose registry root has already been released are included:
-    /// this copies the current binding for cleanup and never queries the
-    /// manager's running list or closes anything here.
-    pub fn mobile_attachment_members(&self, attachment_id: Uuid) -> Vec<SharedVirtualNicMember> {
-        let rt = self.runtime.read();
-        let Some(snapshot) = rt.applied.as_ref() else {
-            return Vec::new();
-        };
-        if snapshot.attachment_id != attachment_id {
-            return Vec::new();
-        }
-        snapshot
-            .members
-            .iter()
-            .filter_map(|member| {
-                rt.instances
-                    .get(&member.instance_id)
-                    .and_then(|instances| instances.member.clone())
-            })
-            .collect()
-    }
-
-    /// Clear the actual record only when it is the attachment the caller really
-    /// revoked. A stale revocation never touches a newer installation, and the
-    /// request mark is never cleared here.
-    pub fn confirm_mobile_revoked(&self, attachment_id: Uuid) -> bool {
-        let removed = {
-            let mut rt = self.runtime.write();
-            let matches = rt
-                .applied
-                .as_ref()
-                .is_some_and(|snapshot| snapshot.attachment_id == attachment_id);
-            if matches {
-                rt.applied = None;
-            }
-            matches
-        };
-        if removed {
-            self.dirty.mark();
-            self.changed.notify_waiters();
-        }
-        removed
-    }
-
-    /// Whether the whole recorded installation is still attached: the snapshot
-    /// matches, every run still owns its registry root, every current member is
-    /// open, and every run's attached registration is the current one. This is
-    /// not a per-route readiness verdict, and an empty target is never attached.
-    pub fn mobile_snapshot_attached(&self, snapshot_id: Uuid) -> bool {
-        let rt = self.runtime.read();
-        if rt.shutdown {
-            return false;
-        }
-        let Some(snapshot) = rt.applied.as_ref() else {
-            return false;
-        };
-        if snapshot.config.snapshot_id != snapshot_id || snapshot.members.is_empty() {
-            return false;
-        }
-        snapshot.members.iter().all(|member| {
-            let run = member.instance_id;
-            let Some(instances) = rt.instances.get(&run) else {
-                return false;
-            };
-            if instances.registry.upgrade().is_none() {
-                return false;
-            }
-            let Some(current) = instances.member.as_ref() else {
-                return false;
-            };
-            current.ensure_open().is_ok()
-                && snapshot.attached_members.get(&run) == Some(&current.registration_id())
-        })
+    /// The local attachment evidence of this exact run/registration.
+    #[cfg(test)]
+    pub(super) fn mobile_installed_prefixes(
+        &self,
+        run: Uuid,
+        registration: Uuid,
+    ) -> Option<BTreeSet<IpCidr>> {
+        self.runtime
+            .read()
+            .installed_routes
+            .get(&(run, registration))
+            .cloned()
     }
 
     /// Whether the current configuration really asks for Magic DNS.
@@ -588,39 +430,29 @@ impl RouteController {
         }
         withdraw
     }
-
-    /// Claims of the run's actual installed member.
-    ///
-    /// Only a registration that is both attached in the ledger and still the
-    /// run's current binding may provide claims. This reads the existing ledger
-    /// only: it never waits for the NIC, projects a new target or caches input.
-    pub fn mobile_installed_claims(&self, run: Uuid) -> Option<SharedIfConfigClaims> {
-        let rt = self.runtime.read();
-        let snapshot = rt.applied.as_ref()?;
-        let current = rt.instances.get(&run)?.member.as_ref()?;
-        if snapshot.attached_members.get(&run) != Some(&current.registration_id()) {
-            return None;
-        }
-        snapshot
-            .members
-            .iter()
-            .find(|member| member.instance_id == run)
-            .map(|member| member.claims.clone())
-    }
 }
 
-/// Mobile background reconciler: member prefixes and per-route feedback.
+/// One failed whole-plan build and its local backoff.
+struct PlanRetry {
+    retry_at: tokio::time::Instant,
+    attempts: u32,
+}
+
+/// Mobile background reconciler: local member routes, local evidence and
+/// per-route feedback.
 ///
-/// It owns no system route backend and never creates the external VPN. The
-/// external owner alone performs the system installation; this actor keeps the
-/// shared NIC member claims in line with the current declarations, reports
-/// per-route status from the real installation evidence, and waits for real
-/// cleanup before records are removed.
+/// It owns no system route backend and never creates the external VPN. Every
+/// round takes its complete targets from the same policy entry used by config
+/// export and attach preparation; this actor only performs local NIC route
+/// synchronization and reports feedback from real ACKs and local evidence.
 pub(super) struct RouteReconciler {
     controller: RouteController,
     /// Only the backoff of a member synchronization that already failed; the
     /// member handle is kept until its real withdrawal finishes.
     pub(super) member_retries: BTreeMap<(Uuid, Uuid), MemberRetry>,
+    /// The complete table could not be read because a claims hint timed out.
+    /// This is a local retry of the policy entry, not an install request.
+    plan_retry: Option<PlanRetry>,
     /// Deadlines at or before this instant have already had their attempt.
     retry_horizon: tokio::time::Instant,
 }
@@ -630,6 +462,7 @@ impl RouteReconciler {
         Self {
             controller,
             member_retries: BTreeMap::new(),
+            plan_retry: None,
             retry_horizon: tokio::time::Instant::now(),
         }
     }
@@ -637,12 +470,12 @@ impl RouteReconciler {
     /// Mobile worker loop.
     ///
     /// Every input mark (registry, slot, address or DNS configuration) wakes a
-    /// round; every other wake only re-evaluates cleanup. Retry deadlines are
-    /// local scheduling values: the next attempt is read after the previous
+    /// round; every other wake only re-evaluates local cleanup. Retry deadlines
+    /// are local scheduling values: the next attempt is read after the previous
     /// I/O and never from the time this iteration started. The task returns
-    /// `Ok` only when shutdown has no record, no actual installation, no
-    /// outstanding request and no member cleanup left; shutdown alone never
-    /// cancels that cleanup.
+    /// `Ok` only when shutdown has no instance record, no local attachment
+    /// evidence, no member cleanup and no local retry left. It never waits for
+    /// the host's system VPN, an external request or a historical snapshot.
     pub(super) async fn run(mut self) -> anyhow::Result<()> {
         // The first round reads the current inputs even without any event.
         self.controller.dirty.mark();
@@ -658,10 +491,13 @@ impl RouteReconciler {
             let consumed_input = self.controller.dirty.reset();
             let now = tokio::time::Instant::now();
             let retry_horizon = self.retry_horizon;
-            let retry_due = self
-                .member_retries
-                .values()
-                .any(|retry| retry.retry_at > retry_horizon && retry.retry_at <= now);
+            let retry_due =
+                self.member_retries
+                    .values()
+                    .any(|retry| retry.retry_at > retry_horizon && retry.retry_at <= now)
+                    || self.plan_retry.as_ref().is_some_and(|retry| {
+                        retry.retry_at > retry_horizon && retry.retry_at <= now
+                    });
 
             if consumed_input || retry_due {
                 let batch_started = tokio::time::Instant::now();
@@ -679,9 +515,10 @@ impl RouteReconciler {
                 continue;
             }
 
-            // A wake without input (for example a compare that only cleared
-            // the request mark) still gets its cleanup evaluated.
-            let removed = self.remove_finished_instances();
+            // A wake without input still gets local cleanup evaluated. Without
+            // a fresh policy pass no bound member can prove an empty target, so
+            // only records with no current member can be removed here.
+            let removed = self.remove_finished_instances(&BTreeMap::new(), &BTreeSet::new());
             if removed {
                 self.controller.changed().notify_waiters();
             }
@@ -693,6 +530,7 @@ impl RouteReconciler {
                 .member_retries
                 .values()
                 .map(|retry| retry.retry_at)
+                .chain(self.plan_retry.as_ref().map(|retry| retry.retry_at))
                 .filter(|deadline| *deadline > now)
                 .min();
             match next_retry {
@@ -713,138 +551,103 @@ impl RouteReconciler {
         let rt = self.controller.runtime.read();
         rt.shutdown
             && rt.instances.is_empty()
-            && rt.applied.is_none()
+            && rt.installed_routes.is_empty()
             && self.member_retries.is_empty()
-            && rt.pending_install.is_none()
+            && self.plan_retry.is_none()
     }
 
     /// One mobile reconciliation round.
     ///
-    /// Local values only: current bindings, complete member targets, this
-    /// round's admissions, acknowledgements and cleared registrations. Retry
-    /// entries are owned by this task: they carry the failed target, its
-    /// backoff and the member handle still needed for a real withdrawal.
-    /// Returns whether records were removed (visible cleanup progress) and
-    /// whether a scheduled retry recovered.
-    async fn reconcile(&mut self) -> (bool, bool) {
+    /// Local values only: the complete policy plan, this round's admissions,
+    /// ACKs and cleared registrations. Retry entries are owned by this task:
+    /// they carry the failed target, its backoff and the member handle still
+    /// needed for a real local withdrawal. Returns whether records or local
+    /// evidence were removed (visible cleanup progress) and whether a
+    /// scheduled retry recovered.
+    pub(super) async fn reconcile(&mut self) -> (bool, bool) {
+        let mut recovered = false;
+        let plan = match self.controller.build_mobile_plan().await {
+            Ok(plan) => {
+                if self.plan_retry.take().is_some() {
+                    recovered = true;
+                }
+                plan
+            }
+            Err(error) => {
+                tracing::warn!(?error, "failed to read the complete mobile route plan");
+                self.record_plan_failure();
+                return (false, recovered);
+            }
+        };
+
+        // Controller decisions: which members were accepted and why a live
+        // member was not. Feedback uses these instead of deciding per instance.
+        let accepted: BTreeMap<Uuid, BTreeSet<IpCidr>> = plan
+            .members
+            .iter()
+            .map(|member| (member.run, member.installed_prefixes.clone()))
+            .collect();
+        let rejected_by_instance: BTreeMap<Uuid, Arc<str>> = plan
+            .config
+            .rejected
+            .iter()
+            .map(|rejected| (rejected.instance_id, Arc::from(rejected.error.as_str())))
+            .collect();
+
+        let mut removed_evidence = self.prune_installed_evidence().await;
+
+        // Every current binding, every withdrawal decided by the complete
+        // result, and every old registration that still owes cleanup.
+        let mut related: BTreeMap<(Uuid, Uuid), (SharedVirtualNicMember, BTreeSet<IpCidr>)> =
+            BTreeMap::new();
+        {
+            let rt = self.controller.runtime.read();
+            for (run, instance) in &rt.instances {
+                let Some(member) = instance.member.as_ref() else {
+                    continue;
+                };
+                let target = accepted.get(run).cloned().unwrap_or_default();
+                related.insert((*run, member.registration_id()), (member.clone(), target));
+            }
+        }
+        for withdraw in plan.withdraw {
+            related
+                .entry((withdraw.run, withdraw.registration))
+                .or_insert((withdraw.member, BTreeSet::new()));
+        }
+        for (key, retry) in &self.member_retries {
+            related
+                .entry(*key)
+                .or_insert_with(|| (retry.member.clone(), BTreeSet::new()));
+        }
         let mut admission_failures: BTreeMap<(Uuid, Uuid), (BTreeSet<IpCidr>, RouteStatus)> =
             BTreeMap::new();
         let mut synced: BTreeMap<(Uuid, Uuid), BTreeSet<IpCidr>> = BTreeMap::new();
         let mut cleared: BTreeSet<(Uuid, Uuid)> = BTreeSet::new();
-        let mut recovered = false;
 
-        // 1. Short read of the current bindings and their complete targets.
-        let mut related: BTreeMap<(Uuid, Uuid), SharedVirtualNicMember> = BTreeMap::new();
-        {
-            let rt = self.controller.runtime.read();
-            for (run, instance) in &rt.instances {
-                let Some(member) = instance.member.clone() else {
-                    continue;
-                };
-                related.insert((*run, member.registration_id()), member);
-            }
-        }
-        for (key, retry) in &self.member_retries {
-            related.entry(*key).or_insert_with(|| retry.member.clone());
-        }
-
-        // 2. Whole-member admission against this round's complete target.
-        // This result decides whether a transient failure may postpone the
-        // withdrawal, and supplies the rejection feedback.
-        for (key, member) in &related {
-            if !Self::is_current_binding(&self.controller, *key) {
+        // 1. Clear every member that the complete result no longer accepts.
+        // Empty targets are committed first, before any accepted member asks
+        // for admission, so stale local routes cannot block this round.
+        for (key, (member, target)) in &related {
+            if !target.is_empty() {
                 continue;
             }
             let now = tokio::time::Instant::now();
-            let target = self.mobile_current_target(*key).unwrap_or_default();
-            if member_retry_blocked(&self.member_retries, key, &target, now) {
+            if member_retry_blocked(&self.member_retries, key, target, now) {
                 continue;
             }
-            let status = Self::admit_member(member, &target).await;
-            // Recheck after the wait: a rebound registration or a changed
-            // target owns the next marked round, not this result.
-            if self.mobile_current_target(*key).as_ref() != Some(&target) {
-                continue;
-            }
-            match status {
-                Ok(()) => {}
-                Err(status @ RouteStatus::Rejected(_)) => {
-                    admission_failures.insert(*key, (target, status));
-                }
-                Err(RouteStatus::Pending {
-                    error: Some(error), ..
-                }) => {
-                    admission_failures.insert(
-                        *key,
-                        (
-                            target.clone(),
-                            RouteStatus::Pending {
-                                error: Some(error.clone()),
-                            },
-                        ),
-                    );
-                    record_member_failure(
-                        &mut self.member_retries,
-                        *key,
-                        member,
-                        target,
-                        &anyhow::anyhow!("{error}"),
-                    );
-                }
-                // An invalid or replaced binding is already known, not a
-                // failed attempt; the stages below still record real
-                // withdrawal or confirm the registration gone.
-                Err(_) => {}
-            }
-        }
-
-        // 3. Withdraw prefixes the member holds but its current target no
-        // longer contains, before committing the complete target.
-        for (key, member) in &related {
-            let now = tokio::time::Instant::now();
-            if self.transient_admission_unresolved(&admission_failures, *key) {
-                continue;
-            }
-            let final_target = self.mobile_current_target(*key).unwrap_or_default();
-            if member_retry_blocked(&self.member_retries, key, &final_target, now) {
-                continue;
-            }
-            let claims = match tokio::time::timeout(ROUTE_IO_TIMEOUT, member.claims()).await {
-                Ok(claims) => claims,
-                Err(_) => {
-                    synced.remove(key);
-                    cleared.remove(key);
-                    record_member_failure(
-                        &mut self.member_retries,
-                        *key,
-                        member,
-                        final_target,
-                        &anyhow::anyhow!(
-                            "timed out reading claims of member {}",
-                            member.member_id()
-                        ),
-                    );
-                    continue;
-                }
-            };
-            let current = claim_prefixes(&claims);
-            // The target may move while claims are read; only withdraw what
-            // the still-current binding and declarations exclude.
-            let target = self.mobile_current_target(*key).unwrap_or_default();
-            let stage: BTreeSet<IpCidr> = current.intersection(&target).copied().collect();
-            if stage == current {
-                // Nothing stale. The full commit below is the acknowledgement.
-                continue;
-            }
-            match sync_member_routes(member, &stage).await {
+            match sync_member_routes(member, target).await {
                 Ok(true) => {
                     cleared.remove(key);
-                    synced.insert(*key, stage);
+                    synced.insert(*key, target.clone());
                     if self.member_retries.remove(key).is_some() {
                         recovered = true;
                     }
                 }
                 Ok(false) => {
+                    // The registration is gone or the NIC is invalid. This is
+                    // real local cleanup evidence, not an inference from a
+                    // closed flag.
                     synced.remove(key);
                     cleared.insert(*key);
                     if self.member_retries.remove(key).is_some() {
@@ -855,104 +658,83 @@ impl RouteReconciler {
                 Err(error) => {
                     synced.remove(key);
                     cleared.remove(key);
-                    tracing::warn!(?error, ?key, "failed to withdraw member routes");
+                    tracing::warn!(?error, ?key, "failed to clear member routes");
                     record_member_failure(
                         &mut self.member_retries,
                         *key,
                         member,
-                        final_target,
+                        target.clone(),
                         &error,
                     );
                 }
             }
         }
 
-        // 3b. Admit the complete targets again after the withdrawals: a
-        // conflict caused only by a stale prefix withdrawn above is no longer
-        // this member's current rejection.
-        for (key, member) in &related {
+        // 2. Admit and commit exactly the targets the complete result accepted.
+        // Admission here is a real NIC check; a conflict with stale local
+        // claims is a temporary local failure and is retried. A member the
+        // Controller rejected never reaches this stage.
+        for (key, (member, target)) in &related {
+            if target.is_empty() {
+                continue;
+            }
             if !Self::is_current_binding(&self.controller, *key) {
                 continue;
             }
-            // Only a rejection can have been caused by a stale prefix that
-            // this round's withdrawal just removed.
-            if !admission_failures
-                .get(key)
-                .is_some_and(|(_, status)| matches!(status, RouteStatus::Rejected(_)))
-            {
-                continue;
-            }
-            if self.transient_admission_unresolved(&admission_failures, *key) {
-                continue;
-            }
             let now = tokio::time::Instant::now();
-            let target = self.mobile_current_target(*key).unwrap_or_default();
-            if member_retry_blocked(&self.member_retries, key, &target, now) {
+            if member_retry_blocked(&self.member_retries, key, target, now) {
                 continue;
             }
-            let status = Self::admit_member(member, &target).await;
-            if self.mobile_current_target(*key).as_ref() != Some(&target) {
-                continue;
-            }
-            match status {
-                Ok(()) => {
+            match Self::admit_member(member, target).await {
+                Ok(()) => {}
+                Err(RouteStatus::Pending { error: None }) => {
+                    // Closed, invalid or replaced binding: no write target can
+                    // be confirmed this round, and there is nothing to retry
+                    // until a new binding or input arrives.
                     admission_failures.remove(key);
+                    synced.remove(key);
+                    cleared.remove(key);
+                    continue;
                 }
-                Err(status @ RouteStatus::Rejected(_)) => {
-                    admission_failures.insert(*key, (target, status));
-                }
-                Err(RouteStatus::Pending {
-                    error: Some(error), ..
-                }) => {
-                    admission_failures.insert(
-                        *key,
-                        (
-                            target.clone(),
-                            RouteStatus::Pending {
-                                error: Some(error.clone()),
-                            },
-                        ),
-                    );
+                Err(status @ RouteStatus::Pending { error: Some(_) }) => {
+                    synced.remove(key);
+                    cleared.remove(key);
+                    let error = match &status {
+                        RouteStatus::Pending {
+                            error: Some(error), ..
+                        } => error.clone(),
+                        _ => unreachable!("matched Pending with an error"),
+                    };
+                    admission_failures.insert(*key, (target.clone(), status));
                     record_member_failure(
                         &mut self.member_retries,
                         *key,
                         member,
-                        target,
+                        target.clone(),
                         &anyhow::anyhow!("{error}"),
                     );
+                    continue;
                 }
-                Err(_) => {}
+                Err(status) => {
+                    // Admission currently only produces Pending, but keep the
+                    // feedback generic if a definite status is added later.
+                    synced.remove(key);
+                    cleared.remove(key);
+                    admission_failures.insert(*key, (target.clone(), status));
+                    continue;
+                }
             }
-        }
-
-        // 4. Commit every related member's complete current target. Equal
-        // claims are committed again on purpose: only the commit is the
-        // acknowledgement. A whole-target rejection is a real input error, so
-        // it is reported but not installed and not retried as a transient
-        // failure.
-        for (key, member) in &related {
-            let now = tokio::time::Instant::now();
-            if self.transient_admission_unresolved(&admission_failures, *key) {
+            // Recheck after the admission wait: a rebound registration belongs
+            // to the next marked round.
+            if !Self::is_current_binding(&self.controller, *key) {
+                synced.remove(key);
+                cleared.remove(key);
                 continue;
             }
-            let final_target = self.mobile_current_target(*key).unwrap_or_default();
-            if member_retry_blocked(&self.member_retries, key, &final_target, now) {
-                continue;
-            }
-            let target = self.mobile_current_target(*key).unwrap_or_default();
-            if matches!(
-                admission_failures.get(key),
-                Some((failed, RouteStatus::Rejected(_))) if failed == &target
-            ) {
-                continue;
-            }
-            if !self.member_retries.contains_key(key) && synced.get(key) == Some(&target) {
-                continue;
-            }
-            match sync_member_routes(member, &target).await {
+            match sync_member_routes(member, target).await {
                 Ok(true) => {
                     cleared.remove(key);
-                    synced.insert(*key, target);
+                    synced.insert(*key, target.clone());
                     if self.member_retries.remove(key).is_some() {
                         recovered = true;
                     }
@@ -964,42 +746,120 @@ impl RouteReconciler {
                         recovered = true;
                     }
                     self.controller.unready(key.0, key.1);
-                }
-                Err(error) if error.is::<SharedIfConfigConflict>() => {
-                    // Another member committed a conflicting target between
-                    // admission and this commit; the whole target is rejected,
-                    // not a transient failure to retry.
-                    synced.remove(key);
-                    cleared.remove(key);
-                    tracing::warn!(?error, ?key, "rejected member route target");
-                    admission_failures.insert(
-                        *key,
-                        (target, RouteStatus::Rejected(error.to_string().into())),
-                    );
                 }
                 Err(error) => {
                     synced.remove(key);
                     cleared.remove(key);
                     tracing::warn!(?error, ?key, "failed to sync member routes");
+                    let status = RouteStatus::Pending {
+                        error: Some(error.to_string().into()),
+                    };
+                    admission_failures.insert(*key, (target.clone(), status));
                     record_member_failure(
                         &mut self.member_retries,
                         *key,
                         member,
-                        final_target,
+                        target.clone(),
                         &error,
                     );
                 }
             }
         }
 
-        // 5. Feedback reads the current policy and available slots again.
-        self.update_statuses(&admission_failures, &synced);
+        // 3. Feedback only consumes Controller decisions, this round's real
+        // ACKs and local installed evidence; it never recomputes a target.
+        self.update_statuses(
+            &accepted,
+            &rejected_by_instance,
+            &admission_failures,
+            &synced,
+        );
 
-        // 6. A member replaced during the waits still owes withdrawal.
+        // 4. A member replaced during the waits still owes local cleanup.
         self.transfer_orphan_members(&related, &synced, &cleared);
 
-        let removed = self.remove_finished_instances();
-        (removed, recovered)
+        if self.remove_finished_instances(&synced, &cleared) {
+            removed_evidence = true;
+        }
+        (removed_evidence, recovered)
+    }
+
+    /// Drop evidence only after the actual NIC registration is gone or the
+    /// dispatcher is invalid. A closed flag alone is intentionally enough to
+    /// keep it: close is allowed to set that flag before its cleanup finishes.
+    async fn prune_installed_evidence(&mut self) -> bool {
+        let observed: Vec<((Uuid, Uuid), SharedVirtualNicMember)> = {
+            let rt = self.controller.runtime.read();
+            rt.installed_routes
+                .keys()
+                .filter_map(|key| {
+                    let member = rt.instances.get(&key.0)?.member.as_ref()?;
+                    (member.registration_id() == key.1).then(|| (*key, member.clone()))
+                })
+                .collect()
+        };
+        let mut remove = Vec::new();
+        for (key, member) in &observed {
+            let nic = member.shared_nic();
+            match tokio::time::timeout(ROUTE_IO_TIMEOUT, nic.lock()).await {
+                Ok(guard) => {
+                    if !guard.is_valid() || !guard.is_current_member_registration(key.0, key.1) {
+                        remove.push(*key);
+                    }
+                }
+                Err(_) => {
+                    // Keep the evidence and schedule the existing local retry
+                    // path rather than guessing that cleanup happened.
+                    if !self.member_retries.contains_key(key) {
+                        record_member_failure(
+                            &mut self.member_retries,
+                            *key,
+                            member,
+                            BTreeSet::new(),
+                            &anyhow::anyhow!(
+                                "timed out verifying installed prefixes of member {}",
+                                member.member_id()
+                            ),
+                        );
+                    }
+                }
+            }
+        }
+        // A key with no matching current member has no live registration that
+        // could later confirm it.
+        {
+            let rt = self.controller.runtime.read();
+            for key in rt.installed_routes.keys() {
+                if !observed.iter().any(|(observed, _)| observed == key) {
+                    remove.push(*key);
+                }
+            }
+        }
+        remove.sort();
+        remove.dedup();
+        let mut rt = self.controller.runtime.write();
+        let mut removed = false;
+        for key in remove {
+            removed |= rt.installed_routes.remove(&key).is_some();
+        }
+        removed
+    }
+
+    fn record_plan_failure(&mut self) {
+        let now = tokio::time::Instant::now();
+        match &mut self.plan_retry {
+            Some(retry) if retry.retry_at <= now => {
+                retry.attempts = retry.attempts.saturating_add(1);
+                retry.retry_at = now + retry_backoff(retry.attempts);
+            }
+            Some(_) => {}
+            None => {
+                self.plan_retry = Some(PlanRetry {
+                    retry_at: now + retry_backoff(1),
+                    attempts: 1,
+                });
+            }
+        }
     }
 
     /// Whole-member admission through the existing NIC rule.
@@ -1028,15 +888,22 @@ impl RouteReconciler {
         {
             return Err(RouteStatus::Pending { error: None });
         }
-        match guard.prepare_managed_routes(member.member_id(), member.registration_id(), target) {
-            Ok(_) => Ok(()),
-            Err(error) if error.is::<SharedIfConfigConflict>() => {
-                Err(RouteStatus::Rejected(error.to_string().into()))
-            }
-            Err(error) => Err(RouteStatus::Pending {
-                error: Some(error.to_string().into()),
-            }),
-        }
+        guard
+            .prepare_managed_routes(member.member_id(), member.registration_id(), target)
+            .map(|_| ())
+            .map_err(|error| {
+                let message: Arc<str> = if error.is::<SharedIfConfigConflict>() {
+                    // The complete plan accepted this target; a remaining
+                    // overlap is stale local state to clear, not a policy
+                    // rejection.
+                    format!("local route admission conflict: {error}").into()
+                } else {
+                    error.to_string().into()
+                };
+                RouteStatus::Pending {
+                    error: Some(message),
+                }
+            })
     }
 
     fn is_current_binding(controller: &RouteController, (run, registration): (Uuid, Uuid)) -> bool {
@@ -1047,36 +914,17 @@ impl RouteReconciler {
             .is_some_and(|member| member.registration_id() == registration)
     }
 
-    fn mobile_current_target(&self, (run, registration): (Uuid, Uuid)) -> Option<BTreeSet<IpCidr>> {
-        let rt = self.controller.runtime.read();
-        mobile_target_locked(&rt, run, registration)
-    }
-
-    /// Whether a transient admission failure for this exact registration still
-    /// describes a nonempty current target. Committing anything else while it
-    /// is unresolved would turn a failed prepare into an unrequested
-    /// withdrawal.
-    fn transient_admission_unresolved(
-        &self,
-        admission_failures: &BTreeMap<(Uuid, Uuid), (BTreeSet<IpCidr>, RouteStatus)>,
-        key: (Uuid, Uuid),
-    ) -> bool {
-        matches!(
-            admission_failures.get(&key),
-            Some((_, RouteStatus::Pending { error: Some(_) }))
-        ) && self
-            .mobile_current_target(key)
-            .is_some_and(|target| !target.is_empty())
-    }
-
-    /// Per-route status from this round's real evidence.
+    /// Per-route status from the complete plan plus this round's real evidence.
     ///
-    /// Ready needs all of: a real commit for this registration containing the
-    /// prefix, the attached registration of the actual installation matching
-    /// the current member, and the recorded member's own projection containing
-    /// the prefix. An unrelated member's change never makes this run pending.
+    /// Ready requires all of: the Controller accepted this declaration in the
+    /// complete result for the current registration, this round really ACKed
+    /// the complete target, and this exact run/registration has installed
+    /// evidence covering the prefix. Another member's evidence or an equal
+    /// domain-wide union never substitutes for that.
     fn update_statuses(
         &self,
+        accepted: &BTreeMap<Uuid, BTreeSet<IpCidr>>,
+        rejected_by_instance: &BTreeMap<Uuid, Arc<str>>,
         admission_failures: &BTreeMap<(Uuid, Uuid), (BTreeSet<IpCidr>, RouteStatus)>,
         synced: &BTreeMap<(Uuid, Uuid), BTreeSet<IpCidr>>,
     ) {
@@ -1088,25 +936,20 @@ impl RouteReconciler {
             let Some(registry) = instance.registry.upgrade() else {
                 continue;
             };
+            let rejection = instance
+                .global
+                .as_ref()
+                .and_then(Weak::upgrade)
+                .and_then(|global| rejected_by_instance.get(&global.get_id()).cloned());
             let manual = instance
                 .config
                 .as_ref()
                 .is_some_and(|store| store.snapshot().services.manual_routes.is_some());
             let current_member = instance.member.as_ref();
             let registration = current_member.map(SharedVirtualNicMember::registration_id);
-            let target =
-                registration.and_then(|registration| mobile_target_locked(&rt, *run, registration));
-            let recorded_prefixes = rt.applied.as_ref().and_then(|snapshot| {
-                snapshot
-                    .members
-                    .iter()
-                    .find(|member| member.instance_id == *run)
-                    .map(member_prefixes)
-            });
-            let attached = rt
-                .applied
-                .as_ref()
-                .and_then(|snapshot| snapshot.attached_members.get(run).copied());
+            let target = accepted.get(run);
+            let installed = registration
+                .and_then(|registration| rt.installed_routes.get(&(*run, registration)));
 
             for weak in registry.slots() {
                 let Some(slot) = weak.upgrade() else {
@@ -1120,19 +963,17 @@ impl RouteReconciler {
                         ));
                     }
                     let prefix = declaration.destination;
-                    let Some(registration) = registration else {
+                    if let Some(error) = &rejection {
+                        return Some(RouteStatus::Rejected(error.clone()));
+                    }
+                    let (Some(registration), Some(target)) = (registration, target) else {
                         return Some(RouteStatus::Pending { error: None });
                     };
-                    let Some(target) = target.as_ref() else {
-                        return Some(RouteStatus::Pending { error: None });
-                    };
-                    // A declaration added while this round was awaiting has no
-                    // evidence yet.
+                    // A declaration added after the plan, or an instance outside
+                    // the host's scope, has no Controller acceptance yet.
                     if !target.contains(&prefix) {
                         return Some(RouteStatus::Pending { error: None });
                     }
-                    // Only this round's result for exactly the current
-                    // complete target and registration may be reported.
                     if let Some((failed_prefixes, status)) =
                         admission_failures.get(&(*run, registration))
                         && failed_prefixes == target
@@ -1145,13 +986,8 @@ impl RouteReconciler {
                         .filter(|retry| retry.target.contains(&prefix))
                         .map(|retry| retry.error.clone());
                     let ready = current_member.is_some_and(|member| member.ensure_open().is_ok())
-                        && synced
-                            .get(&(*run, registration))
-                            .is_some_and(|prefixes| prefixes.contains(&prefix))
-                        && attached == Some(registration)
-                        && recorded_prefixes
-                            .as_ref()
-                            .is_some_and(|prefixes| prefixes.contains(&prefix));
+                        && synced.get(&(*run, registration)) == Some(target)
+                        && installed.is_some_and(|prefixes| prefixes.contains(&prefix));
                     if ready {
                         Some(RouteStatus::Ready)
                     } else {
@@ -1165,7 +1001,7 @@ impl RouteReconciler {
     /// Keep an orphaned member's real cleanup responsibility.
     fn transfer_orphan_members(
         &mut self,
-        related: &BTreeMap<(Uuid, Uuid), SharedVirtualNicMember>,
+        related: &BTreeMap<(Uuid, Uuid), (SharedVirtualNicMember, BTreeSet<IpCidr>)>,
         synced: &BTreeMap<(Uuid, Uuid), BTreeSet<IpCidr>>,
         cleared: &BTreeSet<(Uuid, Uuid)>,
     ) {
@@ -1182,7 +1018,7 @@ impl RouteReconciler {
                 .collect()
         };
         let now = tokio::time::Instant::now();
-        for (key, member) in related {
+        for (key, (member, _target)) in related {
             if held.contains(key) || cleared.contains(key) {
                 continue;
             }
@@ -1209,22 +1045,23 @@ impl RouteReconciler {
         }
     }
 
-    /// Remove instance records whose whole real responsibility is finished.
+    /// Remove instance records whose whole local responsibility is finished.
     ///
-    /// Only a released root or shutdown makes a record eligible. The actual
-    /// installation must no longer contain the run (including a confirmed
-    /// revocation that cleared the whole record), no member of the run may
-    /// still owe prefix cleanup, and no whole-domain request may be pending.
-    fn remove_finished_instances(&self) -> bool {
+    /// Only a released root or shutdown makes a record eligible. There must be
+    /// no pending member retry, no installed evidence for the run, and every
+    /// current member must have proven an empty local route target this round
+    /// (or have lost its registration). A closed flag or an empty route list
+    /// alone is not proof.
+    fn remove_finished_instances(
+        &self,
+        synced: &BTreeMap<(Uuid, Uuid), BTreeSet<IpCidr>>,
+        cleared: &BTreeSet<(Uuid, Uuid)>,
+    ) -> bool {
         let mut rt = self.controller.runtime.write();
         let shutdown = rt.shutdown;
-        let pending = rt.pending_install.is_some();
         let mut finished = Vec::new();
         for (run, instance) in &rt.instances {
             if !shutdown && instance.registry.upgrade().is_some() {
-                continue;
-            }
-            if pending {
                 continue;
             }
             if self
@@ -1234,14 +1071,20 @@ impl RouteReconciler {
             {
                 continue;
             }
-            let installed = rt.applied.as_ref().is_some_and(|snapshot| {
-                snapshot
-                    .members
-                    .iter()
-                    .any(|member| member.instance_id == *run)
-            });
-            if installed {
+            if rt
+                .installed_routes
+                .keys()
+                .any(|(installed_run, _)| installed_run == run)
+            {
                 continue;
+            }
+            if let Some(member) = instance.member.as_ref() {
+                let key = (*run, member.registration_id());
+                let locally_clean =
+                    cleared.contains(&key) || synced.get(&key).is_some_and(BTreeSet::is_empty);
+                if !locally_clean {
+                    continue;
+                }
             }
             finished.push(*run);
         }
@@ -1252,43 +1095,7 @@ impl RouteReconciler {
         removed
     }
 }
-/// The full target of one currently bound member, read under the runtime lock.
-///
-/// It is the distinct destinations of the run's current declarations under the
-/// current policy. A released root or shutdown withdraws everything, including
-/// manual routes. The recorded member's DNS bootstrap prefix is kept only while
-/// the current configuration still asks for Magic DNS.
-fn mobile_target_locked(
-    rt: &RouteControllerRuntime,
-    run: Uuid,
-    registration: Uuid,
-) -> Option<BTreeSet<IpCidr>> {
-    if rt.shutdown {
-        return None;
-    }
-    let instance = rt.instances.get(&run)?;
-    if instance.member.as_ref()?.registration_id() != registration {
-        return None;
-    }
-    if instance.registry.upgrade().is_none() {
-        return None;
-    }
-    let (declarations, _slots) = instance.declarations()?;
-    let mut prefixes: BTreeSet<IpCidr> = declarations
-        .into_iter()
-        .map(|declaration| declaration.destination)
-        .collect();
-    let dns_recorded = rt.applied.as_ref().is_some_and(|snapshot| {
-        snapshot
-            .members
-            .iter()
-            .any(|member| member.instance_id == run && member.dns)
-    });
-    if dns_recorded && mobile_dns_configured(rt, instance) {
-        prefixes.insert(magic_dns_prefix());
-    }
-    Some(prefixes)
-}
+
 /// Whether this instance's current configuration really enables Magic DNS.
 fn mobile_dns_configured(rt: &RouteControllerRuntime, instance: &InstanceRoutes) -> bool {
     #[cfg(not(feature = "magic-dns"))]

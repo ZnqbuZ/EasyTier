@@ -24,13 +24,15 @@ use uuid::Uuid;
 #[cfg(all(mobile, feature = "tun"))]
 use crate::common::global_ctx::GlobalCtx;
 use crate::common::net_ns::NetNS;
+#[cfg(not(mobile))]
+use crate::instance::route::AppliedRoutes;
 #[cfg(all(feature = "tun", not(mobile)))]
 use crate::instance::route::InterfaceInfo;
 #[cfg(not(mobile))]
 use crate::instance::route::PlatformRouteBackend;
 #[cfg(feature = "tun")]
 use crate::instance::shared_virtual_nic::SharedVirtualNicMember;
-use crate::{instance::route::AppliedRoutes, utils::dirty::DirtyFlag};
+use crate::utils::dirty::DirtyFlag;
 
 #[cfg(not(mobile))]
 mod desktop;
@@ -44,7 +46,7 @@ mod tests;
 #[cfg(not(mobile))]
 use self::desktop::RouteReconciler;
 #[cfg(all(mobile, feature = "tun"))]
-use self::mobile::RouteReconciler;
+use self::mobile::{MobileInstalledRoutes, RouteReconciler};
 
 /// One instance's input directory and current device binding.
 ///
@@ -113,12 +115,14 @@ impl InstanceRoutes {
 #[derive(Default)]
 struct RouteControllerRuntime {
     instances: BTreeMap<Uuid, InstanceRoutes>,
+    #[cfg(not(mobile))]
     applied: AppliedRoutes,
-    shutdown: bool,
-    // Only the mobile TUN build: the latest accepted whole-domain install or
-    // withdraw request that has not really completed yet.
+    /// Local mobile attachment evidence only: which accepted prefixes were
+    /// really installed for one current run/registration. It owns no FD,
+    /// system VPN or NativeRuntime.
     #[cfg(all(mobile, feature = "tun"))]
-    pending_install: Option<Uuid>,
+    installed_routes: MobileInstalledRoutes,
+    shutdown: bool,
     /// The host's participation range, keyed by configured instance id.
     /// `None` means every live instance of this domain; an empty set is an
     /// explicit empty range. This is an input, never a post-export filter.
@@ -356,8 +360,10 @@ impl RouteController {
             };
 
             #[cfg(mobile)]
-            if replaced && let Some(snapshot) = rt.applied.as_mut() {
-                snapshot.attached_members.remove(&run);
+            if replaced {
+                // A new registration has no evidence from the old binding.
+                rt.installed_routes
+                    .retain(|(installed_run, _), _| *installed_run != run);
             }
             replaced
         };
@@ -394,13 +400,10 @@ impl RouteController {
             }
             #[cfg(mobile)]
             {
-                rt.applied.as_mut().is_some_and(|snapshot| {
-                    if snapshot.attached_members.get(&run) != Some(&registration) {
-                        return false;
-                    }
-                    snapshot.attached_members.remove(&run);
-                    true
-                })
+                // Only this exact run/registration loses its local attachment
+                // evidence. A late report from an older registration must not
+                // invalidate a newer binding.
+                rt.installed_routes.remove(&(run, registration)).is_some()
             }
         };
 
@@ -495,10 +498,7 @@ impl RouteController {
         #[cfg(not(mobile))]
         let drained = rt.shutdown && rt.instances.is_empty() && rt.applied.is_empty();
         #[cfg(mobile)]
-        let drained = rt.shutdown
-            && rt.instances.is_empty()
-            && rt.applied.is_none()
-            && rt.pending_install.is_none();
+        let drained = rt.shutdown && rt.instances.is_empty() && rt.installed_routes.is_empty();
         if drained {
             return Ok(());
         }
@@ -523,11 +523,13 @@ impl RouteController {
         #[cfg(mobile)]
         let detail = format!(
             "route controller is not drained: shutdown {}, instance records {:?}, \
-             attachment {:?}, pending install {:?}",
+             installed routes {:?}",
             rt.shutdown,
             rt.instances.keys().collect::<Vec<_>>(),
-            rt.applied.as_ref().map(|snapshot| snapshot.attachment_id),
-            rt.pending_install
+            rt.installed_routes
+                .iter()
+                .map(|(key, prefixes)| format!("{key:?} {prefixes:?}"))
+                .collect::<Vec<_>>()
         );
         Err(anyhow::anyhow!(detail))
     }
@@ -562,12 +564,15 @@ impl RouteController {
         };
         #[cfg(mobile)]
         let detail = {
-            let attachment = rt.applied.as_ref().map(|snapshot| snapshot.attachment_id);
-            let pending = rt.pending_install;
+            let installed = rt
+                .installed_routes
+                .iter()
+                .filter(|((installed_run, _), _)| *installed_run == run)
+                .map(|(key, prefixes)| format!("{key:?} {prefixes:?}"))
+                .collect::<Vec<_>>();
             format!(
                 "timed out waiting for route cleanup of instance {run}: \
-                 instance record {record}, attachment {attachment:?}, \
-                 pending install {pending:?}"
+                 instance record {record}, remaining installed routes {installed:?}"
             )
         };
         anyhow::Error::new(elapsed).context(detail)

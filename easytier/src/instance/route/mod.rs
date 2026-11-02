@@ -1,7 +1,5 @@
 //! Native control of one network domain. Production backend dispatch is static.
 
-#[cfg(all(mobile, feature = "tun"))]
-use std::collections::BTreeMap;
 #[cfg(not(mobile))]
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -12,11 +10,9 @@ use std::{
 use cidr::IpCidr;
 #[cfg(not(mobile))]
 use easytier_core::host::route::{RouteAction, RouteSpec};
-#[cfg(any(not(mobile), all(mobile, feature = "tun")))]
+#[cfg(not(mobile))]
 use uuid::Uuid;
 
-#[cfg(all(mobile, feature = "tun"))]
-use crate::instance::route::mobile::{MobileTunConfig, MobileTunMember};
 #[cfg(all(not(mobile), feature = "tun"))]
 use crate::instance::shared_virtual_nic::SharedVirtualNicMember;
 
@@ -34,19 +30,6 @@ pub(crate) mod runtime;
 
 #[cfg(any(not(mobile), feature = "tun"))]
 pub(crate) use controller::RouteController;
-
-/// The system configuration and member attachments the VPN owner confirmed.
-#[cfg(all(mobile, feature = "tun"))]
-pub(crate) struct AppliedSnapshot {
-    pub attachment_id: Uuid,
-    pub config: MobileTunConfig,
-    pub members: Vec<MobileTunMember>,
-    /// Attached run → registration identity.
-    pub attached_members: BTreeMap<Uuid, Uuid>,
-}
-
-#[cfg(all(mobile, feature = "tun"))]
-pub(crate) type AppliedRoutes = Option<AppliedSnapshot>;
 
 /// Resolved parameters of one instance's real device binding.
 #[cfg(not(mobile))]

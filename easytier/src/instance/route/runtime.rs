@@ -89,7 +89,7 @@ impl NativeRouteContext {
         Ok(self.controller.effective_routes_for_instance(&self.run))
     }
 
-    /// Record one member's real mobile attachment.
+    /// Record one member's real local attachment evidence.
     ///
     /// The validity and registration check and the Controller write happen
     /// without an intervening await. The dispatcher marks a dead NIC invalid
@@ -97,10 +97,10 @@ impl NativeRouteContext {
     /// recorded as attached afterwards. Root release and namespace shutdown do
     /// not discard a genuine fact, so this does not call `ensure_open`.
     #[cfg(all(feature = "tun", mobile))]
-    pub(crate) async fn mobile_ready(
+    pub(crate) async fn record_mobile_ready(
         &self,
         member: &SharedVirtualNicMember,
-        attachment_id: Uuid,
+        installed_prefixes: std::collections::BTreeSet<cidr::IpCidr>,
     ) -> anyhow::Result<bool> {
         let shared_nic = member.shared_nic();
         let guard = tokio::time::timeout(std::time::Duration::from_secs(5), shared_nic.lock())
@@ -120,17 +120,12 @@ impl NativeRouteContext {
         // No await between the check above and this synchronous Controller write.
         Ok(self
             .controller
-            .mobile_ready(self.run, member, attachment_id))
+            .record_mobile_ready(self.run, member, installed_prefixes))
     }
 
     #[cfg(all(feature = "tun", mobile))]
     pub(crate) fn mobile_dns_enabled(&self) -> bool {
         self.controller.mobile_dns_enabled(self.run)
-    }
-
-    #[cfg(all(feature = "tun", mobile))]
-    pub(crate) fn mobile_installed_claims(&self) -> Option<SharedIfConfigClaims> {
-        self.controller.mobile_installed_claims(self.run)
     }
 
     pub(crate) fn public_address(&self) -> Option<cidr::Ipv6Inet> {

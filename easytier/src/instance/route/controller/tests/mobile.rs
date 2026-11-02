@@ -1,23 +1,24 @@
-//! Mobile controller tests: request marks and the actual installation ledger.
+//! Mobile controller tests: inputs, local evidence and local reconciliation.
 
 use std::{collections::BTreeSet, sync::Arc};
 
+use cidr::IpCidr;
 #[cfg(feature = "magic-dns")]
 use easytier_core::config::IpPrefix;
-use easytier_core::config::{
-    peers::PeerRuntimeSnapshot,
-    runtime::{CoreRuntimeConfig, CoreRuntimeConfigStore},
+use easytier_core::{
+    config::{
+        peers::PeerRuntimeSnapshot,
+        runtime::{CoreRuntimeConfig, CoreRuntimeConfigStore},
+    },
+    host::route::{RouteSlot, RouteStatus},
 };
 
+use super::super::member::claim_prefixes;
+use super::super::mobile::RouteReconciler;
 use super::super::*;
 use crate::{
     common::{config::TomlConfig, global_ctx::GlobalCtx, net_ns::tests::test_net_ns},
-    instance::{
-        factory::MobileTunConfig,
-        route::mobile::MobileTunMember,
-        shared_virtual_nic::{SharedIfConfigClaims, SharedVirtualNicRegistry},
-        virtual_nic::VirtualNicConfig,
-    },
+    instance::{shared_virtual_nic::SharedVirtualNicRegistry, virtual_nic::VirtualNicConfig},
 };
 
 fn test_controller() -> RouteController {
@@ -39,23 +40,126 @@ fn test_member(registry: &mut SharedVirtualNicRegistry, run: Uuid) -> SharedVirt
     )
 }
 
-fn tun_member(run: Uuid) -> MobileTunMember {
-    MobileTunMember::new(
+fn test_managed_member(
+    registry: &mut SharedVirtualNicRegistry,
+    run: Uuid,
+) -> SharedVirtualNicMember {
+    registry.create_member(
+        format!("et-{run}"),
+        VirtualNicConfig::new(format!("et-{run}"), 1400, test_net_ns(None))
+            .with_routes_managed(true),
         run,
-        run,
-        SharedIfConfigClaims {
-            ipv4_addresses: BTreeSet::from(["10.126.126.7/24".parse().unwrap()]),
-            ..Default::default()
-        },
-        None,
-        false,
+        Arc::new(Notify::new()),
     )
 }
 
-fn config(snapshot_id: Uuid) -> MobileTunConfig {
-    MobileTunConfig {
-        snapshot_id,
-        ..Default::default()
+fn status_of(slot: &RouteSlot, prefix: IpCidr) -> Option<RouteStatus> {
+    slot.statuses()
+        .into_iter()
+        .find_map(|(declaration, status)| (declaration.destination == prefix).then_some(status))
+}
+
+/// One live instance with inputs and declarations but no member. This is the
+/// no-NIC export/feedback path.
+fn input_only_instance(
+    controller: &RouteController,
+    ipv4: &str,
+    declaration: &str,
+) -> (Arc<GlobalCtx>, Arc<Registry>, RouteSlot) {
+    let global = Arc::new(GlobalCtx::new(TomlConfig::default()));
+    let run = global.key();
+    let registry = controller.open_instance(run).unwrap();
+    controller
+        .bind_mobile_inputs(
+            run,
+            Arc::downgrade(&global),
+            Arc::new(parking_lot::Mutex::new(None)),
+        )
+        .unwrap();
+    global.set_ipv4(Some(ipv4.parse().unwrap()));
+    let slot = registry
+        .handle()
+        .open_slot(RouteSource::Additional)
+        .unwrap();
+    slot.set_routes(RouteSet::from([RouteSpec::for_tun(
+        declaration.parse().unwrap(),
+    )]));
+    (global, registry, slot)
+}
+
+/// Attach the member's registration under the NIC lock, as device creation
+/// does. No device or dispatcher is created here.
+async fn attach_nic_registration(member: &SharedVirtualNicMember) {
+    let shared_nic = member.shared_nic();
+    let mut nic = shared_nic.lock().await;
+    nic.attach_member_registration(member.member_id(), member.registration_id())
+        .await
+        .unwrap();
+}
+
+/// One live mobile instance with a managed member and one Additional route.
+struct MobileHarness {
+    controller: RouteController,
+    _global: Arc<GlobalCtx>,
+    run: Uuid,
+    registry: Arc<Registry>,
+    _nics: SharedVirtualNicRegistry,
+    member: SharedVirtualNicMember,
+    slot: RouteSlot,
+}
+
+impl MobileHarness {
+    async fn new(declaration: &str) -> Self {
+        let controller = test_controller();
+        let global = Arc::new(GlobalCtx::new(TomlConfig::default()));
+        let run = global.key();
+        let registry = controller.open_instance(run).unwrap();
+        controller
+            .bind_mobile_inputs(
+                run,
+                Arc::downgrade(&global),
+                Arc::new(parking_lot::Mutex::new(None)),
+            )
+            .unwrap();
+        global.set_ipv4(Some("10.90.0.1/24".parse().unwrap()));
+        controller
+            .bind_config(
+                run,
+                CoreRuntimeConfigStore::new(
+                    CoreRuntimeConfig::default(),
+                    Arc::new(PeerRuntimeSnapshot::default()),
+                ),
+            )
+            .unwrap();
+        let mut nics = SharedVirtualNicRegistry::new();
+        let member = test_managed_member(&mut nics, run);
+        attach_nic_registration(&member).await;
+        controller.bind_member(run, &member).unwrap();
+        let slot = registry
+            .handle()
+            .open_slot(RouteSource::Additional)
+            .unwrap();
+        slot.set_routes(RouteSet::from([RouteSpec::for_tun(
+            declaration.parse().unwrap(),
+        )]));
+        Self {
+            controller,
+            _global: global,
+            run,
+            registry,
+            _nics: nics,
+            member,
+            slot,
+        }
+    }
+
+    fn declaration(&self, prefix: &str) -> IpCidr {
+        let _ = self;
+        prefix.parse().unwrap()
+    }
+
+    fn status(&self, prefix: IpCidr) -> Option<RouteStatus> {
+        status_of(&self.slot, prefix)
     }
 }
 
@@ -145,288 +249,6 @@ fn mobile_input_binding_rejects_duplicates_mismatches_and_closed_runs() {
             )
             .is_err(),
         "a closed run cannot be bound"
-    );
-}
-
-#[test]
-fn requests_replace_pending_and_only_the_latest_completes() {
-    let controller = test_controller();
-    let run = Uuid::new_v4();
-    let _root = open_run(&controller, run);
-    // Shutdown with a live instance still has cleanup responsibility.
-    controller.request_shutdown();
-    controller.dirty.reset();
-
-    let a = controller.request_mobile_install().unwrap();
-    assert!(!controller.dirty.peek(), "a request mark is not an input");
-    let b = controller.request_mobile_install().unwrap();
-    let c = controller.request_mobile_install().unwrap();
-    assert_ne!(a, b);
-    assert_ne!(b, c);
-    assert_eq!(controller.pending_mobile_install(), Some(c));
-
-    assert!(!controller.complete_mobile_install(a));
-    assert!(!controller.complete_mobile_install(b));
-    assert_eq!(controller.pending_mobile_install(), Some(c));
-    assert!(!controller.dirty.peek());
-    assert!(controller.complete_mobile_install(c));
-    assert_eq!(controller.pending_mobile_install(), None);
-    assert!(!controller.dirty.peek());
-}
-
-#[test]
-fn fully_drained_shutdown_rejects_new_requests() {
-    let controller = test_controller();
-    controller.request_shutdown();
-    assert!(controller.request_mobile_install().is_err());
-    assert_eq!(controller.pending_mobile_install(), None);
-}
-
-#[test]
-fn releasing_the_root_or_shutting_down_keeps_the_request_mark() {
-    let controller = test_controller();
-    let run = Uuid::new_v4();
-    let root = open_run(&controller, run);
-    let id = controller.request_mobile_install().unwrap();
-
-    drop(root);
-    assert_eq!(controller.pending_mobile_install(), Some(id));
-    controller.request_shutdown();
-    assert_eq!(controller.pending_mobile_install(), Some(id));
-
-    assert!(!controller.complete_mobile_install(Uuid::new_v4()));
-    assert_eq!(controller.pending_mobile_install(), Some(id));
-    assert!(controller.complete_mobile_install(id));
-    assert_eq!(controller.pending_mobile_install(), None);
-}
-
-#[test]
-fn late_install_facts_are_recorded_over_a_newer_request() {
-    let controller = test_controller();
-    let run = Uuid::new_v4();
-    let root = open_run(&controller, run);
-    let a = controller.request_mobile_install().unwrap();
-    let d = controller.request_mobile_install().unwrap();
-    let snapshot = Uuid::new_v4();
-
-    controller.dirty.reset();
-    let mut member = tun_member(run);
-    member.current_claims = Some(member.claims.clone());
-    controller.record_mobile_install(a, config(snapshot), vec![member]);
-    assert!(controller.dirty.peek(), "a real fact wakes the reconciler");
-    assert_eq!(controller.current_mobile_attachment(), Some(a));
-    assert_eq!(controller.pending_mobile_install(), Some(d));
-    assert!(
-        controller.runtime.read().applied.as_ref().unwrap().members[0]
-            .current_claims
-            .is_none(),
-        "the selection hint is not part of the recorded fact"
-    );
-
-    // A late A is still the real installation even after the domain has
-    // shut down and its root has been released.
-    drop(root);
-    controller.request_shutdown();
-    let _cleanup = controller.request_mobile_install().unwrap();
-    controller.record_mobile_install(a, config(snapshot), vec![tun_member(run)]);
-    assert_eq!(controller.current_mobile_attachment(), Some(a));
-}
-
-#[test]
-fn only_the_current_registration_and_attachment_change_the_ledger() {
-    let controller = test_controller();
-    let run = Uuid::new_v4();
-    let _root = open_run(&controller, run);
-    let mut nics = SharedVirtualNicRegistry::new();
-    let first = test_member(&mut nics, run);
-    controller.bind_member(run, &first).unwrap();
-
-    let snapshot = Uuid::new_v4();
-    let attachment = Uuid::new_v4();
-    controller.record_mobile_install(attachment, config(snapshot), vec![tun_member(run)]);
-    assert!(controller.mobile_ready(run, &first, attachment));
-    controller.dirty.reset();
-    assert!(
-        controller.mobile_ready(run, &first, attachment),
-        "a repeated matching report is still accepted"
-    );
-    assert!(
-        !controller.dirty.peek(),
-        "an unchanged attachment record is not a change"
-    );
-
-    let second = test_member(&mut nics, run);
-    controller.bind_member(run, &second).unwrap();
-    assert!(
-        !controller.mobile_ready(run, &first, attachment),
-        "an old registration cannot attach to the new binding"
-    );
-    assert!(!controller.mobile_ready(run, &first, Uuid::new_v4()));
-    assert!(!controller.mobile_ready(run, &second, Uuid::new_v4()));
-    assert!(controller.mobile_ready(run, &second, attachment));
-
-    let newer_snapshot = Uuid::new_v4();
-    let newer_attachment = Uuid::new_v4();
-    controller.record_mobile_install(
-        newer_attachment,
-        config(newer_snapshot),
-        vec![tun_member(run)],
-    );
-    assert!(
-        !controller.mobile_ready(run, &second, attachment),
-        "an old attachment cannot attach to the newer installation"
-    );
-    assert!(controller.mobile_ready(run, &second, newer_attachment));
-    assert_eq!(
-        controller.current_mobile_attachment(),
-        Some(newer_attachment)
-    );
-}
-
-#[test]
-fn unready_keeps_the_installed_configuration_and_ownership() {
-    let controller = test_controller();
-    let run = Uuid::new_v4();
-    let _root = open_run(&controller, run);
-    let mut nics = SharedVirtualNicRegistry::new();
-    let member = test_member(&mut nics, run);
-    controller.bind_member(run, &member).unwrap();
-
-    let snapshot = Uuid::new_v4();
-    let attachment = Uuid::new_v4();
-    controller.record_mobile_install(attachment, config(snapshot), vec![tun_member(run)]);
-    assert!(controller.mobile_ready(run, &member, attachment));
-    assert_eq!(
-        controller.mobile_installed_claims(run),
-        Some(tun_member(run).claims)
-    );
-    assert!(controller.mobile_snapshot_attached(snapshot));
-
-    controller.unready(run, member.registration_id());
-    assert_eq!(controller.current_mobile_attachment(), Some(attachment));
-    assert!(controller.mobile_installed_claims(run).is_none());
-    assert!(!controller.mobile_snapshot_attached(snapshot));
-
-    controller.dirty.reset();
-    controller.unready(run, member.registration_id());
-    assert!(
-        !controller.dirty.peek(),
-        "a second unready for the same registration is a no-op"
-    );
-}
-
-#[test]
-fn revocation_clears_only_the_matching_installation_and_never_the_request() {
-    let controller = test_controller();
-    let run = Uuid::new_v4();
-    let _root = open_run(&controller, run);
-    let snapshot = Uuid::new_v4();
-    let attachment = Uuid::new_v4();
-    let pending = controller.request_mobile_install().unwrap();
-    controller.record_mobile_install(attachment, config(snapshot), vec![tun_member(run)]);
-
-    assert!(!controller.confirm_mobile_revoked(Uuid::new_v4()));
-    assert_eq!(controller.current_mobile_attachment(), Some(attachment));
-    assert_eq!(controller.pending_mobile_install(), Some(pending));
-
-    controller.dirty.reset();
-    assert!(controller.confirm_mobile_revoked(attachment));
-    assert!(
-        controller.dirty.peek(),
-        "a real revocation wakes the worker"
-    );
-    assert_eq!(controller.current_mobile_attachment(), None);
-    assert_eq!(controller.pending_mobile_install(), Some(pending));
-
-    let newer_snapshot = Uuid::new_v4();
-    let newer_attachment = Uuid::new_v4();
-    controller.record_mobile_install(
-        newer_attachment,
-        config(newer_snapshot),
-        vec![tun_member(run)],
-    );
-    assert!(
-        !controller.confirm_mobile_revoked(attachment),
-        "an old revocation must not clear the newer installation"
-    );
-    assert_eq!(
-        controller.current_mobile_attachment(),
-        Some(newer_attachment)
-    );
-    assert_eq!(controller.pending_mobile_install(), Some(pending));
-}
-
-#[test]
-fn whole_snapshot_attachment_requires_every_current_member() {
-    let controller = test_controller();
-    let run_a = Uuid::new_v4();
-    let run_b = Uuid::new_v4();
-    let _root_a = open_run(&controller, run_a);
-    let root_b = open_run(&controller, run_b);
-    let mut nics = SharedVirtualNicRegistry::new();
-    let member_a = test_member(&mut nics, run_a);
-    let member_b = test_member(&mut nics, run_b);
-    controller.bind_member(run_a, &member_a).unwrap();
-    controller.bind_member(run_b, &member_b).unwrap();
-
-    let snapshot = Uuid::new_v4();
-    let attachment = Uuid::new_v4();
-    controller.record_mobile_install(
-        attachment,
-        config(snapshot),
-        vec![tun_member(run_a), tun_member(run_b)],
-    );
-    assert!(
-        !controller.mobile_snapshot_attached(snapshot),
-        "no member is attached yet"
-    );
-    assert!(controller.mobile_ready(run_a, &member_a, attachment));
-    assert!(
-        !controller.mobile_snapshot_attached(snapshot),
-        "one attached member is not the whole target"
-    );
-    assert!(controller.mobile_ready(run_b, &member_b, attachment));
-    assert!(controller.mobile_snapshot_attached(snapshot));
-    assert!(!controller.mobile_snapshot_attached(Uuid::new_v4()));
-
-    // Releasing any real run's root withdraws its input and invalidates
-    // the whole-attachment verdict, never a subset of the checks.
-    drop(root_b);
-    assert!(!controller.mobile_snapshot_attached(snapshot));
-
-    controller.request_shutdown();
-    assert!(!controller.mobile_snapshot_attached(snapshot));
-}
-
-#[test]
-fn empty_target_is_never_reported_attached() {
-    let controller = test_controller();
-    let run = Uuid::new_v4();
-    let _root = open_run(&controller, run);
-    let snapshot = Uuid::new_v4();
-    controller.record_mobile_install(Uuid::new_v4(), config(snapshot), Vec::new());
-    assert!(!controller.mobile_snapshot_attached(snapshot));
-}
-
-#[tokio::test]
-async fn installed_claims_reads_the_ledger_without_the_nic_lock() {
-    let controller = test_controller();
-    let run = Uuid::new_v4();
-    let _root = open_run(&controller, run);
-    let mut nics = SharedVirtualNicRegistry::new();
-    let member = test_member(&mut nics, run);
-    controller.bind_member(run, &member).unwrap();
-
-    let attachment = Uuid::new_v4();
-    controller.record_mobile_install(attachment, config(Uuid::new_v4()), vec![tun_member(run)]);
-    assert!(controller.mobile_ready(run, &member, attachment));
-
-    // Holding the NIC lock must not block a synchronous ledger read.
-    let nic = member.shared_nic();
-    let _guard = nic.lock().await;
-    assert_eq!(
-        controller.mobile_installed_claims(run),
-        Some(tun_member(run).claims)
     );
 }
 
@@ -701,4 +523,321 @@ async fn prepare_uses_the_same_table_and_rejects_stale_markers_without_nic_write
     assert_eq!(plan.withdraw.len(), 1);
     assert_eq!(plan.withdraw[0].run, run);
     assert_eq!(plan.withdraw[0].registration, member.registration_id());
+}
+
+#[tokio::test]
+async fn local_evidence_is_registration_scoped_and_never_recreates_records() {
+    let controller = test_controller();
+    let run = Uuid::new_v4();
+    let _root = open_run(&controller, run);
+    let mut nics = SharedVirtualNicRegistry::new();
+    let first = test_member(&mut nics, run);
+    controller.bind_member(run, &first).unwrap();
+    let prefixes = BTreeSet::from(["10.126.126.0/24".parse().unwrap()]);
+
+    controller.dirty.reset();
+    assert!(controller.record_mobile_ready(run, &first, prefixes.clone()));
+    assert!(controller.dirty.peek(), "new local evidence marks");
+    assert_eq!(
+        controller.mobile_installed_prefixes(run, first.registration_id()),
+        Some(prefixes.clone())
+    );
+    controller.dirty.reset();
+    assert!(
+        controller.record_mobile_ready(run, &first, prefixes.clone()),
+        "a repeated matching report is still accepted"
+    );
+    assert!(
+        !controller.dirty.peek(),
+        "unchanged evidence is not a new notification"
+    );
+
+    let other = test_member(&mut nics, run);
+    assert!(
+        !controller.record_mobile_ready(run, &other, prefixes.clone()),
+        "only the current registration may record evidence"
+    );
+
+    let second = test_member(&mut nics, run);
+    controller.bind_member(run, &second).unwrap();
+    assert_eq!(
+        controller.mobile_installed_prefixes(run, first.registration_id()),
+        None,
+        "a new binding invalidates the old registration's evidence"
+    );
+    assert!(controller.record_mobile_ready(run, &second, prefixes.clone()));
+    assert!(
+        !controller.record_mobile_ready(run, &first, prefixes.clone()),
+        "an old registration can never confirm the new binding"
+    );
+
+    first.close().await.unwrap();
+    controller.unready(run, first.registration_id());
+    assert_eq!(
+        controller.mobile_installed_prefixes(run, second.registration_id()),
+        Some(prefixes.clone()),
+        "an old registration's unready cannot invalidate the current evidence"
+    );
+    second.close().await.unwrap();
+    assert!(
+        !controller.record_mobile_ready(run, &second, prefixes.clone()),
+        "a closed member cannot record evidence"
+    );
+
+    controller.unready(run, second.registration_id());
+    assert_eq!(
+        controller.mobile_installed_prefixes(run, second.registration_id()),
+        None
+    );
+    controller.dirty.reset();
+    controller.unready(run, second.registration_id());
+    assert!(
+        !controller.dirty.peek(),
+        "a stale unready for an absent registration is a no-op"
+    );
+
+    let third = test_member(&mut nics, run);
+    controller.bind_member(run, &third).unwrap();
+    controller.runtime.write().instances.remove(&run);
+    assert!(
+        !controller.record_mobile_ready(run, &third, prefixes),
+        "recording evidence never recreates a removed instance record"
+    );
+    assert_eq!(
+        controller.mobile_installed_prefixes(run, third.registration_id()),
+        None
+    );
+}
+
+#[tokio::test]
+async fn ready_requires_the_complete_plan_ack_and_this_members_installed_evidence() {
+    let h = MobileHarness::new("10.91.0.0/24").await;
+    let declaration = h.declaration("10.91.0.0/24");
+    let mut reconciler = RouteReconciler::new(h.controller.clone());
+
+    reconciler.reconcile().await;
+    assert_eq!(
+        h.status(declaration),
+        Some(RouteStatus::Pending { error: None }),
+        "local route ACK without installed evidence is only Pending"
+    );
+    let claims_after_reconcile = h.member.claims().await;
+    assert!(
+        claim_prefixes(&claims_after_reconcile).contains(&declaration),
+        "the worker really committed the Controller-decided target"
+    );
+
+    let config = h.controller.mobile_config().await.unwrap();
+    let plan = h
+        .controller
+        .prepare_mobile_attach(config.snapshot_id)
+        .await
+        .unwrap();
+    let accepted = plan
+        .members
+        .iter()
+        .find(|member| member.run == h.run)
+        .expect("the live member is accepted");
+    assert!(accepted.installed_prefixes.contains(&declaration));
+    assert!(h.controller.record_mobile_ready(
+        h.run,
+        &h.member,
+        accepted.installed_prefixes.clone()
+    ));
+
+    reconciler.reconcile().await;
+    assert_eq!(
+        h.status(declaration),
+        Some(RouteStatus::Ready),
+        "ready needs the exact plan target, its ACK and this member's evidence"
+    );
+
+    h.controller.unready(h.run, h.member.registration_id());
+    reconciler.reconcile().await;
+    assert_eq!(
+        h.status(declaration),
+        Some(RouteStatus::Pending { error: None }),
+        "removing this member's evidence invalidates Ready"
+    );
+}
+
+#[tokio::test]
+async fn root_withdrawal_keeps_the_record_until_real_registration_cleanup() {
+    let h = MobileHarness::new("10.92.0.0/24").await;
+    let mut reconciler = RouteReconciler::new(h.controller.clone());
+    reconciler.reconcile().await;
+    let config = h.controller.mobile_config().await.unwrap();
+    let plan = h
+        .controller
+        .prepare_mobile_attach(config.snapshot_id)
+        .await
+        .unwrap();
+    let accepted = plan
+        .members
+        .iter()
+        .find(|member| member.run == h.run)
+        .expect("the live member is accepted");
+    assert!(h.controller.record_mobile_ready(
+        h.run,
+        &h.member,
+        accepted.installed_prefixes.clone()
+    ));
+
+    drop(h.registry);
+    reconciler.reconcile().await;
+    assert!(
+        h.controller.runtime.read().instances.contains_key(&h.run),
+        "empty routes do not remove a record while installed evidence remains"
+    );
+    h.controller.request_shutdown();
+    reconciler.reconcile().await;
+    assert!(
+        h.controller.ensure_drained().is_err(),
+        "local installed evidence is still outstanding"
+    );
+
+    h.member.close().await.unwrap();
+    reconciler.reconcile().await;
+    assert!(
+        !h.controller.runtime.read().instances.contains_key(&h.run),
+        "the record is removed only after the real registration cleanup"
+    );
+    assert!(
+        h.controller.ensure_drained().is_ok(),
+        "drain waits for local records and evidence, not external VPN state"
+    );
+}
+
+#[tokio::test]
+async fn drain_waits_only_for_local_records() {
+    let controller = test_controller();
+    let run = Uuid::new_v4();
+    let root = open_run(&controller, run);
+    controller.request_shutdown();
+    assert!(controller.ensure_drained().is_err());
+
+    drop(root);
+    let mut reconciler = RouteReconciler::new(controller.clone());
+    reconciler.reconcile().await;
+    assert!(
+        controller.ensure_drained().is_ok(),
+        "a released root with no local member responsibility drains immediately"
+    );
+}
+
+#[tokio::test]
+async fn controller_rejection_is_fed_back_without_recomputing_the_target() {
+    let controller = test_controller();
+    let (first, _first_root, first_slot) =
+        input_only_instance(&controller, "10.95.0.1/24", "10.95.0.0/24");
+    let (second, _second_root, second_slot) =
+        input_only_instance(&controller, "10.95.0.2/24", "10.95.0.0/24");
+    let first_declaration: IpCidr = "10.95.0.0/24".parse().unwrap();
+
+    let config = controller.mobile_config().await.unwrap();
+    assert_eq!(config.rejected.len(), 1);
+    let rejected = &config.rejected[0];
+    let (rejected_slot, accepted_slot) = if rejected.instance_id == first.get_id() {
+        (&first_slot, &second_slot)
+    } else {
+        (&second_slot, &first_slot)
+    };
+
+    let mut reconciler = RouteReconciler::new(controller.clone());
+    reconciler.reconcile().await;
+    match status_of(rejected_slot, first_declaration) {
+        Some(RouteStatus::Rejected(error)) => {
+            assert_eq!(&*error, rejected.error.as_str());
+        }
+        other => panic!("expected the Controller's rejection, got {other:?}"),
+    }
+    assert_eq!(
+        status_of(accepted_slot, first_declaration),
+        Some(RouteStatus::Pending { error: None }),
+        "the accepted instance has no registration or installed evidence yet"
+    );
+}
+
+#[tokio::test]
+async fn another_members_evidence_cannot_confirm_this_member() {
+    let controller = test_controller();
+    let first = Arc::new(GlobalCtx::new(TomlConfig::default()));
+    let second = Arc::new(GlobalCtx::new(TomlConfig::default()));
+    let first_run = first.key();
+    let second_run = second.key();
+    let first_registry = controller.open_instance(first_run).unwrap();
+    let second_registry = controller.open_instance(second_run).unwrap();
+    let mut nics = SharedVirtualNicRegistry::new();
+    let first_member = test_managed_member(&mut nics, first_run);
+    let second_member = test_managed_member(&mut nics, second_run);
+    attach_nic_registration(&first_member).await;
+    attach_nic_registration(&second_member).await;
+    for (global, run, address, member) in [
+        (&first, first_run, "10.96.0.1/24", &first_member),
+        (&second, second_run, "10.97.0.1/24", &second_member),
+    ] {
+        controller
+            .bind_mobile_inputs(
+                run,
+                Arc::downgrade(global),
+                Arc::new(parking_lot::Mutex::new(None)),
+            )
+            .unwrap();
+        global.set_ipv4(Some(address.parse().unwrap()));
+        controller
+            .bind_config(
+                run,
+                CoreRuntimeConfigStore::new(
+                    CoreRuntimeConfig::default(),
+                    Arc::new(PeerRuntimeSnapshot::default()),
+                ),
+            )
+            .unwrap();
+        controller.bind_member(run, member).unwrap();
+    }
+    let first_slot = first_registry
+        .handle()
+        .open_slot(RouteSource::Additional)
+        .unwrap();
+    first_slot.set_routes(RouteSet::from([RouteSpec::for_tun(
+        "10.96.0.0/24".parse().unwrap(),
+    )]));
+    let second_slot = second_registry
+        .handle()
+        .open_slot(RouteSource::Additional)
+        .unwrap();
+    second_slot.set_routes(RouteSet::from([RouteSpec::for_tun(
+        "10.97.0.0/24".parse().unwrap(),
+    )]));
+    let first_declaration: IpCidr = "10.96.0.0/24".parse().unwrap();
+    let second_declaration: IpCidr = "10.97.0.0/24".parse().unwrap();
+
+    let mut reconciler = RouteReconciler::new(controller.clone());
+    reconciler.reconcile().await;
+    let config = controller.mobile_config().await.unwrap();
+    let plan = controller
+        .prepare_mobile_attach(config.snapshot_id)
+        .await
+        .unwrap();
+    let first_accepted = plan
+        .members
+        .iter()
+        .find(|member| member.run == first_run)
+        .expect("the first member is accepted");
+    assert!(controller.record_mobile_ready(
+        first_run,
+        &first_member,
+        first_accepted.installed_prefixes.clone()
+    ));
+
+    reconciler.reconcile().await;
+    assert_eq!(
+        status_of(&first_slot, first_declaration),
+        Some(RouteStatus::Ready)
+    );
+    assert_eq!(
+        status_of(&second_slot, second_declaration),
+        Some(RouteStatus::Pending { error: None }),
+        "the first member's installed evidence must not confirm the second"
+    );
 }
