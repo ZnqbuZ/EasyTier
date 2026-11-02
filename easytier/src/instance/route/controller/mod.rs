@@ -19,6 +19,8 @@ use parking_lot::RwLock;
 use tokio::sync::Notify;
 use uuid::Uuid;
 
+#[cfg(all(mobile, feature = "tun"))]
+use crate::common::global_ctx::GlobalCtx;
 use crate::common::net_ns::NetNS;
 #[cfg(all(feature = "tun", not(mobile)))]
 use crate::instance::route::InterfaceInfo;
@@ -54,6 +56,14 @@ struct InstanceRoutes {
     member: Option<SharedVirtualNicMember>,
     #[cfg(all(feature = "tun", not(mobile)))]
     interface: Option<InterfaceInfo>,
+    /// Mobile authority observation: the native instance runtime owns the
+    /// context; the controller only reads its current values.
+    #[cfg(all(mobile, feature = "tun"))]
+    global: Option<Weak<GlobalCtx>>,
+    /// The exact public-address intent shared with the native route context.
+    /// Nothing here is a second address value.
+    #[cfg(all(mobile, feature = "tun"))]
+    public_address: Option<Arc<parking_lot::Mutex<Option<cidr::Ipv6Inet>>>>,
 }
 
 impl InstanceRoutes {
@@ -196,6 +206,10 @@ impl RouteController {
                     member: None,
                     #[cfg(all(feature = "tun", not(mobile)))]
                     interface: None,
+                    #[cfg(all(mobile, feature = "tun"))]
+                    global: None,
+                    #[cfg(all(mobile, feature = "tun"))]
+                    public_address: None,
                 },
             );
             registry
@@ -232,6 +246,50 @@ impl RouteController {
         self.dirty.mark();
         Ok(())
     }
+    /// Bind the mobile authority inputs once.
+    ///
+    /// The controller observes the instance's `GlobalCtx` weakly and shares the
+    /// exact public-address mutex owned by the native route context; it never
+    /// copies the current addresses. A closed run, a mismatched context or a
+    /// second binding is rejected without replacing the first binding.
+    #[cfg(all(mobile, feature = "tun"))]
+    pub fn bind_mobile_inputs(
+        &self,
+        run: Uuid,
+        global: Weak<GlobalCtx>,
+        public_address: Arc<parking_lot::Mutex<Option<cidr::Ipv6Inet>>>,
+    ) -> anyhow::Result<()> {
+        let current = global
+            .upgrade()
+            .ok_or_else(|| anyhow::anyhow!("global context is closed"))?;
+        anyhow::ensure!(
+            current.key() == run,
+            "global context run {} does not match instance {run}",
+            current.key()
+        );
+        drop(current);
+        {
+            let mut rt = self.runtime.write();
+            anyhow::ensure!(!rt.shutdown, "route controller is shut down");
+            let instances = rt
+                .instances
+                .get_mut(&run)
+                .ok_or_else(|| anyhow::anyhow!("instance {run} has no route inputs"))?;
+            anyhow::ensure!(
+                instances.registry.upgrade().is_some(),
+                "instance {run} route registry is closed"
+            );
+            anyhow::ensure!(
+                instances.global.is_none(),
+                "mobile route inputs are already bound for instance {run}"
+            );
+            instances.global = Some(global);
+            instances.public_address = Some(public_address);
+        }
+        self.dirty.mark();
+        Ok(())
+    }
+
     pub fn ensure_instance_open(&self, run: Uuid) -> anyhow::Result<()> {
         let rt = self.runtime.read();
         anyhow::ensure!(!rt.shutdown, "route controller is shut down");
@@ -384,6 +442,18 @@ impl RouteController {
             self.dirty.mark();
         }
     }
+    /// Test-only observation of the shared route input mark.
+    #[cfg(test)]
+    pub(crate) fn route_input_is_dirty(&self) -> bool {
+        self.dirty.peek()
+    }
+
+    /// Test-only reset of the shared route input mark.
+    #[cfg(test)]
+    pub(crate) fn reset_route_input_dirty(&self) {
+        self.dirty.reset();
+    }
+
     /// Wait until the reconciler has removed this run's instance record.
     ///
     /// The registry having been released is not enough: the record stays while

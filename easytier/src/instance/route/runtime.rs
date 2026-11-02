@@ -27,7 +27,9 @@ pub(crate) struct NativeRouteContext {
     net_ns: Arc<NativeNetNSServices>,
     run: Uuid,
     name: String,
-    public_address: Mutex<Option<cidr::Ipv6Inet>>,
+    /// The one public-address intent. On mobile the controller observes this
+    /// exact mutex instead of a second address value.
+    public_address: Arc<Mutex<Option<cidr::Ipv6Inet>>>,
     pub(crate) handle: RouteHandle,
     controller: RouteController,
 }
@@ -135,6 +137,35 @@ impl NativeRouteContext {
         *self.public_address.lock()
     }
 
+    /// Test-only observation of the shared route input mark.
+    #[cfg(test)]
+    pub(crate) fn input_is_dirty(&self) -> bool {
+        self.controller.route_input_is_dirty()
+    }
+
+    /// Test-only reset of the shared route input mark.
+    #[cfg(test)]
+    pub(crate) fn reset_input_dirty(&self) {
+        self.controller.reset_route_input_dirty();
+    }
+
+    /// Mark this instance's route inputs as changed after an actual fact write.
+    ///
+    /// A released root has already withdrawn the input; invalidating then only
+    /// marks the shared input range and never reopens anything.
+    pub(crate) fn invalidate_input(&self) {
+        self.controller.invalidate_instance(&self.run);
+    }
+
+    /// The real current claims of the bound mobile member, when it is a valid
+    /// selection hint. This is the existing NIC read, not the old snapshot.
+    #[cfg(all(feature = "tun", mobile))]
+    pub(crate) async fn mobile_current_claims(
+        &self,
+    ) -> anyhow::Result<Option<SharedIfConfigClaims>> {
+        self.controller.mobile_current_claims(self.run).await
+    }
+
     #[cfg(feature = "public-ipv6-provider")]
     fn public_address_changing(&self, address: Option<cidr::Ipv6Inet>) {
         let mut current = self.public_address.lock();
@@ -163,11 +194,14 @@ impl NativeRouteRuntime {
         let controller = net_ns.route_controller()?;
         let owner = controller.open_instance(run)?;
         let handle = owner.handle();
+        let public_address = Arc::new(Mutex::new(None));
+        #[cfg(all(mobile, feature = "tun"))]
+        controller.bind_mobile_inputs(run, Arc::downgrade(global_ctx), public_address.clone())?;
         let context = Arc::new(NativeRouteContext {
             net_ns,
             run,
             name,
-            public_address: Mutex::new(None),
+            public_address,
             handle,
             controller,
         });
@@ -275,7 +309,7 @@ mod tests {
             net_ns,
             run,
             name: global.get_flags().dev_name.clone(),
-            public_address: Mutex::new(None),
+            public_address: Arc::new(Mutex::new(None)),
             handle,
             controller,
         });
@@ -317,6 +351,20 @@ mod tests {
             slot.statuses().get(&declaration),
             Some(&RouteStatus::Pending { error: None }),
             "an existing slot stays mutable after its root is gone"
+        );
+    }
+
+    #[test]
+    fn invalidate_input_marks_the_shared_range() {
+        let global = global_ctx();
+        let runtime = runtime_without_worker(&global);
+        let context = runtime.context();
+        context.reset_input_dirty();
+        assert!(!context.input_is_dirty());
+        context.invalidate_input();
+        assert!(
+            context.input_is_dirty(),
+            "an actual input change marks the shared route range"
         );
     }
 

@@ -7,7 +7,7 @@ use easytier_core::config::{IpPrefix, peers::PeerRuntimeSnapshot, runtime::CoreR
 
 use super::super::*;
 use crate::{
-    common::net_ns::tests::test_net_ns,
+    common::{config::TomlConfig, global_ctx::GlobalCtx, net_ns::tests::test_net_ns},
     instance::{
         factory::{MobileTunConfig, mobile_tun::MobileTunMember},
         shared_virtual_nic::{SharedIfConfigClaims, SharedVirtualNicRegistry},
@@ -52,6 +52,95 @@ fn config(snapshot_id: Uuid) -> MobileTunConfig {
         snapshot_id,
         ..Default::default()
     }
+}
+
+#[test]
+fn mobile_inputs_bind_once_and_follow_live_authority_values() {
+    let controller = test_controller();
+    let global = Arc::new(GlobalCtx::new(TomlConfig::default()));
+    let run = global.key();
+    let _root = controller.open_instance(run).unwrap();
+    controller.dirty.reset();
+    assert!(
+        controller.mobile_inputs(run).unwrap().is_none(),
+        "an unbound instance has no authority observation yet"
+    );
+    let public_address = Arc::new(parking_lot::Mutex::new(None));
+    controller
+        .bind_mobile_inputs(run, Arc::downgrade(&global), public_address.clone())
+        .unwrap();
+    assert!(controller.dirty.peek(), "binding marks the input range");
+    controller.dirty.reset();
+
+    global.set_ipv4(Some("10.40.0.1/24".parse().unwrap()));
+    global.set_ipv6(Some("fd40::1/64".parse().unwrap()));
+    *public_address.lock() = Some("2001:db8::40/128".parse().unwrap());
+    let inputs = controller.mobile_inputs(run).unwrap().unwrap();
+    assert_eq!(inputs.instance_id, global.get_id());
+    assert_eq!(inputs.run, run);
+    assert_eq!(inputs.ipv4, global.get_ipv4());
+    assert_eq!(inputs.ipv6, global.get_ipv6());
+    assert_eq!(inputs.public_address, *public_address.lock());
+    assert!(
+        !controller.dirty.peek(),
+        "reading the live authorities does not mark input"
+    );
+
+    global.set_ipv4(None);
+    global.set_ipv6(None);
+    *public_address.lock() = None;
+    let cleared = controller.mobile_inputs(run).unwrap().unwrap();
+    assert_eq!(cleared.ipv4, None);
+    assert_eq!(cleared.ipv6, None);
+    assert_eq!(cleared.public_address, None);
+}
+
+#[test]
+fn mobile_input_binding_rejects_duplicates_mismatches_and_closed_runs() {
+    let controller = test_controller();
+    let global = Arc::new(GlobalCtx::new(TomlConfig::default()));
+    let run = global.key();
+    let root = controller.open_instance(run).unwrap();
+    let public_address = Arc::new(parking_lot::Mutex::new(None));
+    controller
+        .bind_mobile_inputs(run, Arc::downgrade(&global), public_address.clone())
+        .unwrap();
+    assert!(
+        controller
+            .bind_mobile_inputs(run, Arc::downgrade(&global), public_address)
+            .is_err(),
+        "the input binding may only be installed once"
+    );
+
+    let other = Arc::new(GlobalCtx::new(TomlConfig::default()));
+    let other_run = other.key();
+    let _other_root = controller.open_instance(other_run).unwrap();
+    assert!(
+        controller
+            .bind_mobile_inputs(
+                other_run,
+                Arc::downgrade(&global),
+                Arc::new(parking_lot::Mutex::new(None)),
+            )
+            .is_err(),
+        "a context for another run is rejected"
+    );
+
+    drop(root);
+    assert!(
+        controller.mobile_inputs(run).unwrap().is_none(),
+        "a released root withdraws the whole input even with a live context"
+    );
+    assert!(
+        controller
+            .bind_mobile_inputs(
+                run,
+                Arc::downgrade(&global),
+                Arc::new(parking_lot::Mutex::new(None)),
+            )
+            .is_err(),
+        "a closed run cannot be bound"
+    );
 }
 
 #[test]

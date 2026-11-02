@@ -8,7 +8,7 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet},
-    sync::Arc,
+    sync::{Arc, Weak},
 };
 
 use cidr::IpCidr;
@@ -28,6 +28,19 @@ use super::member::{
     MemberRetry, claim_prefixes, member_retry_blocked, record_member_failure, sync_member_routes,
 };
 use super::{InstanceRoutes, ROUTE_IO_TIMEOUT, RouteController, RouteControllerRuntime};
+
+/// The authority values the mobile policy reads for one live instance.
+///
+/// This is a per-call observation, not a cache: `instance_id` is the
+/// configuration identity and `run` is the runtime key, and both addresses are
+/// read from `GlobalCtx` at sampling time.
+pub(super) struct MobileRouteInputs {
+    pub(super) instance_id: Uuid,
+    pub(super) run: Uuid,
+    pub(super) ipv4: Option<cidr::Ipv4Inet>,
+    pub(super) ipv6: Option<cidr::Ipv6Inet>,
+    pub(super) public_address: Option<cidr::Ipv6Inet>,
+}
 
 impl RouteController {
     /// Register a new whole-domain mobile install or withdraw request.
@@ -265,6 +278,106 @@ impl RouteController {
             rt.instances
                 .get(&run)
                 .is_some_and(|instance| mobile_dns_configured(&rt, instance))
+        }
+    }
+
+    /// The live mobile authority inputs of one instance.
+    ///
+    /// The addresses are read from the bound `GlobalCtx` on every call; the
+    /// directory never stores a second address value. A released registry root
+    /// or a shut-down controller is an input withdrawal even while the context
+    /// is alive, and no temporary root survives this read.
+    pub(super) fn mobile_inputs(&self, run: Uuid) -> anyhow::Result<Option<MobileRouteInputs>> {
+        let (global, public_address) = {
+            let rt = self.runtime.read();
+            if rt.shutdown {
+                return Ok(None);
+            }
+            let Some(instance) = rt.instances.get(&run) else {
+                return Ok(None);
+            };
+            if instance.registry.upgrade().is_none() {
+                return Ok(None);
+            }
+            let Some(global) = instance.global.as_ref().and_then(Weak::upgrade) else {
+                return Ok(None);
+            };
+            let Some(public_address) = instance.public_address.as_ref() else {
+                return Ok(None);
+            };
+            (global, public_address.clone())
+        };
+        let public_address = *public_address.lock();
+        Ok(Some(MobileRouteInputs {
+            instance_id: global.get_id(),
+            run: global.key(),
+            ipv4: global.get_ipv4(),
+            ipv6: global.get_ipv6(),
+            public_address,
+        }))
+    }
+
+    /// Read the current bound member's claims as this round's selection hint.
+    ///
+    /// Only the runtime lock's short section copies the member handle; the
+    /// claim read is the existing NIC lock wait and no controller lock is held
+    /// across it. A registration that changed while waiting discards the hint
+    /// instead of returning another binding's claims. A real read failure is
+    /// reported, never turned into an empty input.
+    pub(crate) async fn mobile_current_claims(
+        &self,
+        run: Uuid,
+    ) -> anyhow::Result<Option<SharedIfConfigClaims>> {
+        let member = {
+            let rt = self.runtime.read();
+            if rt.shutdown {
+                return Ok(None);
+            }
+            let Some(instance) = rt.instances.get(&run) else {
+                return Ok(None);
+            };
+            if instance.registry.upgrade().is_none() {
+                return Ok(None);
+            }
+            let Some(member) = instance.member.as_ref() else {
+                return Ok(None);
+            };
+            member.clone()
+        };
+        if member.ensure_open().is_err() {
+            // A closed binding has no current claims to offer as a hint.
+            return Ok(None);
+        }
+        let claims = tokio::time::timeout(ROUTE_IO_TIMEOUT, member.claims())
+            .await
+            .map_err(|_| {
+                anyhow::anyhow!(
+                    "timed out reading current claims of member {}",
+                    member.member_id()
+                )
+            })?;
+        let current = {
+            let rt = self.runtime.read();
+            if rt.shutdown {
+                return Ok(None);
+            }
+            let Some(instance) = rt.instances.get(&run) else {
+                return Ok(None);
+            };
+            if instance.registry.upgrade().is_none() {
+                return Ok(None);
+            }
+            instance
+                .member
+                .as_ref()
+                .map(SharedVirtualNicMember::registration_id)
+        };
+        if current == Some(member.registration_id()) {
+            Ok(Some(claims))
+        } else {
+            // The binding or its root changed while waiting: the old hint is
+            // not evidence for the current registration.
+            Ok(None)
         }
     }
 

@@ -191,16 +191,34 @@ impl NativeInstanceRuntimeHost {
             );
         }
         if patch.ipv4.is_some() && !config.services.dhcp_ipv4 {
-            self.global_ctx
-                .set_ipv4(crate::common::global_ctx::GlobalCtx::runtime_ipv4(
+            dhcp::write_runtime_addresses(
+                &self.global_ctx,
+                || {
+                    #[cfg(any(not(mobile), feature = "tun"))]
+                    if let Some(routes) = self.route_context() {
+                        routes.invalidate_input();
+                    }
+                },
+                Some(crate::common::global_ctx::GlobalCtx::runtime_ipv4(
                     &config.peer,
-                ));
+                )),
+                None,
+            );
         }
         if patch.ipv6.is_some() && !config.services.dhcp_ipv6 {
-            self.global_ctx
-                .set_ipv6(crate::common::global_ctx::GlobalCtx::runtime_ipv6(
+            dhcp::write_runtime_addresses(
+                &self.global_ctx,
+                || {
+                    #[cfg(any(not(mobile), feature = "tun"))]
+                    if let Some(routes) = self.route_context() {
+                        routes.invalidate_input();
+                    }
+                },
+                None,
+                Some(crate::common::global_ctx::GlobalCtx::runtime_ipv6(
                     &config.peer,
-                ));
+                )),
+            );
         }
         if patch.disable_relay_data.is_some() || patch.prefer_peer_relay.is_some() {
             self.global_ctx.set_flags(config.peer.flags.clone());
@@ -272,7 +290,7 @@ impl NativeInstanceRuntimeHost {
         }
         Ok((
             claims,
-            routes.mobile_installed_claims(),
+            routes.mobile_current_claims().await?,
             cfg!(feature = "magic-dns")
                 && routes.mobile_dns_enabled()
                 && self.global_ctx.get_ipv4().is_some(),
@@ -487,6 +505,49 @@ mod tests {
         assert_eq!(global_ctx.get_ipv6(), Some("fd00::2/64".parse().unwrap()));
         assert!(global_ctx.get_flags().disable_relay_data);
         assert!(global_ctx.get_flags().prefer_peer_relay);
+    }
+
+    #[cfg(feature = "web-client")]
+    #[test]
+    fn static_sync_applies_actual_address_values() {
+        use easytier_core::{config::toml::ConfigLoader as _, instance::InstanceRuntimeHost as _};
+
+        let config = TomlConfig::default();
+        config.set_ipv4(Some("10.30.0.1/24".parse().unwrap()));
+        let global_ctx = Arc::new(GlobalCtx::new(config.clone()));
+        let runtime_host = runtime_host(global_ctx.clone());
+
+        runtime_host.synchronize_config(
+            &crate::proto::api::config::InstanceConfigPatch {
+                hostname: Some("renamed".to_owned()),
+                ..Default::default()
+            },
+            &runtime_config(&config),
+        );
+        assert_eq!(
+            global_ctx.get_ipv4(),
+            Some("10.30.0.1/24".parse().unwrap()),
+            "a hostname-only patch leaves the address unchanged"
+        );
+
+        runtime_host.synchronize_config(
+            &crate::proto::api::config::InstanceConfigPatch {
+                ipv4: Some("10.30.0.1/24".parse::<cidr::Ipv4Inet>().unwrap().into()),
+                ..Default::default()
+            },
+            &runtime_config(&config),
+        );
+        assert_eq!(global_ctx.get_ipv4(), Some("10.30.0.1/24".parse().unwrap()));
+
+        config.set_ipv4(None);
+        runtime_host.synchronize_config(
+            &crate::proto::api::config::InstanceConfigPatch {
+                ipv4: Some("10.99.0.1/24".parse::<cidr::Ipv4Inet>().unwrap().into()),
+                ..Default::default()
+            },
+            &runtime_config(&config),
+        );
+        assert_eq!(global_ctx.get_ipv4(), None);
     }
 
     #[cfg(feature = "web-client")]
