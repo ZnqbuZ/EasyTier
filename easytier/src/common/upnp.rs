@@ -286,7 +286,7 @@ pub(crate) fn spawn_udp_port_mapping_lifecycle(
     cfg_select! {
         target_os = "linux" => {
             tokio::task::spawn_blocking(move || {
-                let result = net_ns.run(|| -> anyhow::Result<()> {
+                let result = net_ns.run_unchecked(|| -> anyhow::Result<()> {
                     let runtime = tokio::runtime::Builder::new_current_thread()
                         .enable_all()
                         .build()?;
@@ -316,7 +316,7 @@ where
     cfg_select! {
         target_os = "linux" => {
             tokio::task::spawn_blocking(move || {
-                net_ns.run(|| {
+                net_ns.run_unchecked(|| {
                     let runtime = tokio::runtime::Builder::new_current_thread()
                         .enable_all()
                         .build()

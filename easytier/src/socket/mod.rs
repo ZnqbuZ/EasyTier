@@ -98,7 +98,6 @@ impl Bindable for UdpSocket {
 /// await. Failures drop the unbound socket instead of allowing early I/O.
 pub(crate) async fn bind<B: Bindable>(config: BindConfig) -> Result<B, TunnelError> {
     let net_ns = crate::host_runtime::native_host_runtime().net_ns(&config.context)?;
-    net_ns.ensure_open()?;
     let BindConfig {
         context,
         need_protect,
@@ -148,7 +147,6 @@ pub(crate) async fn bind<B: Bindable>(config: BindConfig) -> Result<B, TunnelErr
     })??;
     crate::socket_protector::protect_native_socket(&socket, need_protect).await?;
     // Restore the requested namespace for synchronous configuration and bind only.
-    net_ns.ensure_open()?;
     net_ns.run(|| {
         #[cfg(target_os = "windows")]
         {

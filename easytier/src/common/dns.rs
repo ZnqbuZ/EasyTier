@@ -152,10 +152,11 @@ struct RuntimeDnsIoContext {
 
 impl RuntimeDnsIoContext {
     fn from_socket_context(context: &SocketContext, net_ns: &NetNS) -> std::io::Result<Self> {
-        net_ns.validate_context(context)?;
+        let mut normalized = context.clone();
+        crate::host_runtime::normalize_context(&mut normalized, net_ns)?;
         Ok(Self {
             net_ns: net_ns.clone(),
-            socket_mark: context.socket_mark,
+            socket_mark: normalized.socket_mark,
         })
     }
 
@@ -441,9 +442,9 @@ pub(crate) async fn socket_addrs_in_net_ns(
     url: &url::Url,
     default_port: u16,
     net_ns: NetNS,
-    context: SocketContext,
+    mut context: SocketContext,
 ) -> Result<Vec<SocketAddr>, Error> {
-    net_ns.validate_context(&context)?;
+    crate::host_runtime::normalize_context(&mut context, &net_ns)?;
     let port = url.port().unwrap_or(default_port);
     let addresses = match url
         .host()

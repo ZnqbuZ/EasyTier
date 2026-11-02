@@ -11,7 +11,6 @@ use std::{
     },
 };
 
-use crate::socket::SocketContext;
 use equivalent::Equivalent;
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -86,13 +85,6 @@ impl NetNS {
         }
     }
 
-    pub fn ensure_open(&self) -> io::Result<()> {
-        if self.is_closed() {
-            return Err(io::Error::other("network namespace is closing"));
-        }
-        Ok(())
-    }
-
     pub fn is_closed(&self) -> bool {
         self.0.closing.load(Ordering::Acquire)
     }
@@ -102,20 +94,19 @@ impl NetNS {
         self.0.closing.store(true, Ordering::Release);
     }
 
-    pub fn validate_context(&self, context: &SocketContext) -> io::Result<()> {
-        self.ensure_open()?;
-        if context.net_ns.as_ref().is_some_and(|net_ns| net_ns != self) {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "socket context belongs to a different network namespace",
-            ));
+    /// Run resource creation or query after checking I/O admission.
+    pub fn run<R>(&self, operation: impl FnOnce() -> R) -> io::Result<R> {
+        if self.is_closed() {
+            return Err(io::Error::other("network namespace is closing"));
         }
-        Ok(())
+        self.run_unchecked(operation)
     }
 
-    /// Run resource creation/query synchronously. Cleanup may still enter a
-    /// closing domain; factories must check admission before creating new I/O.
-    pub fn run<R>(&self, operation: impl FnOnce() -> R) -> io::Result<R> {
+    /// Enter a closing domain for cleanup only.
+    ///
+    /// Never create new I/O here; use [`run`](Self::run) for creation and
+    /// queries that must be rejected after [`close`](Self::close).
+    pub fn run_unchecked<R>(&self, operation: impl FnOnce() -> R) -> io::Result<R> {
         let mut operation = Some(operation);
         let mut result = None;
         self.0.backend.run(&mut || {

@@ -401,7 +401,7 @@ impl IfConfiguerTrait for NetlinkIfConfiger {
         address: Ipv4Addr,
         cidr_prefix: u8,
     ) -> Result<(), Error> {
-        self.net_ns.run(|| {
+        self.net_ns.run_unchecked(|| {
             let routes = Self::list_routes()?;
             let ifidx = NetlinkIfConfiger::get_interface_index(name)?;
 
@@ -432,7 +432,7 @@ impl IfConfiguerTrait for NetlinkIfConfiger {
         cost: Option<i32>,
         source_hint: Option<Ipv4Addr>,
     ) -> Result<(), Error> {
-        self.net_ns.run(|| {
+        self.net_ns.run_unchecked(|| {
             let message = Self::ipv4_route_message(
                 Self::get_interface_index(name)?,
                 address,
@@ -488,7 +488,7 @@ impl IfConfiguerTrait for NetlinkIfConfiger {
     }
 
     async fn remove_ip(&self, name: &str, ip: Option<Ipv4Inet>) -> Result<(), Error> {
-        self.net_ns.run(|| {
+        self.net_ns.run_unchecked(|| {
             if let Some(ip) = ip {
                 let prefix_len = Self::get_prefix_len(name, ip.address())?;
                 Self::remove_one_ip(name, ip.address(), prefix_len)?;
@@ -536,7 +536,7 @@ impl IfConfiguerTrait for NetlinkIfConfiger {
     }
 
     async fn remove_ipv6(&self, name: &str, ip: Option<Ipv6Inet>) -> Result<(), Error> {
-        self.net_ns.run(|| {
+        self.net_ns.run_unchecked(|| {
             if let Some(ipv6) = ip {
                 let prefix_len = Self::get_prefix_len_ipv6(name, ipv6.address())?;
                 Self::remove_one_ipv6(name, ipv6.address(), prefix_len)?;
@@ -588,7 +588,7 @@ impl IfConfiguerTrait for NetlinkIfConfiger {
         address: std::net::Ipv6Addr,
         cidr_prefix: u8,
     ) -> Result<(), Error> {
-        self.net_ns.run(|| {
+        self.net_ns.run_unchecked(|| {
             let routes = Self::list_route_messages(libc::AF_INET6 as u8)?;
             let ifidx = NetlinkIfConfiger::get_interface_index(name)?;
 

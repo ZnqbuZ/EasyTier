@@ -109,6 +109,24 @@ pub(crate) fn net_ns_services(net_ns: &NetNS) -> io::Result<Arc<NativeNetNSServi
     native_host_runtime().services(net_ns)
 }
 
+/// Normalize a context selector to the namespace of a bound capability.
+///
+/// An explicit different namespace is an error; an absent selector is filled
+/// with the bound namespace. Callers must not overwrite a conflicting value.
+pub(crate) fn normalize_context(context: &mut SocketContext, net_ns: &NetNS) -> io::Result<()> {
+    match context.net_ns.as_ref() {
+        Some(current) if current != net_ns => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "socket context belongs to a different network namespace",
+        )),
+        Some(_) => Ok(()),
+        None => {
+            context.net_ns = Some(net_ns.clone());
+            Ok(())
+        }
+    }
+}
+
 /// Process-wide directory and owner of native services.
 /// Instance I/O uses a capability bound to one canonical NetNS.
 #[derive(educe::Educe)]
@@ -355,7 +373,6 @@ impl ConnectorRuntime for NativeNetNSServices {
         &self,
         url: &url::Url,
     ) -> anyhow::Result<ConnectedByteStream<RuntimeTcpSocket>> {
-        self.ensure_open()?;
         #[cfg(unix)]
         if url.scheme() == "unix" {
             let socket = self.run(tokio::net::UnixSocket::new_stream)??;
@@ -401,7 +418,7 @@ impl ConnectorRuntime for NativeNetNSServices {
         ip: Ipv6Addr,
         context: SocketContext,
     ) -> Option<PreferredIpv6Source> {
-        self.validate_context(&context).ok()?;
+        let _ = context;
         collect_interfaces(self.net_ns.clone(), false)
             .await
             .into_iter()
@@ -418,28 +435,20 @@ impl ConnectorRuntime for NativeNetNSServices {
     }
 
     async fn collect_ip_addrs(&self, context: &SocketContext) -> GetIpListResponse {
-        if self.validate_context(context).is_err() {
-            return GetIpListResponse::default();
-        }
+        let _ = context;
         collect_local_ip_addrs(self.net_ns.clone()).await
     }
 }
 
 impl NativeNetNSServices {
     fn prepare_bind(&self, config: &mut BindConfig) -> io::Result<()> {
-        self.validate_context(&config.context)?;
-        config
-            .context
-            .net_ns
-            .get_or_insert_with(|| self.net_ns.clone());
-        Ok(())
+        normalize_context(&mut config.context, &self.net_ns)
     }
 
     pub(crate) fn is_local_ip(&self, ip: &IpAddr, context: &SocketContext) -> bool {
-        self.validate_context(context).is_ok()
-            && self
-                .run(|| std::net::UdpSocket::bind(SocketAddr::new(*ip, 0)).is_ok())
-                .unwrap_or(false)
+        let _ = context;
+        self.run(|| std::net::UdpSocket::bind(SocketAddr::new(*ip, 0)).is_ok())
+            .unwrap_or(false)
     }
 }
 
@@ -471,7 +480,6 @@ impl VirtualUdpSocketFactory for NativeNetNSServices {
 #[async_trait]
 impl DnsResolver for NativeNetNSServices {
     async fn resolve(&self, query: DnsQuery) -> anyhow::Result<Vec<IpAddr>> {
-        self.ensure_open()?;
         self.dns.resolve(query).await
     }
 }
@@ -479,12 +487,10 @@ impl DnsResolver for NativeNetNSServices {
 #[async_trait]
 impl DnsRecordResolver for NativeNetNSServices {
     async fn resolve_txt(&self, query: DnsQuery) -> anyhow::Result<String> {
-        self.ensure_open()?;
         self.dns.resolve_txt(query).await
     }
 
     async fn resolve_srv(&self, query: DnsQuery) -> anyhow::Result<Vec<DnsSrvRecord>> {
-        self.ensure_open()?;
         self.dns.resolve_srv(query).await
     }
 }
@@ -598,7 +604,7 @@ mod tests {
         #[cfg(feature = "tun")]
         let permit = services.nics.lock().await;
         host.request_service_shutdown();
-        assert!(net_ns.ensure_open().is_err());
+        assert!(net_ns.run(|| ()).is_err());
         assert!(host.capture_default_net_ns().is_err());
         assert!(host.shared_executor().is_ok());
         #[cfg(feature = "tun")]

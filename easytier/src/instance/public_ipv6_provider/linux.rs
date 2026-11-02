@@ -422,7 +422,7 @@ impl NdpProxyRuntime {
 
     fn clear_current_in_net_ns(&mut self, net_ns: &NetNS) -> bool {
         net_ns
-            .run(|| self.clear_current_locked())
+            .run_unchecked(|| self.clear_current_locked())
             .unwrap_or_else(|error| {
                 tracing::warn!(%error, "cannot enter namespace for NDP cleanup");
                 false

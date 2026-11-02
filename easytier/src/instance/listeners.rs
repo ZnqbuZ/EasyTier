@@ -112,7 +112,7 @@ impl SocketListener for RuntimeUnixStreamListener {
 
     async fn listen(&mut self) -> anyhow::Result<()> {
         if self.inner.is_none() {
-            self.net_ns.validate_context(&self.context)?;
+            crate::host_runtime::normalize_context(&mut self.context, &self.net_ns)?;
             self.inner = Some(
                 self.net_ns
                     .run(|| tokio::net::UnixListener::bind(self.url.path()))??,
@@ -181,7 +181,7 @@ impl SocketListener for RuntimeFakeTcpSocketListener {
     type Accepted = AcceptedTransport<RuntimeTcpSocket>;
 
     async fn listen(&mut self) -> anyhow::Result<()> {
-        self.net_ns.validate_context(&self.context)?;
+        crate::host_runtime::normalize_context(&mut self.context, &self.net_ns)?;
         SocketListener::listen(&mut self.inner).await?;
         Ok(())
     }

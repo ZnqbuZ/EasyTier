@@ -236,25 +236,23 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn contexts_are_runtime_identities_and_none_uses_the_bound_domain() {
+    fn contexts_are_normalized_to_the_bound_domain() {
         let net_ns = crate::common::net_ns::current().unwrap();
-        assert!(net_ns.validate_context(&SocketContext::default()).is_ok());
-        assert!(
-            net_ns
-                .validate_context(&SocketContext {
-                    net_ns: Some(net_ns.clone()),
-                    ..SocketContext::default()
-                })
-                .is_ok()
-        );
-        assert!(
-            net_ns
-                .validate_context(&SocketContext {
-                    net_ns: Some(NetNS::from_host_reference("configured-name")),
-                    ..SocketContext::default()
-                })
-                .is_err()
-        );
+        let mut context = SocketContext::default();
+        crate::host_runtime::normalize_context(&mut context, &net_ns).unwrap();
+        assert_eq!(context.net_ns.as_ref(), Some(&net_ns));
+
+        let mut context = SocketContext {
+            net_ns: Some(net_ns.clone()),
+            ..SocketContext::default()
+        };
+        assert!(crate::host_runtime::normalize_context(&mut context, &net_ns).is_ok());
+
+        let mut context = SocketContext {
+            net_ns: Some(NetNS::from_host_reference("configured-name")),
+            ..SocketContext::default()
+        };
+        assert!(crate::host_runtime::normalize_context(&mut context, &net_ns).is_err());
     }
 
     #[test]

@@ -20,8 +20,7 @@ impl RuntimeIcmpProxyHost {
         Self { net_ns }
     }
 
-    fn create_raw_socket(&self, context: &SocketContext) -> Result<Socket, std::io::Error> {
-        self.net_ns.validate_context(context)?;
+    fn create_raw_socket(&self, _context: &SocketContext) -> Result<Socket, std::io::Error> {
         self.net_ns.run(|| {
             let socket = Socket::new(
                 socket2::Domain::IPV4,
@@ -77,8 +76,9 @@ impl IcmpProxySocket for RuntimeIcmpSocket {
 impl IcmpProxyHost for RuntimeIcmpProxyHost {
     async fn open_icmp_v4(
         &self,
-        context: SocketContext,
+        mut context: SocketContext,
     ) -> Result<Arc<dyn IcmpProxySocket>, ProxyRuntimeError> {
+        crate::host_runtime::normalize_context(&mut context, &self.net_ns)?;
         let socket = self.create_raw_socket(&context).inspect_err(|error| {
             tracing::warn!(?error, "create ICMP socket failed");
         })?;
