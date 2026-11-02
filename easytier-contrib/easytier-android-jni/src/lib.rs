@@ -5,7 +5,8 @@
 //! modules so this facade stays readable as an API map.
 //!
 //! Network management APIs:
-//! - `setTunFd(instanceName, fd, snapshotId)`: attach an Android TUN fd to an instance.
+//! - `setTunFd(instanceName, fd, snapshotId)`: attach or locally detach an Android TUN fd.
+//! - `getMobileTunConfig(instanceName)`: read the complete mobile VPN configuration JSON.
 //! - `parseConfig(config)`: validate TOML config text.
 //! - `runNetworkInstance(config)`: start a local network instance.
 //! - `retainNetworkInstance(instanceNames)`: retain named instances and stop the rest.
@@ -35,15 +36,18 @@ use jni::JNIEnv;
 use jni::objects::{JClass, JObject, JObjectArray, JString};
 use jni::sys::{jboolean, jint, jstring};
 
-/// Attach a TUN file descriptor to an EasyTier network instance.
+/// Attach or locally detach a TUN file descriptor for an EasyTier network
+/// instance.
 ///
 /// Java signature:
-/// `EasyTierJNI.setTunFd(instanceName: String, fd: Int, snapshotId: String): Int`
+/// `EasyTierJNI.setTunFd(instanceName: String, fd: Int, snapshotId: String?): Int`
 ///
-/// `instanceName` must name an instance known to the shared FFI instance cache.
-/// The `fd` must be a valid Android TUN file descriptor. On failure this
-/// returns `-1` and throws `RuntimeException` with the FFI error message when
-/// one is available.
+/// A positive `fd` requires snapshotId from `getMobileTunConfig` and waits for
+/// the complete FFI/Native local attachment. A non-positive `fd` releases
+/// local borrows only; snapshotId may be null, and the call does not claim the
+/// system VPN was closed. This JNI method creates no thread and starts no
+/// request; callers must invoke it from their existing background entry point.
+/// On failure it returns `-1` and throws `RuntimeException`.
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_com_easytier_jni_EasyTierJNI_setTunFd(
     env: JNIEnv,
@@ -56,7 +60,17 @@ pub extern "system" fn Java_com_easytier_jni_EasyTierJNI_setTunFd(
     network_api::set_tun_fd_jni(env, class, inst_name, fd, snapshot_id)
 }
 
-/// Return the system VPN configuration to install, including its snapshot ID.
+/// Return the complete system VPN configuration to install, including its
+/// snapshot ID.
+///
+/// Java signature:
+/// `EasyTierJNI.getMobileTunConfig(instanceName: String): String`
+///
+/// The returned JSON is the Controller/FFI complete result. JNI only copies
+/// the string: it does not parse, filter or merge routes. The call may wait
+/// for NIC facts, so callers must use their existing background entry point.
+/// A null FFI result is thrown as `RuntimeException`, never treated as an empty
+/// configuration. On failure this returns null and throws `RuntimeException`.
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_com_easytier_jni_EasyTierJNI_getMobileTunConfig(
     env: JNIEnv,

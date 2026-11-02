@@ -12,13 +12,32 @@ object EasyTierJNI {
     }
 
     /**
-     * 设置 TUN 文件描述符
+     * 设置或解除 TUN 文件描述符。
+     *
+     * [snapshotId] 为正 fd 必须提供，必须来自 [getMobileTunConfig] 返回 JSON 的
+     * `snapshot_id`；解除本地借用（fd <= 0）时可传 null。该调用会同步等待
+     * Native 本地接入或 detach 完成，只表示本地结果，不代表系统 VPN 已关闭。
+     * 可能等待 NIC facts，调用方必须使用既有后台入口，不能阻塞 Android 主线程。
+     *
      * @param instanceName 实例名称
-     * @param fd TUN 文件描述符
-     * @return 0 表示成功，-1 表示失败
-     * @throws RuntimeException 当操作失败时抛出异常
+     * @param fd TUN 文件描述符；小于等于 0 时执行本地 detach
+     * @param snapshotId 正 fd 对应的完整配置快照标识；detach 时可为 null
+     * @return 0 表示本地操作真实成功，-1 表示失败
+     * @throws RuntimeException 当参数、快照或本地接入/清理失败时抛出异常
      */
-    @JvmStatic external fun setTunFd(instanceName: String, fd: Int, snapshotId: String): Int
+    @JvmStatic external fun setTunFd(instanceName: String, fd: Int, snapshotId: String?): Int
+
+    /**
+     * 读取本次系统 VPN 应安装的完整配置 JSON。
+     *
+     * JSON 来自 Controller 的完整结果，包含 snapshot_id、addresses、routes、
+     * dns 和 rejected；调用方不得再次按 proxy/manual/成员冲突筛选路由。
+     * 该调用可能等待 NIC facts，必须使用既有后台入口，不能阻塞 Android 主线程。
+     *
+     * @param instanceName 实例名称
+     * @return 完整配置 JSON
+     * @throws RuntimeException 当参数、查询或字符串转换失败时抛出异常
+     */
     @JvmStatic external fun getMobileTunConfig(instanceName: String): String
 
     /**
