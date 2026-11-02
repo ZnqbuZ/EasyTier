@@ -570,7 +570,7 @@ impl DnsRecordResolver for NativeHostRuntime {
 
 #[cfg(test)]
 mod tests {
-    use crate::common::native_executor::NativeExecutor;
+    use crate::instance::runtime_executor::NativeInstanceExecutor;
 
     use super::*;
 
@@ -707,7 +707,7 @@ mod tests {
     async fn shared_reactor_survives_the_instance_that_first_initialized_it() {
         use std::time::Duration;
         let host = Arc::new(NativeHostRuntime::new());
-        let first = NativeExecutor::new(false, 1).unwrap();
+        let first = NativeInstanceExecutor::new(false, 1).unwrap();
         let first_handle = first.handle();
         let net_ns = net_ns_services(&crate::common::net_ns::current().unwrap()).unwrap();
         let initialize_host = host.clone();
@@ -744,7 +744,7 @@ mod tests {
                 .unwrap_err()
                 .is_cancelled()
         );
-        let second = NativeExecutor::new(false, 1).unwrap();
+        let second = NativeInstanceExecutor::new(false, 1).unwrap();
         let socket = Arc::new(socket);
         let receive = socket.clone();
         let receive = second.handle().spawn(async move {

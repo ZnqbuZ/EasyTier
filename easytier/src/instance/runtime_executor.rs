@@ -7,14 +7,14 @@ use tokio::{
     sync::oneshot,
 };
 
-pub(super) struct NativeInstanceExecutor {
+pub(crate) struct NativeInstanceExecutor {
     handle: Handle,
     // Dropping the sender stops the driver, including on construction failure.
     _shutdown: oneshot::Sender<()>,
 }
 
 impl NativeInstanceExecutor {
-    pub(super) fn new(multi_thread: bool, thread_count: u32) -> anyhow::Result<Self> {
+    pub(crate) fn new(multi_thread: bool, thread_count: u32) -> anyhow::Result<Self> {
         let (ready_tx, ready_rx) = mpsc::sync_channel(1);
         let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
         std::thread::Builder::new()
@@ -50,7 +50,7 @@ impl NativeInstanceExecutor {
         })
     }
 
-    pub(super) fn handle(&self) -> Handle {
+    pub(crate) fn handle(&self) -> Handle {
         self.handle.clone()
     }
 }
