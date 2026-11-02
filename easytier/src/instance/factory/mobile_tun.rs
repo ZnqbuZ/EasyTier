@@ -8,10 +8,14 @@
 //! members through the existing Native attachment queue. It never selects,
 //! merges or projects routes of its own.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    sync::Arc,
+};
 
 use anyhow::Context as _;
 use easytier_core::instance::CoreInstanceState;
+use tokio::sync::Notify;
 use uuid::Uuid;
 
 use super::{NativeCoreInstance, NativeInstanceManager, NativeInstanceRuntimeHost};
@@ -148,6 +152,21 @@ async fn withdraw_plan_member(
         });
     }
     anyhow::bail!("no native runtime or member handle remains for withdrawn run {run}")
+}
+
+/// Borrow the existing mobile route domain's change notification.
+///
+/// The handle carries no route table, instance or Registry root: a host task
+/// may keep it while re-reading the complete configuration and must still
+/// decide whether any system VPN action is needed. `None` means no existing
+/// route domain can be identified; this function never creates one and starts
+/// no worker. Once the host task observes a notification it should subscribe
+/// again before reading, because the notification carries no payload and only
+/// wakes waiters registered at the time of the change.
+pub fn mobile_tun_changed() -> Option<Arc<Notify>> {
+    crate::host_runtime::native_host_runtime()
+        .existing_route_controller()
+        .map(|controller| controller.changed().clone())
 }
 
 /// Query the complete table for the host's explicit participation scope.

@@ -609,6 +609,168 @@ async fn local_evidence_is_registration_scoped_and_never_recreates_records() {
     );
 }
 
+/// Run a synchronous state-changing action after registering the waiter, then
+/// require that the Controller's real notification wakes it.
+async fn expect_wake(changed: &Notify, action: impl FnOnce()) {
+    let notified = changed.notified();
+    tokio::pin!(notified);
+    notified.as_mut().enable();
+    action();
+    tokio::time::timeout(std::time::Duration::from_secs(1), notified)
+        .await
+        .expect("a real state change must wake the host notification");
+}
+
+/// Run a no-op action after registering the waiter and require that it does
+/// not manufacture a notification.
+async fn expect_no_wake(changed: &Notify, action: impl FnOnce()) {
+    let notified = changed.notified();
+    tokio::pin!(notified);
+    notified.as_mut().enable();
+    action();
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(100), notified)
+            .await
+            .is_err(),
+        "an unchanged state must not notify the host"
+    );
+}
+
+#[tokio::test]
+async fn only_real_local_evidence_changes_notify_the_host() {
+    let controller = test_controller();
+    let run = Uuid::new_v4();
+    let _root = open_run(&controller, run);
+    let mut nics = SharedVirtualNicRegistry::new();
+    let member = test_member(&mut nics, run);
+    controller.bind_member(run, &member).unwrap();
+    let changed = controller.changed().clone();
+    let prefixes = BTreeSet::from(["10.127.127.0/24".parse().unwrap()]);
+
+    expect_wake(&changed, || {
+        assert!(controller.record_mobile_ready(run, &member, prefixes.clone()));
+    })
+    .await;
+    expect_no_wake(&changed, || {
+        assert!(controller.record_mobile_ready(run, &member, prefixes.clone()));
+    })
+    .await;
+
+    expect_wake(&changed, || {
+        controller.unready(run, member.registration_id());
+    })
+    .await;
+    expect_no_wake(&changed, || {
+        controller.unready(run, member.registration_id());
+    })
+    .await;
+
+    // A later real attachment report is recovery, not a duplicate ACK.
+    expect_wake(&changed, || {
+        assert!(controller.record_mobile_ready(run, &member, prefixes));
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn worker_consumes_real_inputs_notifies_once_and_then_waits() {
+    let controller = test_controller();
+    let changed = controller.changed().clone();
+    let worker = tokio::spawn(RouteReconciler::new(controller.clone()).run());
+
+    // The worker's first round consumes its own initial mark. Wait for that
+    // real notification before asserting the quiet state.
+    let notified = changed.notified();
+    tokio::pin!(notified);
+    notified.as_mut().enable();
+    tokio::time::timeout(std::time::Duration::from_secs(1), notified)
+        .await
+        .expect("the initial policy round must be observable");
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(100), changed.notified())
+            .await
+            .is_err(),
+        "an idle worker must not produce a self-notification loop"
+    );
+
+    let scope = BTreeSet::from([Uuid::new_v4()]);
+    let notified = changed.notified();
+    tokio::pin!(notified);
+    notified.as_mut().enable();
+    controller.set_mobile_scope(Some(scope.clone())).unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(1), notified)
+        .await
+        .expect("a real scope input must reach the host after processing");
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(100), changed.notified())
+            .await
+            .is_err(),
+        "consuming one input must not leave a second wake pending"
+    );
+    expect_no_wake(&changed, || {
+        controller.set_mobile_scope(Some(scope)).unwrap();
+    })
+    .await;
+
+    let run = Uuid::new_v4();
+    let notified = changed.notified();
+    tokio::pin!(notified);
+    notified.as_mut().enable();
+    let root = controller.open_instance(run).unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(1), notified)
+        .await
+        .expect("a new instance record must reach the host");
+
+    // Address, DHCP, public-address and DNS writers mark the same input; the
+    // host must observe the resulting processing, not a stale cached table.
+    let notified = changed.notified();
+    tokio::pin!(notified);
+    notified.as_mut().enable();
+    controller.invalidate_instance(&run);
+    tokio::time::timeout(std::time::Duration::from_secs(1), notified)
+        .await
+        .expect("a real route input invalidation must reach the host");
+
+    let config = CoreRuntimeConfigStore::new(
+        CoreRuntimeConfig::default(),
+        Arc::new(PeerRuntimeSnapshot::default()),
+    );
+    let notified = changed.notified();
+    tokio::pin!(notified);
+    notified.as_mut().enable();
+    controller.bind_config(run, config.clone()).unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(1), notified)
+        .await
+        .expect("binding the current configuration must reach the host");
+
+    let mut dns_peer = PeerRuntimeSnapshot::default();
+    dns_peer.flags.accept_dns = true;
+    let dns_peer = Arc::new(dns_peer);
+    let notified = changed.notified();
+    tokio::pin!(notified);
+    notified.as_mut().enable();
+    config.update_peer(dns_peer.clone());
+    tokio::time::timeout(std::time::Duration::from_secs(1), notified)
+        .await
+        .expect("a real DNS policy change must reach the host");
+    expect_no_wake(&changed, || config.update_peer(dns_peer)).await;
+
+    let notified = changed.notified();
+    tokio::pin!(notified);
+    notified.as_mut().enable();
+    drop(root);
+    tokio::time::timeout(std::time::Duration::from_secs(1), notified)
+        .await
+        .expect("the last Root release and cleanup progress must reach the host");
+
+    controller.request_shutdown();
+    tokio::time::timeout(std::time::Duration::from_secs(1), worker)
+        .await
+        .expect("the idle worker must stop after shutdown")
+        .unwrap()
+        .unwrap();
+}
+
 #[tokio::test]
 async fn ready_requires_the_complete_plan_ack_and_this_members_installed_evidence() {
     let h = MobileHarness::new("10.91.0.0/24").await;

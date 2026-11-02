@@ -424,6 +424,31 @@ impl NativeHostRuntime {
             })
     }
 
+    /// Resolve an already-registered mobile route domain for host notification.
+    ///
+    /// This only observes the Host's existing namespace directory. It never
+    /// calls `capture_default_net_ns`, `intern_net_ns` or `route_controller`,
+    /// so a missing domain stays missing and no instance or Registry root is
+    /// retained. A mobile host has one participation domain; if more than one
+    /// distinct domain exists and none is the process default, the caller gets
+    /// `None` instead of a notification handle for an arbitrary domain.
+    #[cfg(all(mobile, feature = "tun"))]
+    pub(crate) fn existing_route_controller(
+        &self,
+    ) -> Option<crate::instance::route::RouteController> {
+        let services = self.net_ns.lock().unwrap();
+        if let Some(default) = self.default_net_ns.get()
+            && let Some(services) = services.get(default)
+        {
+            return Some(services.routes.clone());
+        }
+        let mut controllers = services.iter().map(|services| services.routes.clone());
+        let first = controllers.next()?;
+        controllers
+            .all(|controller| controller.same_controller(&first))
+            .then_some(first)
+    }
+
     pub(crate) fn capture_default_net_ns(&self) -> io::Result<NetNS> {
         if self.closing.load(Ordering::Acquire) {
             return Err(io::Error::other("native host runtime is closing"));
@@ -717,6 +742,63 @@ mod tests {
             self.net_ns(context)
                 .is_ok_and(|net_ns| net_ns.is_local_ip(ip, context))
         }
+    }
+
+    #[cfg(all(mobile, feature = "tun"))]
+    #[tokio::test]
+    async fn mobile_change_handle_only_uses_an_existing_domain() {
+        let host = Arc::new(NativeHostRuntime::new());
+        assert!(host.default_net_ns.get().is_none());
+        assert!(host.net_ns.lock().unwrap().is_empty());
+        assert!(
+            host.existing_route_controller().is_none(),
+            "a notification lookup must not create a route domain"
+        );
+        assert!(host.default_net_ns.get().is_none());
+        assert!(host.net_ns.lock().unwrap().is_empty());
+
+        let _net_ns = host.capture_default_net_ns().unwrap();
+        let first = host
+            .existing_route_controller()
+            .expect("the existing domain is observable");
+        let second = host
+            .existing_route_controller()
+            .expect("a second lookup observes the same domain");
+        assert!(first.same_controller(&second));
+        assert!(
+            Arc::ptr_eq(first.changed(), second.changed()),
+            "every host notification handle is the Controller's one Notify"
+        );
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), host.shutdown())
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    #[cfg(all(mobile, feature = "tun"))]
+    #[tokio::test]
+    async fn holding_the_mobile_change_handle_does_not_retain_an_instance_root() {
+        let host = Arc::new(NativeHostRuntime::new());
+        let _net_ns = host.capture_default_net_ns().unwrap();
+        let controller = host.existing_route_controller().unwrap();
+        let changed = controller.changed().clone();
+        let run = uuid::Uuid::new_v4();
+        let root = controller.open_instance(run).unwrap();
+
+        // A notification handle may outlive the instance. The Registry root,
+        // not this handle, is what keeps the route record alive.
+        drop(root);
+        tokio::time::timeout(std::time::Duration::from_secs(5), controller.drain(run))
+            .await
+            .expect("the released instance must be cleaned while the handle is held")
+            .unwrap();
+        drop(changed);
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), host.shutdown())
+            .await
+            .unwrap()
+            .unwrap();
     }
 
     #[tokio::test]
