@@ -392,6 +392,24 @@ mod tests {
         assert_eq!(host.cleanup_result.borrow().as_ref(), Some(&Ok(())));
     }
 
+    #[tokio::test]
+    async fn one_instance_shutdown_does_not_wait_for_another_instances_operation() {
+        let first = runtime_host(Arc::new(GlobalCtx::new(TomlConfig::default())));
+        let second = runtime_host(Arc::new(GlobalCtx::new(TomlConfig::default())));
+        let second_operation = second.operation.lock().await;
+
+        tokio::time::timeout(std::time::Duration::from_secs(3), first.shutdown_runtime())
+            .await
+            .expect("A's local shutdown must not wait for B's pending operation");
+        assert_eq!(first.cleanup_result.borrow().as_ref(), Some(&Ok(())));
+
+        drop(second_operation);
+        tokio::time::timeout(std::time::Duration::from_secs(3), second.shutdown_runtime())
+            .await
+            .expect("B can finish its own cleanup after the operation is released");
+        assert_eq!(second.cleanup_result.borrow().as_ref(), Some(&Ok(())));
+    }
+
     #[cfg(not(mobile))]
     #[tokio::test]
     async fn desktop_route_context_exists_without_tun() {

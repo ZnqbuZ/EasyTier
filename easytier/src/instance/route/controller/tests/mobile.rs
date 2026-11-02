@@ -639,6 +639,15 @@ async fn ready_requires_the_complete_plan_ack_and_this_members_installed_evidenc
         .find(|member| member.run == h.run)
         .expect("the live member is accepted");
     assert!(accepted.installed_prefixes.contains(&declaration));
+    assert_eq!(
+        plan.config.snapshot_id, config.snapshot_id,
+        "get and prepare must return the same complete result"
+    );
+    assert_eq!(
+        accepted.installed_prefixes,
+        claim_prefixes(&h.member.claims().await),
+        "the worker committed exactly the plan's member target"
+    );
     assert!(h.controller.record_mobile_ready(
         h.run,
         &h.member,
@@ -730,7 +739,7 @@ async fn controller_rejection_is_fed_back_without_recomputing_the_target() {
     let controller = test_controller();
     let (first, _first_root, first_slot) =
         input_only_instance(&controller, "10.95.0.1/24", "10.95.0.0/24");
-    let (second, _second_root, second_slot) =
+    let (_second, _second_root, second_slot) =
         input_only_instance(&controller, "10.95.0.2/24", "10.95.0.0/24");
     let first_declaration: IpCidr = "10.95.0.0/24".parse().unwrap();
 
@@ -840,4 +849,109 @@ async fn another_members_evidence_cannot_confirm_this_member() {
         Some(RouteStatus::Pending { error: None }),
         "the first member's installed evidence must not confirm the second"
     );
+}
+
+#[tokio::test]
+async fn a_later_declaration_is_not_confirmed_by_previous_installed_evidence() {
+    let h = MobileHarness::new("10.93.0.0/24").await;
+    let first: IpCidr = "10.93.0.0/24".parse().unwrap();
+    let second: IpCidr = "10.94.0.0/24".parse().unwrap();
+    let mut reconciler = RouteReconciler::new(h.controller.clone());
+    reconciler.reconcile().await;
+    let config = h.controller.mobile_config().await.unwrap();
+    let plan = h
+        .controller
+        .prepare_mobile_attach(config.snapshot_id)
+        .await
+        .unwrap();
+    let accepted = plan
+        .members
+        .iter()
+        .find(|member| member.run == h.run)
+        .unwrap();
+    assert!(h.controller.record_mobile_ready(
+        h.run,
+        &h.member,
+        accepted.installed_prefixes.clone()
+    ));
+    reconciler.reconcile().await;
+    assert_eq!(h.status(first), Some(RouteStatus::Ready));
+
+    // The declaration changes while the old installed evidence remains. The
+    // worker can ACK the new target, but the new prefix has no system evidence.
+    h.slot.set_routes(RouteSet::from([
+        RouteSpec::for_tun(first.into()),
+        RouteSpec::for_tun(second.into()),
+    ]));
+    reconciler.reconcile().await;
+    assert_eq!(
+        h.status(first),
+        Some(RouteStatus::Ready),
+        "unchanged prefix keeps its own evidence"
+    );
+    assert_eq!(
+        h.status(second),
+        Some(RouteStatus::Pending { error: None }),
+        "a declaration added after installation is not confirmed by old evidence"
+    );
+}
+
+#[tokio::test]
+async fn closed_flag_does_not_count_as_cleanup_evidence() {
+    let h = MobileHarness::new("10.95.0.0/24").await;
+    let mut reconciler = RouteReconciler::new(h.controller.clone());
+    reconciler.reconcile().await;
+    let config = h.controller.mobile_config().await.unwrap();
+    let plan = h
+        .controller
+        .prepare_mobile_attach(config.snapshot_id)
+        .await
+        .unwrap();
+    let accepted = plan
+        .members
+        .iter()
+        .find(|member| member.run == h.run)
+        .unwrap();
+    assert!(h.controller.record_mobile_ready(
+        h.run,
+        &h.member,
+        accepted.installed_prefixes.clone()
+    ));
+    h.controller.request_shutdown();
+
+    let shared_nic = h.member.shared_nic();
+    let guard = shared_nic.lock().await;
+    let mut close = Box::pin(h.member.close());
+    assert!(
+        futures::poll!(close.as_mut()).is_pending(),
+        "close must block on the held NIC lock after setting its flag"
+    );
+    assert!(
+        h.member.ensure_open().is_err(),
+        "close marks the member closed before its cleanup finishes"
+    );
+    assert_eq!(
+        h.controller
+            .mobile_installed_prefixes(h.run, h.member.registration_id()),
+        Some(accepted.installed_prefixes.clone()),
+        "the closed flag must not erase real installed evidence"
+    );
+    assert!(
+        h.controller.ensure_drained().is_err(),
+        "shutdown cannot be reported drained while cleanup is blocked"
+    );
+    assert!(
+        tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            h.controller.drain(h.run)
+        )
+        .await
+        .is_err(),
+        "the local drain must not finish before the member cleanup"
+    );
+
+    drop(guard);
+    close.await.unwrap();
+    reconciler.reconcile().await;
+    assert!(h.controller.ensure_drained().is_ok());
 }
