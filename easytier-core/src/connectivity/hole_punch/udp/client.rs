@@ -91,7 +91,7 @@ where
         runtime.as_ref(),
         BindConfig {
             bind_device: Some("".into()),
-            reuse_addr: Some(false),
+            reuse_addr: false,
             context: SocketContext {
                 ip_version: crate::socket::IpVersion::V4,
                 ..runtime.socket_context()
@@ -862,7 +862,7 @@ mod tests {
         assert_eq!(
             bind_options.as_slice(),
             &[BindConfig {
-                reuse_addr: Some(false),
+                reuse_addr: false,
                 context: crate::socket::SocketContext {
                     ip_version: crate::socket::IpVersion::V4,
                     ..SocketContext::default()

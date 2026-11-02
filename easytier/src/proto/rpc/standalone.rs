@@ -31,6 +31,7 @@ pub fn runtime_rpc_client(remote_url: url::Url) -> RuntimeRpcClient {
 pub fn runtime_rpc_listener(local_addr: std::net::SocketAddr) -> RuntimeRpcListener {
     // RPC clients may arrive through TUN; their replies must retain VPN routing.
     let bind = BindConfig {
+        reuse_addr: true,
         local_addr: Some(local_addr),
         only_v6: true,
         need_protect: false,

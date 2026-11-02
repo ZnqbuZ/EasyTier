@@ -38,7 +38,7 @@ async fn new_protected_natpmp(
     let gateway_addr = SocketAddr::V4(SocketAddrV4::new(gateway, natpmp::NATPMP_PORT));
     let socket = crate::socket::bind::<UdpSocket>(BindConfig {
         local_addr: Some("0.0.0.0:0".parse().unwrap()),
-        reuse_addr: Some(false),
+        reuse_addr: false,
         need_protect: true,
         ..BindConfig::default()
     })
@@ -541,7 +541,7 @@ async fn resolve_internal_addr(
         let udp = crate::socket::bind::<UdpSocket>(BindConfig {
             local_addr: Some("0.0.0.0:0".parse().unwrap()),
             bind_device: Some("".into()),
-            reuse_addr: Some(false),
+            reuse_addr: false,
             need_protect: true,
             ..BindConfig::default()
         })

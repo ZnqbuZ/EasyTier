@@ -315,7 +315,7 @@ where
     ) -> anyhow::Result<UdpPunchListener<HostUdpSocket<H>>> {
         let bind = BindConfig {
             bind_device: Some("".into()),
-            reuse_addr: Some(false),
+            reuse_addr: false,
             local_addr: port
                 .map(|port| SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, port))),
             context: SocketContext {
@@ -416,7 +416,7 @@ where
         self.host
             .bind_udp(BindConfig {
                 bind_device: Some("".into()),
-                reuse_addr: Some(false),
+                reuse_addr: false,
                 context: SocketContext {
                     ip_version: IpVersion::V4,
                     ..self.socket_context.clone()

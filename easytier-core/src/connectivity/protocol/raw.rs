@@ -217,7 +217,7 @@ where
             ip_version: IpVersion::Both,
             bind_addrs: Vec::new(),
             bind: BindConfig {
-                reuse_addr: Some(false),
+                reuse_addr: false,
                 ..BindConfig::default()
             },
         }

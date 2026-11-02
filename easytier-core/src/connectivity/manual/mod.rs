@@ -307,7 +307,7 @@ impl Default for ManualConnectorOptions {
             allow_interface_bind: true,
             tcp_bind: BindConfig::default(),
             udp_bind: BindConfig {
-                reuse_addr: Some(false),
+                reuse_addr: false,
                 ..BindConfig::default()
             },
         }

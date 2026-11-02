@@ -32,7 +32,7 @@ pub struct SocketContext {
 ///     ..BindConfig::default()
 /// };
 /// assert!(socket.need_protect);
-/// assert_eq!(socket.reuse_addr, None);
+/// assert!(!socket.reuse_addr);
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Educe)]
 #[educe(Default)]
@@ -47,8 +47,10 @@ pub struct BindConfig {
     /// None discovers the local address's device; an empty string disables
     /// device binding; a nonempty string selects that device explicitly.
     pub bind_device: Option<String>,
-    /// None selects the host's default. Explicit true and false always win.
-    pub reuse_addr: Option<bool>,
+    /// Whether the socket may share its local address/port with another
+    /// socket. UDP endpoints default to exclusive; callers that really need
+    /// sharing must set this explicitly.
+    pub reuse_addr: bool,
     pub reuse_port: bool,
     pub only_v6: bool,
 }
@@ -58,10 +60,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn default_requests_protection_and_serde_keeps_tri_state_reuse() {
+    fn default_is_protected_and_exclusive() {
         assert!(BindConfig::default().need_protect);
+        assert!(!BindConfig::default().reuse_addr);
         assert_eq!(BindConfig::default().context, SocketContext::default());
-        for reuse in [None, Some(false), Some(true)] {
+        for reuse in [false, true] {
             let options = BindConfig {
                 reuse_addr: reuse,
                 bind_device: Some(String::new()),
@@ -76,5 +79,6 @@ mod tests {
         let omitted: BindConfig = serde_json::from_str("{}").unwrap();
         assert_eq!(omitted, BindConfig::default());
         assert!(omitted.need_protect);
+        assert!(!omitted.reuse_addr);
     }
 }

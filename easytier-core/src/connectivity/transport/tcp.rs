@@ -44,6 +44,7 @@ where
     } else {
         for bind_addr in bind_addrs {
             let bind = BindConfig {
+                reuse_addr: true,
                 local_addr: Some(bind_addr),
                 only_v6: true,
                 ..default_bind.clone()

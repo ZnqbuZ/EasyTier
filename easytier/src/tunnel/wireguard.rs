@@ -817,7 +817,7 @@ pub mod tests {
                     remote_addr,
                     Vec::new(),
                     BindConfig {
-                        reuse_addr: Some(false),
+                        reuse_addr: false,
                         ..BindConfig::default()
                     },
                     UdpSessionMode::Classified(UdpSessionProtocol::WireGuard),

@@ -267,6 +267,7 @@ impl<R: TcpProxyRuntime + 'static, F: VirtualTcpListenerFactory, C: TcpProxyDest
             .listener_factory
             .bind_tcp(
                 TcpListenOptions::proxy_nat(listen_addr).with_bind(BindConfig {
+                    reuse_addr: true,
                     need_protect: false,
                     context: SocketContext {
                         ip_version: crate::socket::IpVersion::V4,

@@ -125,10 +125,7 @@ pub(crate) async fn bind<B: Bindable>(config: BindConfig) -> Result<B, TunnelErr
             "socket requires a local address or explicit IP version".to_owned(),
         )
     })?;
-    // Independent UDP receivers stay exclusive unless reuse is explicitly requested.
-    let reuse_addr = reuse_addr.unwrap_or(
-        B::TYPE != socket2::Type::DGRAM && addr.is_some() && !cfg!(target_os = "windows"),
-    );
+    // The caller owns the reuse policy; this path applies it unchanged.
     let (socket, dev) = {
         let _g = net_ns.guard();
         let dev = match bind_device.as_deref() {
@@ -230,10 +227,10 @@ mod tests {
             let listener = TcpListener::bind((ip, 0)).await.unwrap();
             let remote_addr = listener.local_addr().unwrap();
             for (local_addr, reuse_addr) in [
-                (None, None),
-                (None, Some(true)),
-                (Some(std::net::SocketAddr::new(ip, 0)), None),
-                (Some(std::net::SocketAddr::new(ip, 0)), Some(false)),
+                (None, false),
+                (None, true),
+                (Some(std::net::SocketAddr::new(ip, 0)), false),
+                (Some(std::net::SocketAddr::new(ip, 0)), true),
             ] {
                 let socket = bind::<TcpSocket>(BindConfig {
                     context: SocketContext {
@@ -257,10 +254,7 @@ mod tests {
                 let addr = socket.local_addr().unwrap();
                 assert_eq!(addr.port() == 0, local_addr.is_none());
                 let socket_ref = socket2::SockRef::from(&socket);
-                assert_eq!(
-                    socket_ref.reuse_address().unwrap(),
-                    reuse_addr.unwrap_or(local_addr.is_some() && !cfg!(target_os = "windows"))
-                );
+                assert_eq!(socket_ref.reuse_address().unwrap(), reuse_addr);
                 if ip.is_ipv6() {
                     assert!(socket_ref.only_v6().unwrap());
                 }

@@ -69,7 +69,7 @@ where
     fn udp_bind_options(&self) -> BindConfig {
         BindConfig {
             bind_device: Some("".into()),
-            reuse_addr: Some(false),
+            reuse_addr: false,
             need_protect: false,
             context: SocketContext {
                 ip_version: IpVersion::V6,
@@ -134,7 +134,7 @@ where
             .host
             .bind_udp(BindConfig {
                 bind_device: Some("".into()),
-                reuse_addr: Some(false),
+                reuse_addr: false,
                 context: SocketContext {
                     ip_version: IpVersion::V6,
                     ..self.socket_context.clone()
@@ -300,7 +300,7 @@ mod tests {
         assert_eq!(association.local_addr().unwrap().port(), 42000);
         assert_eq!(host.binds.load(Ordering::Relaxed), 1);
         let options = host.options.lock().unwrap();
-        assert_eq!(options[0].reuse_addr, Some(false));
+        assert!(!options[0].reuse_addr);
         assert_eq!(options[0].bind_device.as_deref(), Some(""));
         assert_eq!(options[0].context.socket_mark, context.socket_mark);
         assert_eq!(options[0].context.ip_version, IpVersion::V6);

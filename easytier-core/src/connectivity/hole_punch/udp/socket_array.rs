@@ -134,7 +134,7 @@ where
                 .socket_factory
                 .bind_udp(BindConfig {
                     bind_device: Some("".into()),
-                    reuse_addr: Some(false),
+                    reuse_addr: false,
                     context: SocketContext {
                         ip_version: IpVersion::V4,
                         ..self.socket_context.clone()
@@ -399,7 +399,7 @@ mod tests {
             &[
                 BindConfig {
                     bind_device: Some("".into()),
-                    reuse_addr: Some(false),
+                    reuse_addr: false,
                     context: SocketContext {
                         ip_version: IpVersion::V4,
                         ..context.clone()
@@ -408,7 +408,7 @@ mod tests {
                 },
                 BindConfig {
                     bind_device: Some("".into()),
-                    reuse_addr: Some(false),
+                    reuse_addr: false,
                     context: SocketContext {
                         ip_version: IpVersion::V4,
                         ..context

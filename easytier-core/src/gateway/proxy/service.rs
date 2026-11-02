@@ -531,7 +531,7 @@ mod tests {
             options.context.netns.as_ref().map(|netns| netns.token()),
             Some("udp-proxy")
         );
-        assert_eq!(options.reuse_addr, None);
+        assert!(!options.reuse_addr);
         assert_eq!(options.bind_device.as_deref(), Some(""));
     }
 }

@@ -311,6 +311,7 @@ impl WsTunnelListener {
 
         let addr = SocketAddr::from_url(self.addr.clone(), IpVersion::Both).await?;
         let listener = crate::socket::bind::<TcpListener>(BindConfig {
+            reuse_addr: true,
             local_addr: Some(addr),
             only_v6: true,
             context: SocketContext {

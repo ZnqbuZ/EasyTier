@@ -324,7 +324,7 @@ pub trait UdpHolePunchRuntime: Send + Sync + 'static {
         UdpHolePunchRuntime::bind_udp(
             self,
             BindConfig {
-                reuse_addr: Some(false),
+                reuse_addr: false,
                 context: SocketContext {
                     ip_version: crate::socket::IpVersion::V4,
                     ..self.socket_context()

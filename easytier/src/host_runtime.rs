@@ -120,7 +120,7 @@ impl ConnectorRuntime for NativeHostRuntime {
             local_addr: Some(bind_addr),
             bind_device: Some("".into()),
             context,
-            reuse_addr: Some(false),
+            reuse_addr: false,
             need_protect: true,
             ..BindConfig::default()
         })

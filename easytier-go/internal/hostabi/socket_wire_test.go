@@ -208,7 +208,7 @@ func TestDecodeUDPBindOptionsV3(t *testing.T) {
 	if opts.BindDevice == nil || *opts.BindDevice != "eth1" {
 		t.Errorf("bind device = %v, want eth1", opts.BindDevice)
 	}
-	if opts.ReuseAddr == nil || *opts.ReuseAddr {
+	if opts.ReuseAddr {
 		t.Errorf("legacy UDP reuse_addr = %v, want explicit false", opts.ReuseAddr)
 	}
 }
@@ -226,7 +226,8 @@ func TestDecodeUDPBindOptionsV4PreservesReuseAndProtection(t *testing.T) {
 				if err != nil {
 					t.Fatal(err)
 				}
-				if (options.ReuseAddr == nil) != (mode == 0) || (mode != 0 && *options.ReuseAddr != (mode == 2)) {
+				wantReuse := mode == 2
+				if options.ReuseAddr != wantReuse {
 					t.Fatalf("reuse_addr mode %d decoded as %v", mode, options.ReuseAddr)
 				}
 				if options.NeedProtect != (protect == 1) {
@@ -263,7 +264,7 @@ func TestDecodeLegacyUDPReuseFalseStaysExclusive(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if options.ReuseAddr == nil || *options.ReuseAddr {
+		if options.ReuseAddr {
 			t.Fatalf("purpose %d: legacy false must stay explicit false, got %v", purpose, options.ReuseAddr)
 		}
 		autoDevice := purpose == 2 || purpose == 3 || purpose == 7

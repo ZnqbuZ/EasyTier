@@ -93,7 +93,7 @@ where
             let socket = factory
                 .bind_udp(BindConfig {
                     bind_device: Some("".into()),
-                    reuse_addr: Some(false),
+                    reuse_addr: false,
                     context: socket.socket_context(),
                     local_addr: Some(bind_addr),
                     ..BindConfig::default()
@@ -240,7 +240,7 @@ mod tests {
             factory.bind_options(),
             vec![BindConfig {
                 bind_device: Some("".into()),
-                reuse_addr: Some(false),
+                reuse_addr: false,
                 local_addr: Some("[::]:0".parse().unwrap()),
                 ..BindConfig::default()
             }]

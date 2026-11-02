@@ -14,17 +14,12 @@ func applySocketOptions(
 	network string,
 	options platform.BindConfig,
 ) error {
-	reuseAddr := options.ReuseAddr
-	if options.ReusePort {
-		if reuseAddr != nil && !*reuseAddr {
-			return fmt.Errorf("socket reuse_port requires reuse_addr on Windows")
-		}
-		enabled := true
-		reuseAddr = &enabled
+	if options.ReusePort && !options.ReuseAddr {
+		return fmt.Errorf("socket reuse_port requires reuse_addr on Windows")
 	}
-	if reuseAddr != nil {
+	if options.ReuseAddr {
 		if err := windows.SetsockoptInt(windows.Handle(descriptor),
-			windows.SOL_SOCKET, windows.SO_REUSEADDR, boolInt(*reuseAddr)); err != nil {
+			windows.SOL_SOCKET, windows.SO_REUSEADDR, 1); err != nil {
 			return fmt.Errorf("set socket SO_REUSEADDR: %w", err)
 		}
 	}

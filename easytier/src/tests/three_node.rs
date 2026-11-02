@@ -3545,7 +3545,7 @@ async fn assert_peer_admission_blocked(inst: &Instance, url: url::Url) {
                     target,
                     Vec::new(),
                     BindConfig {
-                        reuse_addr: Some(false),
+                        reuse_addr: false,
                         ..BindConfig::default()
                     },
                     easytier_core::connectivity::transport::UdpSessionMode::EasyTierMux,

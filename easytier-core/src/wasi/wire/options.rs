@@ -27,11 +27,7 @@ pub(crate) fn encode_tcp_connect_options(options: &TcpConnectOptions) -> io::Res
     encoded.extend_from_slice(&encode_socket_address(options.remote_addr));
     encode_optional_address(&mut encoded, options.bind.local_addr);
     encode_context(&mut encoded, &options.bind.context)?;
-    encoded.push(match options.bind.reuse_addr {
-        None => 0,
-        Some(false) => 1,
-        Some(true) => 2,
-    });
+    encoded.push(if options.bind.reuse_addr { 2 } else { 1 });
     encoded.push(u8::from(options.bind.reuse_port));
     encoded.push(u8::from(options.bind.only_v6));
     encoded.push(match options.purpose {
@@ -57,11 +53,7 @@ pub(crate) fn encode_udp_bind_options(options: &BindConfig) -> io::Result<Vec<u8
     encoded.push(UDP_OPTIONS_VERSION);
     encode_optional_address(&mut encoded, options.local_addr);
     encode_context(&mut encoded, &options.context)?;
-    encoded.push(match options.reuse_addr {
-        None => 0,
-        Some(false) => 1,
-        Some(true) => 2,
-    });
+    encoded.push(if options.reuse_addr { 2 } else { 1 });
     encoded.push(u8::from(options.reuse_port));
     encoded.push(u8::from(options.only_v6));
     encoded.push(u8::from(options.need_protect));
@@ -77,11 +69,7 @@ pub(crate) fn encode_tcp_listen_options(options: &TcpListenOptions) -> io::Resul
     encoded.push(OPTIONS_VERSION);
     encode_optional_address(&mut encoded, options.bind.local_addr);
     encode_context(&mut encoded, &options.bind.context)?;
-    encoded.push(match options.bind.reuse_addr {
-        None => 0,
-        Some(false) => 1,
-        Some(true) => 2,
-    });
+    encoded.push(if options.bind.reuse_addr { 2 } else { 1 });
     encoded.push(u8::from(options.bind.reuse_port));
     encoded.push(u8::from(options.bind.only_v6));
     encoded.push(match options.purpose {
@@ -216,7 +204,7 @@ mod tests {
                     ..SocketContext::default()
                 },
                 bind_device: Some("device0".to_owned()),
-                reuse_addr: Some(true),
+                reuse_addr: true,
                 reuse_port: true,
                 only_v6: true,
                 ..BindConfig::default()
@@ -235,7 +223,7 @@ mod tests {
 
     #[test]
     fn udp_v4_preserves_reuse_and_protection_without_a_purpose_tag() {
-        for (reuse, encoded_mode) in [(None, 0), (Some(false), 1), (Some(true), 2)] {
+        for (reuse, encoded_mode) in [(false, 1), (true, 2)] {
             for protect in [false, true] {
                 let options = BindConfig {
                     reuse_addr: reuse,
@@ -266,12 +254,12 @@ mod tests {
         assert_eq!(&empty[71..76], &[1, 0, 0, 0, 0]);
 
         let udp_none = encode_udp_bind_options(&BindConfig {
-            reuse_addr: Some(false),
+            reuse_addr: false,
             ..BindConfig::default()
         })
         .unwrap();
         let udp_empty = encode_udp_bind_options(&BindConfig {
-            reuse_addr: Some(false),
+            reuse_addr: false,
             bind_device: Some(String::new()),
             ..BindConfig::default()
         })
@@ -376,13 +364,13 @@ mod tests {
         assert_eq!(listen_false[43], 0);
 
         let udp_true = encode_udp_bind_options(&BindConfig {
-            reuse_addr: Some(false),
+            reuse_addr: false,
             ..BindConfig::default()
         })
         .unwrap();
         let udp_false = encode_udp_bind_options(&BindConfig {
             bind_device: Some("".into()),
-            reuse_addr: Some(false),
+            reuse_addr: false,
             need_protect: false,
             ..BindConfig::default()
         })

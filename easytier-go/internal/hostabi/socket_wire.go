@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net"
 	"net/netip"
+	"runtime"
 	"unicode/utf8"
 
 	"github.com/easytier/easytier/easytier-go/platform"
@@ -29,7 +30,7 @@ func readOwnedOptions(module api.Module, pointer, length uint32) ([]byte, bool) 
 	return append([]byte(nil), options...), true
 }
 
-// TCP keeps its v3 layout. UDP v4 uses tri-state reuse_addr and no purpose tag.
+// TCP keeps its v3 layout. UDP v4 carries an explicit reuse policy and no purpose tag.
 const optionsWireVersion = 3
 const udpOptionsWireVersion = 4
 
@@ -59,6 +60,7 @@ func decodeTCPConnectOptions(encoded []byte) (platform.TCPConnectOptions, error)
 		remainder[1],
 		remainder[2],
 		remainder[5:],
+		tcpDefaultReuse(local != nil),
 	)
 	if err != nil {
 		return platform.TCPConnectOptions{}, err
@@ -111,7 +113,7 @@ func decodeUDPBindOptions(encoded []byte) (platform.BindConfig, error) {
 		}
 		policy = append([]byte{reuseMode, remainder[1], remainder[2], remainder[4]}, remainder[5:]...)
 	}
-	bind, err := decodeSocketBindPolicy(local, context, policy[0], policy[1], policy[2], policy[4:])
+	bind, err := decodeSocketBindPolicy(local, context, policy[0], policy[1], policy[2], policy[4:], false)
 	if err != nil {
 		return platform.BindConfig{}, err
 	}
@@ -156,6 +158,7 @@ func decodeTCPListenOptions(encoded []byte) (platform.TCPListenOptions, error) {
 		remainder[1],
 		remainder[2],
 		remainder[5:],
+		tcpDefaultReuse(local != nil),
 	)
 	if err != nil {
 		return platform.TCPListenOptions{}, err
@@ -178,16 +181,16 @@ func decodeSocketBindPolicy(
 	reusePortByte byte,
 	onlyV6Byte byte,
 	deviceBytes []byte,
+	defaultReuse bool,
 ) (platform.BindConfig, error) {
-	var reuseAddr *bool
+	var reuseAddr bool
 	switch reuseMode {
 	case 0:
+		reuseAddr = defaultReuse
 	case 1:
-		value := false
-		reuseAddr = &value
+		reuseAddr = false
 	case 2:
-		value := true
-		reuseAddr = &value
+		reuseAddr = true
 	default:
 		return platform.BindConfig{}, fmt.Errorf("invalid socket reuse_addr")
 	}
@@ -211,6 +214,12 @@ func decodeSocketBindPolicy(
 		ReusePort:  reusePort,
 		OnlyV6:     onlyV6,
 	}, nil
+}
+
+// tcpDefaultReuse resolves the legacy wire mode 0 for TCP. Current core
+// always sends an explicit value; only older cores rely on this default.
+func tcpDefaultReuse(hasLocalAddr bool) bool {
+	return hasLocalAddr && runtime.GOOS != "windows"
 }
 
 func decodeSocketContext(

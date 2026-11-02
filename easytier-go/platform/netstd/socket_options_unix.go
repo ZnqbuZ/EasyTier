@@ -4,7 +4,6 @@ package netstd
 
 import (
 	"fmt"
-	"strings"
 
 	"github.com/easytier/easytier/easytier-go/platform"
 	"golang.org/x/sys/unix"
@@ -16,13 +15,8 @@ func applySocketOptions(
 	options platform.BindConfig,
 ) error {
 	fd := int(descriptor)
-	// TCP keeps the local-address default. UDP must not default to
-	// SO_REUSEADDR: on Unix that lets another socket bind the same endpoint
-	// and divert incoming datagrams.
-	reuseAddr := strings.HasPrefix(network, "tcp") && options.LocalAddr != nil
-	if options.ReuseAddr != nil {
-		reuseAddr = *options.ReuseAddr
-	}
+	// Core resolves the protocol-specific default; the host applies it.
+	reuseAddr := options.ReuseAddr
 	if err := unix.SetsockoptInt(fd, unix.SOL_SOCKET, unix.SO_REUSEADDR, boolInt(reuseAddr)); err != nil {
 		return fmt.Errorf("set socket SO_REUSEADDR: %w", err)
 	}

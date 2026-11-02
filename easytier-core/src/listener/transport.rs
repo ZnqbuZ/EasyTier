@@ -360,6 +360,7 @@ where
             );
         }
         if let Some(local_addr) = options.bind.local_addr {
+            options.bind.reuse_addr = true;
             options.bind.context.ip_version = if local_addr.is_ipv4() {
                 IpVersion::V4
             } else {

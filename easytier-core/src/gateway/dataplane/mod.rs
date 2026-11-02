@@ -665,6 +665,7 @@ where
         let (ipv4_addr, smoltcp_net, generation) = self.wait_data_plane_net(deadline).await?;
         let bind_addr = "0.0.0.0:0".parse().unwrap();
         let bind = BindConfig {
+            reuse_addr: true,
             local_addr: Some(bind_addr),
             need_protect: false,
             context: self.socket_context.clone(),

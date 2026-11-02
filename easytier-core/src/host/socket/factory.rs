@@ -450,7 +450,7 @@ mod tests {
             need_protect: false,
             local_addr: Some("[::]:11013".parse().unwrap()),
             bind_device: Some("host-device".into()),
-            reuse_addr: Some(true),
+            reuse_addr: true,
             reuse_port: true,
             only_v6: true,
         };

@@ -47,13 +47,12 @@ type SocketContext struct {
 }
 
 // BindConfig is the common TCP/UDP socket configuration supplied by core.
-// Nil ReuseAddr selects the host default; explicit false and true always win.
 type BindConfig struct {
 	Context     SocketContext
 	NeedProtect bool
 	LocalAddr   *netip.AddrPort
 	BindDevice  *string
-	ReuseAddr   *bool
+	ReuseAddr   bool
 	ReusePort   bool
 	OnlyV6      bool
 }

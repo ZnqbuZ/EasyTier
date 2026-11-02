@@ -392,6 +392,7 @@ fn fallback_listener_options(
             ip_version: IpVersion::V4,
             ..socket_context
         },
+        reuse_addr: true,
         local_addr: Some(bind_addr),
         only_v6: true,
         ..BindConfig::default()
@@ -1134,7 +1135,7 @@ mod tests {
             Some("test-netns")
         );
         assert!(options.bind.only_v6);
-        assert_eq!(options.bind.reuse_addr, None);
+        assert!(options.bind.reuse_addr);
         assert!(!options.bind.reuse_port);
     }
 }

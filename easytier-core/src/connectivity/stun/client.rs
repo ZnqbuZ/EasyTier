@@ -714,7 +714,7 @@ pub(super) fn stun_udp_bind_options(
 ) -> BindConfig {
     BindConfig {
         bind_device: Some("".into()),
-        reuse_addr: Some(false),
+        reuse_addr: false,
         context: SocketContext {
             ip_version,
             ..context
@@ -821,7 +821,7 @@ where
                 ..self.socket_context.clone()
             },
             local_addr: Some(bind_addr),
-            reuse_addr: Some(true),
+            reuse_addr: true,
             reuse_port: true,
             only_v6: bind_addr.is_ipv6(),
             ..BindConfig::default()
@@ -1048,7 +1048,7 @@ mod tests {
             Some("instance-a")
         );
         assert_eq!(options.local_addr, Some(local_addr));
-        assert_eq!(options.reuse_addr, Some(false));
+        assert!(!options.reuse_addr);
         assert_eq!(options.bind_device.as_deref(), Some(""));
     }
 }

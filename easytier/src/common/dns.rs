@@ -230,7 +230,7 @@ impl RuntimeProvider for RuntimeDnsIoProvider {
                         },
                         ..socket_context
                     },
-                    reuse_addr: Some(false),
+                    reuse_addr: false,
                     need_protect: true,
                     ..BindConfig::default()
                 })
@@ -260,7 +260,7 @@ impl RuntimeProvider for RuntimeDnsIoProvider {
                 local_addr: Some(local_addr),
                 bind_device: Some("".into()),
                 context: socket_context,
-                reuse_addr: Some(false),
+                reuse_addr: false,
                 need_protect: true,
                 ..BindConfig::default()
             })

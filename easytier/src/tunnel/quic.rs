@@ -696,7 +696,7 @@ mod tests {
                     // Port-bound listeners enable address reuse on Unix. This test
                     // needs an exclusive ephemeral port across parallel processes.
                     BindConfig {
-                        reuse_addr: Some(false),
+                        reuse_addr: false,
                         local_addr: Some(bind_addr),
                         ..BindConfig::default()
                     },
@@ -713,7 +713,7 @@ mod tests {
                 remote_addr,
                 Vec::new(),
                 BindConfig {
-                    reuse_addr: Some(false),
+                    reuse_addr: false,
                     ..BindConfig::default()
                 },
                 UdpSessionMode::Classified(UdpSessionProtocol::Quic),

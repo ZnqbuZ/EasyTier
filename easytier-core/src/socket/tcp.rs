@@ -77,6 +77,7 @@ impl TcpConnectOptions {
         Self {
             remote_addr,
             bind: BindConfig {
+                reuse_addr: local_addr.is_some(),
                 local_addr,
                 ..BindConfig::default()
             },
@@ -96,6 +97,7 @@ impl TcpConnectOptions {
         Self {
             remote_addr,
             bind: BindConfig {
+                reuse_addr: true,
                 local_addr: Some(local_addr),
                 ..BindConfig::default()
             },
@@ -146,6 +148,7 @@ impl TcpListenOptions {
     pub fn direct_connect(local_addr: SocketAddr) -> Self {
         Self {
             bind: BindConfig {
+                reuse_addr: true,
                 local_addr: Some(local_addr),
                 ..BindConfig::default()
             },
@@ -156,6 +159,7 @@ impl TcpListenOptions {
     pub fn hole_punch(local_addr: SocketAddr) -> Self {
         Self {
             bind: BindConfig {
+                reuse_addr: true,
                 local_addr: Some(local_addr),
                 ..BindConfig::default()
             },
@@ -166,6 +170,7 @@ impl TcpListenOptions {
     pub fn manual_connect(local_addr: SocketAddr) -> Self {
         Self {
             bind: BindConfig {
+                reuse_addr: true,
                 local_addr: Some(local_addr),
                 ..BindConfig::default()
             },
@@ -176,6 +181,7 @@ impl TcpListenOptions {
     pub fn proxy_nat(local_addr: SocketAddr) -> Self {
         Self {
             bind: BindConfig {
+                reuse_addr: true,
                 need_protect: false,
                 local_addr: Some(local_addr),
                 ..BindConfig::default()
@@ -187,6 +193,7 @@ impl TcpListenOptions {
     pub fn socks5(local_addr: SocketAddr) -> Self {
         Self {
             bind: BindConfig {
+                reuse_addr: true,
                 need_protect: false,
                 local_addr: Some(local_addr),
                 ..BindConfig::default()
@@ -198,6 +205,7 @@ impl TcpListenOptions {
     pub fn port_forward(local_addr: SocketAddr) -> Self {
         Self {
             bind: BindConfig {
+                reuse_addr: true,
                 need_protect: false,
                 local_addr: Some(local_addr),
                 ..BindConfig::default()
@@ -209,6 +217,7 @@ impl TcpListenOptions {
     pub fn port_lease(local_addr: SocketAddr) -> Self {
         Self {
             bind: BindConfig {
+                reuse_addr: true,
                 need_protect: false,
                 local_addr: Some(local_addr),
                 ..BindConfig::default()
@@ -343,6 +352,7 @@ mod tests {
             Self {
                 remote_addr,
                 bind: BindConfig {
+                    reuse_addr: local_addr.is_some(),
                     local_addr,
                     ..BindConfig::default()
                 },
@@ -495,6 +505,7 @@ mod tests {
             TcpConnectOptions {
                 remote_addr,
                 bind: BindConfig {
+                    reuse_addr: true,
                     local_addr: Some(local_addr),
                     ..BindConfig::default()
                 },
@@ -506,6 +517,7 @@ mod tests {
             TcpConnectOptions {
                 remote_addr,
                 bind: BindConfig {
+                    reuse_addr: true,
                     local_addr: Some(local_addr),
                     ..BindConfig::default()
                 },
@@ -525,6 +537,7 @@ mod tests {
             TcpConnectOptions {
                 remote_addr,
                 bind: BindConfig {
+                    reuse_addr: true,
                     local_addr: Some(local_addr),
                     ..BindConfig::default()
                 },
@@ -566,6 +579,7 @@ mod tests {
             TcpListenOptions::direct_connect(local_addr),
             TcpListenOptions {
                 bind: BindConfig {
+                    reuse_addr: true,
                     local_addr: Some(local_addr),
                     ..BindConfig::default()
                 },
@@ -576,6 +590,7 @@ mod tests {
             TcpListenOptions::hole_punch(local_addr),
             TcpListenOptions {
                 bind: BindConfig {
+                    reuse_addr: true,
                     local_addr: Some(local_addr),
                     ..BindConfig::default()
                 },
@@ -586,6 +601,7 @@ mod tests {
             TcpListenOptions::manual_connect(local_addr),
             TcpListenOptions {
                 bind: BindConfig {
+                    reuse_addr: true,
                     local_addr: Some(local_addr),
                     ..BindConfig::default()
                 },
@@ -596,6 +612,7 @@ mod tests {
             TcpListenOptions::proxy_nat(local_addr),
             TcpListenOptions {
                 bind: BindConfig {
+                    reuse_addr: true,
                     need_protect: false,
                     local_addr: Some(local_addr),
                     ..BindConfig::default()

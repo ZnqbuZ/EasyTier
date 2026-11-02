@@ -286,7 +286,7 @@ impl CoreInstanceConfig {
             ..BindConfig::default()
         };
         let udp_bind = BindConfig {
-            reuse_addr: Some(false),
+            reuse_addr: false,
             context: socket_context.clone(),
             ..BindConfig::default()
         };

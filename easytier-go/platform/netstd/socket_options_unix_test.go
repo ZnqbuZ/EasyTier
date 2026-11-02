@@ -12,7 +12,7 @@ import (
 )
 
 func TestUDPReuseAddrHonorsExplicitFalseAndTrue(t *testing.T) {
-	for _, reuse := range []*bool{nil, boolPtr(false), boolPtr(true)} {
+	for _, reuse := range []bool{false, true} {
 		socket, err := (SocketFactory{}).BindUDP(context.Background(), platform.BindConfig{
 			LocalAddr: sourceAddr(0), ReuseAddr: reuse, BindDevice: strPtr(""),
 		})
@@ -35,7 +35,7 @@ func TestUDPReuseAddrHonorsExplicitFalseAndTrue(t *testing.T) {
 			t.Fatal(optionErr)
 		}
 		expected := 0
-		if reuse != nil && *reuse {
+		if reuse {
 			expected = 1
 		}
 		if actual != expected {
@@ -64,27 +64,26 @@ func TestUDPDefaultReuseAddrRejectsDuplicateBind(t *testing.T) {
 	}
 }
 
-func boolPtr(value bool) *bool    { return &value }
 func strPtr(value string) *string { return &value }
 
-func TestSocketFactoryUsesNativeTCPReuseAddrDefault(t *testing.T) {
+func TestSocketFactoryExplicitTCPReuseAllowsSharedSourcePort(t *testing.T) {
 	firstServer := listenTCP4(t)
 	defer firstServer.Close()
 	secondServer := listenTCP4(t)
 	defer secondServer.Close()
 	sourcePort := unusedTCP4Port(t)
 
-	reuse := true
 	first := connectTCP(t, firstServer, platform.BindConfig{
 		Context:   platform.SocketContext{IPVersion: platform.IPVersionV4},
 		LocalAddr: sourceAddr(sourcePort),
-		ReuseAddr: &reuse,
+		ReuseAddr: true,
 	}, platform.TCPConnectSTUNProbe)
 	defer first.Close()
 
 	second := connectTCP(t, secondServer, platform.BindConfig{
 		Context:   platform.SocketContext{IPVersion: platform.IPVersionV4},
 		LocalAddr: sourceAddr(sourcePort),
+		ReuseAddr: true,
 		OnlyV6:    true,
 	}, platform.TCPConnectHolePunch)
 	defer second.Close()

@@ -188,7 +188,7 @@ mod tests {
 
                 for reuse_addr in [false, true] {
                     let error = crate::socket::bind::<UdpSocket>(BindConfig {
-                        reuse_addr: Some(reuse_addr),
+                        reuse_addr,
                         ..occupied.clone()
                     })
                     .await
@@ -254,7 +254,7 @@ mod tests {
     async fn factory_honors_explicit_udp_reuse() {
         let addr = "127.0.0.1:0".parse().unwrap();
         for need_protect in [false, true] {
-            for reuse in [None, Some(false), Some(true)] {
+            for reuse in [false, true] {
                 let options = BindConfig {
                     local_addr: Some(addr),
                     bind_device: Some("".into()),
@@ -270,7 +270,7 @@ mod tests {
                     socket2::SockRef::from(socket.socket.as_ref())
                         .reuse_address()
                         .unwrap(),
-                    reuse.unwrap_or(false)
+                    reuse
                 );
             }
         }
@@ -281,7 +281,7 @@ mod tests {
         let factory = RuntimeUdpSocketFactory::new();
         let bind = BindConfig {
             bind_device: Some("".into()),
-            reuse_addr: Some(false),
+            reuse_addr: false,
             ..BindConfig::default()
         };
         let first = factory
@@ -311,7 +311,7 @@ mod tests {
         ] {
             let socket = RuntimeUdpSocketFactory::new()
                 .bind_udp(BindConfig {
-                    reuse_addr: Some(false),
+                    reuse_addr: false,
                     context: easytier_core::socket::SocketContext {
                         ip_version: family,
                         ..SocketContext::default()

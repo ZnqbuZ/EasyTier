@@ -62,13 +62,14 @@ binds a source address, using the requested family when none is specified.
 Native DNS and route probes use the same builder. Legacy WebSocket listeners
 explicitly keep their unprotected policy.
 
-`reuse_addr` is tri-state for both protocols: `None` selects the host default,
-while `Some(false)` and `Some(true)` are authoritative. Native bound sockets
-default to reuse on non-Windows hosts; unbound TCP sockets default to no reuse.
-Callers select device/reuse policy by setting the fields when constructing the
-configuration. The native host does not override those settings by inspecting an endpoint purpose
-tag. Multi-address connection attempts clone the configuration and override
-`local_addr` for each attempt.
+`reuse_addr` is an explicit boolean; `Default` is false (exclusive). Callers
+that need source-port sharing set it to true, and the TCP option constructors
+do so for bound listeners and hole-punch/STUN paths. The host applies the value
+as-is and never infers a protocol or platform default. Callers select
+device/reuse policy by setting the fields when constructing the configuration.
+The native host does not override those settings by inspecting an endpoint
+purpose tag. Multi-address connection attempts clone the configuration and
+override `local_addr` for each attempt.
 
 The HarmonyOS broker wakes the already-pending request consumer with `Notify`
 (no polling timer). It keeps a duplicate FD alive until ArkTS completes
@@ -86,15 +87,16 @@ never allow the first SYN/query to race ahead of protection.
 
 The `easytier_host` import names and function signatures are unchanged. TCP
 connect/listen retain their version 3 bytes. UDP bind uses **version 4**:
-`reuse_addr` uses the same 0=default, 1=disabled, 2=enabled encoding as TCP, and
-the UDP purpose byte is removed. `need_protect` follows `only_v6`, before the
+`reuse_addr` uses 1=disabled and 2=enabled; mode 0 is accepted only as a legacy
+fallback from older cores, and the UDP purpose byte is removed. `need_protect` follows `only_v6`, before the
 optional bind-device field. A minimal UDP document is 48 bytes. Other option
 fields and DNS/environment/instance-config/data-plane layouts are unchanged.
 
 The bundled Go host accepts UDP versions 3 and 4, translating the legacy purpose
 defaults into the shared configuration at the version 3 boundary. Version 4
-keeps explicit false distinct from a host default. Older hosts reject the new
-UDP version instead of silently changing that request.
+carries an explicit boolean from current core; mode 0 remains a legacy fallback.
+Older hosts reject the new UDP version instead of silently changing that
+request.
 
 An embedding host must update its versioned option decoder and honor the flag
 inside its existing creation implementation. The external host implementation

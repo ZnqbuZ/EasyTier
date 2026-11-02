@@ -767,7 +767,7 @@ mod tests {
         assert_eq!(mapped, "198.51.100.10:40123".parse().unwrap());
         let binds = runtime.udp_binds.lock().unwrap();
         assert!(!binds.is_empty());
-        assert_eq!(binds[0].reuse_addr, Some(false));
+        assert!(!binds[0].reuse_addr);
         assert_eq!(binds[0].bind_device.as_deref(), Some(""));
         assert_eq!(binds[0].local_addr, Some("0.0.0.0:0".parse().unwrap()));
         assert_eq!(binds[0].context.ip_version, IpVersion::V4);

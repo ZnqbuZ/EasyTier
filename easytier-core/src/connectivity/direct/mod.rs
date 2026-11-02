@@ -143,7 +143,7 @@ impl Default for DirectConnectorOptions {
             allow_interface_bind: true,
             tcp_bind: BindConfig::default(),
             udp_bind: BindConfig {
-                reuse_addr: Some(false),
+                reuse_addr: false,
                 ..BindConfig::default()
             },
             testing: false,
@@ -723,7 +723,7 @@ where
         let socket = self
             .host
             .bind_udp(BindConfig {
-                reuse_addr: Some(false),
+                reuse_addr: false,
                 context: SocketContext {
                     ip_version: IpVersion::V4,
                     ..self.options.udp_bind.context.clone()
@@ -756,7 +756,7 @@ where
         let socket = self
             .host
             .bind_udp(BindConfig {
-                reuse_addr: Some(false),
+                reuse_addr: false,
                 context: SocketContext {
                     ip_version: IpVersion::V6,
                     ..self.options.udp_bind.context.clone()

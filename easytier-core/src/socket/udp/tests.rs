@@ -44,7 +44,7 @@ fn session_connect_request_keeps_peer_scoped_udp_shape() {
             context: SocketContext::default(),
             local_addr: Some(bind_addr),
             bind_device: None,
-            reuse_addr: None,
+            reuse_addr: false,
             reuse_port: false,
             only_v6: false,
             need_protect: true,
@@ -1650,7 +1650,7 @@ async fn udp_session_layer_routes_stun_and_hole_punch_control_packets() {
         stun_responder.bind_options(),
         vec![BindConfig {
             bind_device: Some("".into()),
-            reuse_addr: Some(false),
+            reuse_addr: false,
             local_addr: Some(SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0))),
             ..BindConfig::default()
         }]
@@ -2208,7 +2208,7 @@ async fn udp_session_dialer_uses_factory_as_stun_responder() {
             expected_session_bind,
             BindConfig {
                 bind_device: Some("".into()),
-                reuse_addr: Some(false),
+                reuse_addr: false,
                 local_addr: Some(SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0))),
                 ..BindConfig::default()
             }
@@ -2236,7 +2236,7 @@ async fn v4_hole_punch_control_sender_uses_factory_socket() {
         factory.bind_options(),
         vec![BindConfig {
             bind_device: Some("".into()),
-            reuse_addr: Some(false),
+            reuse_addr: false,
             need_protect: false,
             context: SocketContext {
                 ip_version: IpVersion::V4,
@@ -2285,7 +2285,7 @@ async fn v6_hole_punch_control_sender_uses_factory_socket() {
         factory.bind_options(),
         vec![BindConfig {
             bind_device: Some("".into()),
-            reuse_addr: Some(false),
+            reuse_addr: false,
             need_protect: false,
             context: SocketContext {
                 ip_version: IpVersion::V6,

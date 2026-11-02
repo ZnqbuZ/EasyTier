@@ -29,11 +29,10 @@ func TestSocketFactoryReusesTCPSourcePort(t *testing.T) {
 	defer secondServer.Close()
 	sourcePort := unusedTCP4Port(t)
 
-	reuse := true
 	bind := platform.BindConfig{
 		Context:   platform.SocketContext{IPVersion: platform.IPVersionV4},
 		LocalAddr: sourceAddr(sourcePort),
-		ReuseAddr: &reuse,
+		ReuseAddr: true,
 		ReusePort: true,
 		OnlyV6:    true,
 	}

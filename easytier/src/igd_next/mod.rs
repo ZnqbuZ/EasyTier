@@ -104,7 +104,7 @@ pub(crate) async fn search_gateway(options: SearchOptions) -> Result<Gateway, Se
 
 async fn search_gateway_inner(options: SearchOptions) -> Result<Gateway, SearchError> {
     let bind_options = BindConfig {
-        reuse_addr: Some(false),
+        reuse_addr: false,
         local_addr: Some(options.bind_addr),
         ..BindConfig::default()
     };

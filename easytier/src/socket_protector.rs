@@ -179,7 +179,7 @@ mod tests {
                         .is_err()
                 );
                 let udp = BindConfig {
-                    reuse_addr: Some(false),
+                    reuse_addr: false,
                     local_addr: Some(local),
                     ..BindConfig::default()
                 };

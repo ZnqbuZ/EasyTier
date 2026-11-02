@@ -145,7 +145,7 @@ impl UdpSessionConnectRequest {
         Self {
             remote_addr,
             bind: BindConfig {
-                reuse_addr: Some(false),
+                reuse_addr: false,
                 ..BindConfig::default()
             },
             protocol: UdpSessionProtocol::WireGuard,

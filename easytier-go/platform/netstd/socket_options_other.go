@@ -14,7 +14,7 @@ func applySocketOptions(
 	_ string,
 	options platform.BindConfig,
 ) error {
-	if options.ReuseAddr == nil && !options.ReusePort && !options.OnlyV6 {
+	if !options.ReuseAddr && !options.ReusePort && !options.OnlyV6 {
 		return nil
 	}
 	return fmt.Errorf("socket options are not supported on %s", runtime.GOOS)

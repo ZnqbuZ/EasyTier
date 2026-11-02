@@ -142,7 +142,7 @@ where
     let socket = factory
         .bind_udp(BindConfig {
             bind_device: Some("".into()),
-            reuse_addr: Some(false),
+            reuse_addr: false,
             need_protect: false,
             context: SocketContext {
                 ip_version: IpVersion::V4,
@@ -171,7 +171,7 @@ where
     let socket = factory
         .bind_udp(BindConfig {
             bind_device: Some("".into()),
-            reuse_addr: Some(false),
+            reuse_addr: false,
             need_protect: false,
             context: SocketContext {
                 ip_version: IpVersion::V6,
