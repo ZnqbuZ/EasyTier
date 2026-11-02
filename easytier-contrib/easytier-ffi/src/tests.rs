@@ -43,6 +43,99 @@ fn test_run_network_instance() {
 }
 
 #[test]
+fn mobile_tun_get_rejects_null_name_without_returning_json() {
+    let config = unsafe { get_mobile_tun_config(std::ptr::null()) };
+    assert!(config.is_null());
+    let error = take_last_error().expect("null name must set the last error");
+    assert!(error.contains("instance_name is null"), "{error}");
+}
+
+#[test]
+fn mobile_tun_get_rejects_invalid_utf8_name() {
+    let name = CString::new(vec![0xff, b'A']).unwrap();
+    let config = unsafe { get_mobile_tun_config(name.as_ptr()) };
+    assert!(config.is_null());
+    let error = take_last_error().expect("invalid UTF-8 must set the last error");
+    assert!(error.contains("not valid UTF-8"), "{error}");
+}
+
+#[test]
+fn set_tun_fd_rejects_invalid_name_arguments_before_any_operation() {
+    assert_eq!(
+        unsafe { set_tun_fd(std::ptr::null(), 0, std::ptr::null()) },
+        -1
+    );
+    let error = take_last_error().expect("null name must set the last error");
+    assert!(error.contains("instance_name is null"), "{error}");
+
+    let name = CString::new(vec![0xff, b'A']).unwrap();
+    assert_eq!(
+        unsafe { set_tun_fd(name.as_ptr(), 1, std::ptr::null()) },
+        -1
+    );
+    let error = take_last_error().expect("invalid UTF-8 must set the last error");
+    assert!(error.contains("not valid UTF-8"), "{error}");
+}
+
+#[cfg(not(any(
+    target_os = "android",
+    target_os = "ios",
+    target_env = "ohos",
+    all(target_os = "macos", feature = "macos-ne")
+)))]
+#[test]
+fn desktop_mobile_tun_get_keeps_the_missing_name_error() {
+    let name = CString::new(format!("missing-{}", Uuid::new_v4())).unwrap();
+    let config = unsafe { get_mobile_tun_config(name.as_ptr()) };
+    assert!(config.is_null());
+    let error = take_last_error().expect("a missing desktop name must set the last error");
+    assert!(error.contains("instance not found"), "{error}");
+}
+
+#[cfg(any(
+    target_os = "android",
+    target_os = "ios",
+    target_env = "ohos",
+    all(target_os = "macos", feature = "macos-ne")
+))]
+#[test]
+fn mobile_get_without_a_live_instance_returns_the_empty_table() {
+    let name = CString::new(format!("missing-{}", Uuid::new_v4())).unwrap();
+    let config = unsafe { get_mobile_tun_config(name.as_ptr()) };
+    assert!(!config.is_null());
+    let json = unsafe { CStr::from_ptr(config) }
+        .to_string_lossy()
+        .into_owned();
+    unsafe { free_string(config) };
+    let value: Value = serde_json::from_str(&json).unwrap();
+    assert_eq!(value["instance_ids"], serde_json::json!([]));
+    assert_eq!(value["addresses"], serde_json::json!([]));
+    assert_eq!(value["routes"], serde_json::json!([]));
+    assert_eq!(value["rejected"], serde_json::json!([]));
+    assert_ne!(
+        value["snapshot_id"].as_str().unwrap(),
+        Uuid::nil().to_string()
+    );
+}
+
+#[cfg(any(
+    target_os = "android",
+    target_os = "ios",
+    target_env = "ohos",
+    all(target_os = "macos", feature = "macos-ne")
+))]
+#[test]
+fn mobile_positive_fd_requires_a_snapshot_before_instance_lookup() {
+    let name = CString::new(format!("missing-{}", Uuid::new_v4())).unwrap();
+    assert_eq!(
+        unsafe { set_tun_fd(name.as_ptr(), 1, std::ptr::null()) },
+        -1
+    );
+    let error = take_last_error().expect("a missing snapshot must set the last error");
+    assert!(error.contains("snapshot_id is null"), "{error}");
+}
+
+#[test]
 fn get_error_msg_returns_config_server_callback_error() {
     let hooks = ManagedConfigServerClientHooks::new(None, std::ptr::null_mut());
     let callback_error = format!("callback delivery failed {}", Uuid::new_v4());

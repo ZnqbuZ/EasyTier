@@ -11,7 +11,8 @@
 //! - `delete_network_instance`: stop named local network instances.
 //! - `list_instance`: list running instance names and IDs.
 //! - `collect_network_infos`: collect running instance info as key/value pairs.
-//! - `set_tun_fd`: attach a TUN file descriptor to a named instance.
+//! - `set_tun_fd`: attach/detach a TUN file descriptor for a named instance.
+//! - `get_mobile_tun_config`: read the complete mobile VPN configuration as JSON.
 //! - `call_json_rpc`: call an exposed EasyTier RPC service with JSON payload.
 //!
 //! Config server client APIs:
@@ -181,18 +182,26 @@ pub unsafe extern "C" fn collect_network_infos(
 
 /// Attach a TUN file descriptor to a named network instance.
 ///
-/// The instance must already have been registered in the FFI name cache by
-/// `run_network_instance` or by a managed config-server remote start event.
+/// `inst_name` is normally registered by `run_network_instance` or by a managed
+/// config-server remote start event.
+///
+/// On mobile targets a positive `fd` requires a live named instance and
+/// `snapshot_id` from `get_mobile_tun_config`; this call waits for the complete
+/// local attachment and returns `0` only after the Native operation finished.
+/// A non-positive `fd` releases local borrows through the existing detach path
+/// and does not require the named instance to still be running.
 ///
 /// # Safety
 /// `inst_name` must be a non-null pointer to a null-terminated UTF-8 string.
 /// `fd` must be a valid TUN file descriptor owned by the caller.
-/// On mobile targets, `snapshot_id` must identify the configuration actually installed,
-/// or be null when detaching (`fd <= 0`).
+/// On mobile targets, `snapshot_id` must be a non-null pointer to a
+/// null-terminated UUID string for `fd > 0`, or null for `fd <= 0`.
 ///
 /// # Return
-/// Returns `0` if the descriptor is accepted by the instance, or `-1` on
-/// failure.
+/// Returns `0` only when the requested local operation really succeeded, or
+/// `-1` on any parameter, resolution, snapshot or local attachment/detach
+/// failure. A failed call never claims the system VPN was closed. On failure,
+/// call `get_error_msg` on the same thread and release it with `free_string`.
 #[cfg_attr(feature = "c-abi", unsafe(no_mangle))]
 pub unsafe extern "C" fn set_tun_fd(
     inst_name: *const c_char,
@@ -202,10 +211,25 @@ pub unsafe extern "C" fn set_tun_fd(
     unsafe { instance_api::set_tun_fd(inst_name, fd, snapshot_id) }
 }
 
-/// Get the exact VPN configuration to install, as JSON. Free with `free_string`.
+/// Get the complete VPN configuration to install, as JSON.
+///
+/// The JSON object has the same shape as `MobileTunConfig`: `snapshot_id`,
+/// `instance_ids`, `addresses`, `routes`, optional `dns`, and `rejected`
+/// entries. The routes and addresses are the Controller's complete final table;
+/// the caller must not filter or merge them again.
+///
+/// A valid instance name that has no live run exports the normalized empty
+/// table so a stopping host can re-read and converge. An invalid name string,
+/// an ambiguous name, a real query failure, or an unsupported desktop target
+/// returns `NULL` and sets the last error.
 ///
 /// # Safety
-/// `inst_name` must point to a null-terminated UTF-8 instance name.
+/// `inst_name` must be a non-null pointer to a null-terminated UTF-8 string.
+///
+/// # Return
+/// Returns a newly allocated JSON string that must be released with
+/// `free_string`, or `NULL` on failure. On failure, call `get_error_msg` on the
+/// same thread and release it with `free_string`.
 #[cfg_attr(feature = "c-abi", unsafe(no_mangle))]
 pub unsafe extern "C" fn get_mobile_tun_config(inst_name: *const c_char) -> *mut c_char {
     unsafe { instance_api::get_mobile_tun_config(inst_name) }

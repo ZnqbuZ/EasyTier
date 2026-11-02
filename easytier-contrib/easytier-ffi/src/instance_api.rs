@@ -10,67 +10,107 @@ use crate::{
 };
 
 /// # Safety
-/// Set the tun fd
+/// Set the tun fd.
+///
+/// A positive `fd` requires a non-null, valid snapshot UUID and a live named
+/// instance; the call waits for the complete local attachment. A non-positive
+/// `fd` only releases local borrows through the existing detach path and does
+/// not require the name to remain running. It never claims the system VPN was
+/// closed.
 pub(crate) unsafe fn set_tun_fd(
     inst_name: *const c_char,
     fd: c_int,
     snapshot_id: *const c_char,
 ) -> c_int {
-    let inst_name = unsafe {
-        assert!(!inst_name.is_null());
-        std::ffi::CStr::from_ptr(inst_name)
-            .to_string_lossy()
-            .into_owned()
-    };
-    let inst_id = match resolve_instance_id_by_name(&inst_name) {
-        Ok(Some(instance_id)) => instance_id,
-        Ok(None) => {
-            set_error_msg(&format!("instance not found: {inst_name}"));
-            return -1;
+    let result = (|| -> Result<(), String> {
+        let inst_name = unsafe { crate::strings::c_str_to_string(inst_name, "instance_name") }?;
+        cfg_select! {
+            any(target_os = "android", target_os = "ios", target_env = "ohos", all(target_os = "macos", feature = "macos-ne")) => {
+                if fd > 0 {
+                    let snapshot = unsafe { crate::strings::c_str_to_string(snapshot_id, "snapshot_id") }?;
+                    let snapshot = uuid::Uuid::parse_str(&snapshot)
+                        .map_err(|error| format!("invalid snapshot_id: {error}"))?;
+                    let instance_id = resolve_instance_id_by_name(&inst_name)?
+                        .ok_or_else(|| format!("instance not found: {inst_name}"))?;
+                    let config = ffi_context()
+                        .runtime
+                        .block_on(easytier::instance::factory::attach_mobile_tun_fd(
+                            ffi_context().manager.as_ref(),
+                            fd,
+                            Some(std::slice::from_ref(&instance_id)),
+                            Some(snapshot),
+                        ))
+                        .map_err(|error| error.to_string())?;
+                    if !config.instance_ids.contains(&instance_id) {
+                        return Err(format!(
+                            "instance {inst_name} is not part of the attached mobile configuration"
+                        ));
+                    }
+                    Ok(())
+                } else {
+                    // The host may have already removed the named instance.
+                    // Release every surviving local borrow through the existing
+                    // complete-table detach path instead of resolving the name.
+                    ffi_context()
+                        .runtime
+                        .block_on(easytier::instance::factory::attach_mobile_tun_fd(
+                            ffi_context().manager.as_ref(),
+                            fd,
+                            None,
+                            None,
+                        ))
+                        .map(|_| ())
+                        .map_err(|error| error.to_string())
+                }
+            },
+            _ => {
+                let _ = snapshot_id;
+                let instance_id = resolve_instance_id_by_name(&inst_name)?
+                    .ok_or_else(|| format!("instance not found: {inst_name}"))?;
+                ffi_context()
+                    .manager
+                    .attach_tun_fd(instance_id, fd)
+                    .map_err(|error| error.to_string())
+            },
         }
-        Err(error) => {
-            set_error_msg(&error.to_string());
-            return -1;
-        }
-    };
+    })();
 
-    let result;
-    cfg_select! {
-        any(target_os = "android", target_os = "ios", target_env = "ohos", all(target_os = "macos", feature = "macos-ne")) => {
-            let snapshot = if fd > 0 {
-                let value = match unsafe { crate::strings::c_str_to_string(snapshot_id, "snapshot_id") } {
-                    Ok(value) => value, Err(error) => { set_error_msg(&error); return -1; }
-                };
-                match uuid::Uuid::parse_str(&value) { Ok(id) => Some(id), Err(error) => { set_error_msg(&error.to_string()); return -1; } }
-            } else { None };
-            result = ffi_context().runtime.block_on(easytier::instance::factory::attach_mobile_tun_fd(ffi_context().manager.as_ref(), fd, Some(&[inst_id]), snapshot)).map(|_| ());
-        },
-        _ => {
-            let _ = snapshot_id;
-            result = ffi_context().manager.attach_tun_fd(inst_id, fd);
-        },
-    }
     match result {
-        Ok(_) => 0,
-        Err(e) => {
-            set_error_msg(&format!("failed to set tun fd: {}", e));
+        Ok(()) => 0,
+        Err(error) => {
+            set_error_msg(&format!("failed to set tun fd: {error}"));
             -1
         }
     }
 }
 
-/// Returns the configuration the local VPN owner must install before attaching.
+/// Returns the complete configuration the local VPN owner must install before
+/// attaching. A valid name that no longer has a live instance exports the
+/// normalized empty table; malformed input, ambiguous names and real query
+/// failures return `NULL` with the last error set.
 pub(crate) unsafe fn get_mobile_tun_config(inst_name: *const c_char) -> *mut c_char {
     let result = (|| -> Result<String, String> {
         let name = unsafe { crate::strings::c_str_to_string(inst_name, "instance_name") }?;
-        let id = resolve_instance_id_by_name(&name)?
-            .ok_or_else(|| format!("instance not found: {name}"))?;
         cfg_select! {
             any(target_os = "android", target_os = "ios", target_env = "ohos", all(target_os = "macos", feature = "macos-ne")) => {
-                let config = ffi_context().runtime.block_on(easytier::instance::factory::get_mobile_tun_config(ffi_context().manager.as_ref(), &[id]));
+                // None is the explicit empty participation range. It lets a
+                // stopping host re-read the complete result and converge
+                // without treating the absence of a live run as a query error.
+                let scope = resolve_instance_id_by_name(&name)?.into_iter().collect::<Vec<_>>();
+                let config = ffi_context()
+                    .runtime
+                    .block_on(easytier::instance::factory::get_mobile_tun_config(
+                        ffi_context().manager.as_ref(),
+                        &scope,
+                    ))
+                    .map_err(|error| error.to_string())?;
                 serde_json::to_string(&config).map_err(|error| error.to_string())
             },
-            _ => { let _ = id; Err("system VPN configuration is unavailable on this target".to_owned()) },
+            _ => {
+                let _ = resolve_instance_id_by_name(&name)?
+                    .ok_or_else(|| format!("instance not found: {name}"))?;
+                Err("system VPN configuration is unavailable on this target".to_owned())
+            },
         }
     })();
     match result.and_then(|json| CString::new(json).map_err(|error| error.to_string())) {
