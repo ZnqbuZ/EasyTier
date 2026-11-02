@@ -336,7 +336,6 @@ impl NativeHostRuntime {
                     let mut pending = net_ns
                         .into_iter()
                         .map(|net_ns| {
-                            let result = result.clone();
                             async move {
                                 loop {
                                     match net_ns.wait_services_stopped().await {
@@ -345,10 +344,9 @@ impl NativeHostRuntime {
                                             if crate::host_runtime::cleanup_timed_out(&error) =>
                                         {
                                             // A bounded wait elapsed, not a real
-                                            // failure: report the residual and keep
-                                            // the same cleanup future alive.
-                                            let detail = format!("{:?}: {error:#}", net_ns.id());
-                                            result.send_replace(Some(Err(detail.clone().into())));
+                                            // failure: keep the same cleanup future
+                                            // alive. No terminal result is published
+                                            // while real local work is still owed.
                                             tracing::warn!(
                                                 namespace = ?net_ns.id(),
                                                 %error,
@@ -356,12 +354,10 @@ impl NativeHostRuntime {
                                             );
                                         }
                                         Err(error) => {
-                                            // Publish the real failure now instead of
-                                            // waiting for every namespace to finish;
-                                            // the final report still joins all errors.
-                                            let detail = format!("{:?}: {error:#}", net_ns.id());
-                                            result.send_replace(Some(Err(detail.clone().into())));
-                                            return Err(detail);
+                                            // This namespace has a real terminal
+                                            // error. Other namespaces still finish
+                                            // before the single final result.
+                                            return Err(format!("{:?}: {error:#}", net_ns.id()));
                                         }
                                     }
                                 }
@@ -935,6 +931,54 @@ mod tests {
             net_ns.ensure_open().is_err(),
             "a successful wait closes the namespace only at the end"
         );
+    }
+
+    #[cfg(any(not(mobile), feature = "tun"))]
+    #[tokio::test]
+    async fn route_timeout_does_not_publish_a_terminal_host_result() {
+        use std::time::Duration;
+        use tokio::sync::Notify;
+
+        let host = Arc::new(NativeHostRuntime::new());
+        let platform = PlatformNetNS::thread().unwrap();
+        let net_ns = NetNS::new(platform.id(), platform);
+        let routes = crate::instance::route::RouteController::new(Arc::new(
+            crate::utils::dirty::DirtyFlag::new(false),
+        ));
+        let release = Arc::new(Notify::new());
+        let waiting = release.clone();
+        let task = tokio::spawn(async move {
+            waiting.notified().await;
+            Ok::<(), anyhow::Error>(())
+        });
+        let services = Arc::new(NativeNetNSServices {
+            net_ns: net_ns.clone(),
+            routes,
+            route_task: AsyncMutex::new(Some(task)),
+            dns: RuntimeDnsResolver::in_net_ns(net_ns.clone()),
+            #[cfg(feature = "tun")]
+            nics: Arc::new(AsyncMutex::new(SharedVirtualNicRegistry::in_domain(
+                net_ns.clone(),
+            ))),
+        });
+        host.net_ns.lock().unwrap().insert(services);
+
+        host.request_service_shutdown();
+        // The namespace wait has a 30s bound; a bounded timeout is only a
+        // diagnostic and must not be published as the final host result.
+        tokio::time::sleep(Duration::from_secs(31)).await;
+        assert!(
+            host.shutdown_result.borrow().is_none(),
+            "a timed-out wait must not publish a terminal shutdown result"
+        );
+        assert!(host.shared_executor().is_ok());
+
+        release.notify_waiters();
+        tokio::time::timeout(Duration::from_secs(5), host.shutdown())
+            .await
+            .expect("the released route task must finish the same cleanup")
+            .expect("the local cleanup must succeed");
+        assert!(host.shared_executor().is_err());
     }
 
     #[cfg(target_os = "linux")]

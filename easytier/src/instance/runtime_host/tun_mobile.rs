@@ -70,7 +70,7 @@ impl NativeTunRuntime {
         routes: Option<Arc<crate::instance::route::runtime::NativeRouteContext>>,
         installed_prefixes: std::collections::BTreeSet<cidr::IpCidr>,
     ) -> anyhow::Result<()> {
-        nic_state.drain().await;
+        nic_state.drain().await?;
         if fd <= 0 {
             return Ok(());
         }
@@ -137,12 +137,20 @@ impl NativeTunRuntime {
                     attachment.installed_prefixes,
                 )
                 .await;
-                if let Err(error) = &result {
-                    tracing::error!(?error, "failed to attach mobile TUN fd");
-                    // Finish the existing NIC error cleanup before reporting
-                    // the real failure to the caller.
-                    nic_state.stop().await;
-                }
+                let result = match result {
+                    Ok(()) => Ok(()),
+                    Err(error) => {
+                        tracing::error!(?error, "failed to attach mobile TUN fd");
+                        // Finish the existing NIC error cleanup before reporting
+                        // the real failure to the caller.
+                        match nic_state.stop().await {
+                            Ok(()) => Err(error),
+                            Err(cleanup) => Err(error.context(format!(
+                                "mobile TUN cleanup failed after attachment error: {cleanup:#}"
+                            ))),
+                        }
+                    }
+                };
                 if let Some(completion) = attachment.completion {
                     let _ = completion.send(result);
                 }
@@ -160,12 +168,23 @@ impl NativeTunRuntime {
         Ok(())
     }
 
-    pub(super) async fn shutdown(&self) {
+    pub(super) async fn shutdown(&self) -> anyhow::Result<()> {
         self.cancel.cancel();
-        if let Some(task) = self.task.lock().await.take() {
-            let _ = task.await;
+        let task_result = if let Some(task) = self.task.lock().await.take() {
+            task.await.map_err(|error| {
+                anyhow::anyhow!("mobile TUN worker stopped without completing: {error}")
+            })
+        } else {
+            Ok(())
+        };
+        let nic_result = self.nic.stop().await;
+        match (task_result, nic_result) {
+            (Ok(()), Ok(())) => Ok(()),
+            (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
+            (Err(worker), Err(cleanup)) => {
+                Err(worker.context(format!("mobile TUN local cleanup failed: {cleanup:#}")))
+            }
         }
-        self.nic.stop().await;
     }
 
     pub(super) fn attach_fd(&self, _fd: i32) -> anyhow::Result<()> {
@@ -263,6 +282,40 @@ mod tests {
             error.contains("not executed"),
             "a queued request must receive the real unexecuted result: {error}"
         );
-        runtime.shutdown().await;
+        runtime.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn stopped_runtime_rejects_a_late_attachment() {
+        let instance = TestInstance::new_with_process_runtime(
+            TomlConfig::default(),
+            CoreProcessRuntime::new(),
+        );
+        let cancel = CancellationToken::new();
+        let runtime = NativeTunRuntime::new(
+            instance.get_global_ctx(),
+            cancel,
+            TestInstance::current_shared_virtual_nic_registry(),
+            None,
+        );
+        let (_sender, receiver) = mpsc::channel(1);
+        runtime
+            .install_packet_receiver(HostPacketReceiver::new(receiver))
+            .unwrap();
+        runtime
+            .prepare(instance.get_core_instance().packet_plane())
+            .await
+            .unwrap();
+        runtime.shutdown().await.unwrap();
+
+        let error = runtime
+            .attach_mobile_fd(0, false, None, std::collections::BTreeSet::new())
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("not running"),
+            "a late FD must be rejected without re-registering the old run: {error}"
+        );
     }
 }

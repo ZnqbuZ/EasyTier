@@ -62,7 +62,7 @@ impl TunNicState {
             .clone()
     }
 
-    pub(super) async fn stop(&self) {
+    pub(super) async fn stop(&self) -> anyhow::Result<()> {
         let old = self.nic_ctx.lock().await.take();
         match old {
             Some(NicCtxContainer::Active {
@@ -70,11 +70,18 @@ impl TunNicState {
                 mut magic_dns,
             }) => {
                 magic_dns.stop().await;
-                nic_ctx.shutdown().await;
+                if let Err(error) = nic_ctx.shutdown().await {
+                    // Keep the partially shut owner so a later cleanup can
+                    // retry the real member registration cleanup.
+                    *self.nic_ctx.lock().await =
+                        Some(NicCtxContainer::Active { nic_ctx, magic_dns });
+                    return Err(error);
+                }
             }
             Some(NicCtxContainer::PacketDrain(mut tasks)) => tasks.shutdown().await,
             None => {}
         }
+        Ok(())
     }
 
     #[cfg(not(mobile))]
@@ -86,7 +93,7 @@ impl TunNicState {
         packet_plane: Arc<CorePacketPlane>,
         addresses: DhcpAddresses,
     ) -> anyhow::Result<()> {
-        self.stop().await;
+        self.stop().await?;
         let mut slot = self.nic_ctx.lock().await;
         *slot = Some(NicCtxContainer::new(nic, MagicDnsRuntime::default()));
         let Some(NicCtxContainer::Active { nic_ctx, magic_dns }) = slot.as_mut() else {
@@ -113,8 +120,8 @@ impl TunNicState {
         Ok(())
     }
 
-    pub(super) async fn drain(&self) {
-        self.stop().await;
+    pub(super) async fn drain(&self) -> anyhow::Result<()> {
+        self.stop().await?;
         let receiver = self.receiver();
         let mut tasks = JoinSet::new();
         tasks.spawn(async move {
@@ -127,6 +134,7 @@ impl TunNicState {
             .lock()
             .await
             .replace(NicCtxContainer::packet_drain(tasks));
+        Ok(())
     }
 
     #[cfg(mobile)]
@@ -140,7 +148,7 @@ impl TunNicState {
         claims: crate::instance::shared_virtual_nic::SharedIfConfigClaims,
         installed_prefixes: std::collections::BTreeSet<cidr::IpCidr>,
     ) -> anyhow::Result<()> {
-        self.stop().await;
+        self.stop().await?;
         let mut slot = self.nic_ctx.lock().await;
         *slot = Some(NicCtxContainer::new(nic, MagicDnsRuntime::default()));
         let Some(NicCtxContainer::Active { nic_ctx, magic_dns }) = slot.as_mut() else {
@@ -199,10 +207,11 @@ impl NativeDhcpHost {
         if next == self.current() {
             return Ok(());
         }
-        tokio::select! {
+        let drained = tokio::select! {
             _ = self.cancel.cancelled() => anyhow::bail!("instance is closing; DHCP update cancelled"),
-            _ = self.nic.drain() => {}
-        }
+            result = self.nic.drain() => result,
+        };
+        drained?;
         #[cfg(not(mobile))]
         self.set_addresses(DhcpAddresses::default());
         self.ensure_open()?;
@@ -284,7 +293,7 @@ mod tests {
             *state.nic_ctx.lock().await,
             Some(NicCtxContainer::Active { .. })
         ));
-        state.stop().await;
+        state.stop().await.unwrap();
         assert!(state.nic_ctx.lock().await.is_none());
     }
 
@@ -296,7 +305,7 @@ mod tests {
             .install_receiver(HostPacketReceiver::new(receiver))
             .unwrap();
         let receiver = state.receiver();
-        state.drain().await;
+        state.drain().await.unwrap();
         // Let the drain acquire the receiver and block waiting for a packet.
         tokio::time::timeout(std::time::Duration::from_secs(5), async {
             while receiver.try_lock().is_ok() {
@@ -306,7 +315,7 @@ mod tests {
         .await
         .unwrap();
 
-        state.stop().await;
+        state.stop().await.unwrap();
         assert!(receiver.try_lock().is_ok());
     }
 
@@ -379,6 +388,6 @@ mod tests {
         assert_eq!(outcome.actual, addresses);
         assert_eq!(global_ctx.get_ipv4(), addresses.ipv4);
         assert_eq!(global_ctx.get_ipv6(), addresses.ipv6);
-        runtime.shutdown().await;
+        runtime.shutdown().await.unwrap();
     }
 }

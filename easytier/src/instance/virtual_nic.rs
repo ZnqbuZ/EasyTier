@@ -1193,18 +1193,23 @@ impl NicCtx {
         self.backend.ifname().await
     }
 
-    pub(crate) async fn shutdown(&mut self) {
+    pub(crate) async fn shutdown(&mut self) -> anyhow::Result<()> {
         if let (Some(routes), NicBackend::Shared(member)) = (&self.routes, &self.backend) {
             routes.unready(member).await;
         }
         // The forwarding tasks own the TUN stream and sink. Wait until both
         // release the device before another NIC with the same name is created.
         self.tasks.shutdown().await;
-        if let NicBackend::Shared(member) = &self.backend
-            && let Err(error) = member.close().await
-        {
-            tracing::warn!(?error, "shared NIC member cleanup failed");
+        if let NicBackend::Shared(member) = &self.backend {
+            // `close` awaits the NIC lock, removes this registration's claims
+            // and dispatcher sources, and reports real cleanup failures. The
+            // closed flag alone is never treated as success.
+            member
+                .close()
+                .await
+                .map_err(|error| anyhow::anyhow!("shared NIC member cleanup failed: {error:#}"))?;
         }
+        Ok(())
     }
 
     async fn tun_ifname(&self) -> Result<String, Error> {
@@ -2181,6 +2186,65 @@ mod tests {
             .unwrap();
             assert!(other_stream.next().now_or_never().is_none());
         }
+    }
+
+    #[tokio::test]
+    async fn shutdown_reports_a_real_member_close_failure() {
+        use std::{sync::Arc, time::Duration};
+
+        use easytier_core::{
+            host::packet::HostPacketReceiver, process_runtime::CoreProcessRuntime,
+        };
+        use tokio::sync::{Mutex, Notify, mpsc};
+
+        use super::{NicBackend, NicCtx};
+        use crate::{
+            common::net_ns::tests::test_net_ns,
+            instance::{
+                shared_virtual_nic::SharedVirtualNicRegistry, test_instance::TestInstance,
+                virtual_nic::VirtualNicConfig,
+            },
+        };
+
+        let instance = TestInstance::new_with_process_runtime(
+            crate::common::config::TomlConfig::default(),
+            CoreProcessRuntime::new(),
+        );
+        let global_ctx = instance.get_global_ctx();
+        let run = global_ctx.key();
+        let mut nics = SharedVirtualNicRegistry::new();
+        let member = nics.create_member(
+            "close-failure".into(),
+            VirtualNicConfig::new("close-failure".into(), 1400, test_net_ns(None)),
+            run,
+            Arc::new(Notify::new()),
+        );
+        {
+            let shared = member.shared_nic();
+            let mut nic = shared.lock().await;
+            nic.attach_member_registration(member.member_id(), member.registration_id())
+                .await
+                .unwrap();
+            nic.invalidate_and_shutdown_dispatcher().await;
+        }
+        let (_sender, receiver) = mpsc::channel(1);
+        let mut nic = NicCtx::new_with_backend(
+            global_ctx,
+            instance.get_core_instance().packet_plane(),
+            Arc::new(Mutex::new(HostPacketReceiver::new(receiver))),
+            Arc::new(Notify::new()),
+            NicBackend::Shared(member),
+        );
+        let error = tokio::time::timeout(Duration::from_secs(5), nic.shutdown())
+            .await
+            .expect("member close must not hang")
+            .expect_err("a failed registration cleanup must be reported");
+        assert!(
+            error
+                .to_string()
+                .contains("shared NIC member cleanup failed"),
+            "unexpected shutdown error: {error:#}"
+        );
     }
 
     async fn run_test_helper() -> Result<VirtualNic, Error> {

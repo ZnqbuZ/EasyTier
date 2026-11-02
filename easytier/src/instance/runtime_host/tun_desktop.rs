@@ -79,7 +79,12 @@ impl NativeTunRuntime {
                     Self::report_static_ip_cancelled(&mut output);
                     return;
                 }
-                nic_state.stop().await;
+                if let Err(error) = nic_state.stop().await {
+                    if let Some(output) = output.take() {
+                        let _ = output.send(Err(error.into()));
+                    }
+                    return;
+                }
                 let closed = Arc::new(Notify::new());
                 let nic = NicCtx::new(
                     global_ctx.clone(),
@@ -117,7 +122,13 @@ impl NativeTunRuntime {
                         Self::report_static_ip_cancelled(&mut output);
                         return;
                     }
-                    nic_state.stop().await;
+                    let error = anyhow::Error::from(error);
+                    let error = match nic_state.stop().await {
+                        Ok(()) => error,
+                        Err(cleanup) => error.context(format!(
+                            "desktop TUN cleanup failed after interface error: {cleanup:#}"
+                        )),
+                    };
                     if let Some(output) = output.take() {
                         let _ = output.send(Err(error.into()));
                         return;
@@ -147,7 +158,7 @@ impl NativeTunRuntime {
     }
 
     pub(super) async fn prepare(&self, packet_plane: Arc<CorePacketPlane>) -> anyhow::Result<()> {
-        self.nic.drain().await;
+        self.nic.drain().await?;
         if !self.global_ctx.get_flags().no_tun
             && !self.global_ctx.config.get_dhcp()
             && !self.global_ctx.config.get_dhcpv6()
@@ -157,11 +168,22 @@ impl NativeTunRuntime {
         Ok(())
     }
 
-    pub(super) async fn shutdown(&self) {
-        if let Some(task) = self.static_ip_task.lock().await.take() {
-            let _ = task.await;
+    pub(super) async fn shutdown(&self) -> anyhow::Result<()> {
+        let task_result = if let Some(task) = self.static_ip_task.lock().await.take() {
+            task.await.map_err(|error| {
+                anyhow::anyhow!("desktop TUN worker stopped without completing: {error}")
+            })
+        } else {
+            Ok(())
+        };
+        let nic_result = self.nic.stop().await;
+        match (task_result, nic_result) {
+            (Ok(()), Ok(())) => Ok(()),
+            (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
+            (Err(worker), Err(cleanup)) => {
+                Err(worker.context(format!("desktop TUN local cleanup failed: {cleanup:#}")))
+            }
         }
-        self.nic.stop().await;
     }
 
     pub(super) fn attach_fd(&self, _fd: i32) -> anyhow::Result<()> {

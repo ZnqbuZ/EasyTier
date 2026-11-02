@@ -308,6 +308,29 @@ impl NativeInstanceRuntimeHost {
 }
 
 impl NativeInstanceRuntimeState {
+    /// Wait for the route domain's real local cleanup.
+    ///
+    /// A bounded wait expiring is only a diagnostic: the real record is still
+    /// owed, so this same future keeps waiting and never publishes a terminal
+    /// result.
+    #[cfg(any(not(mobile), feature = "tun"))]
+    async fn drain_route_input(
+        routes: Option<Arc<super::route::runtime::NativeRouteRuntime>>,
+    ) -> anyhow::Result<()> {
+        let Some(routes) = routes else {
+            return Ok(());
+        };
+        loop {
+            match routes.drain().await {
+                Ok(()) => return Ok(()),
+                Err(error) if crate::host_runtime::cleanup_timed_out(&error) => {
+                    tracing::warn!(%error, "native route cleanup is still in progress");
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
     fn request_runtime_shutdown(&self) {
         // Withdraw the instance's whole route input first, then stop the
         // business producers. The cleanup below still waits for the real
@@ -340,40 +363,35 @@ impl NativeInstanceRuntimeState {
                 shared.spawn(async move {
                     let _operation = operation.lock().await;
                     journal.stop().await;
-                    #[cfg(any(not(mobile), feature = "tun"))]
-                    let drained = match routes {
-                        Some(routes) => loop {
-                            match routes.drain().await {
-                                Ok(()) => break Ok(()),
-                                Err(error) if crate::host_runtime::cleanup_timed_out(&error) => {
-                                    // The record still owes real cleanup. Report
-                                    // the residual but keep this same future and
-                                    // its captures waiting; the TUN stays alive.
-                                    tracing::warn!(
-                                        %error,
-                                        "native route cleanup is still in progress"
-                                    );
-                                    result.send_replace(Some(Err(Arc::from(format!(
-                                        "native route cleanup is still in progress: {error:#}"
-                                    )))));
-                                }
-                                Err(error) => break Err(error),
-                            }
-                        },
-                        None => Ok(()),
+
+                    // Desktop keeps OS route cleanup before NIC teardown.
+                    // Mobile first stops the local install worker, DNS,
+                    // forwarding and member registrations, then drains the
+                    // route controller; it never waits for external VPN work.
+                    #[cfg(not(mobile))]
+                    let outcome = match Self::drain_route_input(routes).await {
+                        Ok(()) => tun.shutdown().await,
+                        Err(error) => Err(error),
+                    };
+                    #[cfg(all(mobile, feature = "tun"))]
+                    let outcome = {
+                        let tun_result = tun.shutdown().await;
+                        let route_result = Self::drain_route_input(routes).await;
+                        match (tun_result, route_result) {
+                            (Ok(()), Ok(())) => Ok(()),
+                            (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
+                            (Err(tun_error), Err(route_error)) => Err(tun_error
+                                .context(format!("native route cleanup failed: {route_error:#}"))),
+                        }
                     };
                     #[cfg(all(mobile, not(feature = "tun")))]
-                    let drained: anyhow::Result<()> = Ok(());
-                    if drained.is_ok() {
-                        // Routes are really drained; only now may the existing
-                        // NIC/TUN shutdown withdraw members and the device.
-                        tun.shutdown().await;
-                    }
-                    if let Err(error) = &drained {
+                    let outcome = tun.shutdown().await;
+
+                    if let Err(error) = &outcome {
                         tracing::warn!(%error, "native runtime cleanup incomplete");
                     }
                     result.send_replace(Some(
-                        drained.map_err(|error| Arc::<str>::from(format!("{error:#}"))),
+                        outcome.map_err(|error| Arc::<str>::from(format!("{error:#}"))),
                     ));
                     let _ = interrupted.defuse();
                 });

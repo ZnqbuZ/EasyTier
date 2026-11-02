@@ -200,7 +200,7 @@ impl SharedVirtualNic {
     ///
     /// A mobile FD replacement affects the whole NIC, so the routing layer
     /// needs the affected registration identities before the physical update.
-    #[cfg(any(mobile, test))]
+    #[cfg(mobile)]
     pub(crate) fn member_registrations_snapshot(
         &self,
     ) -> Vec<(
