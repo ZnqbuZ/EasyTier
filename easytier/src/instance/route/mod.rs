@@ -16,10 +16,12 @@ use easytier_core::host::route::{RouteAction, RouteSpec};
 use uuid::Uuid;
 
 #[cfg(all(mobile, feature = "tun"))]
-use crate::instance::factory::{MobileTunConfig, mobile_tun::MobileTunMember};
+use crate::instance::route::mobile::{MobileTunConfig, MobileTunMember};
 #[cfg(all(not(mobile), feature = "tun"))]
 use crate::instance::shared_virtual_nic::SharedVirtualNicMember;
 
+#[cfg(feature = "tun")]
+pub(crate) mod mobile;
 #[cfg(not(mobile))]
 pub(crate) mod platform;
 #[cfg(not(mobile))]

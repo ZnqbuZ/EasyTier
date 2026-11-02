@@ -3,13 +3,18 @@
 use std::{collections::BTreeSet, sync::Arc};
 
 #[cfg(feature = "magic-dns")]
-use easytier_core::config::{IpPrefix, peers::PeerRuntimeSnapshot, runtime::CoreRuntimeConfig};
+use easytier_core::config::IpPrefix;
+use easytier_core::config::{
+    peers::PeerRuntimeSnapshot,
+    runtime::{CoreRuntimeConfig, CoreRuntimeConfigStore},
+};
 
 use super::super::*;
 use crate::{
     common::{config::TomlConfig, global_ctx::GlobalCtx, net_ns::tests::test_net_ns},
     instance::{
-        factory::{MobileTunConfig, mobile_tun::MobileTunMember},
+        factory::MobileTunConfig,
+        route::mobile::MobileTunMember,
         shared_virtual_nic::{SharedIfConfigClaims, SharedVirtualNicRegistry},
         virtual_nic::VirtualNicConfig,
     },
@@ -35,16 +40,16 @@ fn test_member(registry: &mut SharedVirtualNicRegistry, run: Uuid) -> SharedVirt
 }
 
 fn tun_member(run: Uuid) -> MobileTunMember {
-    MobileTunMember {
-        instance_id: run,
+    MobileTunMember::new(
         run,
-        claims: SharedIfConfigClaims {
+        run,
+        SharedIfConfigClaims {
             ipv4_addresses: BTreeSet::from(["10.126.126.7/24".parse().unwrap()]),
             ..Default::default()
         },
-        current_claims: None,
-        dns: false,
-    }
+        None,
+        false,
+    )
 }
 
 fn config(snapshot_id: Uuid) -> MobileTunConfig {
@@ -477,4 +482,223 @@ fn dns_enabled_reads_the_current_configuration() {
     assert!(!controller.mobile_dns_enabled(run));
     controller.request_shutdown();
     assert!(!controller.mobile_dns_enabled(run));
+}
+
+#[tokio::test]
+async fn mobile_scope_is_an_input_and_reads_do_not_rewrite_it() {
+    let controller = test_controller();
+    controller.dirty.reset();
+    controller.set_mobile_scope(None).unwrap();
+    assert!(
+        !controller.dirty.peek(),
+        "the default scope is already None"
+    );
+
+    let ids = BTreeSet::from([Uuid::new_v4()]);
+    controller.set_mobile_scope(Some(ids.clone())).unwrap();
+    assert!(controller.dirty.peek(), "a real scope change marks input");
+    controller.dirty.reset();
+    controller.set_mobile_scope(Some(ids.clone())).unwrap();
+    assert!(
+        !controller.dirty.peek(),
+        "the same scope value does not mark again"
+    );
+
+    controller.dirty.reset();
+    let _ = controller.mobile_config().await.unwrap();
+    assert!(
+        !controller.dirty.peek(),
+        "reading the complete table does not rewrite the scope"
+    );
+    controller.set_mobile_scope(Some(BTreeSet::new())).unwrap();
+    assert!(
+        controller.dirty.peek(),
+        "an explicit empty range differs from a set of ids"
+    );
+    controller.dirty.reset();
+    controller.set_mobile_scope(None).unwrap();
+    assert!(
+        controller.dirty.peek(),
+        "removing the range is a real input change"
+    );
+}
+
+#[tokio::test]
+async fn manual_policy_three_states_and_additional_are_projected_without_a_member() {
+    let controller = test_controller();
+    let global = Arc::new(GlobalCtx::new(TomlConfig::default()));
+    let run = global.key();
+    let registry = controller.open_instance(run).unwrap();
+    controller
+        .bind_mobile_inputs(
+            run,
+            Arc::downgrade(&global),
+            Arc::new(parking_lot::Mutex::new(None)),
+        )
+        .unwrap();
+    global.set_ipv4(Some("10.50.0.1/24".parse().unwrap()));
+    let store = CoreRuntimeConfigStore::new(
+        CoreRuntimeConfig::default(),
+        Arc::new(PeerRuntimeSnapshot::default()),
+    );
+    controller.bind_config(run, store.clone()).unwrap();
+    let auto = registry.handle().open_slot(RouteSource::AutoProxy).unwrap();
+    auto.set_routes(RouteSet::from([RouteSpec::for_tun(
+        "10.51.0.0/24".parse().unwrap(),
+    )]));
+    let additional = registry
+        .handle()
+        .open_slot(RouteSource::Additional)
+        .unwrap();
+    additional.set_routes(RouteSet::from([RouteSpec::for_tun(
+        "10.52.0.0/24".parse().unwrap(),
+    )]));
+
+    let automatic = controller.mobile_config().await.unwrap();
+    assert_eq!(automatic.instance_ids, vec![global.get_id()]);
+    assert_eq!(automatic.addresses, vec!["10.50.0.1/24"]);
+    assert!(automatic.routes.contains(&"10.50.0.0/24".to_owned()));
+    assert!(automatic.routes.contains(&"10.51.0.0/24".to_owned()));
+    assert!(automatic.routes.contains(&"10.52.0.0/24".to_owned()));
+
+    store.update_services(|services| services.manual_routes = Some(BTreeSet::new()));
+    let empty_manual = controller.mobile_config().await.unwrap();
+    assert!(
+        !empty_manual.routes.contains(&"10.51.0.0/24".to_owned()),
+        "Some(empty) suppresses every AutoProxy declaration"
+    );
+    assert!(empty_manual.routes.contains(&"10.52.0.0/24".to_owned()));
+    assert!(
+        empty_manual.routes.contains(&"10.50.0.0/24".to_owned()),
+        "the address network prefix is still generated"
+    );
+
+    store.update_services(|services| {
+        services.manual_routes = Some(BTreeSet::from(["10.53.0.0/24".parse().unwrap()]));
+    });
+    let manual = controller.mobile_config().await.unwrap();
+    assert!(!manual.routes.contains(&"10.51.0.0/24".to_owned()));
+    assert!(manual.routes.contains(&"10.52.0.0/24".to_owned()));
+    assert!(manual.routes.contains(&"10.53.0.0/24".to_owned()));
+}
+
+#[tokio::test]
+async fn scope_none_empty_and_subset_select_members_before_export() {
+    let controller = test_controller();
+    let first = Arc::new(GlobalCtx::new(TomlConfig::default()));
+    let second = Arc::new(GlobalCtx::new(TomlConfig::default()));
+    let first_run = first.key();
+    let second_run = second.key();
+    let _first_root = controller.open_instance(first_run).unwrap();
+    let _second_root = controller.open_instance(second_run).unwrap();
+    for (global, run, address) in [
+        (&first, first_run, "10.61.0.1/24"),
+        (&second, second_run, "10.62.0.1/24"),
+    ] {
+        controller
+            .bind_mobile_inputs(
+                run,
+                Arc::downgrade(global),
+                Arc::new(parking_lot::Mutex::new(None)),
+            )
+            .unwrap();
+        global.set_ipv4(Some(address.parse().unwrap()));
+    }
+
+    let all = controller.mobile_config().await.unwrap();
+    assert_eq!(all.instance_ids.len(), 2);
+
+    controller.set_mobile_scope(Some(BTreeSet::new())).unwrap();
+    let empty = controller.mobile_config().await.unwrap();
+    assert!(empty.instance_ids.is_empty());
+    assert!(empty.addresses.is_empty());
+    assert!(empty.routes.is_empty());
+    assert!(empty.rejected.is_empty());
+
+    controller
+        .set_mobile_scope(Some(BTreeSet::from([first.get_id()])))
+        .unwrap();
+    let subset = controller.mobile_config().await.unwrap();
+    assert_eq!(subset.instance_ids, vec![first.get_id()]);
+    assert_eq!(subset.addresses, vec!["10.61.0.1/24"]);
+
+    let foreign = Uuid::new_v4();
+    controller
+        .set_mobile_scope(Some(BTreeSet::from([foreign])))
+        .unwrap();
+    let missing = controller.mobile_config().await.unwrap();
+    assert!(missing.instance_ids.is_empty());
+    assert_eq!(missing.rejected.len(), 1);
+    assert_eq!(missing.rejected[0].instance_id, foreign);
+    assert!(missing.rejected[0].error.contains("not participating"));
+}
+
+#[tokio::test]
+async fn prepare_uses_the_same_table_and_rejects_stale_markers_without_nic_writes() {
+    let controller = test_controller();
+    let global = Arc::new(GlobalCtx::new(TomlConfig::default()));
+    let run = global.key();
+    let registry = controller.open_instance(run).unwrap();
+    controller
+        .bind_mobile_inputs(
+            run,
+            Arc::downgrade(&global),
+            Arc::new(parking_lot::Mutex::new(None)),
+        )
+        .unwrap();
+    global.set_ipv4(Some("10.70.0.1/24".parse().unwrap()));
+    let mut nics = SharedVirtualNicRegistry::new();
+    let member = test_member(&mut nics, run);
+    controller.bind_member(run, &member).unwrap();
+    let additional = registry
+        .handle()
+        .open_slot(RouteSource::Additional)
+        .unwrap();
+    additional.set_routes(RouteSet::from([RouteSpec::for_tun(
+        "10.71.0.0/24".parse().unwrap(),
+    )]));
+
+    let config = controller.mobile_config().await.unwrap();
+    let before = member.claims().await;
+    let plan = controller
+        .prepare_mobile_attach(config.snapshot_id)
+        .await
+        .unwrap();
+    assert_eq!(plan.config.snapshot_id, config.snapshot_id);
+    assert_eq!(plan.members.len(), 1);
+    assert!(plan.withdraw.is_empty());
+    assert!(
+        plan.members[0]
+            .installed_prefixes
+            .contains(&"10.71.0.0/24".parse().unwrap())
+    );
+
+    let stale = config.snapshot_id;
+    additional.set_routes(RouteSet::from([RouteSpec::for_tun(
+        "10.72.0.0/24".parse().unwrap(),
+    )]));
+    let error = controller
+        .prepare_mobile_attach(stale)
+        .await
+        .err()
+        .expect("a stale marker is rejected")
+        .to_string();
+    assert!(error.contains("configuration changed"));
+    assert_eq!(
+        member.claims().await,
+        before,
+        "a mismatched marker performs no NIC write"
+    );
+
+    controller.set_mobile_scope(Some(BTreeSet::new())).unwrap();
+    let empty = controller.mobile_config().await.unwrap();
+    assert!(empty.instance_ids.is_empty());
+    let plan = controller
+        .prepare_mobile_attach(empty.snapshot_id)
+        .await
+        .unwrap();
+    assert!(plan.members.is_empty());
+    assert_eq!(plan.withdraw.len(), 1);
+    assert_eq!(plan.withdraw[0].run, run);
+    assert_eq!(plan.withdraw[0].registration, member.registration_id());
 }

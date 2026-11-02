@@ -16,11 +16,13 @@ use easytier_core::host::route::{RouteSource, RouteStatus};
 use uuid::Uuid;
 
 use crate::instance::{
-    factory::{
-        MobileTunConfig,
-        mobile_tun::{MobileTunMember, member_prefixes},
+    route::{
+        AppliedSnapshot,
+        mobile::{
+            MobilePlan, MobileTunConfig, MobileTunMember, MobileWithdraw, claims_from_facts,
+            filter_scope, magic_dns_prefix, member_prefixes, select_and_project,
+        },
     },
-    route::AppliedSnapshot,
     shared_virtual_nic::{SharedIfConfigClaims, SharedIfConfigConflict, SharedVirtualNicMember},
 };
 
@@ -40,6 +42,33 @@ pub(super) struct MobileRouteInputs {
     pub(super) ipv4: Option<cidr::Ipv4Inet>,
     pub(super) ipv6: Option<cidr::Ipv6Inet>,
     pub(super) public_address: Option<cidr::Ipv6Inet>,
+}
+
+/// One live instance sampled for a policy pass.
+struct SampledMobileMember {
+    instance_id: Uuid,
+    run: Uuid,
+    member: Option<SharedVirtualNicMember>,
+    claims: SharedIfConfigClaims,
+    dns: bool,
+}
+
+impl SampledMobileMember {
+    fn into_member(self, current_claims: Option<SharedIfConfigClaims>) -> MobileTunMember {
+        MobileTunMember::new(
+            self.instance_id,
+            self.run,
+            self.claims,
+            current_claims,
+            self.dns,
+        )
+    }
+}
+
+/// One observation of the live domain and the host's scope.
+struct MobileSample {
+    scope: Option<BTreeSet<Uuid>>,
+    members: Vec<SampledMobileMember>,
 }
 
 impl RouteController {
@@ -379,6 +408,185 @@ impl RouteController {
             // not evidence for the current registration.
             Ok(None)
         }
+    }
+
+    /// Accept the host's participation range as a route-domain input.
+    ///
+    /// The range is keyed by configured instance id. `None` means every live
+    /// instance of this domain; an empty set is an explicit empty range. Only
+    /// a real value change marks the shared dirty flag; reading the complete
+    /// result never rewrites the range.
+    pub(crate) fn set_mobile_scope(&self, scope: Option<BTreeSet<Uuid>>) -> anyhow::Result<()> {
+        let changed = {
+            let mut rt = self.runtime.write();
+            if rt.mobile_scope == scope {
+                false
+            } else {
+                rt.mobile_scope = scope;
+                true
+            }
+        };
+        if changed {
+            self.dirty.mark();
+        }
+        Ok(())
+    }
+
+    /// Read the complete exported table through the one policy entry.
+    ///
+    /// This is a read: it neither modifies the accepted range nor any NIC.
+    pub(crate) async fn mobile_config(&self) -> anyhow::Result<MobileTunConfig> {
+        Ok(self.build_mobile_plan().await?.config)
+    }
+
+    /// Validate the host's snapshot and return the exact execution plan.
+    ///
+    /// The same private policy entry produces the complete result; a stale
+    /// marker is rejected before any NIC work. Only the crate-internal
+    /// execution adapter receives the accepted member data and withdrawals.
+    pub(crate) async fn prepare_mobile_attach(
+        &self,
+        snapshot_id: Uuid,
+    ) -> anyhow::Result<MobilePlan> {
+        let plan = self.build_mobile_plan().await?;
+        anyhow::ensure!(
+            plan.config.snapshot_id == snapshot_id,
+            "mobile TUN configuration changed; query and install a new snapshot before attaching"
+        );
+        Ok(plan)
+    }
+
+    /// The only complete mobile policy pass.
+    ///
+    /// Facts are sampled twice: the first pass supplies the current member
+    /// handles used for bounded claims hints, and the second pass is the actual
+    /// plan input. A registration that changed while waiting drops its hint;
+    /// the complete target and admission never come from a hint. Config,
+    /// prepare and the background local reconciler all use this one entry.
+    async fn build_mobile_plan(&self) -> anyhow::Result<MobilePlan> {
+        let before = self.sample_mobile_members();
+        let in_scope = |member: &SampledMobileMember| {
+            before
+                .scope
+                .as_ref()
+                .is_none_or(|scope| scope.contains(&member.instance_id))
+        };
+        let mut hints = BTreeMap::new();
+        for sampled in &before.members {
+            if !in_scope(sampled) {
+                continue;
+            }
+            let Some(member) = &sampled.member else {
+                continue;
+            };
+            if let Some(claims) = self.mobile_current_claims(sampled.run).await? {
+                hints.insert((sampled.run, member.registration_id()), claims);
+            }
+        }
+
+        // Re-read root, configuration, addresses, declarations and bindings
+        // after every await. Only a hint whose registration is still current
+        // reaches the policy pass.
+        let after = self.sample_mobile_members();
+        let members = after
+            .members
+            .into_iter()
+            .map(|sampled| {
+                let current = sampled.member.as_ref().and_then(|member| {
+                    hints.get(&(sampled.run, member.registration_id())).cloned()
+                });
+                sampled.into_member(current)
+            })
+            .collect();
+        let (members, rejected) = filter_scope(members, after.scope.as_ref());
+        let (members, config) = select_and_project(members, rejected);
+        let accepted_runs = members.iter().map(|member| member.run).collect();
+        let withdraw = self.mobile_withdrawals(&accepted_runs);
+        Ok(MobilePlan {
+            config,
+            members,
+            withdraw,
+        })
+    }
+
+    /// One observation of every live instance's current mobile facts.
+    ///
+    /// The runtime lock only copies handles and values. The shared public
+    /// address is read after it is released, so the NIC/address locks are
+    /// never nested inside the controller lock.
+    fn sample_mobile_members(&self) -> MobileSample {
+        let rt = self.runtime.read();
+        let scope = rt.mobile_scope.clone();
+        if rt.shutdown {
+            return MobileSample {
+                scope,
+                members: Vec::new(),
+            };
+        }
+        let mut sampled = Vec::new();
+        for (run, instance) in &rt.instances {
+            if instance.registry.upgrade().is_none() {
+                continue;
+            }
+            let Some(global) = instance.global.as_ref().and_then(Weak::upgrade) else {
+                continue;
+            };
+            let Some(public_address) = instance.public_address.clone() else {
+                continue;
+            };
+            let Some((declarations, _slots)) = instance.declarations() else {
+                continue;
+            };
+            let ipv4 = global.get_ipv4();
+            let ipv6 = global.get_ipv6();
+            let dns = mobile_dns_configured(&rt, instance) && ipv4.is_some();
+            sampled.push((
+                SampledMobileMember {
+                    instance_id: global.get_id(),
+                    run: *run,
+                    member: instance.member.clone(),
+                    claims: SharedIfConfigClaims::default(),
+                    dns,
+                },
+                ipv4,
+                ipv6,
+                public_address,
+                declarations
+                    .into_iter()
+                    .map(|declaration| declaration.destination)
+                    .collect::<BTreeSet<_>>(),
+            ));
+        }
+        drop(rt);
+        let members = sampled
+            .into_iter()
+            .map(|(mut member, ipv4, ipv6, public_address, declarations)| {
+                let public_address = *public_address.lock();
+                member.claims = claims_from_facts(ipv4, ipv6, public_address, declarations);
+                member
+            })
+            .collect();
+        MobileSample { scope, members }
+    }
+
+    /// Every currently bound member that the accepted result no longer uses.
+    fn mobile_withdrawals(&self, accepted_runs: &BTreeSet<Uuid>) -> Vec<MobileWithdraw> {
+        let rt = self.runtime.read();
+        let mut withdraw = Vec::new();
+        for (run, instance) in &rt.instances {
+            let Some(member) = instance.member.as_ref() else {
+                continue;
+            };
+            if accepted_runs.contains(run) {
+                continue;
+            }
+            withdraw.push(MobileWithdraw {
+                run: *run,
+                registration: member.registration_id(),
+                member: member.clone(),
+            });
+        }
+        withdraw
     }
 
     /// Claims of the run's actual installed member.
@@ -1099,16 +1307,4 @@ fn mobile_dns_configured(rt: &RouteControllerRuntime, instance: &InstanceRoutes)
         let snapshot = config.snapshot();
         snapshot.peer.flags.accept_dns && snapshot.peer.runtime.core.routes.ipv4.is_some()
     }
-}
-/// The existing Magic DNS fake-IP route prefix.
-fn magic_dns_prefix() -> IpCidr {
-    IpCidr::V4(
-        cidr::Ipv4Cidr::new(
-            crate::instance::dns_server::MAGIC_DNS_FAKE_IP
-                .parse()
-                .expect("Magic DNS fake IP is valid"),
-            32,
-        )
-        .expect("Magic DNS fake IP is a /32"),
-    )
 }

@@ -5,6 +5,8 @@
 //! synchronization and facts live in `mobile`; the bounded NIC synchronization
 //! shared by both lives in `member`. Only this module exports the controller.
 
+#[cfg(all(mobile, feature = "tun"))]
+use std::collections::BTreeSet;
 use std::{
     collections::BTreeMap,
     sync::{Arc, Weak},
@@ -117,6 +119,11 @@ struct RouteControllerRuntime {
     // withdraw request that has not really completed yet.
     #[cfg(all(mobile, feature = "tun"))]
     pending_install: Option<Uuid>,
+    /// The host's participation range, keyed by configured instance id.
+    /// `None` means every live instance of this domain; an empty set is an
+    /// explicit empty range. This is an input, never a post-export filter.
+    #[cfg(all(mobile, feature = "tun"))]
+    mobile_scope: Option<BTreeSet<Uuid>>,
 }
 
 /// Lightweight, cloneable handle to the per-namespace RouteController.
