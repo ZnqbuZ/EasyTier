@@ -123,6 +123,35 @@ impl NativeRouteContext {
             .record_mobile_ready(self.run, member, installed_prefixes))
     }
 
+    /// Invalidate the local attachment evidence of every registration on the
+    /// same actual shared NIC before an FD replacement.
+    ///
+    /// The registration list is read under the existing bounded NIC lock. The
+    /// Controller only drops observed evidence; it does not claim the external
+    /// VPN was closed. If the list cannot be read, the caller must not perform
+    /// the physical replacement.
+    #[cfg(all(feature = "tun", mobile))]
+    pub(crate) async fn invalidate_shared_mobile_evidence(
+        &self,
+        member: &SharedVirtualNicMember,
+    ) -> anyhow::Result<()> {
+        let shared_nic = member.shared_nic();
+        let guard = tokio::time::timeout(std::time::Duration::from_secs(5), shared_nic.lock())
+            .await
+            .map_err(|_| {
+                anyhow::anyhow!(
+                    "timed out locking shared NIC before replacing the TUN fd of member {}",
+                    member.member_id()
+                )
+            })?;
+        let registrations = guard.member_registrations_snapshot();
+        drop(guard);
+        for (run, registration) in registrations {
+            self.controller.unready(run, registration);
+        }
+        Ok(())
+    }
+
     #[cfg(all(feature = "tun", mobile))]
     pub(crate) fn mobile_dns_enabled(&self) -> bool {
         self.controller.mobile_dns_enabled(self.run)
@@ -395,6 +424,69 @@ mod tests {
                  treating the released root as success"
             );
         }
+    }
+
+    #[cfg(all(feature = "tun", mobile))]
+    #[tokio::test]
+    async fn fd_replacement_invalidates_every_registration_on_the_same_nic() {
+        let global = global_ctx();
+        let runtime = runtime_without_worker(&global);
+        let context = runtime.context();
+        let controller = context.controller.clone();
+        let run_a = context.run;
+        let run_b = uuid::Uuid::new_v4();
+        let _owner_b = controller.open_instance(run_b).unwrap();
+        let mut nics = crate::instance::shared_virtual_nic::SharedVirtualNicRegistry::new();
+        let member_a = nics
+            .try_create_member(
+                "shared-mobile".into(),
+                context.config(1400),
+                run_a,
+                Arc::new(Notify::new()),
+            )
+            .unwrap();
+        let member_b = nics
+            .try_create_member(
+                "shared-mobile".into(),
+                context.config(1400),
+                run_b,
+                Arc::new(Notify::new()),
+            )
+            .unwrap();
+        for member in [&member_a, &member_b] {
+            let nic = member.shared_nic();
+            let mut guard = nic.lock().await;
+            guard
+                .attach_member_registration(member.member_id(), member.registration_id())
+                .await
+                .unwrap();
+        }
+        context.bind_member(&member_a).unwrap();
+        controller.bind_member(run_b, &member_b).unwrap();
+
+        assert!(controller.record_mobile_ready(
+            run_a,
+            &member_a,
+            std::collections::BTreeSet::from(["10.120.0.0/24".parse().unwrap()]),
+        ));
+        assert!(controller.record_mobile_ready(
+            run_b,
+            &member_b,
+            std::collections::BTreeSet::from(["10.121.0.0/24".parse().unwrap()]),
+        ));
+        context
+            .invalidate_shared_mobile_evidence(&member_a)
+            .await
+            .unwrap();
+        assert_eq!(
+            controller.mobile_installed_prefixes(run_a, member_a.registration_id()),
+            None
+        );
+        assert_eq!(
+            controller.mobile_installed_prefixes(run_b, member_b.registration_id()),
+            None,
+            "every registration on the replaced actual NIC loses its old evidence"
+        );
     }
 
     #[cfg(all(feature = "tun", not(mobile)))]

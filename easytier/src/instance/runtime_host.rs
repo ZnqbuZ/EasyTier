@@ -244,10 +244,10 @@ impl NativeInstanceRuntimeHost {
         fd: i32,
         replace_tun_fd: bool,
         claims: Option<crate::instance::shared_virtual_nic::SharedIfConfigClaims>,
-        attachment_id: uuid::Uuid,
+        installed_prefixes: std::collections::BTreeSet<cidr::IpCidr>,
     ) -> anyhow::Result<()> {
         self.tun
-            .attach_mobile_fd(fd, replace_tun_fd, claims, attachment_id)
+            .attach_mobile_fd(fd, replace_tun_fd, claims, installed_prefixes)
             .await
     }
 

@@ -196,6 +196,23 @@ impl SharedVirtualNic {
             .is_some_and(|current| *current == registration_id)
     }
 
+    /// The registrations currently attached to this actual shared NIC.
+    ///
+    /// A mobile FD replacement affects the whole NIC, so the routing layer
+    /// needs the affected registration identities before the physical update.
+    #[cfg(any(mobile, test))]
+    pub(crate) fn member_registrations_snapshot(
+        &self,
+    ) -> Vec<(
+        SharedVirtualNicMemberId,
+        SharedVirtualNicMemberRegistrationId,
+    )> {
+        self.member_registrations
+            .iter()
+            .map(|(member, registration)| (*member, *registration))
+            .collect()
+    }
+
     async fn apply_member_claims_for_registration(
         &mut self,
         member_id: SharedVirtualNicMemberId,

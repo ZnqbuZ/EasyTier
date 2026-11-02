@@ -138,7 +138,7 @@ impl TunNicState {
         fd: i32,
         replace_tun_fd: bool,
         claims: crate::instance::shared_virtual_nic::SharedIfConfigClaims,
-        attachment_id: uuid::Uuid,
+        installed_prefixes: std::collections::BTreeSet<cidr::IpCidr>,
     ) -> anyhow::Result<()> {
         self.stop().await;
         let mut slot = self.nic_ctx.lock().await;
@@ -147,7 +147,7 @@ impl TunNicState {
             unreachable!()
         };
         nic_ctx
-            .run_for_mobile(fd, replace_tun_fd, claims, attachment_id)
+            .run_for_mobile(fd, replace_tun_fd, claims, installed_prefixes)
             .await?;
         if let Some(ip) = global_ctx.get_ipv4() {
             *magic_dns = MagicDnsRuntime::start(

@@ -1328,14 +1328,20 @@ impl NicCtx {
                 let ret = sink.send(packet.into_tun_packet()).await;
                 if ret.is_err() {
                     tracing::error!(?ret, "do_forward_tunnel_to_nic sink error");
-                    // A closed sink means this member's real forwarding is
-                    // over; ordinary forwarding errors keep the existing
-                    // policy.
+                    // Only a really closed sink means this member's forwarding
+                    // is over. Recoverable packet errors keep the existing
+                    // policy and do not invalidate the installed evidence.
                     #[cfg(mobile)]
-                    if let Some((routes, member)) = &unready {
+                    if matches!(&ret, Err(easytier_core::tunnel::TunnelError::Shutdown))
+                        && let Some((routes, member)) = &unready
+                    {
                         routes.unready(member).await;
                     }
                 }
+            }
+            #[cfg(mobile)]
+            if let Some((routes, member)) = &unready {
+                routes.unready(member).await;
             }
             close_notifier.notify_one();
             tracing::error!("nic closed when sending to it");
@@ -1627,7 +1633,7 @@ impl NicCtx {
         Ok(())
     }
 
-    async fn run_public_ipv6_addr_updater(&mut self) -> Result<(), Error> {
+    async fn run_public_ipv6_addr_updater(&mut self, manage_routes: bool) -> Result<(), Error> {
         let packet_plane = self.packet_plane.clone();
         let global_ctx = self.global_ctx.clone();
         let backend = self.backend.clone();
@@ -1644,9 +1650,10 @@ impl NicCtx {
             {
                 tracing::warn!(addr = ?addr, ?err, "failed to add public ipv6 address");
             }
-            if let Err(err) = backend
-                .add_ipv6_route_with_cost(Ipv6Addr::UNSPECIFIED, 0, Some(5))
-                .await
+            if manage_routes
+                && let Err(err) = backend
+                    .add_ipv6_route_with_cost(Ipv6Addr::UNSPECIFIED, 0, Some(5))
+                    .await
             {
                 tracing::warn!(route = %Ipv6Addr::UNSPECIFIED, prefix = 0, ?err, "failed to add default public ipv6 route");
             }
@@ -1674,9 +1681,10 @@ impl NicCtx {
                     tracing::warn!(?err, "failed to bring public ipv6 nic link up");
                 }
                 if let Some(old) = old {
-                    if let Err(err) = backend
-                        .remove_ipv6_route(Ipv6Addr::UNSPECIFIED, 0)
-                        .await
+                    if manage_routes
+                        && let Err(err) = backend
+                            .remove_ipv6_route(Ipv6Addr::UNSPECIFIED, 0)
+                            .await
                     {
                         tracing::warn!(route = %Ipv6Addr::UNSPECIFIED, prefix = 0, ?err, "failed to remove default public ipv6 route");
                     }
@@ -1691,9 +1699,10 @@ impl NicCtx {
                     {
                         tracing::warn!(addr = ?new, ?err, "failed to add public ipv6 address");
                     }
-                    if let Err(err) = backend
-                        .add_ipv6_route_with_cost(Ipv6Addr::UNSPECIFIED, 0, Some(5))
-                        .await
+                    if manage_routes
+                        && let Err(err) = backend
+                            .add_ipv6_route_with_cost(Ipv6Addr::UNSPECIFIED, 0, Some(5))
+                            .await
                     {
                         tracing::warn!(route = %Ipv6Addr::UNSPECIFIED, prefix = 0, ?err, "failed to add default public ipv6 route");
                     }
@@ -1750,7 +1759,7 @@ impl NicCtx {
         self.run_public_ipv6_route_updater().await?;
         // Keep the updater running so runtime config patches can enable auto mode
         // without recreating the NIC.
-        self.run_public_ipv6_addr_updater().await?;
+        self.run_public_ipv6_addr_updater(true).await?;
 
         Ok(())
     }
@@ -1808,7 +1817,7 @@ impl NicCtx {
         self.apply_mobile_tun_claims(claims).await?;
         self.run_proxy_cidrs_route_updater().await?;
         self.run_public_ipv6_route_updater().await?;
-        self.run_public_ipv6_addr_updater().await?;
+        self.run_public_ipv6_addr_updater(true).await?;
         Ok(())
     }
 
@@ -1818,7 +1827,7 @@ impl NicCtx {
         tun_fd: std::os::fd::RawFd,
         replace_tun_fd: bool,
         claims: super::shared_virtual_nic::SharedIfConfigClaims,
-        attachment_id: uuid::Uuid,
+        installed_prefixes: std::collections::BTreeSet<cidr::IpCidr>,
     ) -> Result<(), Error> {
         // These facts describe the configuration installed by the external
         // VPN owner, not the mutable dispatcher admission that the controller
@@ -1832,6 +1841,14 @@ impl NicCtx {
         let ipv6_addresses = claims.ipv6_addresses.clone();
         // Reject the entire member configuration before touching the shared fd.
         self.apply_mobile_tun_claims(claims).await?;
+        // Replacing the shared fd affects every registration on this actual
+        // NIC. Invalidate their old evidence immediately before the physical
+        // update; each member must confirm again through its own attachment.
+        if replace_tun_fd
+            && let (Some(routes), NicBackend::Shared(member)) = (&self.routes, &self.backend)
+        {
+            routes.invalidate_shared_mobile_evidence(member).await?;
+        }
         let tunnel = match self
             .backend
             .create_dev_for_mobile(tun_fd, replace_tun_fd)
@@ -1869,6 +1886,18 @@ impl NicCtx {
             }
         }
 
+        if self.routes.is_some() {
+            // Managed routes have one continuous writer: the Controller
+            // reconciler. Keep the public address updater, but its route part
+            // is already represented by declarations/the complete plan.
+            self.run_public_ipv6_addr_updater(false).await?;
+        } else {
+            // Legacy path: keep the existing proxy and public route updaters.
+            self.run_proxy_cidrs_route_updater().await?;
+            self.run_public_ipv6_route_updater().await?;
+            self.run_public_ipv6_addr_updater(true).await?;
+        }
+
         self.global_ctx.set_tun_device_ready(ifname);
 
         self.start_tunnel_forwarding(tunnel)?;
@@ -1877,7 +1906,9 @@ impl NicCtx {
         // that ended before this point has already made the NIC invalid, so
         // the Controller check below cannot resurrect a dead attachment.
         if let (Some(routes), NicBackend::Shared(member)) = (&self.routes, &self.backend)
-            && !routes.mobile_ready(member, attachment_id).await?
+            && !routes
+                .record_mobile_ready(member, installed_prefixes)
+                .await?
         {
             return Err(
                 anyhow::anyhow!("mobile TUN member is no longer the current registration").into(),

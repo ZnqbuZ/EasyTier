@@ -18,7 +18,7 @@ struct MobileTunAttachment {
     replace_tun_fd: bool,
     completion: Option<oneshot::Sender<anyhow::Result<()>>>,
     claims: Option<crate::instance::shared_virtual_nic::SharedIfConfigClaims>,
-    attachment_id: uuid::Uuid,
+    installed_prefixes: std::collections::BTreeSet<cidr::IpCidr>,
 }
 
 pub(super) struct NativeTunRuntime {
@@ -68,7 +68,7 @@ impl NativeTunRuntime {
         shared_virtual_nic_registry: ArcSharedVirtualNicRegistry,
         claims: Option<crate::instance::shared_virtual_nic::SharedIfConfigClaims>,
         routes: Option<Arc<crate::instance::route::runtime::NativeRouteContext>>,
-        attachment_id: uuid::Uuid,
+        installed_prefixes: std::collections::BTreeSet<cidr::IpCidr>,
     ) -> anyhow::Result<()> {
         nic_state.drain().await;
         if fd <= 0 {
@@ -98,7 +98,7 @@ impl NativeTunRuntime {
                 fd,
                 replace_tun_fd,
                 claims,
-                attachment_id,
+                installed_prefixes,
             )
             .await
             .context("attach mobile TUN failed")?;
@@ -116,12 +116,13 @@ impl NativeTunRuntime {
         let shared_virtual_nic_registry = self.shared_virtual_nic_registry.clone();
         let routes = self.routes.clone();
         self.task.lock().await.replace(tokio::spawn(async move {
-            loop {
+            let unfinished = loop {
                 let attachment = tokio::select! {
-                    _ = cancel.cancelled() => return,
+                    biased;
+                    _ = cancel.cancelled() => break "instance is closing",
                     attachment = tun_fds.recv() => match attachment {
                         Some(attachment) => attachment,
-                        None => return,
+                        None => break "the mobile TUN runtime stopped",
                     },
                 };
                 let result = Self::install_mobile_tun(
@@ -133,7 +134,7 @@ impl NativeTunRuntime {
                     shared_virtual_nic_registry.clone(),
                     attachment.claims,
                     routes.clone(),
-                    attachment.attachment_id,
+                    attachment.installed_prefixes,
                 )
                 .await;
                 if let Err(error) = &result {
@@ -144,6 +145,15 @@ impl NativeTunRuntime {
                 }
                 if let Some(completion) = attachment.completion {
                     let _ = completion.send(result);
+                }
+            };
+            // Requests already accepted by the channel but never picked up
+            // still receive a real "not executed" result.
+            while let Ok(attachment) = tun_fds.try_recv() {
+                if let Some(completion) = attachment.completion {
+                    let _ = completion.send(Err(anyhow::anyhow!(
+                        "mobile TUN attachment was not executed: {unfinished}"
+                    )));
                 }
             }
         }));
@@ -167,7 +177,7 @@ impl NativeTunRuntime {
         fd: i32,
         replace_tun_fd: bool,
         claims: Option<crate::instance::shared_virtual_nic::SharedIfConfigClaims>,
-        attachment_id: uuid::Uuid,
+        installed_prefixes: std::collections::BTreeSet<cidr::IpCidr>,
     ) -> anyhow::Result<()> {
         if self.task.lock().await.is_none() {
             anyhow::bail!("mobile TUN runtime is not running");
@@ -182,8 +192,10 @@ impl NativeTunRuntime {
                 replace_tun_fd,
                 completion: Some(completion),
                 claims,
-                attachment_id,
-            }) => send_result.map_err(|error| anyhow::anyhow!("failed to send TUN fd: {error}"))?,
+                installed_prefixes,
+            }) => send_result.map_err(|error| {
+                anyhow::anyhow!("mobile TUN attachment was not executed: {error}")
+            })?,
         }
 
         // Once submitted, the real completion decides the outcome; closing the
@@ -205,5 +217,52 @@ impl NativeTunRuntime {
             nic: self.nic.clone(),
             routes: self.routes.clone(),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use easytier_core::{config::toml::TomlConfig, process_runtime::CoreProcessRuntime};
+
+    use crate::instance::test_instance::TestInstance;
+
+    /// Cancellation after the real channel accepted a request must produce a
+    /// real "not executed" completion, not a silent channel drop.
+    #[tokio::test(flavor = "current_thread")]
+    async fn cancellation_after_enqueue_reports_not_executed() {
+        let instance = TestInstance::new_with_process_runtime(
+            TomlConfig::default(),
+            CoreProcessRuntime::new(),
+        );
+        let cancel = CancellationToken::new();
+        let runtime = NativeTunRuntime::new(
+            instance.get_global_ctx(),
+            cancel.clone(),
+            TestInstance::current_shared_virtual_nic_registry(),
+            None,
+        );
+        let (_sender, receiver) = mpsc::channel(1);
+        runtime
+            .install_packet_receiver(HostPacketReceiver::new(receiver))
+            .unwrap();
+        runtime
+            .prepare(instance.get_core_instance().packet_plane())
+            .await
+            .unwrap();
+
+        let mut attach =
+            Box::pin(runtime.attach_mobile_fd(0, false, None, std::collections::BTreeSet::new()));
+        assert!(
+            futures::poll!(attach.as_mut()).is_pending(),
+            "the request must really be enqueued before cancellation"
+        );
+        cancel.cancel();
+        let error = attach.await.unwrap_err().to_string();
+        assert!(
+            error.contains("not executed"),
+            "a queued request must receive the real unexecuted result: {error}"
+        );
+        runtime.shutdown().await;
     }
 }

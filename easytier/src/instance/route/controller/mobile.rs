@@ -120,7 +120,7 @@ impl RouteController {
 
     /// The local attachment evidence of this exact run/registration.
     #[cfg(test)]
-    pub(super) fn mobile_installed_prefixes(
+    pub(crate) fn mobile_installed_prefixes(
         &self,
         run: Uuid,
         registration: Uuid,
