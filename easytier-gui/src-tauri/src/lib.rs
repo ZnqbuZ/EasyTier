@@ -4,12 +4,12 @@
 mod elevate;
 
 use anyhow::Context;
-#[cfg(target_os = "android")]
-use easytier::instance::factory::subscribe_native_instance_event;
 #[cfg(any(target_os = "android", target_os = "ios"))]
 use easytier::instance::factory::{
     attach_mobile_tun_fd, get_mobile_tun_config as native_mobile_tun_config,
 };
+#[cfg(target_os = "android")]
+use easytier::instance::factory::{mobile_tun_changed, subscribe_native_instance_event};
 use easytier::proto::api::config::{
     ConfigPatchAction, ConfigRpc, ConfigRpcClientFactory, VpnPortalClientPatch,
 };
@@ -280,7 +280,9 @@ async fn get_mobile_tun_config(instance_ids: Vec<Uuid>) -> Result<MobileTunConfi
         let Some(manager) = INSTANCE_MANAGER.read().await.clone() else {
             return Err("mobile TUN configuration is not supported in remote mode".to_owned());
         };
-        Ok(native_mobile_tun_config(manager.as_ref(), &instance_ids).await)
+        native_mobile_tun_config(manager.as_ref(), &instance_ids)
+            .await
+            .map_err(|error| error.to_string())
     }
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
     {
@@ -1092,30 +1094,61 @@ mod manager {
                 let instance_uuid = *instance_id;
                 if let Some(instance) = instance_manager.instance(instance_uuid) {
                     if let Some(mut event_receiver) = subscribe_native_instance_event(&instance) {
+                        // Keep only the broadcast receiver and the shared change
+                        // notification. The instance and its Registry root are
+                        // released by the instance lifecycle, not this task.
+                        let route_changed = mobile_tun_changed();
                         let app_clone = app.clone();
                         let instance_id_clone = *instance_id;
                         tokio::spawn(async move {
                             let instance_id_str = instance_id_clone.to_string();
                             loop {
-                                match event_receiver.recv().await {
-                                    Ok(easytier::common::global_ctx::GlobalCtxEvent::DhcpIpv4Changed(_, _)
-                                        | easytier::common::global_ctx::GlobalCtxEvent::DhcpIpv4Conflicted(_)
-                                        | easytier::common::global_ctx::GlobalCtxEvent::DhcpIpv6Changed(_, _)
-                                        | easytier::common::global_ctx::GlobalCtxEvent::DhcpIpv6Conflicted(_)) => {
-                                        let _ = app_clone.emit("dhcp_ip_changed", &instance_id_str);
-                                    }
-                                    Ok(easytier::common::global_ctx::GlobalCtxEvent::ProxyCidrsUpdated(_, _)
-                                        | easytier::common::global_ctx::GlobalCtxEvent::PublicIpv6Changed(_, _)
-                                        | easytier::common::global_ctx::GlobalCtxEvent::PublicIpv6RoutesUpdated(_, _)) => {
-                                        let _ = app_clone.emit("proxy_cidrs_updated", &instance_id_str);
-                                    }
-                                    Ok(_) => {}
-                                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
-                                        break;
-                                    }
-                                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
-                                        let _ = app_clone.emit("event_lagged", &instance_id_str);
-                                        event_receiver = event_receiver.resubscribe();
+                                // Register/enable the notification before waiting so a
+                                // route change cannot fall into the setup gap.
+                                let route_notification = route_changed
+                                    .as_ref()
+                                    .map(|changed| changed.clone().notified_owned());
+                                tokio::pin!(route_notification);
+                                if let Some(notification) = route_notification.as_mut().as_pin_mut()
+                                {
+                                    notification.enable();
+                                }
+
+                                tokio::select! {
+                                    event = event_receiver.recv() => match event {
+                                        Ok(easytier::common::global_ctx::GlobalCtxEvent::DhcpIpv4Changed(_, _)
+                                            | easytier::common::global_ctx::GlobalCtxEvent::DhcpIpv4Conflicted(_)
+                                            | easytier::common::global_ctx::GlobalCtxEvent::DhcpIpv6Changed(_, _)
+                                            | easytier::common::global_ctx::GlobalCtxEvent::DhcpIpv6Conflicted(_)) => {
+                                            let _ = app_clone.emit("dhcp_ip_changed", &instance_id_str);
+                                        }
+                                        Ok(easytier::common::global_ctx::GlobalCtxEvent::ProxyCidrsUpdated(_, _)
+                                            | easytier::common::global_ctx::GlobalCtxEvent::PublicIpv6Changed(_, _)
+                                            | easytier::common::global_ctx::GlobalCtxEvent::PublicIpv6RoutesUpdated(_, _)) => {
+                                            let _ = app_clone.emit("proxy_cidrs_updated", &instance_id_str);
+                                        }
+                                        Ok(_) => {}
+                                        Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                                            // The route worker may have changed the
+                                            // complete table while this instance's
+                                            // event receiver was closing.
+                                            let _ = app_clone.emit("vpn_service_config_changed", "");
+                                            break;
+                                        }
+                                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                                            let _ = app_clone.emit("event_lagged", &instance_id_str);
+                                            event_receiver = event_receiver.resubscribe();
+                                        }
+                                    },
+                                    _ = async {
+                                        match route_notification.as_mut().as_pin_mut() {
+                                            Some(notification) => notification.await,
+                                            None => std::future::pending::<()>().await,
+                                        }
+                                    } => {
+                                        // No payload: the host re-reads the complete
+                                        // table and decides whether to act.
+                                        let _ = app_clone.emit("vpn_service_config_changed", "");
                                     }
                                 }
                             }

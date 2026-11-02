@@ -174,8 +174,8 @@ function syncVpnStatusFromNative(status: Awaited<ReturnType<typeof get_vpn_statu
     return
   }
 
-  curVpnStatus.ipv4Addrs = [...(status?.ipv4Addrs ?? [])]
-  curVpnStatus.routes = [...(status?.routes ?? [])]
+  curVpnStatus.ipv4Addrs = [...(status?.ipv4Addrs ?? [])].sort()
+  curVpnStatus.routes = [...(status?.routes ?? [])].sort()
   curVpnStatus.dns = status?.dns ?? undefined
 }
 
@@ -190,12 +190,10 @@ async function waitVpnStatus(target_status: boolean, timeout_sec: number) {
 }
 
 async function detachTunFd() {
-  try {
-    await setTunFd(0)
-  }
-  catch (e) {
-    console.error('detach tun fd failed', e)
-  }
+  // The host must not close the system FD while Native still owns a local
+  // attachment. setTunFd(0) resolves only after the existing Factory/Native
+  // detach path has really completed.
+  await setTunFd(0)
 }
 
 async function doStopVpn(force = false) {
@@ -255,12 +253,15 @@ async function doStartVpn(
   }
   const actual = await waitVpnAttachment()
 
-  curVpnStatus.ipv4Addrs = [...ipv4Addrs]
-  curVpnStatus.routes = routes
+  // Status comparisons are order-insensitive; the plugin receives the
+  // complete result in the order returned by the Controller.
+  curVpnStatus.ipv4Addrs = [...ipv4Addrs].sort()
+  curVpnStatus.routes = [...routes].sort()
   curVpnStatus.dns = dns
   vpnAttachedInstanceIds = [...actual.instance_ids].sort()
-  if (JSON.stringify(actual.addresses) !== JSON.stringify(ipv4Addrs)
-    || JSON.stringify(actual.routes) !== JSON.stringify(routes)
+  if (JSON.stringify([...actual.instance_ids].sort()) !== JSON.stringify([...instanceIds].sort())
+    || JSON.stringify([...actual.addresses].sort()) !== JSON.stringify([...ipv4Addrs].sort())
+    || JSON.stringify([...actual.routes].sort()) !== JSON.stringify([...routes].sort())
     || (actual.dns ?? undefined) !== dns) {
     scheduleVpnReconcile(vpnReconcileGeneration, 'attachment_configuration_changed')
   }
@@ -301,7 +302,15 @@ async function onVpnServiceStop(payload: any) {
   console.log('vpn service stop', JSON.stringify(payload))
   if (payload.snapshotId && payload.snapshotId !== vpnStartingSnapshotId)
     return
-  await detachTunFd()
+  // The plugin has already stopped its system VPN. Try to release any local
+  // borrow, but do not turn a late Native cleanup failure into a stale
+  // "running" status for an FD the host no longer owns.
+  try {
+    await detachTunFd()
+  }
+  catch (error) {
+    console.error('detach tun fd after vpn service stop failed', error)
+  }
   curVpnStatus.running = false
   resetVpnConfigStatus()
 }
@@ -351,11 +360,19 @@ async function reconcileNetworkInstance(generation: number) {
     return
 
   if (!instances.length) {
-    if (curVpnStatus.running)
-      await doStopVpn()
+    if (curVpnStatus.running) {
+      try {
+        await doStopVpn()
+      }
+      catch (error) {
+        console.error('stop vpn service failed', error)
+      }
+    }
     return
   }
 
+  // Network info is only a retry signal. It must not choose members, routes or
+  // the exported addresses; those come from the Controller's complete table.
   let retryReason: string | undefined
   let networkInfoUnavailable = false
 
@@ -404,17 +421,13 @@ async function reconcileNetworkInstance(generation: number) {
   if (!isCurrentVpnReconcile(generation))
     return
 
-  if (networkInfoUnavailable && curVpnStatus.running) {
-    scheduleVpnReconcile(generation, retryReason || 'network_info_unavailable')
-    return
-  }
-
-  const preferredIds = [...instances].sort((a, b) =>
-    Number(vpnAttachedInstanceIds.includes(b.instanceId)) - Number(vpnAttachedInstanceIds.includes(a.instanceId))
-    || a.instanceId.localeCompare(b.instanceId)).map(({ instanceId }) => instanceId)
+  // The Controller decides which running TUN instances participate. The host
+  // only supplies its running-instance scope and applies the complete result;
+  // it must not pre-filter members from network-info or config flags here.
+  const instanceIds = instances.map(({ instanceId }) => instanceId).sort()
   let config: MobileTunConfig
   try {
-    config = await getMobileTunConfig(preferredIds)
+    config = await getMobileTunConfig(instanceIds)
   }
   catch (error) {
     console.error('mobile TUN configuration query failed', error)
@@ -424,11 +437,27 @@ async function reconcileNetworkInstance(generation: number) {
   if (!isCurrentVpnReconcile(generation))
     return
   reportRejectedMembers(config)
-  if (!config.addresses.length) {
+
+  // Keep the complete table's order for the system VPN request. Sorted copies
+  // are only used to compare semantic content with the plugin's status.
+  const addresses = [...config.addresses]
+  const routes = [...config.routes]
+  const dns = config.dns ?? undefined
+  if (!addresses.length) {
     if (retryReason)
       scheduleVpnReconcile(generation, retryReason)
-    if (curVpnStatus.running)
-      await doStopVpn()
+    if (curVpnStatus.running) {
+      // A temporary network-info gap must not tear down a VPN whose native
+      // routes may still be valid. Wait for the next notification/retry.
+      if (networkInfoUnavailable)
+        return
+      try {
+        await doStopVpn()
+      }
+      catch (error) {
+        console.error('stop vpn service failed', error)
+      }
+    }
     return
   }
 
@@ -436,14 +465,12 @@ async function reconcileNetworkInstance(generation: number) {
     scheduleVpnReconcile(generation, retryReason)
   else
     vpnReconcileAttempts = 0
-  const sortedIpv4Addrs = [...config.addresses].sort()
-  const sortedRoutes = [...config.routes].sort()
-  const instanceIds = [...config.instance_ids].sort()
-  const dns = config.dns ?? undefined
+  const sortedAddresses = [...addresses].sort()
+  const sortedRoutes = [...routes].sort()
   // A replacement runtime needs its own attachment even with identical OS routes.
-  const membersChanged = JSON.stringify(instanceIds) !== JSON.stringify(vpnAttachedInstanceIds)
+  const membersChanged = JSON.stringify([...config.instance_ids].sort()) !== JSON.stringify(vpnAttachedInstanceIds)
   const configChanged
-    = JSON.stringify(sortedIpv4Addrs) !== JSON.stringify(curVpnStatus.ipv4Addrs)
+    = JSON.stringify(sortedAddresses) !== JSON.stringify(curVpnStatus.ipv4Addrs)
       || JSON.stringify(sortedRoutes) !== JSON.stringify(curVpnStatus.routes)
       || dns !== curVpnStatus.dns
 
@@ -461,7 +488,7 @@ async function reconcileNetworkInstance(generation: number) {
       return
 
     try {
-      await doStartVpn(instanceIds, sortedIpv4Addrs, sortedRoutes, dns, config.snapshot_id)
+      await doStartVpn([...config.instance_ids].sort(), addresses, routes, dns, config.snapshot_id)
       if (!isCurrentVpnReconcile(generation))
         await doStopVpn()
     }
