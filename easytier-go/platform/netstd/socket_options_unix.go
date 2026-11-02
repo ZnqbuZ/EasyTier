@@ -16,7 +16,10 @@ func applySocketOptions(
 	options platform.BindConfig,
 ) error {
 	fd := int(descriptor)
-	reuseAddr := strings.HasPrefix(network, "udp") || options.LocalAddr != nil
+	// TCP keeps the local-address default. UDP must not default to
+	// SO_REUSEADDR: on Unix that lets another socket bind the same endpoint
+	// and divert incoming datagrams.
+	reuseAddr := strings.HasPrefix(network, "tcp") && options.LocalAddr != nil
 	if options.ReuseAddr != nil {
 		reuseAddr = *options.ReuseAddr
 	}

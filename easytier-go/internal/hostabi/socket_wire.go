@@ -102,12 +102,12 @@ func decodeUDPBindOptions(encoded []byte) (platform.BindConfig, error) {
 		if err != nil {
 			return platform.BindConfig{}, err
 		}
-		// Translate the old purpose-dependent defaults once at the boundary.
+		// v3 encoded reuse_addr as an authoritative boolean. Preserve false as
+		// explicit exclusion; turning it into a host default would allow hosts
+		// to enable endpoint sharing that the old caller did not request.
 		reuseMode := byte(1)
 		if reuse {
 			reuseMode = 2
-		} else if remainder[3] == 3 || remainder[3] == 4 || remainder[3] == 7 {
-			reuseMode = 0
 		}
 		policy = append([]byte{reuseMode, remainder[1], remainder[2], remainder[4]}, remainder[5:]...)
 	}

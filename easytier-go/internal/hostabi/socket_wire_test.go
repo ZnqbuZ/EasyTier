@@ -196,6 +196,9 @@ func TestDecodeUDPBindOptionsV3(t *testing.T) {
 	if opts.LocalAddr == nil || opts.LocalAddr.Port() != 11011 {
 		t.Errorf("local addr = %v, want port 11011", opts.LocalAddr)
 	}
+	if !opts.LocalAddr.Addr().Is4() {
+		t.Errorf("local addr = %v, want canonical IPv4", opts.LocalAddr)
+	}
 	if opts.Context.SocketMark == nil || *opts.Context.SocketMark != 100 {
 		t.Errorf("socket mark = %v, want 100", opts.Context.SocketMark)
 	}
@@ -249,7 +252,7 @@ func TestDecodeUDPBindOptionsV4PreservesReuseAndProtection(t *testing.T) {
 	}
 }
 
-func TestDecodeLegacyUDPDefaultsBecomeCommonConfiguration(t *testing.T) {
+func TestDecodeLegacyUDPReuseFalseStaysExclusive(t *testing.T) {
 	for purpose := byte(0); purpose <= 8; purpose++ {
 		encoded := []byte{optionsWireVersion}
 		encoded = append(encoded, encodeSocketAddress(nil)...)
@@ -260,9 +263,8 @@ func TestDecodeLegacyUDPDefaultsBecomeCommonConfiguration(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		hostDefault := purpose == 3 || purpose == 4 || purpose == 7
-		if (options.ReuseAddr == nil) != hostDefault || (!hostDefault && *options.ReuseAddr) {
-			t.Fatalf("purpose %d: incorrect reuse default", purpose)
+		if options.ReuseAddr == nil || *options.ReuseAddr {
+			t.Fatalf("purpose %d: legacy false must stay explicit false, got %v", purpose, options.ReuseAddr)
 		}
 		autoDevice := purpose == 2 || purpose == 3 || purpose == 7
 		if (options.BindDevice == nil) != autoDevice {
@@ -322,6 +324,24 @@ func TestDecodeTCPConnectOptionsV2Rejected(t *testing.T) {
 	_, err := decodeTCPConnectOptions(encoded)
 	if err == nil {
 		t.Fatal("wire v2 should be rejected")
+	}
+}
+
+func TestDecodeUDPMetadataStoresCanonicalIPv4(t *testing.T) {
+	metadata := make([]byte, udpMetadataLen)
+	metadata[0] = 4
+	copy(metadata[1:5], []byte{192, 0, 2, 1})
+	binary.BigEndian.PutUint16(metadata[17:19], 11013)
+
+	peer, optional, _, _, err := decodeUDPMetadata(metadata)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if peer == nil || !peer.AddrPort().Addr().Is4() {
+		t.Fatalf("peer = %v, want canonical IPv4", peer)
+	}
+	if optional != nil {
+		t.Fatalf("optional IP = %v, want nil", optional)
 	}
 }
 

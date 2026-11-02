@@ -34,13 +34,33 @@ func TestUDPReuseAddrHonorsExplicitFalseAndTrue(t *testing.T) {
 		if optionErr != nil {
 			t.Fatal(optionErr)
 		}
-		expected := 1
-		if reuse != nil && !*reuse {
-			expected = 0
+		expected := 0
+		if reuse != nil && *reuse {
+			expected = 1
 		}
 		if actual != expected {
 			t.Fatalf("SO_REUSEADDR = %d, want %d", actual, expected)
 		}
+	}
+}
+
+func TestUDPDefaultReuseAddrRejectsDuplicateBind(t *testing.T) {
+	factory := SocketFactory{}
+	first, err := factory.BindUDP(context.Background(), platform.BindConfig{
+		LocalAddr: sourceAddr(0), BindDevice: strPtr(""),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer first.Close()
+
+	port := first.LocalAddr().(*net.UDPAddr).Port
+	second, err := factory.BindUDP(context.Background(), platform.BindConfig{
+		LocalAddr: sourceAddr(port), BindDevice: strPtr(""),
+	})
+	if err == nil {
+		second.Close()
+		t.Fatal("default UDP bind must reject a duplicate endpoint")
 	}
 }
 
