@@ -70,6 +70,12 @@ impl MobileTunMember {
     }
 }
 
+/// The canonical empty exported table used when no route domain exists.
+#[cfg(mobile)]
+pub(crate) fn empty_mobile_tun_config() -> MobileTunConfig {
+    config_for_members(&[], Vec::new())
+}
+
 /// The complete result of one policy pass.
 #[cfg(mobile)]
 pub(crate) struct MobilePlan {

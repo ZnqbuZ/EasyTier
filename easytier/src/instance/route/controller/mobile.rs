@@ -33,6 +33,7 @@ use super::{
 /// This is a per-call observation, not a cache: `instance_id` is the
 /// configuration identity and `run` is the runtime key, and both addresses are
 /// read from `GlobalCtx` at sampling time.
+#[cfg(test)]
 pub(super) struct MobileRouteInputs {
     pub(super) instance_id: Uuid,
     pub(super) run: Uuid,
@@ -118,6 +119,32 @@ impl RouteController {
         true
     }
 
+    /// Wait until no instance record remains for this configured instance id.
+    ///
+    /// A removed manager entry can still have a route record while its Root is
+    /// alive; this method reports that timeout instead of claiming release.
+    pub(crate) async fn drain_mobile_instance_id(&self, instance_id: Uuid) -> anyhow::Result<()> {
+        let runs = {
+            let rt = self.runtime.read();
+            rt.instances
+                .iter()
+                .filter_map(|(run, instance)| {
+                    let matches = instance.instance_id == Some(instance_id)
+                        || instance
+                            .global
+                            .as_ref()
+                            .and_then(Weak::upgrade)
+                            .is_some_and(|global| global.get_id() == instance_id);
+                    matches.then_some(*run)
+                })
+                .collect::<Vec<_>>()
+        };
+        for run in runs {
+            self.drain(run).await?;
+        }
+        Ok(())
+    }
+
     /// The local attachment evidence of this exact run/registration.
     #[cfg(test)]
     pub(crate) fn mobile_installed_prefixes(
@@ -137,6 +164,7 @@ impl RouteController {
     /// The answer comes from the current store under a short lock: a live root,
     /// an enabled build, `accept_dns`, and a current peer IPv4. The native side
     /// still verifies the actual IPv4 source.
+    #[cfg(test)]
     pub fn mobile_dns_enabled(&self, run: Uuid) -> bool {
         #[cfg(not(feature = "magic-dns"))]
         {
@@ -158,6 +186,7 @@ impl RouteController {
     /// directory never stores a second address value. A released registry root
     /// or a shut-down controller is an input withdrawal even while the context
     /// is alive, and no temporary root survives this read.
+    #[cfg(test)]
     pub(super) fn mobile_inputs(&self, run: Uuid) -> anyhow::Result<Option<MobileRouteInputs>> {
         let (global, public_address) = {
             let rt = self.runtime.read();

@@ -106,7 +106,7 @@ impl NativeTunRuntime {
     }
 
     pub(super) async fn prepare(&self, packet_plane: Arc<CorePacketPlane>) -> anyhow::Result<()> {
-        self.nic.drain().await;
+        self.nic.drain().await?;
         let Some(mut tun_fds) = self.tun_fd_receiver.lock().await.take() else {
             return Ok(());
         };

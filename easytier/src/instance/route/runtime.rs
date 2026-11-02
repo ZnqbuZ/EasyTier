@@ -11,8 +11,6 @@ use uuid::Uuid;
 use super::RouteController;
 #[cfg(all(feature = "tun", not(mobile)))]
 use super::{InterfaceInfo, interface_index};
-#[cfg(all(feature = "tun", mobile))]
-use crate::instance::shared_virtual_nic::SharedIfConfigClaims;
 use crate::{
     common::global_ctx::ArcGlobalCtx,
     host_runtime::{NativeNetNSServices, net_ns_services},
@@ -83,10 +81,14 @@ impl NativeRouteContext {
         )
     }
 
-    #[cfg(mobile)]
-    pub(crate) fn external_routes(&self) -> anyhow::Result<easytier_core::host::route::RouteSet> {
-        self.ensure_open()?;
-        Ok(self.controller.effective_routes_for_instance(&self.run))
+    #[cfg(all(feature = "tun", mobile))]
+    pub(crate) fn controller(&self) -> RouteController {
+        self.controller.clone()
+    }
+
+    #[cfg(all(feature = "tun", mobile))]
+    pub(crate) async fn drain_local(&self) -> anyhow::Result<()> {
+        self.controller.drain(self.run).await
     }
 
     /// Record one member's real local attachment evidence.
@@ -152,11 +154,6 @@ impl NativeRouteContext {
         Ok(())
     }
 
-    #[cfg(all(feature = "tun", mobile))]
-    pub(crate) fn mobile_dns_enabled(&self) -> bool {
-        self.controller.mobile_dns_enabled(self.run)
-    }
-
     pub(crate) fn public_address(&self) -> Option<cidr::Ipv6Inet> {
         *self.public_address.lock()
     }
@@ -183,13 +180,6 @@ impl NativeRouteContext {
 
     /// The real current claims of the bound mobile member, when it is a valid
     /// selection hint. This is the existing NIC read, not the old snapshot.
-    #[cfg(all(feature = "tun", mobile))]
-    pub(crate) async fn mobile_current_claims(
-        &self,
-    ) -> anyhow::Result<Option<SharedIfConfigClaims>> {
-        self.controller.mobile_current_claims(self.run).await
-    }
-
     #[cfg(feature = "public-ipv6-provider")]
     fn public_address_changing(&self, address: Option<cidr::Ipv6Inet>) {
         let mut current = self.public_address.lock();

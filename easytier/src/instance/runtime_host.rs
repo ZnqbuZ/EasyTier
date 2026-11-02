@@ -252,52 +252,6 @@ impl NativeInstanceRuntimeHost {
     }
 
     #[cfg(all(feature = "tun", mobile))]
-    pub(crate) async fn mobile_tun_claims(
-        &self,
-        _packet_plane: &CorePacketPlane,
-    ) -> anyhow::Result<(
-        crate::instance::shared_virtual_nic::SharedIfConfigClaims,
-        Option<crate::instance::shared_virtual_nic::SharedIfConfigClaims>,
-        bool,
-    )> {
-        use crate::instance::shared_virtual_nic::{
-            SharedIfConfigClaims, SharedIpv4Route, SharedIpv6Route,
-        };
-        let routes = self
-            .route_context()
-            .ok_or_else(|| anyhow::anyhow!("mobile route controller is unavailable"))?;
-        let mut claims = SharedIfConfigClaims::default();
-        claims.ipv4_addresses.extend(self.global_ctx.get_ipv4());
-        claims.ipv6_addresses.extend(self.global_ctx.get_ipv6());
-        claims.ipv6_addresses.extend(routes.public_address());
-        for route in routes.external_routes()? {
-            match route.destination {
-                cidr::IpCidr::V4(prefix) => {
-                    claims.ipv4_routes.insert(SharedIpv4Route::new(
-                        prefix.first_address(),
-                        prefix.network_length(),
-                        None,
-                    ));
-                }
-                cidr::IpCidr::V6(prefix) => {
-                    claims.ipv6_routes.insert(SharedIpv6Route::new(
-                        prefix.first_address(),
-                        prefix.network_length(),
-                        None,
-                    ));
-                }
-            }
-        }
-        Ok((
-            claims,
-            routes.mobile_current_claims().await?,
-            cfg!(feature = "magic-dns")
-                && routes.mobile_dns_enabled()
-                && self.global_ctx.get_ipv4().is_some(),
-        ))
-    }
-
-    #[cfg(all(feature = "tun", mobile))]
     pub(crate) fn instance_run_key(&self) -> uuid::Uuid {
         self.global_ctx.key()
     }

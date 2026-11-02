@@ -60,6 +60,11 @@ struct InstanceRoutes {
     member: Option<SharedVirtualNicMember>,
     #[cfg(all(feature = "tun", not(mobile)))]
     interface: Option<InterfaceInfo>,
+    /// The configured instance identity captured when the mobile authority
+    /// was bound. It is not an address input and remains usable for local
+    /// cleanup confirmation after the GlobalCtx is gone.
+    #[cfg(all(mobile, feature = "tun"))]
+    instance_id: Option<Uuid>,
     /// Mobile authority observation: the native instance runtime owns the
     /// context; the controller only reads its current values.
     #[cfg(all(mobile, feature = "tun"))]
@@ -157,6 +162,12 @@ impl RouteController {
         &self.changed
     }
 
+    /// Whether both handles observe the same per-namespace controller.
+    #[cfg(mobile)]
+    pub(crate) fn same_controller(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.runtime, &other.runtime)
+    }
+
     /// Static constructor: starts the platform backend worker in `net_ns` and
     /// returns a lightweight handle together with the real worker task.
     ///
@@ -218,6 +229,8 @@ impl RouteController {
                     #[cfg(all(feature = "tun", not(mobile)))]
                     interface: None,
                     #[cfg(all(mobile, feature = "tun"))]
+                    instance_id: None,
+                    #[cfg(all(mobile, feature = "tun"))]
                     global: None,
                     #[cfg(all(mobile, feature = "tun"))]
                     public_address: None,
@@ -278,6 +291,7 @@ impl RouteController {
             "global context run {} does not match instance {run}",
             current.key()
         );
+        let instance_id = current.get_id();
         drop(current);
         {
             let mut rt = self.runtime.write();
@@ -294,6 +308,7 @@ impl RouteController {
                 instances.global.is_none(),
                 "mobile route inputs are already bound for instance {run}"
             );
+            instances.instance_id = Some(instance_id);
             instances.global = Some(global);
             instances.public_address = Some(public_address);
         }
@@ -434,7 +449,7 @@ impl RouteController {
     /// bound NIC, so an instance without a TUN can still contribute its manual
     /// routes. A stopped namespace, a released registry and an unknown run all
     /// contribute nothing.
-    #[cfg(any(mobile, test))]
+    #[cfg(test)]
     pub fn effective_routes_for_instance(&self, run: &Uuid) -> RouteSet {
         let rt = self.runtime.read();
         if rt.shutdown {
