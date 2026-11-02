@@ -469,3 +469,63 @@ pub fn runtime_instance_from_config_snapshot(
         manual_routes,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static NEXT_TEST_ID: AtomicU64 = AtomicU64::new(0);
+
+    fn unique_id(prefix: &str) -> String {
+        format!(
+            "{prefix}-{}-{}",
+            std::process::id(),
+            NEXT_TEST_ID.fetch_add(1, Ordering::Relaxed)
+        )
+    }
+
+    #[test]
+    fn attached_markers_are_scoped_and_clearable() {
+        let first = unique_id("attached");
+        let second = unique_id("attached");
+        clear_tun_attached(&first);
+        clear_tun_attached(&second);
+        assert!(!is_tun_attached(&first));
+        assert!(!is_tun_attached(&second));
+
+        mark_tun_attached(&first);
+        assert!(is_tun_attached(&first));
+        assert!(!is_tun_attached(&second));
+
+        clear_tun_attached(&first);
+        assert!(!is_tun_attached(&first));
+
+        clear_tun_attached(&second);
+    }
+
+    #[test]
+    fn attached_view_requires_running_and_the_local_marker() {
+        let id = unique_id("attached-view");
+        clear_tun_attached(&id);
+        let config = || easytier::proto::api::manage::NetworkConfig {
+            dev_name: Some("tun0".to_string()),
+            ..Default::default()
+        };
+
+        let running = runtime_instance_from_config_snapshot(id.clone(), id.clone(), config(), true);
+        assert!(!running.tun_attached);
+
+        mark_tun_attached(&id);
+        let attached =
+            runtime_instance_from_config_snapshot(id.clone(), id.clone(), config(), true);
+        assert!(attached.tun_attached);
+
+        let stopped =
+            runtime_instance_from_config_snapshot(id.clone(), id.clone(), config(), false);
+        assert!(!stopped.tun_attached);
+
+        clear_tun_attached(&id);
+        assert!(!is_tun_attached(&id));
+    }
+}

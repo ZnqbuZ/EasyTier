@@ -23,7 +23,9 @@ pub(crate) mod mobile_tun;
 #[cfg(feature = "tun")]
 pub use crate::instance::route::mobile::MobileTunConfig;
 #[cfg(all(feature = "management-rpc", feature = "tun", mobile))]
-pub use mobile_tun::{attach_mobile_tun_fd, get_mobile_tun_config, mobile_tun_changed};
+pub use mobile_tun::{
+    attach_mobile_tun_fd, current_mobile_tun_config, get_mobile_tun_config, mobile_tun_changed,
+};
 #[cfg(feature = "management-rpc")]
 pub type NativeInstanceManager = InstanceManager<NativeInstanceFactory>;
 #[cfg(feature = "management")]

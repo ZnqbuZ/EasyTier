@@ -169,6 +169,38 @@ pub fn mobile_tun_changed() -> Option<Arc<Notify>> {
         .map(|controller| controller.changed().clone())
 }
 
+/// Read the current complete table without submitting a participation scope.
+///
+/// This is the read-only counterpart of [`get_mobile_tun_config`]. It resolves
+/// the same existing Factory domains, then asks the one domain for its current
+/// `mobile_config()`; it never calls `set_mobile_scope`, creates a domain, marks
+/// the shared route input dirty or computes a second policy result.
+///
+/// No identifiable domain returns the normalized empty table. Multiple
+/// distinct domains are an ambiguity error instead of an arbitrary choice or a
+/// merge.
+async fn current_mobile_tun_config_from_domains(
+    domains: &[MobileDomain],
+) -> anyhow::Result<MobileTunConfig> {
+    let Some(domain) = select_domain(domains, &BTreeSet::new())? else {
+        return Ok(empty_mobile_tun_config());
+    };
+    domain.controller.mobile_config().await
+}
+
+/// Read the current complete table of the existing mobile route domain.
+///
+/// This does not accept or submit a participation scope and does not mutate
+/// Controller input state. It is intended for status/diagnostic consumers;
+/// hosts that intentionally change the range must use
+/// [`get_mobile_tun_config`].
+pub async fn current_mobile_tun_config(
+    manager: &NativeInstanceManager,
+) -> anyhow::Result<MobileTunConfig> {
+    let domains = domains(manager);
+    current_mobile_tun_config_from_domains(&domains).await
+}
+
 /// Query the complete table for the host's explicit participation scope.
 ///
 /// `instance_ids` is always an explicit scope, including an empty slice. The
@@ -418,10 +450,44 @@ fn is_claim_conflict(error: &anyhow::Error) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::{sync::Arc, time::Duration};
 
     use super::*;
-    use crate::instance::shared_virtual_nic::SharedIfConfig;
+    use crate::{
+        common::{config::TomlConfig, global_ctx::GlobalCtx, net_ns::tests::test_net_ns},
+        instance::{
+            shared_virtual_nic::{SharedIfConfig, SharedVirtualNicRegistry},
+            virtual_nic::VirtualNicConfig,
+        },
+        utils::dirty::DirtyFlag,
+    };
+    use tokio::sync::Notify;
+
+    fn test_controller() -> RouteController {
+        RouteController::new(Arc::new(DirtyFlag::new(false)))
+    }
+
+    fn input_instance(
+        controller: &RouteController,
+        ipv4: &str,
+    ) -> (
+        Uuid,
+        Arc<GlobalCtx>,
+        Arc<easytier_core::host::route::Registry>,
+    ) {
+        let global = Arc::new(GlobalCtx::new(TomlConfig::default()));
+        let run = global.key();
+        let root = controller.open_instance(run).unwrap();
+        controller
+            .bind_mobile_inputs(
+                run,
+                Arc::downgrade(&global),
+                Arc::new(parking_lot::Mutex::new(None)),
+            )
+            .unwrap();
+        global.set_ipv4(Some(ipv4.parse().unwrap()));
+        (global.get_id(), global, root)
+    }
 
     #[test]
     fn domain_selection_never_merges_and_requires_an_explicit_disambiguator() {
@@ -480,6 +546,10 @@ mod tests {
         assert_eq!(config.snapshot_id, empty_mobile_tun_config().snapshot_id);
         assert!(config.instance_ids.is_empty());
 
+        let current = current_mobile_tun_config(&manager).await.unwrap();
+        assert_eq!(current.snapshot_id, empty_mobile_tun_config().snapshot_id);
+        assert!(current.instance_ids.is_empty());
+
         let attach =
             attach_mobile_tun_fd(&manager, 1, Some(&[Uuid::new_v4()]), Some(Uuid::new_v4()))
                 .await
@@ -523,5 +593,132 @@ mod tests {
         assert!(!is_claim_conflict(&anyhow::Error::new(
             std::io::Error::from_raw_os_error(19)
         )));
+    }
+
+    #[tokio::test]
+    async fn current_read_keeps_the_existing_scope_and_inputs_quiet() {
+        let controller = test_controller();
+        let (id_a, _global_a, _root_a) = input_instance(&controller, "10.1.1.1/24");
+        let (id_b, _global_b, _root_b) = input_instance(&controller, "10.2.2.1/24");
+        let domains = vec![MobileDomain {
+            controller: controller.clone(),
+            instance_ids: BTreeSet::from([id_a, id_b]),
+        }];
+
+        controller
+            .set_mobile_scope(Some(BTreeSet::from([id_a])))
+            .unwrap();
+        controller.reset_route_input_dirty();
+        let changed = controller.changed().clone();
+        let notified = changed.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+
+        let config = current_mobile_tun_config_from_domains(&domains)
+            .await
+            .unwrap();
+        assert_eq!(config.instance_ids, vec![id_a]);
+        assert!(
+            config
+                .addresses
+                .iter()
+                .any(|address| address == "10.1.1.1/24")
+        );
+        assert!(
+            !config
+                .addresses
+                .iter()
+                .any(|address| address == "10.2.2.1/24")
+        );
+        assert!(!controller.route_input_is_dirty());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), notified)
+                .await
+                .is_err(),
+            "a read-only query must not notify"
+        );
+
+        // Reading again keeps the same scope; it does not expand to all members.
+        let again = current_mobile_tun_config_from_domains(&domains)
+            .await
+            .unwrap();
+        assert_eq!(again.instance_ids, vec![id_a]);
+        assert!(!controller.route_input_is_dirty());
+
+        controller.set_mobile_scope(None).unwrap();
+        controller.reset_route_input_dirty();
+        let all = current_mobile_tun_config_from_domains(&domains)
+            .await
+            .unwrap();
+        assert_eq!(
+            all.instance_ids.into_iter().collect::<BTreeSet<_>>(),
+            BTreeSet::from([id_a, id_b])
+        );
+        assert!(!controller.route_input_is_dirty());
+
+        controller.set_mobile_scope(Some(BTreeSet::new())).unwrap();
+        controller.reset_route_input_dirty();
+        let empty = current_mobile_tun_config_from_domains(&domains)
+            .await
+            .unwrap();
+        assert!(empty.instance_ids.is_empty());
+        assert!(empty.addresses.is_empty());
+        assert!(empty.routes.is_empty());
+        assert!(!controller.route_input_is_dirty());
+    }
+
+    #[tokio::test]
+    async fn current_read_distinguishes_no_domain_from_multiple_domains() {
+        let config = current_mobile_tun_config_from_domains(&[]).await.unwrap();
+        assert_eq!(config.snapshot_id, empty_mobile_tun_config().snapshot_id);
+        assert!(config.instance_ids.is_empty());
+
+        let domains = vec![
+            MobileDomain {
+                controller: test_controller(),
+                instance_ids: BTreeSet::from([Uuid::from_u128(1)]),
+            },
+            MobileDomain {
+                controller: test_controller(),
+                instance_ids: BTreeSet::from([Uuid::from_u128(2)]),
+            },
+        ];
+        let error = current_mobile_tun_config_from_domains(&domains)
+            .await
+            .expect_err("multiple domains must be an explicit ambiguity error");
+        assert!(
+            error.to_string().contains("multiple mobile route domains"),
+            "{error:#}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn current_read_propagates_a_claim_read_failure() {
+        let controller = test_controller();
+        let (id, _global, _root) = input_instance(&controller, "10.3.3.1/24");
+        let run = _global.key();
+        let mut nics = SharedVirtualNicRegistry::new();
+        let member = nics.create_member(
+            format!("et-{run}"),
+            VirtualNicConfig::new(format!("et-{run}"), 1400, test_net_ns(None)),
+            run,
+            Arc::new(Notify::new()),
+        );
+        controller.bind_member(run, &member).unwrap();
+        let shared_nic = member.shared_nic();
+        let lock = shared_nic.lock().await;
+        let domains = vec![MobileDomain {
+            controller,
+            instance_ids: BTreeSet::from([id]),
+        }];
+
+        let error = current_mobile_tun_config_from_domains(&domains)
+            .await
+            .expect_err("a facts read failure must propagate");
+        assert!(
+            format!("{error:#}").contains("timed out reading current claims"),
+            "{error:#}"
+        );
+        drop(lock);
     }
 }
