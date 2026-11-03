@@ -1,3 +1,4 @@
+use crate::common::net_ns::NetNSImpl;
 use std::{
     fmt,
     net::{Ipv4Addr, SocketAddr, SocketAddrV4},

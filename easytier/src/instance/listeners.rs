@@ -1,3 +1,4 @@
+use crate::common::net_ns::NetNSImpl;
 use std::fmt::{self, Debug};
 
 use async_trait::async_trait;
@@ -191,6 +192,7 @@ impl SocketListener for RuntimeFakeTcpSocketListener {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::common::net_ns::NetNSImpl;
     use crate::host_runtime::NativeNetNSServices;
 
     #[test]

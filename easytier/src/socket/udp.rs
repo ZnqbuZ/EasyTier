@@ -157,6 +157,7 @@ impl VirtualUdpSocketFactory for RuntimeUdpSocketFactory {
 
 #[cfg(test)]
 mod tests {
+    use crate::common::net_ns::NetNSImpl;
     use easytier_core::{
         socket::SocketListener,
         socket::udp::{

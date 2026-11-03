@@ -10,6 +10,8 @@ use std::{
 
 use guarden::guarded;
 
+use super::NetNSImpl;
+
 /// Cloning pins the same kernel namespace.
 #[derive(Clone)]
 pub struct NetNS {
@@ -20,33 +22,6 @@ pub struct NetNS {
 impl NetNS {
     fn identity(metadata: &Metadata) -> u128 {
         (u128::from(metadata.dev()) << 64) | u128::from(metadata.ino())
-    }
-
-    pub fn id(&self) -> u128 {
-        self.id
-    }
-
-    pub fn process() -> io::Result<Self> {
-        Self::at(Path::new("/proc/self/ns/net"))
-    }
-
-    pub fn current() -> io::Result<Self> {
-        Self::at(Path::new("/proc/thread-self/ns/net"))
-    }
-
-    pub fn open(name: &str) -> io::Result<Self> {
-        if name == super::ROOT_NET_NS_NAME {
-            return Self::at(Path::new("/proc/1/ns/net"));
-        }
-        // Names are labels under /var/run/netns, not arbitrary file paths.
-        let mut components = Path::new(name).components();
-        if !matches!(components.next(), Some(Component::Normal(_))) || components.next().is_some() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "network namespace name must be one path component",
-            ));
-        }
-        Self::at(&Path::new("/var/run/netns").join(name))
     }
 
     fn at(path: &Path) -> io::Result<Self> {
@@ -81,10 +56,42 @@ impl NetNS {
         }
         Ok(Self { id, file })
     }
+}
+
+impl NetNSImpl for NetNS {
+    fn id(&self) -> u128 {
+        self.id
+    }
+
+    fn process() -> io::Result<Self> {
+        Self::at(Path::new("/proc/self/ns/net"))
+    }
+
+    fn current() -> io::Result<Self> {
+        Self::at(Path::new("/proc/thread-self/ns/net"))
+    }
+
+    fn open(name: Option<&str>) -> io::Result<Self> {
+        let Some(name) = name else {
+            return Self::current();
+        };
+        if name == super::ROOT_NET_NS_NAME {
+            return Self::at(Path::new("/proc/1/ns/net"));
+        }
+        // Names are labels under /var/run/netns, not arbitrary file paths.
+        let mut components = Path::new(name).components();
+        if !matches!(components.next(), Some(Component::Normal(_))) || components.next().is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "network namespace name must be one path component",
+            ));
+        }
+        Self::at(&Path::new("/var/run/netns").join(name))
+    }
 
     /// Run resource creation or a query inside this namespace, restoring the
     /// calling thread before returning.
-    pub fn run<R>(&self, operation: impl FnOnce() -> R) -> io::Result<R> {
+    fn run<R>(&self, operation: impl FnOnce() -> R) -> io::Result<R> {
         let current = Self::identity(&fs::metadata("/proc/thread-self/ns/net")?);
         if current == self.id {
             // Even setns to our own namespace requires privileges. Do not do it.
@@ -110,11 +117,11 @@ mod tests {
 
     #[test]
     fn rejects_wrong_net_ns_type_and_path_names() {
-        let error = NetNS::at(Path::new("/proc/thread-self/ns/mnt")).unwrap_err();
+        let error = NetNS::at(Path::new("/proc/thread-self/ns/mnt")).err().unwrap();
         assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
         for name in ["", ".", "..", "/tmp/test", "a/b"] {
             assert_eq!(
-                NetNS::open(name).unwrap_err().kind(),
+                NetNS::open(Some(name)).err().unwrap().kind(),
                 io::ErrorKind::InvalidInput
             );
         }

@@ -1,3 +1,4 @@
+use crate::common::net_ns::NetNSImpl;
 #[cfg(feature = "faketcp")]
 pub(crate) mod fake_tcp;
 pub(crate) mod tcp;
@@ -221,6 +222,7 @@ pub(crate) async fn bind<B: Bindable>(
 #[cfg(test)]
 mod tests {
     use crate::common::net_ns::NetNS;
+    use crate::common::net_ns::NetNSImpl;
     use easytier_core::socket::SocketContext;
     use easytier_core::socket::{BindConfig, IpVersion};
     use easytier_core::tunnel::TunnelError;

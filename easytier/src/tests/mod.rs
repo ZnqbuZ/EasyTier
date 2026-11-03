@@ -1,3 +1,4 @@
+use crate::common::net_ns::NetNSImpl;
 #[cfg(target_os = "linux")]
 mod three_node;
 

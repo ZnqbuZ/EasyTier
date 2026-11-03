@@ -79,6 +79,7 @@ pub(crate) async fn protect_native_socket(
 mod tests {
     use super::*;
     use crate::common::net_ns::NetNS;
+    use crate::common::net_ns::NetNSImpl;
     use crate::socket::udp::RuntimeUdpSocketFactory;
     use easytier_core::socket::BindConfig;
     use easytier_core::socket::{

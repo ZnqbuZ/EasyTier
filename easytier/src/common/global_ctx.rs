@@ -1,3 +1,4 @@
+use crate::common::net_ns::NetNSImpl;
 use std::{
     collections::HashSet,
     net::{IpAddr, Ipv6Addr},
@@ -187,7 +188,7 @@ impl GlobalCtx {
         let id = config_fs.get_id();
         let network = config_fs.get_network_identity();
         let net_ns = net_ns.unwrap_or_else(|| {
-            NetNS::from_config(config_fs.get_net_ns().as_deref())
+            NetNS::open(config_fs.get_net_ns().as_deref())
                 .expect("resolve native network namespace")
         });
         let hostname = runtime
@@ -375,6 +376,7 @@ impl GlobalCtx {
 #[cfg(test)]
 pub mod tests {
     use crate::common::config::TomlConfigLoader;
+    use crate::common::net_ns::NetNSImpl;
 
     use super::*;
 

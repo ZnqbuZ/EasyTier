@@ -1,3 +1,4 @@
+use crate::common::net_ns::NetNSImpl;
 use std::net::{IpAddr, SocketAddr, ToSocketAddrs as _};
 #[cfg(feature = "dns-resolver")]
 use std::{future::Future, io, pin::Pin, sync::Arc, time::Duration};
@@ -530,6 +531,7 @@ async fn socket_addrs_with_system_resolver(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::common::net_ns::NetNSImpl;
 
     #[cfg(feature = "dns-resolver")]
     #[tokio::test]

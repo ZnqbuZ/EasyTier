@@ -1,3 +1,4 @@
+use crate::common::net_ns::NetNSImpl;
 use std::{
     ffi::OsStr,
     net::{IpAddr, Ipv4Addr, SocketAddr},

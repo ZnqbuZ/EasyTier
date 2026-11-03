@@ -1,3 +1,4 @@
+use crate::common::net_ns::NetNSImpl;
 #[cfg(not(mobile))]
 use std::collections::HashMap;
 use std::net::IpAddr;
@@ -576,6 +577,7 @@ pub(crate) async fn collect_local_ip_addrs(net_ns: NetNS) -> GetIpListResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::common::net_ns::NetNSImpl;
 
     #[test]
     fn converts_contiguous_ip_masks_to_prefixes() {

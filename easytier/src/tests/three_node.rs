@@ -1,5 +1,6 @@
 #![allow(clippy::too_many_arguments)]
 
+use crate::common::net_ns::NetNSImpl;
 use core::panic;
 use std::{
     future::Future,

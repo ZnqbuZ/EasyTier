@@ -3,6 +3,8 @@
     allow(dead_code)
 )]
 
+use crate::common::net_ns::NetNSImpl;
+
 use std::{
     collections::BTreeSet,
     ffi::CString,

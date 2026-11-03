@@ -164,6 +164,7 @@ impl ServerProtocolUpgrader<RuntimeTcpSocket> for RuntimeServerProtocolUpgrader 
 mod tests {
     use crate::common::global_ctx::tests::get_mock_global_ctx;
     use crate::common::net_ns::NetNS;
+    use crate::common::net_ns::NetNSImpl;
 
     use super::*;
 

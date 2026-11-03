@@ -1,3 +1,4 @@
+use crate::common::net_ns::NetNSImpl;
 use std::sync::Arc;
 
 #[cfg(feature = "wrapped-transport")]
@@ -61,7 +62,7 @@ pub(super) fn compose_native_core_instance(
         runtime_core_host_config()
     };
     let configured_net_ns = toml_config.get_net_ns();
-    let net_ns = NetNS::from_config(cfg_select! {
+    let net_ns = NetNS::open(cfg_select! {
         target_os = "linux" => configured_net_ns.as_deref(),
         _ => {
             if host_config.ignore_unsupported_config {

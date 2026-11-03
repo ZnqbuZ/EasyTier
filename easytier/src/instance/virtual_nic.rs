@@ -1,3 +1,4 @@
+use crate::common::net_ns::NetNSImpl;
 use std::{
     collections::BTreeSet,
     io,
@@ -1693,6 +1694,7 @@ impl NicCtx {
 
 #[cfg(test)]
 mod tests {
+    use crate::common::net_ns::NetNSImpl;
     use crate::common::{error::Error, global_ctx::tests::get_mock_global_ctx};
 
     use super::{NicCtx, VirtualNic};

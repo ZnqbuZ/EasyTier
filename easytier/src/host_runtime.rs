@@ -1,3 +1,4 @@
+use crate::common::net_ns::NetNSImpl;
 use easytier_core::socket::BindConfig;
 use std::{
     fmt, io,
@@ -413,6 +414,7 @@ impl DnsRecordResolver for NativeNetNSServices {
 
 #[cfg(test)]
 mod tests {
+    use crate::common::net_ns::NetNSImpl;
     use crate::instance::runtime_executor::NativeInstanceExecutor;
 
     use super::*;

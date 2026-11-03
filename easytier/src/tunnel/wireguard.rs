@@ -9,7 +9,10 @@ use std::{
 use quanta::Instant;
 
 use crate::{
-    common::{net_ns::NetNS, shrink_dashmap},
+    common::{
+        net_ns::{NetNS, NetNSImpl},
+        shrink_dashmap,
+    },
     proto::common::TunnelInfo,
     socket::udp::{RuntimeUdpSessionSocketListener, new_runtime_udp_session_listener},
     tunnel::{TunnelUrl, build_url_from_socket_addr},

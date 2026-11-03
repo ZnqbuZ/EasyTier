@@ -276,6 +276,7 @@ pub(crate) fn prepare_proxy_tcp_socket(stream: &TcpStream) -> io::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use crate::common::net_ns::NetNSImpl;
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
     use super::*;

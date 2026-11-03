@@ -1,3 +1,4 @@
+use crate::common::net_ns::NetNSImpl;
 mod netfilter;
 mod packet;
 mod stack;

@@ -662,6 +662,7 @@ impl ServerTunnelAcceptor for QuicAcceptedSession {
 
 #[cfg(test)]
 mod tests {
+    use crate::common::net_ns::NetNSImpl;
     use std::{net::SocketAddr, sync::Arc, time::Duration};
 
     use easytier_core::socket::BindConfig;

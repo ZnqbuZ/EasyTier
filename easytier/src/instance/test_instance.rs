@@ -1,5 +1,6 @@
 //! Test-only convenience around the production CoreInstance composition.
 
+use crate::common::net_ns::NetNSImpl;
 use std::sync::Arc;
 
 use easytier_core::{

@@ -1,3 +1,4 @@
+use crate::common::net_ns::NetNSImpl;
 use std::{net::Ipv4Addr, process::Command, sync::Arc, time::Duration};
 
 use easytier_core::{config::PeerId, process_runtime::CoreProcessRuntime};
@@ -912,7 +913,7 @@ async fn magic_dns_route_follows_serving_member_and_takeover() {
     let route = SharedIpv4Route::new(MAGIC_DNS_FAKE_IP.parse::<Ipv4Addr>().unwrap(), 32, None);
     assert_eq!(
         shared_route_owner_count(
-            &NativeNetNSServices::of(&NetNS::open(&net_ns.name).unwrap())
+            &NativeNetNSServices::of(&NetNS::open(Some(&net_ns.name)).unwrap())
                 .unwrap()
                 .nics,
             &dev_name,
@@ -932,7 +933,7 @@ async fn magic_dns_route_follows_serving_member_and_takeover() {
     .await;
     assert_eq!(
         shared_route_owner_count(
-            &NativeNetNSServices::of(&NetNS::open(&net_ns.name).unwrap())
+            &NativeNetNSServices::of(&NetNS::open(Some(&net_ns.name)).unwrap())
                 .unwrap()
                 .nics,
             &dev_name,
@@ -959,7 +960,7 @@ async fn magic_dns_route_follows_serving_member_and_takeover() {
     wait_for_condition(
         || async {
             shared_route_owner_count(
-                &NativeNetNSServices::of(&NetNS::open(&net_ns.name).unwrap())
+                &NativeNetNSServices::of(&NetNS::open(Some(&net_ns.name)).unwrap())
                     .unwrap()
                     .nics,
                 &dev_name,

@@ -1,3 +1,4 @@
+use crate::common::net_ns::NetNSImpl;
 // Derived from igd-next 0.17.0 and upstream commit
 // bb335d60348386526684d9249d7ae733772279e4, with its network transport
 // replaced by EasyTier's socket factories. See LICENSE in this

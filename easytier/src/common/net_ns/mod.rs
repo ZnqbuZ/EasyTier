@@ -6,53 +6,60 @@ use std::{
     io,
 };
 
+/// Operations every platform's `NetNS` must provide, so the platform
+/// implementations cannot drift apart. Import it to call these methods.
+pub(crate) trait NetNSImpl: Clone + Sized {
+    /// Kernel namespace identity, independent of the name/path used to open it.
+    fn id(&self) -> u128;
+    /// The process's own namespace, regardless of the calling thread.
+    fn process() -> io::Result<Self>;
+    /// The calling thread's namespace.
+    fn current() -> io::Result<Self>;
+    /// Open a configured namespace by name; `None` selects the calling thread's.
+    fn open(name: Option<&str>) -> io::Result<Self>;
+    /// Run resource creation or a query inside this namespace, restoring the
+    /// calling thread before returning.
+    fn run<R>(&self, operation: impl FnOnce() -> R) -> io::Result<R>;
+}
+
 cfg_select! {
     target_os = "linux" => {
         mod linux;
         pub use linux::NetNS;
     },
     _ => {
+        /// Platforms without network namespaces have exactly one.
         #[derive(Clone, Copy)]
         pub struct NetNS;
 
-        impl NetNS {
-            pub fn id(&self) -> u128 {
+        impl NetNSImpl for NetNS {
+            fn id(&self) -> u128 {
                 0
             }
 
-            pub fn process() -> io::Result<Self> {
+            fn process() -> io::Result<Self> {
                 Ok(Self)
             }
 
-            pub fn current() -> io::Result<Self> {
+            fn current() -> io::Result<Self> {
                 Ok(Self)
             }
 
-            pub fn run<R>(&self, operation: impl FnOnce() -> R) -> io::Result<R> {
+            fn open(name: Option<&str>) -> io::Result<Self> {
+                if name.is_none() {
+                    return Ok(Self);
+                }
+                Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "named network namespaces are unsupported",
+                ))
+            }
+
+            fn run<R>(&self, operation: impl FnOnce() -> R) -> io::Result<R> {
                 Ok(operation())
             }
         }
     },
-}
-
-impl NetNS {
-    pub(crate) fn from_config(name: Option<&str>) -> io::Result<NetNS> {
-        match name {
-            None => Self::current(),
-            Some(name) => {
-                cfg_select! {
-                    target_os = "linux" => Self::open(name),
-                    _ => {
-                        let _ = name;
-                        Err(io::Error::new(
-                            io::ErrorKind::Unsupported,
-                            "named network namespaces are unsupported",
-                        ))
-                    },
-                }
-            }
-        }
-    }
 }
 
 impl fmt::Debug for NetNS {
@@ -86,7 +93,7 @@ pub(crate) mod tests {
     use std::sync::Arc;
 
     pub(crate) fn test_net_ns(name: Option<String>) -> NetNS {
-        NetNS::from_config(name.as_deref()).expect("open test network namespace")
+        NetNS::open(name.as_deref()).expect("open test network namespace")
     }
 
     #[cfg(target_os = "linux")]

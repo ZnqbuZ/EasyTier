@@ -1,5 +1,6 @@
 use super::FromUrl;
 use crate::common::net_ns::NetNS;
+use crate::common::net_ns::NetNSImpl;
 use crate::{proto::common::TunnelInfo, socket::tcp::RuntimeTcpSocket};
 use anyhow::Context as _;
 use bytes::BytesMut;

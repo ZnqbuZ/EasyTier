@@ -1,3 +1,4 @@
+use crate::common::net_ns::NetNSImpl;
 use crate::common::net_ns::{NetNS, ROOT_NET_NS_NAME};
 use crate::host_runtime::NativeNetNSServices;
 use easytier_core::socket::BindConfig;
