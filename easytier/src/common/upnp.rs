@@ -64,16 +64,16 @@ async fn new_protected_natpmp(
     let gateway = gateway.map(Ok).unwrap_or_else(mapping_gateway)?;
     let gateway_addr = SocketAddr::V4(SocketAddrV4::new(gateway, natpmp::NATPMP_PORT));
     let net_ns = crate::common::net_ns::current()?;
-    let socket = crate::socket::bind::<UdpSocket>(BindConfig {
-        context: SocketContext {
-            net_ns: Some(net_ns),
-            ..SocketContext::default()
+    let socket = crate::socket::bind::<UdpSocket>(
+        &net_ns,
+        BindConfig {
+            context: SocketContext::default(),
+            local_addr: Some("0.0.0.0:0".parse().unwrap()),
+            reuse_addr: Some(false),
+            need_protect: true,
+            ..BindConfig::default()
         },
-        local_addr: Some("0.0.0.0:0".parse().unwrap()),
-        reuse_addr: Some(false),
-        need_protect: true,
-        ..BindConfig::default()
-    })
+    )
     .await
     .context("create protected nat-pmp socket")?;
     socket
@@ -316,7 +316,7 @@ where
     cfg_select! {
         target_os = "linux" => {
             tokio::task::spawn_blocking(move || {
-                net_ns.run_unchecked(|| {
+                net_ns.run(|| {
                     let runtime = tokio::runtime::Builder::new_current_thread()
                         .enable_all()
                         .build()
@@ -544,17 +544,17 @@ async fn resolve_internal_addr(
 
     let ip = if host.is_unspecified() {
         let net_ns = crate::common::net_ns::current()?;
-        let udp = crate::socket::bind::<UdpSocket>(BindConfig {
-            context: SocketContext {
-                net_ns: Some(net_ns),
-                ..SocketContext::default()
+        let udp = crate::socket::bind::<UdpSocket>(
+            &net_ns,
+            BindConfig {
+                context: SocketContext::default(),
+                local_addr: Some("0.0.0.0:0".parse().unwrap()),
+                bind_device: Some("".into()),
+                reuse_addr: Some(false),
+                need_protect: true,
+                ..BindConfig::default()
             },
-            local_addr: Some("0.0.0.0:0".parse().unwrap()),
-            bind_device: Some("".into()),
-            reuse_addr: Some(false),
-            need_protect: true,
-            ..BindConfig::default()
-        })
+        )
         .await
         .context("create protected probe socket for gateway route")?;
         udp.connect(gateway_addr)

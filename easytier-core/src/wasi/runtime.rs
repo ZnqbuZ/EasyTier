@@ -91,6 +91,7 @@ pub(super) fn new_wasi_core_runtime(
 
     use crate::host::{dns::HostDnsResolver, packet::HostPacketSink, socket::HostSocketRuntime};
     use crate::{
+        config::toml::ConfigLoader as _,
         instance::{CoreHostAdapters, CoreInstance},
         wasi::adapter::{
             dns::WasiHostDnsIo, environment::WasiHostConnectorEnvironmentIo,
@@ -105,8 +106,9 @@ pub(super) fn new_wasi_core_runtime(
     use crate::connectivity::connector_host::new_connector_host_with_external_tunnel;
 
     let socket_runtime = HostSocketRuntime::new();
-    let socket_backend = Arc::new(WasiHostSocketBackend::default());
-    let environment_io = Arc::new(WasiHostConnectorEnvironmentIo);
+    let net_ns = config.get_net_ns();
+    let socket_backend = Arc::new(WasiHostSocketBackend::new(net_ns.clone()));
+    let environment_io = Arc::new(WasiHostConnectorEnvironmentIo::new(net_ns.clone()));
     #[cfg(feature = "wasm-host-tunnel")]
     let host_tunnel_schemes: Arc<[String]> = Arc::from(["ws".to_owned(), "wss".to_owned()]);
     #[cfg(feature = "wasm-host-tunnel-outbound")]
@@ -132,7 +134,7 @@ pub(super) fn new_wasi_core_runtime(
     ));
     let dns = Arc::new(HostDnsResolver::new(
         socket_runtime.clone(),
-        Arc::new(WasiHostDnsIo),
+        Arc::new(WasiHostDnsIo::new(net_ns)),
     ));
     let packet_sink = Arc::new(HostPacketSink::new(
         socket_runtime.clone(),
@@ -140,9 +142,6 @@ pub(super) fn new_wasi_core_runtime(
         packet_sink,
     ));
     let mut adapters = CoreHostAdapters::new(host, dns, packet_sink, process_runtime);
-    adapters.config.net_ns = config
-        .get_net_ns()
-        .map(crate::net_ns::NetNS::from_host_reference);
     adapters.instance_runtime = Arc::new(WasiInstanceRuntimeHost);
     adapters.events = Arc::new(WasiHostEventSink::new(event_sink));
     #[cfg(feature = "wasm-host-tunnel-outbound")]

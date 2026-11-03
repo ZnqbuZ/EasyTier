@@ -1034,7 +1034,6 @@ mod tests {
     fn stun_udp_bind_request_preserves_context_and_family() {
         let context = SocketContext {
             socket_mark: Some(0),
-            net_ns: Some(crate::socket::NetNS::from_host_reference("instance-a")),
             ..SocketContext::default()
         };
         let local_addr = "0.0.0.0:0".parse().unwrap();
@@ -1043,14 +1042,6 @@ mod tests {
 
         assert_eq!(options.context.ip_version, IpVersion::V4);
         assert_eq!(options.context.socket_mark, Some(0));
-        assert_eq!(
-            options
-                .context
-                .net_ns
-                .as_ref()
-                .map(|net_ns| net_ns.host_reference().unwrap()),
-            Some("instance-a")
-        );
         assert_eq!(options.local_addr, Some(local_addr));
         assert_eq!(options.reuse_addr, Some(false));
         assert_eq!(options.bind_device.as_deref(), Some(""));

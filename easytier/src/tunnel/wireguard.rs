@@ -664,7 +664,6 @@ impl WgTunnelListener {
         let bind = BindConfig {
             local_addr: Some(local_addr),
             context: SocketContext {
-                net_ns: Some(net_ns.clone()),
                 socket_mark: self.socket_mark,
                 ..SocketContext::default()
             },
@@ -673,6 +672,7 @@ impl WgTunnelListener {
             ..BindConfig::default()
         };
         let mut session_listener = new_runtime_udp_session_listener(
+            net_ns,
             self.addr.clone(),
             UdpSessionListenRequest::new(bind),
             UdpSessionAcceptKind::Classified(UdpSessionProtocol::WireGuard),
@@ -798,7 +798,7 @@ pub(crate) fn upgrade_accepted(
 pub mod tests {
     use super::*;
     use crate::{
-        common::global_ctx::tests::get_mock_global_ctx, host_runtime::native_host_runtime,
+        common::global_ctx::tests::get_mock_global_ctx,
         tunnel::protocol::runtime_client_protocol_upgrader,
     };
     use easytier_core::socket::BindConfig;
@@ -832,7 +832,7 @@ pub mod tests {
             let mut tunnels = Vec::with_capacity(CONN_COUNT);
             for _ in 0..CONN_COUNT {
                 let connected = connect_udp(
-                    native_host_runtime(),
+                    crate::host_runtime::process_default_services().unwrap(),
                     remote_addr,
                     Vec::new(),
                     BindConfig {

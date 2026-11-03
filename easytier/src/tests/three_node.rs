@@ -1936,15 +1936,15 @@ pub async fn udp_broadcast_test() {
     let _insts = init_three_node(&network, "tcp").await;
 
     let udp_broadcast_responder = |net_ns: NetNS, counter: Arc<AtomicU32>| async move {
-        let socket: UdpSocket = crate::socket::bind::<UdpSocket>(BindConfig {
-            context: SocketContext {
-                net_ns: Some(net_ns),
-                ..SocketContext::default()
+        let socket: UdpSocket = crate::socket::bind::<UdpSocket>(
+            &net_ns,
+            BindConfig {
+                context: SocketContext::default(),
+                reuse_addr: Some(false),
+                local_addr: Some("0.0.0.0:22111".parse().unwrap()),
+                ..BindConfig::default()
             },
-            reuse_addr: Some(false),
-            local_addr: Some("0.0.0.0:22111".parse().unwrap()),
-            ..BindConfig::default()
-        })
+        )
         .await
         .unwrap();
         socket.set_broadcast(true).unwrap();
@@ -1973,15 +1973,15 @@ pub async fn udp_broadcast_test() {
 
     // send broadcast
     let net_ns = crate::common::net_ns::tests::test_net_ns(Some(network.net_ns("net_a").into()));
-    let socket: UdpSocket = crate::socket::bind::<UdpSocket>(BindConfig {
-        context: SocketContext {
-            net_ns: Some(net_ns),
-            ..SocketContext::default()
+    let socket: UdpSocket = crate::socket::bind::<UdpSocket>(
+        &net_ns,
+        BindConfig {
+            context: SocketContext::default(),
+            reuse_addr: Some(false),
+            local_addr: Some("0.0.0.0:0".parse().unwrap()),
+            ..BindConfig::default()
         },
-        reuse_addr: Some(false),
-        local_addr: Some("0.0.0.0:0".parse().unwrap()),
-        ..BindConfig::default()
-    })
+    )
     .await
     .unwrap();
     socket.set_broadcast(true).unwrap();

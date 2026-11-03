@@ -5,15 +5,9 @@ use crate::socket::IpVersion;
 
 const DNS_WIRE_VERSION: u8 = 1;
 
-pub(crate) fn encode_query(query: &DnsQuery) -> io::Result<Vec<u8>> {
+pub(crate) fn encode_query(query: &DnsQuery, net_ns: Option<&str>) -> io::Result<Vec<u8>> {
     let host = query.host.as_bytes();
-    let net_ns = query
-        .context
-        .net_ns
-        .as_ref()
-        .map(|net_ns| net_ns.host_reference())
-        .transpose()?
-        .map(str::as_bytes);
+    let net_ns = net_ns.map(str::as_bytes);
     let host_len = encoded_len("DNS host", host.len())?;
     let net_ns_len = encoded_len("DNS netns token", net_ns.map_or(0, <[u8]>::len))?;
     let mut encoded = Vec::with_capacity(16 + host.len() + net_ns.map_or(0, <[u8]>::len));
@@ -149,7 +143,6 @@ impl<'a> Decoder<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::socket::NetNS;
     use crate::socket::SocketContext;
 
     #[test]
@@ -159,10 +152,9 @@ mod tests {
             SocketContext {
                 ip_version: IpVersion::V6,
                 socket_mark: Some(0x01020304),
-                net_ns: Some(NetNS::from_host_reference("netns0")),
             },
         );
-        let encoded = encode_query(&query).unwrap();
+        let encoded = encode_query(&query, Some("netns0")).unwrap();
 
         let mut expected = vec![DNS_WIRE_VERSION, 6, 1, 1, 2, 3, 4, 1];
         expected.extend_from_slice(&6_u32.to_be_bytes());
@@ -171,14 +163,16 @@ mod tests {
         expected.extend_from_slice(b"peer.example");
         assert_eq!(encoded, expected);
 
-        let without_optional = encode_query(&DnsQuery::new(
-            "v4.example",
-            SocketContext {
-                ip_version: IpVersion::V4,
-                socket_mark: None,
-                net_ns: None,
-            },
-        ))
+        let without_optional = encode_query(
+            &DnsQuery::new(
+                "v4.example",
+                SocketContext {
+                    ip_version: IpVersion::V4,
+                    socket_mark: None,
+                },
+            ),
+            None,
+        )
         .unwrap();
         assert_eq!(
             &without_optional[..12],

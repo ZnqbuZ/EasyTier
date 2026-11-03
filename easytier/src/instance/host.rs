@@ -23,7 +23,6 @@ impl NativeInstanceEnvironment {
     fn new(global_ctx: ArcGlobalCtx, runtime: Arc<NativeNetNSServices>) -> Self {
         let socket_context = SocketContext {
             socket_mark: global_ctx.get_flags().socket_mark,
-            net_ns: Some(global_ctx.net_ns.clone()),
             ..SocketContext::default()
         };
         Self {

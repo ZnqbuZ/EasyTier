@@ -20,7 +20,7 @@ impl RuntimeIcmpProxyHost {
         Self { net_ns }
     }
 
-    fn create_raw_socket(&self, _context: &SocketContext) -> Result<Socket, std::io::Error> {
+    fn create_raw_socket(&self) -> Result<Socket, std::io::Error> {
         self.net_ns.run(|| {
             let socket = Socket::new(
                 socket2::Domain::IPV4,
@@ -76,10 +76,9 @@ impl IcmpProxySocket for RuntimeIcmpSocket {
 impl IcmpProxyHost for RuntimeIcmpProxyHost {
     async fn open_icmp_v4(
         &self,
-        mut context: SocketContext,
+        _context: SocketContext,
     ) -> Result<Arc<dyn IcmpProxySocket>, ProxyRuntimeError> {
-        crate::host_runtime::normalize_context(&mut context, &self.net_ns)?;
-        let socket = self.create_raw_socket(&context).inspect_err(|error| {
+        let socket = self.create_raw_socket().inspect_err(|error| {
             tracing::warn!(?error, "create ICMP socket failed");
         })?;
         // Tokio only supplies readiness and recvfrom/sendto here; the underlying

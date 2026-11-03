@@ -4,7 +4,7 @@ use std::{
 };
 
 #[cfg(any(feature = "wireguard", test))]
-use crate::host_runtime::{NativeNetNSServices, native_host_runtime};
+use crate::host_runtime::NativeNetNSServices;
 use async_trait::async_trait;
 use easytier_core::socket::BindConfig;
 use easytier_core::socket::SocketContext;
@@ -19,17 +19,19 @@ use easytier_core::socket::udp::{
 use tokio::net::UdpSocket;
 
 use super::udp_src;
+use crate::common::net_ns::NetNS;
 
 #[cfg(any(feature = "wireguard", test))]
 pub(crate) type RuntimeUdpSessionSocketListener = UdpSessionSocketListener<NativeNetNSServices>;
 
 #[cfg(any(feature = "wireguard", test))]
 pub(crate) fn new_runtime_udp_session_listener(
+    net_ns: &NetNS,
     url: url::Url,
     request: UdpSessionListenRequest,
     accept_kind: UdpSessionAcceptKind,
 ) -> std::io::Result<RuntimeUdpSessionSocketListener> {
-    let runtime = native_host_runtime().net_ns(&request.bind.context)?;
+    let runtime = crate::host_runtime::net_ns_services(net_ns)?;
     Ok(UdpSessionSocketListener::new_with_request(
         url,
         request,
@@ -128,12 +130,14 @@ impl VirtualUdpSocket for RuntimeUdpSocket {
     }
 }
 
-#[derive(Debug, Clone, Copy, Default)]
-pub(crate) struct RuntimeUdpSocketFactory;
+#[derive(Debug, Clone)]
+pub(crate) struct RuntimeUdpSocketFactory {
+    net_ns: NetNS,
+}
 
 impl RuntimeUdpSocketFactory {
-    pub(crate) fn new() -> Self {
-        Self
+    pub(crate) fn new(net_ns: NetNS) -> Self {
+        Self { net_ns }
     }
 }
 
@@ -141,13 +145,9 @@ impl RuntimeUdpSocketFactory {
 impl VirtualUdpSocketFactory for RuntimeUdpSocketFactory {
     type Socket = RuntimeUdpSocket;
 
-    async fn bind_udp(&self, mut options: BindConfig) -> anyhow::Result<Arc<Self::Socket>> {
-        if options.context.net_ns.is_none() {
-            options.context.net_ns =
-                Some(crate::host_runtime::native_host_runtime().capture_default_net_ns()?);
-        }
+    async fn bind_udp(&self, options: BindConfig) -> anyhow::Result<Arc<Self::Socket>> {
         let context = options.context.clone();
-        let socket = crate::socket::bind::<UdpSocket>(options).await?;
+        let socket = crate::socket::bind::<UdpSocket>(&self.net_ns, options).await?;
         Ok(Arc::new(RuntimeUdpSocket::new_with_context(
             Arc::new(socket),
             context,
@@ -166,13 +166,14 @@ mod tests {
     };
     use std::net::Ipv4Addr;
 
-    use crate::host_runtime::native_host_runtime;
+    use crate::host_runtime::process_default_services;
 
     use super::*;
 
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn runtime_udp_bind_rejects_occupied_port() {
+        let net_ns = crate::common::net_ns::process_default().unwrap();
         for local_addr in ["0.0.0.0:0", "[::]:0"] {
             let local_addr = local_addr.parse().unwrap();
             for need_protect in [true, false] {
@@ -182,7 +183,7 @@ mod tests {
                     need_protect,
                     ..BindConfig::default()
                 };
-                let listener = crate::socket::bind::<UdpSocket>(bind.clone())
+                let listener = crate::socket::bind::<UdpSocket>(&net_ns, bind.clone())
                     .await
                     .unwrap();
                 let occupied = BindConfig {
@@ -191,10 +192,13 @@ mod tests {
                 };
 
                 for reuse_addr in [false, true] {
-                    let error = crate::socket::bind::<UdpSocket>(BindConfig {
-                        reuse_addr: Some(reuse_addr),
-                        ..occupied.clone()
-                    })
+                    let error = crate::socket::bind::<UdpSocket>(
+                        &net_ns,
+                        BindConfig {
+                            reuse_addr: Some(reuse_addr),
+                            ..occupied.clone()
+                        },
+                    )
                     .await
                     .expect_err("another socket must not share a bound receive endpoint");
                     assert!(matches!(
@@ -205,13 +209,16 @@ mod tests {
                 }
 
                 drop(listener);
-                crate::socket::bind::<UdpSocket>(occupied).await.unwrap();
+                crate::socket::bind::<UdpSocket>(&net_ns, occupied)
+                    .await
+                    .unwrap();
             }
         }
     }
 
     #[tokio::test]
     async fn runtime_udp_listeners_keep_ephemeral_ports_and_packets_separate() {
+        let net_ns = crate::common::net_ns::process_default().unwrap();
         for (bind_addr, loopback) in [
             ("0.0.0.0:0", "127.0.0.1".parse::<IpAddr>().unwrap()),
             ("[::]:0", "::1".parse::<IpAddr>().unwrap()),
@@ -227,7 +234,7 @@ mod tests {
             let mut ports = std::collections::HashSet::new();
             for index in 0..128 {
                 let bind = binds[index % binds.len()].clone();
-                let listener = crate::socket::bind::<UdpSocket>(bind.clone())
+                let listener = crate::socket::bind::<UdpSocket>(&net_ns, bind.clone())
                     .await
                     .unwrap();
                 assert!(ports.insert(listener.local_addr().unwrap().port()));
@@ -266,10 +273,11 @@ mod tests {
                     reuse_addr: reuse,
                     ..BindConfig::default()
                 };
-                let socket = RuntimeUdpSocketFactory::new()
-                    .bind_udp(options)
-                    .await
-                    .unwrap();
+                let socket =
+                    RuntimeUdpSocketFactory::new(crate::common::net_ns::process_default().unwrap())
+                        .bind_udp(options)
+                        .await
+                        .unwrap();
                 assert_eq!(
                     socket2::SockRef::from(socket.socket.as_ref())
                         .reuse_address()
@@ -282,7 +290,8 @@ mod tests {
 
     #[tokio::test]
     async fn factory_reserves_udp_port_when_reuse_is_explicitly_disabled() {
-        let factory = RuntimeUdpSocketFactory::new();
+        let factory =
+            RuntimeUdpSocketFactory::new(crate::common::net_ns::process_default().unwrap());
         let bind = BindConfig {
             bind_device: Some("".into()),
             reuse_addr: Some(false),
@@ -313,17 +322,18 @@ mod tests {
             easytier_core::socket::IpVersion::V4,
             easytier_core::socket::IpVersion::V6,
         ] {
-            let socket = RuntimeUdpSocketFactory::new()
-                .bind_udp(BindConfig {
-                    reuse_addr: Some(false),
-                    context: easytier_core::socket::SocketContext {
-                        ip_version: family,
-                        ..SocketContext::default()
-                    },
-                    ..BindConfig::default()
-                })
-                .await
-                .unwrap();
+            let socket =
+                RuntimeUdpSocketFactory::new(crate::common::net_ns::process_default().unwrap())
+                    .bind_udp(BindConfig {
+                        reuse_addr: Some(false),
+                        context: easytier_core::socket::SocketContext {
+                            ip_version: family,
+                            ..SocketContext::default()
+                        },
+                        ..BindConfig::default()
+                    })
+                    .await
+                    .unwrap();
             assert_eq!(
                 socket.local_addr().unwrap().is_ipv6(),
                 family == easytier_core::socket::IpVersion::V6
@@ -407,6 +417,7 @@ mod tests {
     async fn runtime_v4_hole_punch_control_packet_is_forwarded() {
         let local_addr = SocketAddr::from(([0, 0, 0, 0], 0));
         let mut listener = new_runtime_udp_session_listener(
+            &crate::common::net_ns::process_default().unwrap(),
             "udp://0.0.0.0:0".parse().unwrap(),
             UdpSessionListenRequest::new(BindConfig {
                 local_addr: Some(local_addr),
@@ -418,7 +429,7 @@ mod tests {
         listener.listen().await.unwrap();
 
         let receiver = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let runtime = native_host_runtime();
+        let runtime = process_default_services().unwrap();
         send_v4_hole_punch_control_packet(
             runtime.as_ref(),
             SocketContext::default(),
@@ -445,6 +456,7 @@ mod tests {
     async fn runtime_v6_hole_punch_control_packet_is_forwarded() {
         let local_addr = "[::]:0".parse().unwrap();
         let mut listener = new_runtime_udp_session_listener(
+            &crate::common::net_ns::process_default().unwrap(),
             "udp://[::]:0".parse().unwrap(),
             UdpSessionListenRequest::new(BindConfig {
                 local_addr: Some(local_addr),
@@ -456,7 +468,7 @@ mod tests {
         listener.listen().await.unwrap();
 
         let receiver = UdpSocket::bind("[::]:0").await.unwrap();
-        let runtime = native_host_runtime();
+        let runtime = process_default_services().unwrap();
         send_v6_hole_punch_control_packet(
             runtime.as_ref(),
             SocketContext::default(),

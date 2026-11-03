@@ -15,10 +15,18 @@ pub(crate) struct NativeInstanceExecutor {
 
 impl NativeInstanceExecutor {
     pub(crate) fn new(multi_thread: bool, thread_count: u32) -> anyhow::Result<Self> {
+        Self::with_thread_name("easytier-instance", multi_thread, thread_count)
+    }
+
+    pub(crate) fn with_thread_name(
+        thread_name: &str,
+        multi_thread: bool,
+        thread_count: u32,
+    ) -> anyhow::Result<Self> {
         let (ready_tx, ready_rx) = mpsc::sync_channel(1);
         let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
         std::thread::Builder::new()
-            .name("easytier-instance".to_owned())
+            .name(thread_name.to_owned())
             .spawn(move || {
                 let mut builder = if multi_thread {
                     let mut builder = Builder::new_multi_thread();

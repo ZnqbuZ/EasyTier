@@ -519,7 +519,6 @@ mod tests {
     fn udp_proxy_bind_options_preserve_the_datagram_context() {
         let context = SocketContext {
             socket_mark: Some(73),
-            net_ns: Some(crate::socket::NetNS::from_host_reference("udp-proxy")),
             ..SocketContext::default()
         };
 
@@ -527,14 +526,6 @@ mod tests {
 
         assert_eq!(options.context.ip_version, IpVersion::V4);
         assert_eq!(options.context.socket_mark, Some(73));
-        assert_eq!(
-            options
-                .context
-                .net_ns
-                .as_ref()
-                .map(|net_ns| net_ns.host_reference().unwrap()),
-            Some("udp-proxy")
-        );
         assert_eq!(options.reuse_addr, None);
         assert_eq!(options.bind_device.as_deref(), Some(""));
     }

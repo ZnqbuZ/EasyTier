@@ -104,16 +104,14 @@ pub(crate) async fn search_gateway(options: SearchOptions) -> Result<Gateway, Se
 }
 
 async fn search_gateway_inner(options: SearchOptions) -> Result<Gateway, SearchError> {
+    let net_ns = crate::common::net_ns::current().map_err(SearchError::Io)?;
     let bind_options = BindConfig {
-        context: SocketContext {
-            net_ns: Some(crate::common::net_ns::current().map_err(SearchError::Io)?),
-            ..SocketContext::default()
-        },
+        context: SocketContext::default(),
         reuse_addr: Some(false),
         local_addr: Some(options.bind_addr),
         ..BindConfig::default()
     };
-    let socket = RuntimeUdpSocketFactory::new()
+    let socket = RuntimeUdpSocketFactory::new(net_ns.clone())
         .bind_udp(bind_options)
         .await
         .map_err(|error| SearchError::Io(std::io::Error::other(error.to_string())))?;
@@ -216,12 +214,11 @@ async fn send_http_request_inner(
     soap_action: Option<&str>,
     body: String,
 ) -> Result<Bytes, HttpTransportError> {
+    let net_ns = crate::common::net_ns::current().map_err(TunnelError::from)?;
     let stream = connect_tcp(
+        &net_ns,
         TcpConnectOptions::direct_connect(addr).with_bind(BindConfig {
-            context: SocketContext {
-                net_ns: Some(crate::common::net_ns::current().map_err(TunnelError::from)?),
-                ..SocketContext::default()
-            },
+            context: SocketContext::default(),
             ..BindConfig::default()
         }),
     )

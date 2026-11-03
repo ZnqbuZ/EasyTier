@@ -115,7 +115,7 @@ impl SystemDnsResolver {
                 .await
                 .context("system DNS lookup slot closed")?;
             crate::host_runtime::native_host_runtime()
-                .shared_executor()?
+                .service_executor()?
                 .spawn(async move {
                     let _permit = permit;
                     system_lookup.await
@@ -152,18 +152,19 @@ struct RuntimeDnsIoContext {
 
 impl RuntimeDnsIoContext {
     fn from_socket_context(context: &SocketContext, net_ns: &NetNS) -> std::io::Result<Self> {
-        let mut normalized = context.clone();
-        crate::host_runtime::normalize_context(&mut normalized, net_ns)?;
+        // Admission applies even to queries answered without I/O, such as IP literals.
+        if net_ns.is_closed() {
+            return Err(std::io::Error::other("network namespace is closing"));
+        }
         Ok(Self {
             net_ns: net_ns.clone(),
-            socket_mark: normalized.socket_mark,
+            socket_mark: context.socket_mark,
         })
     }
 
     #[cfg(feature = "dns-resolver")]
     fn socket_context(&self) -> SocketContext {
         SocketContext {
-            net_ns: Some(self.net_ns.clone()),
             socket_mark: self.socket_mark,
             ..SocketContext::default()
         }
@@ -205,24 +206,28 @@ impl RuntimeProvider for RuntimeDnsIoProvider {
         wait_for: Option<Duration>,
     ) -> Pin<Box<dyn Send + Future<Output = io::Result<Self::Tcp>>>> {
         let socket_context = self.context.socket_context();
+        let net_ns = self.context.net_ns.clone();
         Box::pin(async move {
             let wait_for = wait_for.unwrap_or(Duration::from_secs(5));
             let connect = async {
-                let socket = crate::socket::bind::<TcpSocket>(BindConfig {
-                    local_addr: bind_addr,
-                    bind_device: Some("".into()),
-                    context: SocketContext {
-                        ip_version: if server_addr.is_ipv6() {
-                            easytier_core::socket::IpVersion::V6
-                        } else {
-                            easytier_core::socket::IpVersion::V4
+                let socket = crate::socket::bind::<TcpSocket>(
+                    &net_ns,
+                    BindConfig {
+                        local_addr: bind_addr,
+                        bind_device: Some("".into()),
+                        context: SocketContext {
+                            ip_version: if server_addr.is_ipv6() {
+                                easytier_core::socket::IpVersion::V6
+                            } else {
+                                easytier_core::socket::IpVersion::V4
+                            },
+                            ..socket_context
                         },
-                        ..socket_context
+                        reuse_addr: Some(false),
+                        need_protect: true,
+                        ..BindConfig::default()
                     },
-                    reuse_addr: Some(false),
-                    need_protect: true,
-                    ..BindConfig::default()
-                })
+                )
                 .await
                 .map_err(io::Error::other)?;
                 socket.connect(server_addr).await
@@ -244,15 +249,19 @@ impl RuntimeProvider for RuntimeDnsIoProvider {
         _server_addr: SocketAddr,
     ) -> Pin<Box<dyn Send + Future<Output = io::Result<Self::Udp>>>> {
         let socket_context = self.context.socket_context();
+        let net_ns = self.context.net_ns.clone();
         Box::pin(async move {
-            crate::socket::bind::<UdpSocket>(BindConfig {
-                local_addr: Some(local_addr),
-                bind_device: Some("".into()),
-                context: socket_context,
-                reuse_addr: Some(false),
-                need_protect: true,
-                ..BindConfig::default()
-            })
+            crate::socket::bind::<UdpSocket>(
+                &net_ns,
+                BindConfig {
+                    local_addr: Some(local_addr),
+                    bind_device: Some("".into()),
+                    context: socket_context,
+                    reuse_addr: Some(false),
+                    need_protect: true,
+                    ..BindConfig::default()
+                },
+            )
             .await
             .map_err(io::Error::other)
         })
@@ -273,7 +282,7 @@ impl RuntimeDnsResolver {
     fn requires_socket_dns(context: &RuntimeDnsIoContext) -> std::io::Result<bool> {
         Ok(context.socket_mark.is_some()
             || crate::socket_protector::native_socket_protection_available()
-            || !crate::host_runtime::native_host_runtime().is_process_default(&context.net_ns)?)
+            || !crate::common::net_ns::is_process_default(&context.net_ns)?)
     }
     pub(crate) fn in_net_ns(net_ns: NetNS) -> Self {
         Self {
@@ -442,9 +451,8 @@ pub(crate) async fn socket_addrs_in_net_ns(
     url: &url::Url,
     default_port: u16,
     net_ns: NetNS,
-    mut context: SocketContext,
+    context: SocketContext,
 ) -> Result<Vec<SocketAddr>, Error> {
-    crate::host_runtime::normalize_context(&mut context, &net_ns)?;
     let port = url.port().unwrap_or(default_port);
     let addresses = match url
         .host()
@@ -592,19 +600,11 @@ mod tests {
         let net_ns = crate::common::net_ns::current().unwrap();
         let context = SocketContext {
             socket_mark: Some(0),
-            net_ns: Some(net_ns.clone()),
             ..SocketContext::default()
         };
         let actual = RuntimeDnsIoContext::from_socket_context(&context, &net_ns).unwrap();
         assert_eq!(actual.net_ns.id(), net_ns.id());
         assert_eq!(actual.socket_mark, Some(0));
-        let named = SocketContext {
-            net_ns: Some(easytier_core::socket::NetNS::from_host_reference(
-                "instance-a",
-            )),
-            ..SocketContext::default()
-        };
-        assert!(RuntimeDnsIoContext::from_socket_context(&named, &net_ns).is_err());
     }
 
     #[tokio::test]
@@ -630,11 +630,10 @@ mod tests {
     #[test]
     #[ignore = "run inside an isolated user+network namespace"]
     fn non_default_domains_cannot_use_process_wide_nss() {
-        let host = crate::host_runtime::native_host_runtime();
-        let original = host.capture_default_net_ns().unwrap();
+        let original = crate::common::net_ns::process_default().unwrap();
         let other = crate::common::net_ns::tests::isolated_net_ns_for_test().unwrap();
-        assert!(host.is_process_default(&original).unwrap());
-        assert!(!host.is_process_default(&other).unwrap());
+        assert!(crate::common::net_ns::is_process_default(&original).unwrap());
+        assert!(!crate::common::net_ns::is_process_default(&other).unwrap());
         let context =
             RuntimeDnsIoContext::from_socket_context(&SocketContext::default(), &other).unwrap();
         assert!(RuntimeDnsResolver::requires_socket_dns(&context).unwrap());

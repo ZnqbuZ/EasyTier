@@ -37,7 +37,7 @@ pub(crate) type ArcSharedVirtualNicRegistry = Arc<Mutex<SharedVirtualNicRegistry
 // The host owns this driver independently of all instance runtimes.
 fn shared_virtual_nic_runtime() -> tokio::runtime::Handle {
     crate::host_runtime::native_host_runtime()
-        .shared_executor()
+        .service_executor()
         .expect("native shared executor is unavailable")
 }
 
@@ -535,7 +535,7 @@ impl Drop for SharedVirtualNicMemberRegistration {
         let member_id = self.member_id;
         let registration_id = self.registration_id;
 
-        let Ok(shared) = crate::host_runtime::native_host_runtime().shared_executor() else {
+        let Ok(shared) = crate::host_runtime::native_host_runtime().service_executor() else {
             // Global shutdown already stopped the dispatcher and its actual I/O.
             // Late registration destruction must not panic or restart a driver.
             return;

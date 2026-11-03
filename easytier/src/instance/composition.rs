@@ -53,7 +53,7 @@ pub(super) fn compose_native_core_instance(
     compact_runtime: bool,
     executor: Option<Arc<NativeInstanceExecutor>>,
 ) -> anyhow::Result<Arc<NativeCoreInstance>> {
-    let mut host_config = if compact_runtime {
+    let host_config = if compact_runtime {
         compact_runtime_core_host_config()
     } else {
         runtime_core_host_config()
@@ -69,7 +69,6 @@ pub(super) fn compose_native_core_instance(
             }
         },
     })?;
-    host_config.net_ns = Some(net_ns.clone());
     let normalized = CoreInstanceConfig::from_toml_with_host(&toml_config, &host_config)?;
     let global_ctx = Arc::new(GlobalCtx::new_with_runtime_config(
         toml_config.clone(),
@@ -236,13 +235,12 @@ fn runtime_core_host_adapters_with_packet_egress_and_config(
 fn configure_runtime_core_host_adapters(
     global_ctx: ArcGlobalCtx,
     mut adapters: CoreHostAdapters<NativeInstanceHost>,
-    mut host_config: easytier_core::instance::CoreInstanceHostConfig,
+    host_config: easytier_core::instance::CoreInstanceHostConfig,
 ) -> CoreHostAdapters<NativeInstanceHost> {
     #[cfg(test)]
     adapters.replace_stun_provider(Arc::new(crate::common::stun::MockStunInfoCollector {
         udp_nat_type: crate::proto::common::NatType::Unknown,
     }));
-    host_config.net_ns = Some(global_ctx.net_ns.clone());
     adapters.config = host_config.clone();
     adapters.credential_storage = (!host_config.ignore_unsupported_config)
         .then(|| runtime_peer_credential_storage(&global_ctx))

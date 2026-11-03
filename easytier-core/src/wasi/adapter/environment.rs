@@ -18,7 +18,15 @@ use crate::{
 };
 
 #[derive(Default)]
-pub struct WasiHostConnectorEnvironmentIo;
+pub struct WasiHostConnectorEnvironmentIo {
+    net_ns: Option<String>,
+}
+
+impl WasiHostConnectorEnvironmentIo {
+    pub fn new(net_ns: Option<String>) -> Self {
+        Self { net_ns }
+    }
+}
 
 impl HostConnectorEnvironmentIo for WasiHostConnectorEnvironmentIo {
     fn submit_local_addr_for_remote(
@@ -28,7 +36,7 @@ impl HostConnectorEnvironmentIo for WasiHostConnectorEnvironmentIo {
         context: &SocketContext,
     ) -> io::Result<()> {
         let encoded = encode_socket_address(remote_addr);
-        let encoded_context = encode_socket_context(context)?;
+        let encoded_context = encode_socket_context(context, self.net_ns.as_deref())?;
         status("start_local_addr_for_remote", unsafe {
             start_local_addr_for_remote(
                 operation.0,

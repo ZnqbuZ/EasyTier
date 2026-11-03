@@ -10,18 +10,21 @@ use easytier_core::{
 };
 
 use crate::{
-    host_runtime::{NativeHostRuntime, native_host_runtime},
+    host_runtime::{NativeNetNSServices, process_default_services},
     tunnel::TunnelUrl,
 };
 
 pub use easytier_core::rpc::standalone::{RpcServerHook, StandAloneServer};
 
-pub type RuntimeRpcDialer = TcpTunnelDialer<NativeHostRuntime>;
-pub type RuntimeRpcListener = TcpTunnelListener<NativeHostRuntime>;
+const DEFAULT_NS: &str = "process default network namespace is unavailable";
+
+pub type RuntimeRpcDialer = TcpTunnelDialer<NativeNetNSServices>;
+pub type RuntimeRpcListener = TcpTunnelListener<NativeNetNSServices>;
 pub type RuntimeRpcClient = StandAloneClient<RuntimeRpcDialer>;
 
 pub fn runtime_rpc_dialer(remote_url: url::Url) -> RuntimeRpcDialer {
-    TcpTunnelDialer::new(remote_url, native_host_runtime(), native_host_runtime())
+    let runtime = process_default_services().expect(DEFAULT_NS);
+    TcpTunnelDialer::new(remote_url, runtime.clone(), runtime)
 }
 
 pub fn runtime_rpc_client(remote_url: url::Url) -> RuntimeRpcClient {
@@ -36,11 +39,13 @@ pub fn runtime_rpc_listener(local_addr: std::net::SocketAddr) -> RuntimeRpcListe
         need_protect: false,
         ..BindConfig::default()
     };
-    TcpTunnelListener::new_with_bind(local_addr, bind, native_host_runtime())
+    let runtime = process_default_services().expect(DEFAULT_NS);
+    TcpTunnelListener::new_with_bind(local_addr, bind, runtime)
 }
 
 pub fn runtime_udp_tunnel_dialer(remote_url: url::Url) -> impl TunnelDialer {
-    UdpTunnelDialer::new(remote_url, native_host_runtime(), native_host_runtime())
+    let runtime = process_default_services().expect(DEFAULT_NS);
+    UdpTunnelDialer::new(remote_url, runtime.clone(), runtime)
 }
 
 pub fn runtime_udp_tunnel_listener(
@@ -53,11 +58,8 @@ pub fn runtime_udp_tunnel_listener(
         only_v6: true,
         ..BindConfig::default()
     };
-    UdpTunnelListener::new_with_request(
-        local_url,
-        UdpSessionListenRequest::new(bind),
-        native_host_runtime(),
-    )
+    let runtime = process_default_services().expect(DEFAULT_NS);
+    UdpTunnelListener::new_with_request(local_url, UdpSessionListenRequest::new(bind), runtime)
 }
 
 #[cfg(test)]

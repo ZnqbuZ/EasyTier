@@ -15,7 +15,7 @@ use std::{
 };
 
 use crate::{
-    common::global_ctx::ArcGlobalCtx, host_runtime::native_host_runtime,
+    common::global_ctx::ArcGlobalCtx, host_runtime::NativeNetNSServices,
     socket::udp::RuntimeUdpSocket,
 };
 use anyhow::Context as _;
@@ -44,6 +44,7 @@ use self::engine::{DerivedClient, PortalEngine};
 struct PortalSocket {
     socket: tokio::sync::RwLock<Option<Arc<RuntimeUdpSocket>>>,
     options: BindConfig,
+    runtime: Arc<NativeNetNSServices>,
 }
 
 impl PortalSocket {
@@ -62,7 +63,7 @@ impl PortalSocket {
         self.socket.write().await.take();
         loop {
             easytier_core::socket::retry::wait().await;
-            match native_host_runtime().bind_udp(self.options.clone()).await {
+            match self.runtime.bind_udp(self.options.clone()).await {
                 Ok(socket) => {
                     *self.socket.write().await = Some(socket);
                     return;
@@ -241,7 +242,6 @@ impl WireGuardPortalHost {
     ) -> anyhow::Result<Arc<PortalSocket>> {
         let context = SocketContext {
             socket_mark: self.global_ctx.get_flags().socket_mark,
-            net_ns: Some(self.global_ctx.net_ns.clone()),
             ..SocketContext::default()
         };
         let mut options = BindConfig {
@@ -250,11 +250,13 @@ impl WireGuardPortalHost {
             only_v6,
             ..BindConfig::default()
         };
-        let socket = native_host_runtime().bind_udp(options.clone()).await?;
+        let runtime = crate::host_runtime::net_ns_services(&self.global_ctx.net_ns)?;
+        let socket = runtime.bind_udp(options.clone()).await?;
         options.local_addr = Some(socket.local_addr()?);
         Ok(Arc::new(PortalSocket {
             socket: tokio::sync::RwLock::new(Some(socket)),
             options,
+            runtime,
         }))
     }
 
@@ -449,16 +451,15 @@ mod tests {
             need_protect: false,
             ..BindConfig::default()
         };
-        let initial = native_host_runtime()
-            .bind_udp(options.clone())
-            .await
-            .unwrap();
+        let runtime = crate::host_runtime::process_default_services().unwrap();
+        let initial = runtime.bind_udp(options.clone()).await.unwrap();
         let local = initial.local_addr().unwrap();
         options.local_addr = Some(local);
         let old_socket = Arc::downgrade(&initial);
         let socket = Arc::new(PortalSocket {
             socket: tokio::sync::RwLock::new(Some(initial)),
             options,
+            runtime,
         });
         let endpoint = socket.clone();
         let mut rebind = Box::pin(socket.rebind());

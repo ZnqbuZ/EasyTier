@@ -141,8 +141,9 @@ mod tests {
         TEST_SOCKET_PROTECTOR
             .scope(protector.clone(), async {
                 let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let net_ns = crate::common::net_ns::process_default().unwrap();
                 let options = TcpConnectOptions::direct_connect(listener.local_addr().unwrap());
-                let connect = crate::socket::tcp::connect_tcp(options);
+                let connect = crate::socket::tcp::connect_tcp(&net_ns, options);
                 tokio::pin!(connect);
                 assert!(futures::poll!(&mut connect).is_pending());
                 assert_eq!(protector.calls.load(Ordering::SeqCst), 1);
@@ -164,26 +165,33 @@ mod tests {
         TEST_SOCKET_PROTECTOR
             .scope(protector.clone(), async {
                 let local = "127.0.0.1:0".parse().unwrap();
+                let net_ns = crate::common::net_ns::process_default().unwrap();
                 assert!(
-                    crate::socket::bind::<tokio::net::TcpSocket>(BindConfig {
-                        local_addr: Some(local),
-                        need_protect: true,
-                        ..BindConfig::default()
-                    },)
+                    crate::socket::bind::<tokio::net::TcpSocket>(
+                        &net_ns,
+                        BindConfig {
+                            local_addr: Some(local),
+                            need_protect: true,
+                            ..BindConfig::default()
+                        },
+                    )
                     .await
                     .is_err()
                 );
                 assert!(
-                    crate::socket::tcp::bind_tcp_listener(TcpListenOptions::direct_connect(local))
-                        .await
-                        .is_err()
+                    crate::socket::tcp::bind_tcp_listener(
+                        &net_ns,
+                        TcpListenOptions::direct_connect(local),
+                    )
+                    .await
+                    .is_err()
                 );
                 let udp = BindConfig {
                     reuse_addr: Some(false),
                     local_addr: Some(local),
                     ..BindConfig::default()
                 };
-                let udp_factory = RuntimeUdpSocketFactory::new();
+                let udp_factory = RuntimeUdpSocketFactory::new(net_ns.clone());
                 assert!(udp_factory.bind_udp(udp.clone()).await.is_err());
                 assert_eq!(protector.calls.load(Ordering::SeqCst), 3);
 
@@ -193,7 +201,7 @@ mod tests {
                     TcpListenOptions::port_forward(local),
                     TcpListenOptions::port_lease(local),
                 ] {
-                    let listener = crate::socket::tcp::bind_tcp_listener(options)
+                    let listener = crate::socket::tcp::bind_tcp_listener(&net_ns, options)
                         .await
                         .unwrap();
                     let connect = TcpConnectOptions::direct_connect(listener.local_addr().unwrap())
@@ -201,7 +209,9 @@ mod tests {
                             need_protect: false,
                             ..BindConfig::default()
                         });
-                    let _client = crate::socket::tcp::connect_tcp(connect).await.unwrap();
+                    let _client = crate::socket::tcp::connect_tcp(&net_ns, connect)
+                        .await
+                        .unwrap();
                     listener.accept().await.unwrap();
                 }
                 udp_factory
@@ -226,9 +236,11 @@ mod tests {
         let protector = GateProtector::new(false, false);
         TEST_SOCKET_PROTECTOR
             .scope(protector.clone(), async {
-                let bind = crate::socket::tcp::bind_tcp_listener(TcpListenOptions::direct_connect(
-                    "127.0.0.1:0".parse().unwrap(),
-                ));
+                let net_ns = crate::common::net_ns::process_default().unwrap();
+                let bind = crate::socket::tcp::bind_tcp_listener(
+                    &net_ns,
+                    TcpListenOptions::direct_connect("127.0.0.1:0".parse().unwrap()),
+                );
                 tokio::pin!(bind);
                 assert!(futures::poll!(&mut bind).is_pending());
                 assert_eq!(protector.calls.load(Ordering::SeqCst), 1);

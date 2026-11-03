@@ -13,6 +13,8 @@ use easytier_core::{
 use tokio::io;
 use tokio::net::{TcpListener, TcpSocket, UdpSocket};
 
+use crate::common::net_ns::NetNS;
+
 fn get_interface_name_by_ip(local_ip: &IpAddr) -> Option<String> {
     if local_ip.is_unspecified() || local_ip.is_multicast() {
         return None;
@@ -96,8 +98,11 @@ impl Bindable for UdpSocket {
 /// selection to connect while UDP binds an ephemeral source port.
 /// Protection completes before bind/listen; namespace guards never cross an
 /// await. Failures drop the unbound socket instead of allowing early I/O.
-pub(crate) async fn bind<B: Bindable>(config: BindConfig) -> Result<B, TunnelError> {
-    let net_ns = crate::host_runtime::native_host_runtime().net_ns(&config.context)?;
+/// All synchronous socket setup runs inside `net_ns`.
+pub(crate) async fn bind<B: Bindable>(
+    net_ns: &NetNS,
+    config: BindConfig,
+) -> Result<B, TunnelError> {
     let BindConfig {
         context,
         need_protect,
@@ -223,6 +228,7 @@ mod tests {
 
     #[tokio::test]
     async fn bind_tcp_uses_configured_family_and_preserves_optional_source_binding_and_options() {
+        let net_ns = crate::common::net_ns::process_default().unwrap();
         for ip in ["127.0.0.1", "::1"] {
             let ip: std::net::IpAddr = ip.parse().unwrap();
             let listener = TcpListener::bind((ip, 0)).await.unwrap();
@@ -233,22 +239,25 @@ mod tests {
                 (Some(std::net::SocketAddr::new(ip, 0)), None),
                 (Some(std::net::SocketAddr::new(ip, 0)), Some(false)),
             ] {
-                let socket = bind::<TcpSocket>(BindConfig {
-                    context: SocketContext {
-                        ip_version: if ip.is_ipv6() {
-                            IpVersion::V6
-                        } else {
-                            IpVersion::V4
+                let socket = bind::<TcpSocket>(
+                    &net_ns,
+                    BindConfig {
+                        context: SocketContext {
+                            ip_version: if ip.is_ipv6() {
+                                IpVersion::V6
+                            } else {
+                                IpVersion::V4
+                            },
+                            ..SocketContext::default()
                         },
-                        ..SocketContext::default()
+                        local_addr,
+                        bind_device: Some("".into()),
+                        only_v6: ip.is_ipv6(),
+                        reuse_addr,
+                        reuse_port: true,
+                        ..BindConfig::default()
                     },
-                    local_addr,
-                    bind_device: Some("".into()),
-                    only_v6: ip.is_ipv6(),
-                    reuse_addr,
-                    reuse_port: true,
-                    ..BindConfig::default()
-                })
+                )
                 .await
                 .unwrap();
 
@@ -278,6 +287,7 @@ mod tests {
 
     #[tokio::test]
     async fn bind_rejects_occupied_ports() {
+        let net_ns = crate::common::net_ns::process_default().unwrap();
         for ip in ["127.0.0.1", "::1"] {
             let ip: std::net::IpAddr = ip.parse().unwrap();
             let occupied_udp = std::net::UdpSocket::bind((ip, 0)).unwrap();
@@ -286,22 +296,31 @@ mod tests {
             let tcp_addr = occupied_tcp.local_addr().unwrap();
 
             for error in [
-                bind::<UdpSocket>(BindConfig {
-                    local_addr: Some(udp_addr),
-                    ..BindConfig::default()
-                })
+                bind::<UdpSocket>(
+                    &net_ns,
+                    BindConfig {
+                        local_addr: Some(udp_addr),
+                        ..BindConfig::default()
+                    },
+                )
                 .await
                 .unwrap_err(),
-                bind::<TcpSocket>(BindConfig {
-                    local_addr: Some(tcp_addr),
-                    ..BindConfig::default()
-                })
+                bind::<TcpSocket>(
+                    &net_ns,
+                    BindConfig {
+                        local_addr: Some(tcp_addr),
+                        ..BindConfig::default()
+                    },
+                )
                 .await
                 .unwrap_err(),
-                bind::<TcpListener>(BindConfig {
-                    local_addr: Some(tcp_addr),
-                    ..BindConfig::default()
-                })
+                bind::<TcpListener>(
+                    &net_ns,
+                    BindConfig {
+                        local_addr: Some(tcp_addr),
+                        ..BindConfig::default()
+                    },
+                )
                 .await
                 .unwrap_err(),
             ] {
@@ -316,26 +335,36 @@ mod tests {
     #[tokio::test]
     async fn bind_rejects_nonlocal_ipv6_address() {
         let addr = "[2001:db8::ffff]:0".parse().unwrap();
+        let net_ns = crate::common::net_ns::process_default().unwrap();
         for error in [
-            bind::<UdpSocket>(BindConfig {
-                local_addr: Some(addr),
-                bind_device: Some("".into()),
-                ..BindConfig::default()
-            })
+            bind::<UdpSocket>(
+                &net_ns,
+                BindConfig {
+                    local_addr: Some(addr),
+                    bind_device: Some("".into()),
+                    ..BindConfig::default()
+                },
+            )
             .await
             .unwrap_err(),
-            bind::<TcpSocket>(BindConfig {
-                local_addr: Some(addr),
-                bind_device: Some("".into()),
-                ..BindConfig::default()
-            })
+            bind::<TcpSocket>(
+                &net_ns,
+                BindConfig {
+                    local_addr: Some(addr),
+                    bind_device: Some("".into()),
+                    ..BindConfig::default()
+                },
+            )
             .await
             .unwrap_err(),
-            bind::<TcpListener>(BindConfig {
-                local_addr: Some(addr),
-                bind_device: Some("".into()),
-                ..BindConfig::default()
-            })
+            bind::<TcpListener>(
+                &net_ns,
+                BindConfig {
+                    local_addr: Some(addr),
+                    bind_device: Some("".into()),
+                    ..BindConfig::default()
+                },
+            )
             .await
             .unwrap_err(),
         ] {
@@ -357,11 +386,15 @@ mod tests {
         use std::net::SocketAddr;
 
         let addr: SocketAddr = "0.0.0.0:0".parse().unwrap();
-        let _err = bind::<UdpSocket>(BindConfig {
-            local_addr: Some(addr),
-            bind_device: Some("et/invalid-device-name".into()),
-            ..BindConfig::default()
-        })
+        let net_ns = crate::common::net_ns::process_default().unwrap();
+        let _err = bind::<UdpSocket>(
+            &net_ns,
+            BindConfig {
+                local_addr: Some(addr),
+                bind_device: Some("et/invalid-device-name".into()),
+                ..BindConfig::default()
+            },
+        )
         .await
         .expect_err("custom device must not be skipped for unspecified bind addr");
     }

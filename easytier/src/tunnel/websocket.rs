@@ -310,16 +310,20 @@ impl WsTunnelListener {
         self.listener = None;
 
         let addr = SocketAddr::from_url(self.addr.clone(), IpVersion::Both).await?;
-        let listener = crate::socket::bind::<TcpListener>(BindConfig {
-            local_addr: Some(addr),
-            only_v6: true,
-            context: SocketContext {
-                socket_mark: self.socket_mark,
-                ..SocketContext::default()
+        let net_ns = crate::common::net_ns::process_default()?;
+        let listener = crate::socket::bind::<TcpListener>(
+            &net_ns,
+            BindConfig {
+                local_addr: Some(addr),
+                only_v6: true,
+                context: SocketContext {
+                    socket_mark: self.socket_mark,
+                    ..SocketContext::default()
+                },
+                need_protect: false,
+                ..BindConfig::default()
             },
-            need_protect: false,
-            ..BindConfig::default()
-        })
+        )
         .await?;
 
         self.addr

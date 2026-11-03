@@ -122,7 +122,6 @@ impl PublicIpv6Host for GlobalCtx {
     ) -> HashSet<Ipv6Addr> {
         let context = SocketContext {
             socket_mark: self.get_flags().socket_mark,
-            net_ns: Some(self.net_ns.clone()),
             ..SocketContext::default()
         };
         let ip_list = crate::host_runtime::net_ns_services(&self.net_ns)

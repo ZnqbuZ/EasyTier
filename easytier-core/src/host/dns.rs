@@ -311,7 +311,6 @@ mod tests {
             SocketContext {
                 ip_version,
                 socket_mark: Some(7),
-                net_ns: None,
             },
         )
     }

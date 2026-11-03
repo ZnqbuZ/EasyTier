@@ -399,14 +399,16 @@ impl FakeTcpSocketListener {
         .into_iter()
         .next()
         .ok_or_else(|| TunnelError::InvalidAddr(self.addr.to_string()))?;
-        let os_listener = crate::socket::bind::<TcpListener>(BindConfig {
-            local_addr: Some(bind_addr),
-            context: SocketContext {
-                net_ns: Some(self.net_ns.clone()),
-                ..self.context.clone()
+        let os_listener = crate::socket::bind::<TcpListener>(
+            &self.net_ns,
+            BindConfig {
+                local_addr: Some(bind_addr),
+                context: SocketContext {
+                    ..self.context.clone()
+                },
+                ..BindConfig::default()
             },
-            ..BindConfig::default()
-        })
+        )
         .await?;
         tracing::info!(port, "FakeTcpSocketListener listening");
         self.os_listener = Some(os_listener);

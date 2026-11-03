@@ -61,6 +61,26 @@ pub fn current() -> io::Result<NetNS> {
     native_host_runtime().intern_net_ns(PlatformNetNS::thread()?)
 }
 
+/// The process's own network namespace (/proc/self/ns/net), pinned on first use.
+/// Unlike [`current`], this never follows a temporary per-thread namespace switch.
+fn process_platform() -> io::Result<&'static PlatformNetNS> {
+    static PROCESS: std::sync::OnceLock<Result<PlatformNetNS, (io::ErrorKind, String)>> =
+        std::sync::OnceLock::new();
+    PROCESS
+        .get_or_init(|| PlatformNetNS::process().map_err(|error| (error.kind(), error.to_string())))
+        .as_ref()
+        .map_err(|(kind, message)| io::Error::new(*kind, message.clone()))
+}
+
+/// Canonical handle of the process default namespace.
+pub(crate) fn process_default() -> io::Result<NetNS> {
+    native_host_runtime().intern_net_ns(process_platform()?.clone())
+}
+
+pub(crate) fn is_process_default(net_ns: &NetNS) -> io::Result<bool> {
+    Ok(net_ns.id() == Some(process_platform()?.id()))
+}
+
 #[cfg(target_os = "linux")]
 pub fn open(name: &str) -> io::Result<NetNS> {
     native_host_runtime().intern_net_ns(PlatformNetNS::open(name)?)
@@ -88,7 +108,6 @@ pub(crate) fn resolve_config(name: Option<&str>) -> io::Result<NetNS> {
 pub(crate) mod tests {
     use super::*;
     use easytier_core::socket::BindConfig;
-    use easytier_core::socket::SocketContext;
     use std::sync::Arc;
 
     pub(crate) fn test_net_ns(name: Option<String>) -> NetNS {
@@ -233,26 +252,6 @@ pub(crate) mod tests {
         for thread in threads {
             assert!(expected == thread.join().unwrap());
         }
-    }
-
-    #[test]
-    fn contexts_are_normalized_to_the_bound_domain() {
-        let net_ns = crate::common::net_ns::current().unwrap();
-        let mut context = SocketContext::default();
-        crate::host_runtime::normalize_context(&mut context, &net_ns).unwrap();
-        assert_eq!(context.net_ns.as_ref(), Some(&net_ns));
-
-        let mut context = SocketContext {
-            net_ns: Some(net_ns.clone()),
-            ..SocketContext::default()
-        };
-        assert!(crate::host_runtime::normalize_context(&mut context, &net_ns).is_ok());
-
-        let mut context = SocketContext {
-            net_ns: Some(NetNS::from_host_reference("configured-name")),
-            ..SocketContext::default()
-        };
-        assert!(crate::host_runtime::normalize_context(&mut context, &net_ns).is_err());
     }
 
     #[test]

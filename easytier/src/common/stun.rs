@@ -12,11 +12,11 @@ use easytier_core::socket::SocketContext;
 #[cfg(test)]
 use easytier_proto::common::{NatType, StunInfo};
 
-use crate::host_runtime::{NativeHostRuntime, native_host_runtime};
+use crate::host_runtime::NativeNetNSServices;
 #[cfg(test)]
 use crate::socket::udp::RuntimeUdpSocket;
 
-pub type StunInfoCollector = CoreStunInfoCollector<NativeHostRuntime, NativeHostRuntime>;
+pub type StunInfoCollector = CoreStunInfoCollector<NativeNetNSServices, NativeNetNSServices>;
 
 pub fn default_udp_stun_servers() -> Vec<String> {
     if cfg!(test) {
@@ -91,7 +91,8 @@ impl StunSocketMapper<RuntimeUdpSocket> for MockStunInfoCollector {
 }
 
 pub fn runtime_stun_info_collector(socket_context: SocketContext) -> StunInfoCollector {
-    let runtime = native_host_runtime();
+    let runtime = crate::host_runtime::process_default_services()
+        .expect("process default network namespace is unavailable");
     StunInfoCollector::new(
         runtime.clone(),
         runtime,
@@ -119,7 +120,7 @@ mod tests {
         connectivity::stun::{TcpNatTypeDetector, UdpNatTypeDetector},
         packet::stun::Attribute,
         socket::SocketListener,
-        socket::{NetNS, udp::VirtualUdpSocketFactory},
+        socket::udp::VirtualUdpSocketFactory,
     };
     use stun_codec::rfc5389::{attributes::XorMappedAddress, methods::BINDING};
     use stun_codec::{Message, MessageClass, MessageDecoder, MessageEncoder};
@@ -129,9 +130,7 @@ mod tests {
     };
     use tokio_util::task::AbortOnDropHandle;
 
-    use crate::{
-        host_runtime::native_host_runtime, proto::rpc::standalone::runtime_udp_tunnel_listener,
-    };
+    use crate::proto::rpc::standalone::runtime_udp_tunnel_listener;
 
     use super::*;
 
@@ -139,7 +138,6 @@ mod tests {
     async fn runtime_collector_starts_with_native_runtime() {
         let context = SocketContext {
             socket_mark: Some(0),
-            net_ns: Some(NetNS::from_host_reference("instance-a")),
             ..SocketContext::default()
         };
         let collector = runtime_stun_info_collector(context);
@@ -153,7 +151,7 @@ mod tests {
     #[test]
     fn native_runtime_supports_collector_socket() {
         fn assert_factory<F: VirtualUdpSocketFactory<Socket = RuntimeUdpSocket>>() {}
-        assert_factory::<NativeHostRuntime>();
+        assert_factory::<NativeNetNSServices>();
     }
 
     #[tokio::test]
@@ -184,7 +182,7 @@ mod tests {
             }
         });
 
-        let runtime = native_host_runtime();
+        let runtime = crate::host_runtime::process_default_services().unwrap();
         let detector = UdpNatTypeDetector::new(
             runtime.clone(),
             runtime,
@@ -231,7 +229,7 @@ mod tests {
 
         let (first, _first_task) = spawn_server().await;
         let (second, _second_task) = spawn_server().await;
-        let runtime = native_host_runtime();
+        let runtime = crate::host_runtime::process_default_services().unwrap();
         let detector = TcpNatTypeDetector::new(
             runtime.clone(),
             runtime,

@@ -3,7 +3,7 @@ use std::net::SocketAddr;
 use educe::Educe;
 use serde::{Deserialize, Serialize};
 
-use super::{IpVersion, NetNS};
+use super::IpVersion;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Educe)]
 #[educe(Default)]
@@ -13,9 +13,6 @@ pub struct SocketContext {
     #[educe(Default = IpVersion::Both)]
     pub ip_version: IpVersion,
     pub socket_mark: Option<u32>,
-    /// None inherits the namespace of the host executing the operation.
-    #[serde(rename = "netns")]
-    pub net_ns: Option<NetNS>,
 }
 
 /// Shared socket configuration for TCP and UDP, passed unchanged to the host.
