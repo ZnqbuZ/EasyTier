@@ -10,7 +10,11 @@ use easytier_core::{
 #[cfg(feature = "tun")]
 use crate::instance::shared_virtual_nic::ArcSharedVirtualNicRegistry;
 use crate::{
-    common::global_ctx::{ArcGlobalCtx, GlobalCtx},
+    common::{
+        global_ctx::{ArcGlobalCtx, GlobalCtx},
+        net_ns::NetNS,
+    },
+    host_runtime::NativeNetNSServices,
     instance::{
         composition::{NativeCoreInstance, runtime_core_host_adapters_with_packet_egress},
         runtime_host::NativeInstanceRuntimeHost,
@@ -33,7 +37,7 @@ impl TestInstance {
 
     #[cfg(feature = "tun")]
     pub fn current_shared_virtual_nic_registry() -> ArcSharedVirtualNicRegistry {
-        crate::host_runtime::net_ns_services(&crate::common::net_ns::current().unwrap())
+        NativeNetNSServices::of(&NetNS::current().unwrap())
             .unwrap()
             .nics
             .clone()

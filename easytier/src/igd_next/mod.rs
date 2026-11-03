@@ -36,6 +36,7 @@ use errors::GetExternalIpError;
 pub(crate) use errors::GetGenericPortMappingEntryError;
 use errors::{AddPortError, HttpTransportError, RemovePortError, RequestError, SearchError};
 
+use crate::common::net_ns::NetNS;
 use crate::socket::{tcp::connect_tcp, udp::RuntimeUdpSocketFactory};
 
 const DEFAULT_SEARCH_TIMEOUT: Duration = Duration::from_secs(10);
@@ -104,7 +105,7 @@ pub(crate) async fn search_gateway(options: SearchOptions) -> Result<Gateway, Se
 }
 
 async fn search_gateway_inner(options: SearchOptions) -> Result<Gateway, SearchError> {
-    let net_ns = crate::common::net_ns::current().map_err(SearchError::Io)?;
+    let net_ns = NetNS::current().map_err(SearchError::Io)?;
     let bind_options = BindConfig {
         context: SocketContext::default(),
         reuse_addr: Some(false),
@@ -214,7 +215,7 @@ async fn send_http_request_inner(
     soap_action: Option<&str>,
     body: String,
 ) -> Result<Bytes, HttpTransportError> {
-    let net_ns = crate::common::net_ns::current().map_err(TunnelError::from)?;
+    let net_ns = NetNS::current().map_err(TunnelError::from)?;
     let stream = connect_tcp(
         &net_ns,
         TcpConnectOptions::direct_connect(addr).with_bind(BindConfig {

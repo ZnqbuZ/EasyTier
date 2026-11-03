@@ -680,8 +680,8 @@ mod tests {
     use futures::{SinkExt, StreamExt};
 
     use crate::{
-        host_runtime::process_default_services, socket::udp::new_runtime_udp_session_listener,
-        tunnel::tests::_tunnel_echo_server,
+        common::net_ns::NetNS, host_runtime::NativeNetNSServices,
+        socket::udp::new_runtime_udp_session_listener, tunnel::tests::_tunnel_echo_server,
     };
 
     use super::*;
@@ -691,7 +691,7 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(5), async {
             let bind_addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
             let mut listener = new_runtime_udp_session_listener(
-                &crate::common::net_ns::process_default().unwrap(),
+                &NetNS::process().unwrap(),
                 format!("quic://{bind_addr}").parse().unwrap(),
                 UdpSessionListenRequest::new(
                     // Port-bound listeners enable address reuse on Unix. This test
@@ -710,7 +710,7 @@ mod tests {
             let local_url = listener.local_url();
 
             let connected = connect_udp(
-                process_default_services().unwrap(),
+                NativeNetNSServices::process_default().unwrap(),
                 remote_addr,
                 Vec::new(),
                 BindConfig {

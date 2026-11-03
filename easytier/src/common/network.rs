@@ -596,10 +596,10 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn bound_interface_query_does_not_change_the_callers_net_ns() {
-        let net_ns = crate::common::net_ns::current().unwrap();
+        let net_ns = NetNS::current().unwrap();
         let expected = net_ns.id();
         assert!(!collect_interfaces(net_ns, false).await.is_empty());
-        assert_eq!(crate::common::net_ns::current().unwrap().id(), expected);
+        assert_eq!(NetNS::current().unwrap().id(), expected);
     }
 
     #[cfg(all(target_os = "linux", not(mobile)))]

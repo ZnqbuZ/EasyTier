@@ -8,8 +8,9 @@ use super::{
 use crate::{
     common::{
         config::{ConfigLoader, NetworkIdentity, TomlConfigLoader},
-        net_ns::ROOT_NET_NS_NAME,
+        net_ns::{NetNS, ROOT_NET_NS_NAME},
     },
+    host_runtime::NativeNetNSServices,
     instance::{
         shared_virtual_nic::{ArcSharedVirtualNicRegistry, SharedIpv4Route},
         test_instance::TestInstance as Instance,
@@ -911,11 +912,9 @@ async fn magic_dns_route_follows_serving_member_and_takeover() {
     let route = SharedIpv4Route::new(MAGIC_DNS_FAKE_IP.parse::<Ipv4Addr>().unwrap(), 32, None);
     assert_eq!(
         shared_route_owner_count(
-            &crate::host_runtime::net_ns_services(
-                &crate::common::net_ns::open(&net_ns.name).unwrap()
-            )
-            .unwrap()
-            .nics,
+            &NativeNetNSServices::of(&NetNS::open(&net_ns.name).unwrap())
+                .unwrap()
+                .nics,
             &dev_name,
             &route
         )
@@ -933,11 +932,9 @@ async fn magic_dns_route_follows_serving_member_and_takeover() {
     .await;
     assert_eq!(
         shared_route_owner_count(
-            &crate::host_runtime::net_ns_services(
-                &crate::common::net_ns::open(&net_ns.name).unwrap()
-            )
-            .unwrap()
-            .nics,
+            &NativeNetNSServices::of(&NetNS::open(&net_ns.name).unwrap())
+                .unwrap()
+                .nics,
             &dev_name,
             &route
         )
@@ -962,11 +959,9 @@ async fn magic_dns_route_follows_serving_member_and_takeover() {
     wait_for_condition(
         || async {
             shared_route_owner_count(
-                &crate::host_runtime::net_ns_services(
-                    &crate::common::net_ns::open(&net_ns.name).unwrap(),
-                )
-                .unwrap()
-                .nics,
+                &NativeNetNSServices::of(&NetNS::open(&net_ns.name).unwrap())
+                    .unwrap()
+                    .nics,
                 &dev_name,
                 &route,
             )

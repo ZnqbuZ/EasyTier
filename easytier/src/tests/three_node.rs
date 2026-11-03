@@ -30,6 +30,7 @@ use crate::{
         config::{ConfigLoader, NetworkIdentity, PortForwardConfig, TomlConfigLoader},
         net_ns::{NetNS, ROOT_NET_NS_NAME},
     },
+    host_runtime::NativeNetNSServices,
     instance::config::test_runtime_instance_config,
     instance::test_instance::TestInstance as Instance,
     proto::{
@@ -56,7 +57,7 @@ type TestDialerFactory = Box<dyn FnOnce(NetNS) -> Box<dyn TunnelDialer> + Send +
 
 fn core_tcp_listener(url: url::Url) -> TestListenerFactory {
     Box::new(move |net_ns| {
-        let net_ns = crate::host_runtime::net_ns_services(&net_ns).unwrap();
+        let net_ns = NativeNetNSServices::of(&net_ns).unwrap();
         use easytier_core::connectivity::protocol::raw::TcpTunnelListener;
         let addr = url
             .socket_addrs(|| Some(11010))
@@ -77,7 +78,7 @@ fn core_tcp_listener(url: url::Url) -> TestListenerFactory {
 
 fn core_tcp_dialer(url: url::Url) -> TestDialerFactory {
     Box::new(move |net_ns| {
-        let net_ns = crate::host_runtime::net_ns_services(&net_ns).unwrap();
+        let net_ns = NativeNetNSServices::of(&net_ns).unwrap();
         Box::new(
             easytier_core::connectivity::protocol::raw::TcpTunnelDialer::new(
                 url,
@@ -90,7 +91,7 @@ fn core_tcp_dialer(url: url::Url) -> TestDialerFactory {
 
 fn core_udp_listener(url: url::Url) -> TestListenerFactory {
     Box::new(move |net_ns| {
-        let net_ns = crate::host_runtime::net_ns_services(&net_ns).unwrap();
+        let net_ns = NativeNetNSServices::of(&net_ns).unwrap();
         use easytier_core::{
             connectivity::protocol::raw::UdpTunnelListener, socket::udp::UdpSessionListenRequest,
         };
@@ -116,7 +117,7 @@ fn core_udp_listener(url: url::Url) -> TestListenerFactory {
 
 fn core_udp_dialer(url: url::Url) -> TestDialerFactory {
     Box::new(move |net_ns| {
-        let net_ns = crate::host_runtime::net_ns_services(&net_ns).unwrap();
+        let net_ns = NativeNetNSServices::of(&net_ns).unwrap();
         Box::new(
             easytier_core::connectivity::protocol::raw::UdpTunnelDialer::new(
                 url,

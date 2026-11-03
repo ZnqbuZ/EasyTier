@@ -1,4 +1,5 @@
-use crate::common::net_ns::ROOT_NET_NS_NAME;
+use crate::common::net_ns::{NetNS, ROOT_NET_NS_NAME};
+use crate::host_runtime::NativeNetNSServices;
 use easytier_core::socket::BindConfig;
 
 use super::{add_ns_to_bridge, create_net_ns, del_net_ns, run_network_command};
@@ -122,8 +123,8 @@ async fn bound_sockets_use_distinct_net_ns_without_switching_async_tasks() {
     network.create_empty_net_ns("net_b");
     let a = crate::common::net_ns::tests::test_net_ns(Some(network.net_ns("net_a").into()));
     let b = crate::common::net_ns::tests::test_net_ns(Some(network.net_ns("net_b").into()));
-    let original = crate::common::net_ns::current().unwrap();
-    let socket_a = crate::host_runtime::net_ns_services(&a)
+    let original = NetNS::current().unwrap();
+    let socket_a = NativeNetNSServices::of(&a)
         .unwrap()
         .bind_udp(BindConfig {
             reuse_addr: Some(false),
@@ -134,7 +135,7 @@ async fn bound_sockets_use_distinct_net_ns_without_switching_async_tasks() {
         .await
         .unwrap();
     let address = socket_a.local_addr().unwrap();
-    let _socket_b = crate::host_runtime::net_ns_services(&b)
+    let _socket_b = NativeNetNSServices::of(&b)
         .unwrap()
         .bind_udp(BindConfig {
             reuse_addr: Some(false),
@@ -145,7 +146,7 @@ async fn bound_sockets_use_distinct_net_ns_without_switching_async_tasks() {
         .await
         .unwrap();
     assert!(
-        crate::host_runtime::net_ns_services(&a)
+        NativeNetNSServices::of(&a)
             .unwrap()
             .bind_udp(BindConfig {
                 reuse_addr: Some(false),
@@ -157,5 +158,5 @@ async fn bound_sockets_use_distinct_net_ns_without_switching_async_tasks() {
             .is_err()
     );
     tokio::task::yield_now().await;
-    assert_eq!(original, crate::common::net_ns::current().unwrap());
+    assert_eq!(original, NetNS::current().unwrap());
 }

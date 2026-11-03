@@ -78,6 +78,7 @@ pub(crate) async fn protect_native_socket(
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+    use crate::common::net_ns::NetNS;
     use crate::socket::udp::RuntimeUdpSocketFactory;
     use easytier_core::socket::BindConfig;
     use easytier_core::socket::{
@@ -141,7 +142,7 @@ mod tests {
         TEST_SOCKET_PROTECTOR
             .scope(protector.clone(), async {
                 let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-                let net_ns = crate::common::net_ns::process_default().unwrap();
+                let net_ns = NetNS::process().unwrap();
                 let options = TcpConnectOptions::direct_connect(listener.local_addr().unwrap());
                 let connect = crate::socket::tcp::connect_tcp(&net_ns, options);
                 tokio::pin!(connect);
@@ -165,7 +166,7 @@ mod tests {
         TEST_SOCKET_PROTECTOR
             .scope(protector.clone(), async {
                 let local = "127.0.0.1:0".parse().unwrap();
-                let net_ns = crate::common::net_ns::process_default().unwrap();
+                let net_ns = NetNS::process().unwrap();
                 assert!(
                     crate::socket::bind::<tokio::net::TcpSocket>(
                         &net_ns,
@@ -236,7 +237,7 @@ mod tests {
         let protector = GateProtector::new(false, false);
         TEST_SOCKET_PROTECTOR
             .scope(protector.clone(), async {
-                let net_ns = crate::common::net_ns::process_default().unwrap();
+                let net_ns = NetNS::process().unwrap();
                 let bind = crate::socket::tcp::bind_tcp_listener(
                     &net_ns,
                     TcpListenOptions::direct_connect("127.0.0.1:0".parse().unwrap()),

@@ -63,7 +63,7 @@ async fn new_protected_natpmp(
 ) -> anyhow::Result<natpmp::NatpmpAsync<UdpSocket>> {
     let gateway = gateway.map(Ok).unwrap_or_else(mapping_gateway)?;
     let gateway_addr = SocketAddr::V4(SocketAddrV4::new(gateway, natpmp::NATPMP_PORT));
-    let net_ns = crate::common::net_ns::current()?;
+    let net_ns = NetNS::current()?;
     let socket = crate::socket::bind::<UdpSocket>(
         &net_ns,
         BindConfig {
@@ -286,7 +286,7 @@ pub(crate) fn spawn_udp_port_mapping_lifecycle(
     cfg_select! {
         target_os = "linux" => {
             tokio::task::spawn_blocking(move || {
-                let result = net_ns.run_unchecked(|| -> anyhow::Result<()> {
+                let result = net_ns.run(|| -> anyhow::Result<()> {
                     let runtime = tokio::runtime::Builder::new_current_thread()
                         .enable_all()
                         .build()?;
@@ -543,7 +543,7 @@ async fn resolve_internal_addr(
         listener_ipv4_host(local_listener).ok_or_else(|| anyhow!("listener must be ipv4"))?;
 
     let ip = if host.is_unspecified() {
-        let net_ns = crate::common::net_ns::current()?;
+        let net_ns = NetNS::current()?;
         let udp = crate::socket::bind::<UdpSocket>(
             &net_ns,
             BindConfig {

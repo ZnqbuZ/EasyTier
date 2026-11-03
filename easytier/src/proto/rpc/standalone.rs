@@ -9,10 +9,7 @@ use easytier_core::{
     tunnel::Tunnel,
 };
 
-use crate::{
-    host_runtime::{NativeNetNSServices, process_default_services},
-    tunnel::TunnelUrl,
-};
+use crate::{host_runtime::NativeNetNSServices, tunnel::TunnelUrl};
 
 pub use easytier_core::rpc::standalone::{RpcServerHook, StandAloneServer};
 
@@ -23,7 +20,7 @@ pub type RuntimeRpcListener = TcpTunnelListener<NativeNetNSServices>;
 pub type RuntimeRpcClient = StandAloneClient<RuntimeRpcDialer>;
 
 pub fn runtime_rpc_dialer(remote_url: url::Url) -> RuntimeRpcDialer {
-    let runtime = process_default_services().expect(DEFAULT_NS);
+    let runtime = NativeNetNSServices::process_default().expect(DEFAULT_NS);
     TcpTunnelDialer::new(remote_url, runtime.clone(), runtime)
 }
 
@@ -39,12 +36,12 @@ pub fn runtime_rpc_listener(local_addr: std::net::SocketAddr) -> RuntimeRpcListe
         need_protect: false,
         ..BindConfig::default()
     };
-    let runtime = process_default_services().expect(DEFAULT_NS);
+    let runtime = NativeNetNSServices::process_default().expect(DEFAULT_NS);
     TcpTunnelListener::new_with_bind(local_addr, bind, runtime)
 }
 
 pub fn runtime_udp_tunnel_dialer(remote_url: url::Url) -> impl TunnelDialer {
-    let runtime = process_default_services().expect(DEFAULT_NS);
+    let runtime = NativeNetNSServices::process_default().expect(DEFAULT_NS);
     UdpTunnelDialer::new(remote_url, runtime.clone(), runtime)
 }
 
@@ -58,7 +55,7 @@ pub fn runtime_udp_tunnel_listener(
         only_v6: true,
         ..BindConfig::default()
     };
-    let runtime = process_default_services().expect(DEFAULT_NS);
+    let runtime = NativeNetNSServices::process_default().expect(DEFAULT_NS);
     UdpTunnelListener::new_with_request(local_url, UdpSessionListenRequest::new(bind), runtime)
 }
 

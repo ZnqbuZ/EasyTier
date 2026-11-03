@@ -1,4 +1,4 @@
-use easytier_core::net_ns::NetNS;
+use crate::host_runtime::NativeHostRuntime;
 use std::{
     collections::{BTreeMap, BTreeSet},
     net::{Ipv4Addr, Ipv6Addr},
@@ -36,7 +36,7 @@ pub(crate) type ArcSharedVirtualNicRegistry = Arc<Mutex<SharedVirtualNicRegistry
 
 // The host owns this driver independently of all instance runtimes.
 fn shared_virtual_nic_runtime() -> tokio::runtime::Handle {
-    crate::host_runtime::native_host_runtime()
+    NativeHostRuntime::global()
         .service_executor()
         .expect("native shared executor is unavailable")
 }
@@ -535,7 +535,7 @@ impl Drop for SharedVirtualNicMemberRegistration {
         let member_id = self.member_id;
         let registration_id = self.registration_id;
 
-        let Ok(shared) = crate::host_runtime::native_host_runtime().service_executor() else {
+        let Ok(shared) = NativeHostRuntime::global().service_executor() else {
             // Global shutdown already stopped the dispatcher and its actual I/O.
             // Late registration destruction must not panic or restart a driver.
             return;
@@ -808,7 +808,6 @@ impl SharedVirtualNicMember {
 pub struct SharedVirtualNicRegistry {
     nics: BTreeMap<SharedVirtualNicRegistryKey, SharedVirtualNicRegistryEntry>,
     closing: bool,
-    net_ns: Option<NetNS>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -877,13 +876,6 @@ impl SharedVirtualNicRegistryEntry {
 impl SharedVirtualNicRegistry {
     pub fn new() -> Self {
         Self::default()
-    }
-
-    pub(crate) fn in_domain(net_ns: NetNS) -> Self {
-        Self {
-            net_ns: Some(net_ns),
-            ..Self::default()
-        }
     }
 
     pub(crate) fn take_for_shutdown(&mut self) -> Vec<Arc<Mutex<SharedVirtualNic>>> {
@@ -956,7 +948,7 @@ impl SharedVirtualNicRegistry {
         member_id: SharedVirtualNicMemberId,
         close_notifier: Arc<Notify>,
     ) -> Result<SharedVirtualNicMember, Error> {
-        if self.closing || self.net_ns.as_ref().is_some_and(NetNS::is_closed) {
+        if self.closing {
             return Err(anyhow::anyhow!("network namespace NIC admission is closed").into());
         }
         let configured_mtu = config.mtu();

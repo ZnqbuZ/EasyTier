@@ -250,7 +250,7 @@ impl WireGuardPortalHost {
             only_v6,
             ..BindConfig::default()
         };
-        let runtime = crate::host_runtime::net_ns_services(&self.global_ctx.net_ns)?;
+        let runtime = NativeNetNSServices::of(&self.global_ctx.net_ns)?;
         let socket = runtime.bind_udp(options.clone()).await?;
         options.local_addr = Some(socket.local_addr()?);
         Ok(Arc::new(PortalSocket {
@@ -451,7 +451,7 @@ mod tests {
             need_protect: false,
             ..BindConfig::default()
         };
-        let runtime = crate::host_runtime::process_default_services().unwrap();
+        let runtime = NativeNetNSServices::process_default().unwrap();
         let initial = runtime.bind_udp(options.clone()).await.unwrap();
         let local = initial.local_addr().unwrap();
         options.local_addr = Some(local);

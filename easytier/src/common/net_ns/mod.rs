@@ -1,108 +1,83 @@
-//! Native construction of the shared Core network-domain handle.
+//! Plain OS network-namespace handle.
 
-use crate::host_runtime::native_host_runtime;
-use std::io;
-
-pub use easytier_core::net_ns::NetNS;
+use std::{
+    fmt,
+    hash::{Hash, Hasher},
+    io,
+};
 
 cfg_select! {
     target_os = "linux" => {
         mod linux;
-        pub(crate) use linux::PlatformNetNS;
+        pub use linux::NetNS;
     },
     _ => {
-        use easytier_core::net_ns::NetNSBackend;
+        #[derive(Clone, Copy)]
+        pub struct NetNS;
 
-        #[derive(Clone, Copy, Debug)]
-        pub(crate) struct DummyNetNS;
-
-        pub(crate) type PlatformNetNS = DummyNetNS;
-
-        impl DummyNetNS {
-            pub(crate) fn id(&self) -> u128 {
+        impl NetNS {
+            pub fn id(&self) -> u128 {
                 0
             }
 
-            pub(crate) fn process() -> io::Result<Self> {
+            pub fn process() -> io::Result<Self> {
                 Ok(Self)
             }
 
-            pub(crate) fn thread() -> io::Result<Self> {
+            pub fn current() -> io::Result<Self> {
                 Ok(Self)
             }
-        }
 
-        impl NetNSBackend for DummyNetNS {
-            fn id(&self) -> u128 {
-                Self::id(self)
-            }
-
-            fn process() -> io::Result<Self> {
-                Self::process()
-            }
-
-            fn thread() -> io::Result<Self> {
-                Self::thread()
-            }
-
-            fn run(&self, operation: &mut dyn FnMut()) -> io::Result<()> {
-                operation();
-                Ok(())
+            pub fn run<R>(&self, operation: impl FnOnce() -> R) -> io::Result<R> {
+                Ok(operation())
             }
         }
     },
+}
+
+impl NetNS {
+    pub(crate) fn from_config(name: Option<&str>) -> io::Result<NetNS> {
+        match name {
+            None => Self::current(),
+            Some(name) => {
+                cfg_select! {
+                    target_os = "linux" => Self::open(name),
+                    _ => {
+                        let _ = name;
+                        Err(io::Error::new(
+                            io::ErrorKind::Unsupported,
+                            "named network namespaces are unsupported",
+                        ))
+                    },
+                }
+            }
+        }
+    }
+}
+
+impl fmt::Debug for NetNS {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("NetNS").field("id", &self.id()).finish()
+    }
+}
+
+impl PartialEq for NetNS {
+    fn eq(&self, other: &Self) -> bool {
+        self.id() == other.id()
+    }
+}
+
+impl Eq for NetNS {}
+
+impl Hash for NetNS {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.id().hash(state);
+    }
 }
 
 /// Legacy configuration label for PID 1's network namespace (/proc/1/ns/net).
 /// This is distinct from the process default and may belong to a container.
 pub const ROOT_NET_NS_NAME: &str = "_root_ns";
-
-pub fn current() -> io::Result<NetNS> {
-    native_host_runtime().intern_net_ns(PlatformNetNS::thread()?)
-}
-
-/// The process's own network namespace (/proc/self/ns/net), pinned on first use.
-/// Unlike [`current`], this never follows a temporary per-thread namespace switch.
-fn process_platform() -> io::Result<&'static PlatformNetNS> {
-    static PROCESS: std::sync::OnceLock<Result<PlatformNetNS, (io::ErrorKind, String)>> =
-        std::sync::OnceLock::new();
-    PROCESS
-        .get_or_init(|| PlatformNetNS::process().map_err(|error| (error.kind(), error.to_string())))
-        .as_ref()
-        .map_err(|(kind, message)| io::Error::new(*kind, message.clone()))
-}
-
-/// Canonical handle of the process default namespace.
-pub(crate) fn process_default() -> io::Result<NetNS> {
-    native_host_runtime().intern_net_ns(process_platform()?.clone())
-}
-
-pub(crate) fn is_process_default(net_ns: &NetNS) -> io::Result<bool> {
-    Ok(net_ns.id() == Some(process_platform()?.id()))
-}
-
-#[cfg(target_os = "linux")]
-pub fn open(name: &str) -> io::Result<NetNS> {
-    native_host_runtime().intern_net_ns(PlatformNetNS::open(name)?)
-}
-
-pub(crate) fn resolve_config(name: Option<&str>) -> io::Result<NetNS> {
-    match name {
-        None => current(),
-        Some(name) => {
-            cfg_select! {
-                target_os = "linux" => open(name),
-                _ => {
-                    let _ = name;
-                    Err(io::Error::new(
-                        io::ErrorKind::Unsupported,
-                        "named network namespaces are unsupported",
-                    ))
-                },
-            }
-        }
-    }
-}
 
 #[cfg(test)]
 pub(crate) mod tests {
@@ -111,7 +86,7 @@ pub(crate) mod tests {
     use std::sync::Arc;
 
     pub(crate) fn test_net_ns(name: Option<String>) -> NetNS {
-        resolve_config(name.as_deref()).expect("open test network namespace")
+        NetNS::from_config(name.as_deref()).expect("open test network namespace")
     }
 
     #[cfg(target_os = "linux")]
@@ -128,7 +103,7 @@ pub(crate) mod tests {
                 if !status.success() {
                     return Err(io::Error::other("failed to bring up isolated loopback"));
                 }
-                crate::common::net_ns::current()
+                NetNS::current()
             })?
             .join()
             .map_err(|_| io::Error::other("namespace fixture thread panicked"))?
@@ -138,27 +113,27 @@ pub(crate) mod tests {
     #[test]
     #[ignore = "run inside an isolated user+network namespace"]
     fn distinct_domains_restore_actual_thread_context_after_errors_and_unwind() {
-        let original = crate::common::net_ns::current().unwrap();
+        let original = NetNS::current().unwrap();
         let a = isolated_net_ns_for_test().unwrap();
         let b = isolated_net_ns_for_test().unwrap();
         assert_ne!(a.id(), b.id());
         a.run(|| {
-            assert!(a == crate::common::net_ns::current().unwrap());
+            assert!(a == NetNS::current().unwrap());
             let result = b
                 .run(|| {
-                    assert!(b == crate::common::net_ns::current().unwrap());
+                    assert!(b == NetNS::current().unwrap());
                     Err::<(), _>("operation failed")
                 })
                 .unwrap();
             assert!(result.is_err());
-            assert!(a == crate::common::net_ns::current().unwrap());
+            assert!(a == NetNS::current().unwrap());
         })
         .unwrap();
         let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             a.run(|| panic!("namespace operation panic")).unwrap();
         }));
         assert!(panic.is_err());
-        assert!(original == crate::common::net_ns::current().unwrap());
+        assert!(original == NetNS::current().unwrap());
     }
 
     #[cfg(target_os = "linux")]
@@ -166,10 +141,10 @@ pub(crate) mod tests {
     #[ignore = "run inside an isolated user+network namespace"]
     async fn asynchronous_io_keeps_its_bound_domain_on_default_runtime_threads() {
         use easytier_core::socket::udp::{VirtualUdpSocket, VirtualUdpSocketFactory};
-        let original = crate::common::net_ns::current().unwrap();
+        let original = NetNS::current().unwrap();
         let a = isolated_net_ns_for_test().unwrap();
         let b = isolated_net_ns_for_test().unwrap();
-        let first = crate::host_runtime::net_ns_services(&a)
+        let first = crate::host_runtime::NativeNetNSServices::of(&a)
             .unwrap()
             .bind_udp(BindConfig {
                 reuse_addr: Some(false),
@@ -180,7 +155,7 @@ pub(crate) mod tests {
             .await
             .unwrap();
         let address = first.local_addr().unwrap();
-        let second = crate::host_runtime::net_ns_services(&b)
+        let second = crate::host_runtime::NativeNetNSServices::of(&b)
             .unwrap()
             .bind_udp(BindConfig {
                 reuse_addr: Some(false),
@@ -192,7 +167,7 @@ pub(crate) mod tests {
             .unwrap();
         assert_eq!(first.local_addr().unwrap(), second.local_addr().unwrap());
         assert!(
-            crate::host_runtime::net_ns_services(&a)
+            crate::host_runtime::NativeNetNSServices::of(&a)
                 .unwrap()
                 .bind_udp(BindConfig {
                     reuse_addr: Some(false),
@@ -203,7 +178,7 @@ pub(crate) mod tests {
                 .await
                 .is_err()
         );
-        let client = crate::host_runtime::net_ns_services(&a)
+        let client = crate::host_runtime::NativeNetNSServices::of(&a)
             .unwrap()
             .bind_udp(BindConfig {
                 reuse_addr: Some(false),
@@ -222,7 +197,7 @@ pub(crate) mod tests {
         .unwrap()
         .unwrap();
         assert_eq!(&buffer[..length], b"bound-domain");
-        assert!(original == crate::common::net_ns::current().unwrap());
+        assert!(original == NetNS::current().unwrap());
     }
 
     #[test]
@@ -234,38 +209,27 @@ pub(crate) mod tests {
         assert_ne!(first.key(), second.key());
         #[cfg(feature = "tun")]
         assert!(Arc::ptr_eq(
-            &crate::host_runtime::net_ns_services(&first.net_ns)
+            &crate::host_runtime::NativeNetNSServices::of(&first.net_ns)
                 .unwrap()
                 .nics,
-            &crate::host_runtime::net_ns_services(&second.net_ns)
+            &crate::host_runtime::NativeNetNSServices::of(&second.net_ns)
                 .unwrap()
                 .nics
         ));
     }
 
     #[test]
-    fn concurrent_current_calls_return_the_same_service_owner() {
-        let expected = crate::common::net_ns::current().unwrap();
-        let threads = (0..8)
-            .map(|_| std::thread::spawn(|| crate::common::net_ns::current().unwrap()))
-            .collect::<Vec<_>>();
-        for thread in threads {
-            assert!(expected == thread.join().unwrap());
-        }
-    }
-
-    #[test]
     fn current_identity_is_stable_and_clones_pin_the_same_domain() {
-        let first = PlatformNetNS::thread().unwrap();
-        let second = PlatformNetNS::thread().unwrap();
+        let first = NetNS::current().unwrap();
+        let second = NetNS::current().unwrap();
         assert_eq!(first.id(), second.id());
         assert_eq!(first.clone().id(), second.id());
-        assert_eq!(NetNS::new(first.id(), first).run(|| 42).unwrap(), 42);
+        assert_eq!(first.run(|| 42).unwrap(), 42);
     }
 
     #[test]
     fn nested_current_domain_operations_restore_errors_and_unwind() {
-        let net_ns = current().unwrap();
+        let net_ns = NetNS::current().unwrap();
         assert!(
             net_ns
                 .run(|| net_ns.run(|| Err::<(), _>("operation")))
@@ -277,6 +241,6 @@ pub(crate) mod tests {
             net_ns.run(|| panic!("operation panic")).unwrap();
         }));
         assert!(panic.is_err());
-        assert_eq!(current().unwrap().id(), net_ns.id());
+        assert_eq!(NetNS::current().unwrap().id(), net_ns.id());
     }
 }

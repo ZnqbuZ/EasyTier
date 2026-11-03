@@ -11,6 +11,7 @@ use easytier_core::{
 };
 
 use crate::common::global_ctx::EventBusSubscriber;
+use crate::host_runtime::NativeHostRuntime;
 
 use super::{
     composition::compose_native_core_instance, host::NativeInstanceHost,
@@ -55,7 +56,7 @@ pub fn create_native_instance(config: TomlConfig) -> anyhow::Result<Arc<NativeCo
 /// Terminal process cleanup. Stop instance owners first; this drains shared
 /// native domain services and stops their executor last. It cannot be reopened.
 pub async fn shutdown_native_services() -> anyhow::Result<()> {
-    crate::host_runtime::native_host_runtime().shutdown().await
+    NativeHostRuntime::global().shutdown().await
 }
 
 /// Subscribes to native presentation events owned by this instance's runtime.

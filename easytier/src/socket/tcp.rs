@@ -286,7 +286,7 @@ mod tests {
             let listener = TcpListener::bind((ip, 0)).await.unwrap();
             let remote_addr = listener.local_addr().unwrap();
             let socket = connect_tcp(
-                &crate::common::net_ns::process_default().unwrap(),
+                &NetNS::process().unwrap(),
                 TcpConnectOptions::direct_connect(remote_addr),
             )
             .await

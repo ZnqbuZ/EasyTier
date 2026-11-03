@@ -163,6 +163,7 @@ impl ServerProtocolUpgrader<RuntimeTcpSocket> for RuntimeServerProtocolUpgrader 
 #[cfg(test)]
 mod tests {
     use crate::common::global_ctx::tests::get_mock_global_ctx;
+    use crate::common::net_ns::NetNS;
 
     use super::*;
 
@@ -326,7 +327,7 @@ mod tests {
     #[tokio::test]
     async fn runtime_wireguard_upgraders_consume_core_udp_sessions(#[case] bind_addr: &str) {
         use crate::{
-            host_runtime::process_default_services, socket::udp::new_runtime_udp_session_listener,
+            host_runtime::NativeNetNSServices, socket::udp::new_runtime_udp_session_listener,
         };
         use easytier_core::socket::BindConfig;
         use easytier_core::{
@@ -341,7 +342,7 @@ mod tests {
 
         let bind_addr = bind_addr.parse().unwrap();
         let mut listener = new_runtime_udp_session_listener(
-            &crate::common::net_ns::process_default().unwrap(),
+            &NetNS::process().unwrap(),
             format!("wg://{bind_addr}").parse().unwrap(),
             UdpSessionListenRequest::new(BindConfig {
                 local_addr: Some(bind_addr),
@@ -371,7 +372,7 @@ mod tests {
 
         tokio::time::timeout(std::time::Duration::from_secs(5), async {
             let connected = connect_udp(
-                process_default_services().unwrap(),
+                NativeNetNSServices::process_default().unwrap(),
                 remote_addr,
                 Vec::new(),
                 BindConfig {
@@ -407,7 +408,7 @@ mod tests {
     #[tokio::test]
     async fn runtime_quic_upgraders_consume_core_udp_sessions(#[case] bind_addr: &str) {
         use crate::{
-            host_runtime::process_default_services, socket::udp::new_runtime_udp_session_listener,
+            host_runtime::NativeNetNSServices, socket::udp::new_runtime_udp_session_listener,
         };
         use easytier_core::socket::BindConfig;
         use easytier_core::{
@@ -425,7 +426,7 @@ mod tests {
 
         let bind_addr = bind_addr.parse().unwrap();
         let mut listener = new_runtime_udp_session_listener(
-            &crate::common::net_ns::process_default().unwrap(),
+            &NetNS::process().unwrap(),
             format!("quic://{bind_addr}").parse().unwrap(),
             UdpSessionListenRequest::new(BindConfig {
                 local_addr: Some(bind_addr),
@@ -461,7 +462,7 @@ mod tests {
 
         tokio::time::timeout(std::time::Duration::from_secs(5), async {
             let connected = connect_udp(
-                process_default_services().unwrap(),
+                NativeNetNSServices::process_default().unwrap(),
                 remote_addr,
                 Vec::new(),
                 BindConfig {

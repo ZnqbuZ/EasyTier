@@ -19,6 +19,7 @@ use super::{
     config::{ConfigLoader, Flags, NetworkIdentity},
     net_ns::NetNS,
 };
+use crate::host_runtime::NativeNetNSServices;
 #[cfg(feature = "management")]
 use crate::proto::api::config::InstanceConfigPatch;
 use crate::proto::api::instance::PeerConnInfo;
@@ -124,7 +125,7 @@ impl PublicIpv6Host for GlobalCtx {
             socket_mark: self.get_flags().socket_mark,
             ..SocketContext::default()
         };
-        let ip_list = crate::host_runtime::net_ns_services(&self.net_ns)
+        let ip_list = NativeNetNSServices::of(&self.net_ns)
             .expect("native instance domain must be registered")
             .collect_ip_addrs(&context)
             .await;
@@ -186,7 +187,7 @@ impl GlobalCtx {
         let id = config_fs.get_id();
         let network = config_fs.get_network_identity();
         let net_ns = net_ns.unwrap_or_else(|| {
-            crate::common::net_ns::resolve_config(config_fs.get_net_ns().as_deref())
+            NetNS::from_config(config_fs.get_net_ns().as_deref())
                 .expect("resolve native network namespace")
         });
         let hostname = runtime
@@ -524,7 +525,7 @@ pub mod tests {
             config.clone(),
             &normalized,
             &host,
-            crate::common::net_ns::current().unwrap(),
+            NetNS::current().unwrap(),
         );
 
         assert_eq!(config.get_mapped_listeners().len(), 2);

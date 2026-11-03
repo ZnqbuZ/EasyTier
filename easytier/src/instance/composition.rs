@@ -18,6 +18,8 @@ use easytier_core::{
 };
 
 use crate::common::global_ctx::GlobalCtxEvent;
+use crate::common::net_ns::NetNS;
+use crate::host_runtime::NativeNetNSServices;
 #[cfg(feature = "public-ipv6-provider")]
 use crate::instance::public_ipv6_provider::runtime_public_ipv6_provider_platform;
 use crate::{
@@ -59,7 +61,7 @@ pub(super) fn compose_native_core_instance(
         runtime_core_host_config()
     };
     let configured_net_ns = toml_config.get_net_ns();
-    let net_ns = crate::common::net_ns::resolve_config(cfg_select! {
+    let net_ns = NetNS::from_config(cfg_select! {
         target_os = "linux" => configured_net_ns.as_deref(),
         _ => {
             if host_config.ignore_unsupported_config {
@@ -198,7 +200,7 @@ pub(crate) fn runtime_core_host_adapters(
     packet_sink: Arc<dyn PacketSink>,
 ) -> CoreHostAdapters<NativeInstanceHost> {
     let host = native_instance_host(global_ctx.clone());
-    let runtime_dns = crate::host_runtime::net_ns_services(&global_ctx.net_ns)
+    let runtime_dns = NativeNetNSServices::of(&global_ctx.net_ns)
         .expect("native instance domain must be registered");
     let adapters = CoreHostAdapters::new(host, runtime_dns, packet_sink, process_runtime);
     configure_runtime_core_host_adapters(global_ctx, adapters, runtime_core_host_config())
@@ -211,7 +213,7 @@ pub(crate) fn runtime_core_host_adapters_with_packet_egress(
     packet_egress: Arc<dyn PacketEgressHost>,
 ) -> CoreHostAdapters<NativeInstanceHost> {
     let host = native_instance_host(global_ctx.clone());
-    let runtime_dns = crate::host_runtime::net_ns_services(&global_ctx.net_ns)
+    let runtime_dns = NativeNetNSServices::of(&global_ctx.net_ns)
         .expect("native instance domain must be registered");
     let adapters =
         CoreHostAdapters::new_with_packet_egress(host, runtime_dns, packet_egress, process_runtime);
@@ -225,7 +227,7 @@ fn runtime_core_host_adapters_with_packet_egress_and_config(
     host_config: easytier_core::instance::CoreInstanceHostConfig,
 ) -> CoreHostAdapters<NativeInstanceHost> {
     let host = native_instance_host(global_ctx.clone());
-    let runtime_dns = crate::host_runtime::net_ns_services(&global_ctx.net_ns)
+    let runtime_dns = NativeNetNSServices::of(&global_ctx.net_ns)
         .expect("native instance domain must be registered");
     let adapters =
         CoreHostAdapters::new_with_packet_egress(host, runtime_dns, packet_egress, process_runtime);
@@ -304,7 +306,7 @@ pub(crate) fn runtime_one_shot_manual_connector(
 ) -> anyhow::Result<ManualTunnelConnector<NativeInstanceHost>> {
     let normalized = CoreInstanceConfig::from_toml_with_host(config, &runtime_core_host_config())?;
     let host = native_instance_host(global_ctx.clone());
-    let runtime_dns = crate::host_runtime::net_ns_services(&global_ctx.net_ns)
+    let runtime_dns = NativeNetNSServices::of(&global_ctx.net_ns)
         .expect("native instance domain must be registered");
     let dns: Arc<dyn DnsResolver> = runtime_dns.clone();
     let dns_records: Arc<dyn DnsRecordResolver> = runtime_dns;

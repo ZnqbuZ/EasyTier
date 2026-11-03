@@ -1,4 +1,5 @@
 use super::FromUrl;
+use crate::common::net_ns::NetNS;
 use crate::{proto::common::TunnelInfo, socket::tcp::RuntimeTcpSocket};
 use anyhow::Context as _;
 use bytes::BytesMut;
@@ -310,7 +311,7 @@ impl WsTunnelListener {
         self.listener = None;
 
         let addr = SocketAddr::from_url(self.addr.clone(), IpVersion::Both).await?;
-        let net_ns = crate::common::net_ns::process_default()?;
+        let net_ns = NetNS::process()?;
         let listener = crate::socket::bind::<TcpListener>(
             &net_ns,
             BindConfig {

@@ -546,7 +546,7 @@ impl WgTunnelListener {
     pub fn new(addr: url::Url, config: WgConfig) -> Self {
         let (conn_send, conn_recv) = unbounded_channel();
         WgTunnelListener {
-            net_ns: crate::common::net_ns::current(),
+            net_ns: NetNS::current(),
             addr,
             session_listener: None,
             socket_mark: None,
@@ -797,6 +797,7 @@ pub(crate) fn upgrade_accepted(
 #[cfg(test)]
 pub mod tests {
     use super::*;
+    use crate::host_runtime::NativeNetNSServices;
     use crate::{
         common::global_ctx::tests::get_mock_global_ctx,
         tunnel::protocol::runtime_client_protocol_upgrader,
@@ -832,7 +833,7 @@ pub mod tests {
             let mut tunnels = Vec::with_capacity(CONN_COUNT);
             for _ in 0..CONN_COUNT {
                 let connected = connect_udp(
-                    crate::host_runtime::process_default_services().unwrap(),
+                    NativeNetNSServices::process_default().unwrap(),
                     remote_addr,
                     Vec::new(),
                     BindConfig {

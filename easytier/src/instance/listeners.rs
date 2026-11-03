@@ -67,7 +67,7 @@ struct RuntimeUnixStreamListener {
 impl RuntimeUnixStreamListener {
     #[cfg(test)]
     fn new(url: url::Url) -> Self {
-        Self::new_in_net_ns(url, crate::common::net_ns::current().unwrap())
+        Self::new_in_net_ns(url, NetNS::current().unwrap())
     }
     fn new_in_net_ns(url: url::Url, net_ns: NetNS) -> Self {
         Self {
@@ -191,11 +191,11 @@ impl SocketListener for RuntimeFakeTcpSocketListener {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::host_runtime::NativeNetNSServices;
 
     #[test]
     fn external_listener_capabilities_follow_native_build() {
-        let factory =
-            RuntimeExternalListenerFactory::new(crate::common::net_ns::current().unwrap());
+        let factory = RuntimeExternalListenerFactory::new(NetNS::current().unwrap());
 
         assert_eq!(
             factory.supports_scheme("faketcp"),
@@ -217,7 +217,7 @@ mod tests {
         let mut listener = RuntimeUnixStreamListener::new(url.clone());
         SocketListener::listen(&mut listener).await.unwrap();
 
-        let runtime = crate::host_runtime::process_default_services().unwrap();
+        let runtime = NativeNetNSServices::process_default().unwrap();
         let (accepted, connected) = tokio::join!(
             SocketListener::accept(&mut listener),
             runtime.connect_byte_stream(&url),

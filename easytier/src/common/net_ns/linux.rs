@@ -1,4 +1,4 @@
-//! Pinned OS namespace resources. This module never owns native services.
+//! Plain OS network-namespace handle. This module never owns native services.
 
 use std::{
     fs::{self, File, Metadata},
@@ -8,34 +8,33 @@ use std::{
     sync::Arc,
 };
 
-use easytier_core::net_ns::NetNSBackend;
 use guarden::guarded;
 
-/// Cloning pins the same kernel namespace, without retaining its service owner.
-#[derive(Clone, Debug)]
-pub(crate) struct PlatformNetNS {
+/// Cloning pins the same kernel namespace.
+#[derive(Clone)]
+pub struct NetNS {
     id: u128,
     file: Arc<File>,
 }
 
-impl PlatformNetNS {
+impl NetNS {
     fn identity(metadata: &Metadata) -> u128 {
         (u128::from(metadata.dev()) << 64) | u128::from(metadata.ino())
     }
 
-    pub(crate) fn id(&self) -> u128 {
+    pub fn id(&self) -> u128 {
         self.id
     }
 
-    pub(crate) fn process() -> io::Result<Self> {
+    pub fn process() -> io::Result<Self> {
         Self::at(Path::new("/proc/self/ns/net"))
     }
 
-    pub(crate) fn thread() -> io::Result<Self> {
+    pub fn current() -> io::Result<Self> {
         Self::at(Path::new("/proc/thread-self/ns/net"))
     }
 
-    pub(crate) fn open(name: &str) -> io::Result<Self> {
+    pub fn open(name: &str) -> io::Result<Self> {
         if name == super::ROOT_NET_NS_NAME {
             return Self::at(Path::new("/proc/1/ns/net"));
         }
@@ -82,29 +81,14 @@ impl PlatformNetNS {
         }
         Ok(Self { id, file })
     }
-}
 
-impl NetNSBackend for PlatformNetNS {
-    /// Kernel namespace identity, independent of the name/path used to open it.
-    fn id(&self) -> u128 {
-        self.id
-    }
-
-    fn process() -> io::Result<Self> {
-        Self::at(Path::new("/proc/self/ns/net"))
-    }
-
-    fn thread() -> io::Result<Self> {
-        Self::at(Path::new("/proc/thread-self/ns/net"))
-    }
-
-    /// Run only the synchronous resource-creation/query portion of an operation.
-    fn run(&self, operation: &mut dyn FnMut()) -> io::Result<()> {
+    /// Run resource creation or a query inside this namespace, restoring the
+    /// calling thread before returning.
+    pub fn run<R>(&self, operation: impl FnOnce() -> R) -> io::Result<R> {
         let current = Self::identity(&fs::metadata("/proc/thread-self/ns/net")?);
         if current == self.id {
             // Even setns to our own namespace requires privileges. Do not do it.
-            operation();
-            return Ok(());
+            return Ok(operation());
         }
         let previous = File::open("/proc/thread-self/ns/net")?;
         nix::sched::setns(self.file.as_ref(), nix::sched::CloneFlags::CLONE_NEWNET)?;
@@ -116,8 +100,7 @@ impl NetNSBackend for PlatformNetNS {
                 std::process::abort();
             }
         });
-        operation();
-        Ok(())
+        Ok(operation())
     }
 }
 
@@ -127,11 +110,11 @@ mod tests {
 
     #[test]
     fn rejects_wrong_net_ns_type_and_path_names() {
-        let error = PlatformNetNS::at(Path::new("/proc/thread-self/ns/mnt")).unwrap_err();
+        let error = NetNS::at(Path::new("/proc/thread-self/ns/mnt")).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
         for name in ["", ".", "..", "/tmp/test", "a/b"] {
             assert_eq!(
-                PlatformNetNS::open(name).unwrap_err().kind(),
+                NetNS::open(name).unwrap_err().kind(),
                 io::ErrorKind::InvalidInput
             );
         }

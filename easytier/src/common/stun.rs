@@ -91,7 +91,7 @@ impl StunSocketMapper<RuntimeUdpSocket> for MockStunInfoCollector {
 }
 
 pub fn runtime_stun_info_collector(socket_context: SocketContext) -> StunInfoCollector {
-    let runtime = crate::host_runtime::process_default_services()
+    let runtime = NativeNetNSServices::process_default()
         .expect("process default network namespace is unavailable");
     StunInfoCollector::new(
         runtime.clone(),
@@ -182,7 +182,7 @@ mod tests {
             }
         });
 
-        let runtime = crate::host_runtime::process_default_services().unwrap();
+        let runtime = NativeNetNSServices::process_default().unwrap();
         let detector = UdpNatTypeDetector::new(
             runtime.clone(),
             runtime,
@@ -229,7 +229,7 @@ mod tests {
 
         let (first, _first_task) = spawn_server().await;
         let (second, _second_task) = spawn_server().await;
-        let runtime = crate::host_runtime::process_default_services().unwrap();
+        let runtime = NativeNetNSServices::process_default().unwrap();
         let detector = TcpNatTypeDetector::new(
             runtime.clone(),
             runtime,

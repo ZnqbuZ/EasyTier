@@ -12,7 +12,7 @@ pub type NativeInstanceHost = ConnectorHostAdapter<NativeNetNSServices, NativeIn
 /// Instance facts queried by portable connector policy.
 ///
 /// This Adapter never creates or operates sockets. Mechanical network I/O is
-/// owned by the canonical [`easytier_core::net_ns::NetNS`] selected during composition.
+/// owned by the canonical [`crate::common::net_ns::NetNS`] selected during composition.
 pub struct NativeInstanceEnvironment {
     global_ctx: ArcGlobalCtx,
     runtime: Arc<NativeNetNSServices>,
@@ -34,7 +34,7 @@ impl NativeInstanceEnvironment {
 }
 
 pub(crate) fn native_instance_host(global_ctx: ArcGlobalCtx) -> Arc<NativeInstanceHost> {
-    let runtime = crate::host_runtime::net_ns_services(&global_ctx.net_ns)
+    let runtime = NativeNetNSServices::of(&global_ctx.net_ns)
         .expect("native instance domain must be registered");
     Arc::new(ConnectorHostAdapter::new(
         runtime.clone(),

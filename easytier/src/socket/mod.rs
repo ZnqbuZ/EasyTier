@@ -220,6 +220,7 @@ pub(crate) async fn bind<B: Bindable>(
 
 #[cfg(test)]
 mod tests {
+    use crate::common::net_ns::NetNS;
     use easytier_core::socket::SocketContext;
     use easytier_core::socket::{BindConfig, IpVersion};
     use easytier_core::tunnel::TunnelError;
@@ -228,7 +229,7 @@ mod tests {
 
     #[tokio::test]
     async fn bind_tcp_uses_configured_family_and_preserves_optional_source_binding_and_options() {
-        let net_ns = crate::common::net_ns::process_default().unwrap();
+        let net_ns = NetNS::process().unwrap();
         for ip in ["127.0.0.1", "::1"] {
             let ip: std::net::IpAddr = ip.parse().unwrap();
             let listener = TcpListener::bind((ip, 0)).await.unwrap();
@@ -287,7 +288,7 @@ mod tests {
 
     #[tokio::test]
     async fn bind_rejects_occupied_ports() {
-        let net_ns = crate::common::net_ns::process_default().unwrap();
+        let net_ns = NetNS::process().unwrap();
         for ip in ["127.0.0.1", "::1"] {
             let ip: std::net::IpAddr = ip.parse().unwrap();
             let occupied_udp = std::net::UdpSocket::bind((ip, 0)).unwrap();
@@ -335,7 +336,7 @@ mod tests {
     #[tokio::test]
     async fn bind_rejects_nonlocal_ipv6_address() {
         let addr = "[2001:db8::ffff]:0".parse().unwrap();
-        let net_ns = crate::common::net_ns::process_default().unwrap();
+        let net_ns = NetNS::process().unwrap();
         for error in [
             bind::<UdpSocket>(
                 &net_ns,
@@ -386,7 +387,7 @@ mod tests {
         use std::net::SocketAddr;
 
         let addr: SocketAddr = "0.0.0.0:0".parse().unwrap();
-        let net_ns = crate::common::net_ns::process_default().unwrap();
+        let net_ns = NetNS::process().unwrap();
         let _err = bind::<UdpSocket>(
             &net_ns,
             BindConfig {

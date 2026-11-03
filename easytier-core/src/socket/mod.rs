@@ -54,5 +54,3 @@ pub enum IpVersion {
     V6,
     Both,
 }
-
-pub use crate::net_ns::NetNS;

@@ -9,6 +9,7 @@ use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
 use crate::common::global_ctx::ArcGlobalCtx;
+use crate::host_runtime::NativeNetNSServices;
 
 mod dhcp;
 mod event_journal;
@@ -64,7 +65,7 @@ impl NativeInstanceRuntimeHost {
             global_ctx.clone(),
             cancel.clone(),
             #[cfg(feature = "tun")]
-            crate::host_runtime::net_ns_services(&global_ctx.net_ns)
+            NativeNetNSServices::of(&global_ctx.net_ns)
                 .expect("native instance domain must be registered")
                 .nics
                 .clone(),
