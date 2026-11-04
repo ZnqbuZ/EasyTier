@@ -13,7 +13,6 @@ license-file = "../LICENSE"
 build = "build/main.rs"
 
 [dependencies]
-optionize = { workspace = true, optional = true }
 anyhow = { workspace = true, optional = true }
 async-trait = { workspace = true, optional = true }
 auto_impl = { workspace = true, optional = true }
@@ -22,6 +21,7 @@ bytes = { workspace = true, optional = true }
 chrono = { workspace = true, features = ["serde"], optional = true }
 cidr = { workspace = true, features = ["serde"], optional = true }
 hmac = { workspace = true, optional = true }
+optionize = { workspace = true, optional = true }
 prost = { workspace = true, optional = true }
 prost-types = { workspace = true, optional = true }
 prost-wkt-types = { version = "0.7.2", optional = true }
